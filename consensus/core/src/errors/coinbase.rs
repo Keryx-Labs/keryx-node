@@ -15,6 +15,15 @@ pub enum CoinbaseError {
         "coinbase payload length is {0} bytes but it needs to be at least {1} bytes long in order to accommodate the script public key"
     )]
     PayloadCantContainScriptPublicKey(usize, usize),
+
+    /// OPoI: coinbase extra_data has no `/ai:v1:` inference tag.
+    #[error("OPoI tag missing: coinbase extra_data must contain '/ai:v1:{{16 hex chars}}'")]
+    OPoiTagMissing,
+
+    /// OPoI: the miner's claimed inference tag does not match the
+    /// expected result for the nonce declared in extra_data.
+    #[error("OPoI tag mismatch: nonce {0:#018x} — claimed tag '{1}' does not match expected value")]
+    OPoiTagInvalid(u64, String),
 }
 
 pub type CoinbaseResult<T> = std::result::Result<T, CoinbaseError>;

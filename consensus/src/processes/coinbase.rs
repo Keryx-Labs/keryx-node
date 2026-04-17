@@ -182,6 +182,30 @@ impl CoinbaseManager {
         Ok(payload)
     }
 
+    /// OPoI Phase 2 — verifies the inference tag in a coinbase payload.
+    ///
+    /// Parses the `extra_data` portion of `payload` looking for the pattern
+    /// `/{nonce_hex16}/ai:v1:{tag_hex16}`.  If found, re-executes the deterministic
+    /// MLP and compares the result.  A mismatch returns `CoinbaseError::OPoiTagInvalid`.
+    ///
+    /// Blocks without an OPoI tag are accepted with a warning — Phase 3 will make
+    /// the tag mandatory via a hard `ForkActivation` rule.
+    pub fn validate_opoi_tag(&self, payload: &[u8]) -> CoinbaseResult<()> {
+        match keryx_inference::parse_opoi(payload) {
+            Some((nonce, claimed_tag)) => {
+                if !keryx_inference::verify_tag(nonce, &claimed_tag) {
+                    return Err(CoinbaseError::OPoiTagInvalid(nonce, claimed_tag));
+                }
+            }
+            None => {
+                // No OPoI marker — hard error from genesis since the chain is not yet launched.
+                // Every miner MUST run inference and commit the result in extra_data.
+                return Err(CoinbaseError::OPoiTagMissing);
+            }
+        }
+        Ok(())
+    }
+
     pub fn deserialize_coinbase_payload<'a>(&self, payload: &'a [u8]) -> CoinbaseResult<CoinbaseData<&'a [u8]>> {
         if payload.len() < MIN_PAYLOAD_LENGTH {
             return Err(CoinbaseError::PayloadLenBelowMin(payload.len(), MIN_PAYLOAD_LENGTH));
