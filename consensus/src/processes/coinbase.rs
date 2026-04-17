@@ -198,8 +198,9 @@ impl CoinbaseManager {
                 }
             }
             None => {
-                // No OPoI marker — soft enforcement until Phase 3 fork activation.
-                log::debug!("block coinbase has no OPoI tag (pre-upgrade miner)");
+                // No OPoI marker — hard error from genesis since the chain is not yet launched.
+                // Every miner MUST run inference and commit the result in extra_data.
+                return Err(CoinbaseError::OPoiTagMissing);
             }
         }
         Ok(())

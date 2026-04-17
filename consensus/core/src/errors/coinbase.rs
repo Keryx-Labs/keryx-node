@@ -16,7 +16,11 @@ pub enum CoinbaseError {
     )]
     PayloadCantContainScriptPublicKey(usize, usize),
 
-    /// OPoI Phase 2: the miner's claimed inference tag does not match the
+    /// OPoI: coinbase extra_data has no `/ai:v1:` inference tag.
+    #[error("OPoI tag missing: coinbase extra_data must contain '/ai:v1:{{16 hex chars}}'")]
+    OPoiTagMissing,
+
+    /// OPoI: the miner's claimed inference tag does not match the
     /// expected result for the nonce declared in extra_data.
     #[error("OPoI tag mismatch: nonce {0:#018x} — claimed tag '{1}' does not match expected value")]
     OPoiTagInvalid(u64, String),
