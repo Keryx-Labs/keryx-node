@@ -2714,6 +2714,7 @@ dependencies = [
  "keryx-core",
  "keryx-database",
  "keryx-hashes",
+ "keryx-inference",
  "keryx-math",
  "keryx-merkle",
  "keryx-muhash",
