@@ -120,18 +120,21 @@ impl<const BPS: u64> Bps<BPS> {
         BPS * COINBASE_MATURITY_SECONDS
     }
 
-    /// DAA score after which the pre-deflationary period switches to the deflationary period.
+    /// DAA score after which the pre-emission bootstrapping period ends and the halving schedule begins.
     ///
-    /// This number is calculated as follows:
+    /// Keryx networks set this to 0 (emission starts at genesis), so this function is kept for
+    /// reference and potential future use in development or simulation contexts.
     ///
-    /// - We define a year as 365.25 days
-    /// - Half a year in seconds = 365.25 / 2 * 24 * 60 * 60 = 15778800
-    /// - The network was down for three days shortly after launch
-    /// - Three days in seconds = 3 * 24 * 60 * 60 = 259200
+    /// Formula: BPS × (half a year in seconds minus a three-day downtime offset from Kaspa history).
+    /// Not used by production Keryx networks.
     pub const fn deflationary_phase_daa_score() -> u64 {
         BPS * (15778800 - 259200)
     }
 
+    /// Per-block subsidy during the pre-emission bootstrapping phase (sompi/block).
+    ///
+    /// Scaled down from the original Kaspa 1-BPS constant (50 B sompi/block = 500 KAS/block)
+    /// to preserve the same per-second rate at the given BPS.
     pub const fn pre_deflationary_phase_base_subsidy() -> u64 {
         50000000000 / BPS
     }
