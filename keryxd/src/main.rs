@@ -46,5 +46,5 @@ pub fn main() {
     Arc::new(Signals::new(&core)).init();
 
     core.run();
-    info!("Kaspad has stopped...");
+    info!("Keryxd has stopped.");
 }
