@@ -1,3 +1,4 @@
+use keryx_addresses::Address;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
@@ -5,9 +6,23 @@ use keryx_consensus_core::{
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
 };
+use keryx_txscript::standard::pay_to_address_script;
 use std::convert::TryInto;
 
 use crate::{constants, model::stores::ghostdag::GhostdagData};
+
+// ── R&D allocation ────────────────────────────────────────────────────────────
+
+/// Protocol-level R&D allocation: 2% of every block reward (200 basis points).
+/// Deducted from each miner output before it is committed to the coinbase transaction.
+const RD_ALLOCATION_BPS: u64 = 200;
+const RD_ALLOCATION_BPS_DIVISOR: u64 = 10_000;
+
+/// Mainnet address that receives the R&D allocation.
+const RD_ALLOCATION_ADDRESS: &str =
+    "keryx:qp8zp9wnpqhgygpsv25px8whw0ee7md72s0tgy78x5wt7ryk6w525aqm045zv";
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 const LENGTH_OF_BLUE_SCORE: usize = size_of::<u64>();
 const LENGTH_OF_SUBSIDY: usize = size_of::<u64>();
@@ -97,6 +112,8 @@ pub struct CoinbaseManager {
     emission_schedule: Vec<u64>,
     /// Per-block subsidy applied indefinitely once `emission_schedule` is exhausted.
     tail_emission_per_block: u64,
+    /// Script public key for the protocol R&D allocation output (2% of every block reward).
+    rd_allocation_script_public_key: ScriptPublicKey,
 }
 
 /// Struct used to streamline payload parsing
@@ -127,6 +144,11 @@ impl CoinbaseManager {
     ) -> Self {
         let emission_schedule = build_emission_schedule(bps);
         let tail_emission_per_block = KRX_TAIL_EMISSION_PER_SECOND.div_ceil(bps);
+
+        let rd_address = Address::try_from(RD_ALLOCATION_ADDRESS)
+            .expect("hardcoded R&D allocation address must be valid");
+        let rd_allocation_script_public_key = pay_to_address_script(&rd_address);
+
         Self {
             coinbase_payload_script_public_key_max_len,
             max_coinbase_payload_len,
@@ -135,6 +157,7 @@ impl CoinbaseManager {
             bps,
             emission_schedule,
             tail_emission_per_block,
+            rd_allocation_script_public_key,
         }
     }
 
@@ -146,20 +169,26 @@ impl CoinbaseManager {
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
-        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() + 1); // + 1 for possible red reward
+        // + 1 for possible red reward, + 1 for R&D allocation output
+        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() + 2);
+        let mut rd_total = 0u64;
 
         // Add an output for each mergeset blue block (∩ DAA window), paying to the script reported by the block.
-        // Note that combinatorically it is nearly impossible for a blue block to be non-DAA
+        // 2% of each reward is withheld and accumulated into the R&D allocation output.
+        // Note that combinatorically it is nearly impossible for a blue block to be non-DAA.
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
-            if reward_data.subsidy + reward_data.total_fees > 0 {
-                outputs
-                    .push(TransactionOutput::new(reward_data.subsidy + reward_data.total_fees, reward_data.script_public_key.clone()));
+            let total = reward_data.subsidy + reward_data.total_fees;
+            if total > 0 {
+                let rd_cut = total * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+                rd_total += rd_cut;
+                outputs.push(TransactionOutput::new(total - rd_cut, reward_data.script_public_key.clone()));
             }
         }
 
         // Collect all rewards from mergeset reds ∩ DAA window and create a
-        // single output rewarding all to the current block (the "merging" block)
+        // single output rewarding all to the current block (the "merging" block).
+        // The same 2% R&D cut applies to the merged red reward.
         let mut red_reward = 0u64;
 
         for red in ghostdag_data.mergeset_reds.iter() {
@@ -172,7 +201,14 @@ impl CoinbaseManager {
         }
 
         if red_reward > 0 {
-            outputs.push(TransactionOutput::new(red_reward, miner_data.script_public_key.clone()));
+            let rd_cut = red_reward * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+            rd_total += rd_cut;
+            outputs.push(TransactionOutput::new(red_reward - rd_cut, miner_data.script_public_key.clone()));
+        }
+
+        // Single R&D allocation output — 2% of the total block reward, sent to the protocol treasury.
+        if rd_total > 0 {
+            outputs.push(TransactionOutput::new(rd_total, self.rd_allocation_script_public_key.clone()));
         }
 
         // Build the current block's payload
