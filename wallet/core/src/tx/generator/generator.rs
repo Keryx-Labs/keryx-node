@@ -868,7 +868,6 @@ impl Generator {
 
                 data.aggregate_mass = calc.combine_mass(compute_mass, storage_mass);
 
-                transaction_fees += change_output_value;
                 data.transaction_fees = transaction_fees;
                 stage.aggregate_fees += transaction_fees;
                 context.aggregate_fees += transaction_fees;
@@ -937,7 +936,10 @@ impl Generator {
                         let fees_no_change = calc.calc_fee_for_mass(storage_mass_no_change);
                         let difference = fees_with_change.saturating_sub(fees_no_change);
 
-                        if difference > change_value {
+                        // Also absorb change if using it would push storage mass over the tx limit.
+                        // This covers the case where change_value is above the dust threshold but
+                        // small enough that C/change_value exceeds MAXIMUM_STANDARD_TRANSACTION_MASS.
+                        if difference > change_value || storage_mass_with_change > MAXIMUM_STANDARD_TRANSACTION_MASS {
                             absorb_change_to_fees = true;
                             storage_mass_no_change
                         } else {
