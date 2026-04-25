@@ -60,6 +60,10 @@ Security Mutation: Re-engineered consensus validation layers to ensure unique bl
       git clone https://github.com/Keryx-labs/keryx-node
       cd keryx-node
       ```
+  8. Build the node
+      ```bash
+      cargo build --release
+      ```
   </details>
 
 
@@ -96,6 +100,10 @@ Security Mutation: Re-engineered consensus validation layers to ensure unique bl
       ```bash
       git clone https://github.com/Keryx-labs/keryx-node
       cd keryx-node
+      ```
+  8. Build the node
+      ```bash
+      cargo build --release
       ```
  </details>
 
@@ -157,7 +165,10 @@ To build WASM on MacOS you need to install `llvm` from homebrew (at the time of 
       git clone https://github.com/Keryx-labs/keryx-node
       cd keryx-node
       ```
-
+  8. Build the node
+      ```bash
+      cargo build --release
+      ```
  </details>
 
 ## Running the Node
@@ -165,13 +176,13 @@ To build WASM on MacOS you need to install `llvm` from homebrew (at the time of 
 Start a node
 
 ```bash
-./keryx-node
+./target/release/keryxd
 ```
 
 ## Common options
 
 ```bash
-./keryx-node --help
+./keryxd --help
 ```
 
 ## Connect with us
