@@ -182,7 +182,7 @@ Start a node
 ## Common options
 
 ```bash
-./keryxd --help
+./target/release/keryxd --help
 ```
 
 ## Connect with us
