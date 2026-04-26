@@ -22,9 +22,14 @@ keryx-utils.workspace = true
 wasm-bindgen.workspace = true
 workflow-wasm.workspace = true
 num.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+
+[[bin]]
+name = "mine-genesis"
+path = "src/bin/mine_genesis.rs"
 
 [[bench]]
 name = "bench"

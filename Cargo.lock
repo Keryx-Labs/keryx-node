@@ -3349,6 +3349,7 @@ dependencies = [
  "keryx-math",
  "keryx-utils",
  "num",
+ "rayon",
  "wasm-bindgen",
  "workflow-wasm",
 ]
