@@ -16,6 +16,10 @@ keryx-rpc-core.workspace = true
 keryx-wrpc-client.workspace = true
 tokio.workspace = true
 
+[[bin]]
+name = "check-balance"
+path = "src/check_balance.rs"
+
 
 [lints]
 workspace = true
