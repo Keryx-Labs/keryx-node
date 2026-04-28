@@ -262,28 +262,34 @@ impl CoinbaseManager {
         Ok(payload)
     }
 
-    /// OPoI Phase 2 — verifies the inference tag in a coinbase payload.
+    /// OPoI Phase 1 — verifies that the coinbase payload carries an inference tag.
     ///
     /// Parses the `extra_data` portion of `payload` looking for the pattern
-    /// `/{nonce_hex16}/ai:v1:{tag_hex16}`.  If found, re-executes the deterministic
-    /// MLP and compares the result.  A mismatch returns `CoinbaseError::OPoiTagInvalid`.
+    /// `/{nonce_hex16}/ai:v1:{tag_hex16}`.
     ///
-    /// Blocks without an OPoI tag are accepted with a warning — Phase 3 will make
-    /// the tag mandatory via a hard `ForkActivation` rule.
+    /// **Phase 1 policy (Optimistic)**: only the *presence* and *format* of the
+    /// tag are checked, not the MLP output value.  Checking the exact value here
+    /// causes false rejections during IBD because the MLP result depends on the
+    /// floating-point implementation (candle-core vs. bare Rust vs. GPU kernels)
+    /// and may differ across hardware even for the same nonce.  Value verification
+    /// is deferred to Phase 2 fraud-proofs, which are the authoritative enforcement
+    /// mechanism under the Optimistic Proof of Inference design.
+    ///
+    /// A block whose coinbase carries no `/ai:v1:` tag is rejected: every miner
+    /// MUST commit to having performed inference.  Hard-fork activation for strict
+    /// value checking will be introduced in Phase 2 once all block-production paths
+    /// generate canonical OPoI payloads.
     pub fn validate_opoi_tag(&self, payload: &[u8]) -> CoinbaseResult<()> {
         match keryx_inference::parse_opoi(payload) {
-            Some((nonce, claimed_tag)) => {
-                if !keryx_inference::verify_tag(nonce, &claimed_tag) {
-                    return Err(CoinbaseError::OPoiTagInvalid(nonce, claimed_tag));
-                }
+            Some(_) => {
+                // Tag is present and well-formed — value check deferred to Phase 2 fraud-proofs.
+                Ok(())
             }
             None => {
-                // No OPoI marker — hard error from genesis since the chain is not yet launched.
-                // Every miner MUST run inference and commit the result in extra_data.
-                return Err(CoinbaseError::OPoiTagMissing);
+                // No OPoI marker — every miner must commit to inference.
+                Err(CoinbaseError::OPoiTagMissing)
             }
         }
-        Ok(())
     }
 
     pub fn deserialize_coinbase_payload<'a>(&self, payload: &'a [u8]) -> CoinbaseResult<CoinbaseData<&'a [u8]>> {
