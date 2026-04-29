@@ -67,11 +67,11 @@ members = [
 
 [workspace.package]
 rust-version = "1.88.0"
-version = "1.1.0"
-authors = ["Kaspa developers"]
+version = "1.0.0"
+authors = ["Keryx developers"]
 license = "ISC"
-repository = "https://github.com/kaspanet/rusty-kaspa"
-edition = "2024"
+repository = "https://github.com/Keryx-Labs/keryx-node"
+edition = "2026"
 include = [
     "src/**/*.rs",
     "src/**/*.s",
