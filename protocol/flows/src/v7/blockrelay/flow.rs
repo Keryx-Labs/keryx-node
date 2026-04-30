@@ -3,13 +3,10 @@ use crate::{
     flow_trait::Flow,
     flowcontext::orphans::OrphanOutput,
 };
-use keryx_addresses::Address;
-use keryx_consensus::processes::coinbase::RD_ALLOCATION_ADDRESS;
 use keryx_consensus_core::{api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, errors::block::RuleError};
 use keryx_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
-use keryx_core::{debug, warn};
+use keryx_core::debug;
 use keryx_hashes::Hash;
-use keryx_txscript::pay_to_address_script;
 use keryx_p2p_lib::{
     IncomingRoute, Router, SharedIncomingRoute,
     common::ProtocolError,
@@ -140,24 +137,6 @@ impl HandleRelayInvsFlow {
 
             if block.is_header_only() {
                 return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
-            }
-
-            // Pre-validate the coinbase before entering the consensus pipeline.
-            // Blocks with an obviously invalid coinbase (missing R&D allocation output) are
-            // dropped immediately and the relaying peer is banned — stopping propagation at
-            // the source and avoiding wasted validation work across the network.
-            if let Err(reason) = Self::check_relay_coinbase(&block) {
-                let peer_ip = self.router.net_address().ip();
-                warn!(
-                    "Relay block {} has invalid coinbase ({}) — banning peer {}",
-                    block.hash(), reason, peer_ip
-                );
-                if let Some(cm) = self.ctx.connection_manager() {
-                    cm.ban(peer_ip).await;
-                }
-                return Err(ProtocolError::OtherOwned(format!(
-                    "relay block {} rejected: invalid coinbase ({})", block.hash(), reason
-                )));
             }
 
             let blue_work_threshold = session.async_get_virtual_merge_depth_blue_work_threshold().await;
@@ -386,25 +365,6 @@ impl HandleRelayInvsFlow {
             }
         }
         Ok(false)
-    }
-
-    /// Lightweight pre-validation of a relay block's coinbase.
-    ///
-    /// Checks that the coinbase transaction contains an R&D allocation output before
-    /// submitting the block to the full consensus pipeline. This catches miners running
-    /// outdated software (without the R&D allocation) early, preventing their blocks from
-    /// being relayed across the network and wasting validation resources.
-    ///
-    /// Returns `Ok(())` if the coinbase looks valid, or `Err(reason)` if it is obviously wrong.
-    fn check_relay_coinbase(block: &Block) -> Result<(), &'static str> {
-        let coinbase = block.transactions.first().ok_or("block has no transactions")?;
-        let rd_address = Address::try_from(RD_ALLOCATION_ADDRESS).map_err(|_| "invalid R&D address constant")?;
-        let rd_script = pay_to_address_script(&rd_address);
-        if coinbase.outputs.iter().any(|o| o.script_public_key == rd_script) {
-            Ok(())
-        } else {
-            Err("missing R&D allocation output")
-        }
     }
 
     // Send the block to IBD flow via the dedicated job channel. If the channel has a pending job, we prefer

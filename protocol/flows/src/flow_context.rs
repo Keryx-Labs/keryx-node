@@ -698,15 +698,6 @@ impl FlowContext {
 #[async_trait]
 impl ConnectionInitializer for FlowContext {
     async fn initialize_connection(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
-        // Reject incoming connections from banned IPs before any handshake.
-        // Outbound connections are initiated by us, so we skip this check for them.
-        if !router.is_outbound() {
-            let peer_ip = router.net_address().ip();
-            if self.address_manager.lock().is_banned(peer_ip.into()) {
-                return Err(ProtocolError::IgnorableReject(format!("peer {} is banned", peer_ip)));
-            }
-        }
-
         // Build the handshake object and subscribe to handshake messages
         let mut handshake = KaspadHandshake::new(&router);
 
