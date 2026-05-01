@@ -100,9 +100,10 @@ impl BlockTemplateBuilder {
         let coinbase_tx = &mut block_template.block.transactions[COINBASE_TRANSACTION_INDEX];
         let new_payload = consensus.modify_coinbase_payload(coinbase_tx.payload.clone(), new_miner_data)?;
         coinbase_tx.payload = new_payload;
-        if block_template.coinbase_has_red_reward {
-            // The last output is always the coinbase red blocks reward
-            coinbase_tx.outputs.last_mut().unwrap().script_public_key = new_miner_data.script_public_key.clone();
+        if let Some(idx) = block_template.red_reward_output_index {
+            // Rewrite the red-blocks reward output at the tracked index with the new miner address.
+            // Using an explicit index avoids assumptions about output ordering.
+            coinbase_tx.outputs[idx].script_public_key = new_miner_data.script_public_key.clone();
         }
         // Update the hash merkle root according to the modified transactions
         block_template.block.header.hash_merkle_root = consensus.calc_transaction_hash_merkle_root(&block_template.block.transactions);

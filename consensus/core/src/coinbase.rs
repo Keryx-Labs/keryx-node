@@ -36,5 +36,8 @@ impl BlockRewardData {
 /// Holds a coinbase transaction along with meta-data obtained during creation
 pub struct CoinbaseTransactionTemplate {
     pub tx: Transaction,
-    pub has_red_reward: bool, // Does the last output contain reward for red blocks
+    pub has_red_reward: bool,
+    /// Index of the red-blocks reward output within the coinbase outputs, if present.
+    /// Used by modify_block_template to rewrite the correct output when changing miner address.
+    pub red_reward_output_index: Option<usize>,
 }

@@ -119,6 +119,9 @@ pub struct BlockTemplate {
     pub block: MutableBlock,
     pub miner_data: MinerData,
     pub coinbase_has_red_reward: bool,
+    /// Index of the red-blocks reward output within the coinbase outputs, if present.
+    /// Used by modify_block_template to rewrite the correct output when changing miner address.
+    pub red_reward_output_index: Option<usize>,
     pub selected_parent_timestamp: u64,
     pub selected_parent_daa_score: u64,
     pub selected_parent_hash: Hash,
@@ -131,6 +134,7 @@ impl BlockTemplate {
         block: MutableBlock,
         miner_data: MinerData,
         coinbase_has_red_reward: bool,
+        red_reward_output_index: Option<usize>,
         selected_parent_timestamp: u64,
         selected_parent_daa_score: u64,
         selected_parent_hash: Hash,
@@ -140,6 +144,7 @@ impl BlockTemplate {
             block,
             miner_data,
             coinbase_has_red_reward,
+            red_reward_output_index,
             selected_parent_timestamp,
             selected_parent_daa_score,
             selected_parent_hash,

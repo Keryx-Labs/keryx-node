@@ -1075,6 +1075,7 @@ impl VirtualStateProcessor {
             MutableBlock::new(header, txs),
             miner_data,
             coinbase.has_red_reward,
+            coinbase.red_reward_output_index,
             selected_parent_timestamp,
             selected_parent_daa_score,
             selected_parent_hash,
