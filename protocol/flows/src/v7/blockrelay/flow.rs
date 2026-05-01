@@ -143,21 +143,16 @@ impl HandleRelayInvsFlow {
             }
 
             // Pre-validate the coinbase before entering the consensus pipeline.
-            // Blocks with an obviously invalid coinbase (missing R&D allocation output) are
-            // dropped immediately and the relaying peer is banned — stopping propagation at
-            // the source and avoiding wasted validation work across the network.
+            // Blocks missing the R&D allocation output are silently dropped: the peer
+            // may be an honest node that accepted the block before R&D enforcement was
+            // active. Disconnecting or banning would cause reconnect loops. The block
+            // hash is now known to us so the peer will not re-announce it.
             if let Err(reason) = Self::check_relay_coinbase(&block) {
-                let peer_ip = self.router.net_address().ip();
                 warn!(
-                    "Relay block {} has invalid coinbase ({}) — banning peer {}",
-                    block.hash(), reason, peer_ip
+                    "Relay block {} has invalid coinbase ({}) — dropping silently, keeping connection",
+                    block.hash(), reason
                 );
-                if let Some(cm) = self.ctx.connection_manager() {
-                    cm.ban(peer_ip).await;
-                }
-                return Err(ProtocolError::OtherOwned(format!(
-                    "relay block {} rejected: invalid coinbase ({})", block.hash(), reason
-                )));
+                continue;
             }
 
             let blue_work_threshold = session.async_get_virtual_merge_depth_blue_work_threshold().await;
