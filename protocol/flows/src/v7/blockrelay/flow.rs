@@ -3,10 +3,13 @@ use crate::{
     flow_trait::Flow,
     flowcontext::orphans::OrphanOutput,
 };
+use keryx_addresses::Address;
+use keryx_consensus::processes::coinbase::RD_ALLOCATION_ADDRESS;
 use keryx_consensus_core::{api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, errors::block::RuleError};
 use keryx_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
-use keryx_core::debug;
+use keryx_core::{debug, warn};
 use keryx_hashes::Hash;
+use keryx_txscript::pay_to_address_script;
 use keryx_p2p_lib::{
     IncomingRoute, Router, SharedIncomingRoute,
     common::ProtocolError,
@@ -55,6 +58,10 @@ impl TwoWayIncomingRoute {
     }
 }
 
+/// Number of blocks missing R&D allocation a peer may relay before being banned.
+/// Honest nodes may relay a handful of pre-enforcement blocks; spammers relay many more.
+const RD_VIOLATION_BAN_THRESHOLD: u32 = 5;
+
 pub struct HandleRelayInvsFlow {
     ctx: FlowContext,
     router: Arc<Router>,
@@ -66,6 +73,8 @@ pub struct HandleRelayInvsFlow {
     ibd_sender: JobSender<Block>,
     /// Header format determined by protocol version
     header_format: HeaderFormat,
+    /// Counts blocks relayed by this peer that were missing the R&D allocation output.
+    rd_violation_count: u32,
 }
 
 #[async_trait::async_trait]
@@ -88,7 +97,7 @@ impl HandleRelayInvsFlow {
         ibd_sender: JobSender<Block>,
         header_format: HeaderFormat,
     ) -> Self {
-        Self { ctx, router, invs_route: TwoWayIncomingRoute::new(invs_route), msg_route, ibd_sender, header_format }
+        Self { ctx, router, invs_route: TwoWayIncomingRoute::new(invs_route), msg_route, ibd_sender, header_format, rd_violation_count: 0 }
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
@@ -137,6 +146,32 @@ impl HandleRelayInvsFlow {
 
             if block.is_header_only() {
                 return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
+            }
+
+            // Pre-validate the coinbase before entering the consensus pipeline.
+            // Honest nodes may relay a few pre-enforcement blocks — we drop those silently.
+            // Peers that exceed RD_VIOLATION_BAN_THRESHOLD are banned: they are either a
+            // malicious miner or a node actively spamming invalid blocks.
+            if let Err(reason) = Self::check_relay_coinbase(&block) {
+                self.rd_violation_count += 1;
+                if self.rd_violation_count >= RD_VIOLATION_BAN_THRESHOLD {
+                    let peer_ip = self.router.net_address().ip();
+                    warn!(
+                        "Peer {} reached {} R&D violations (last: block {} — {}) — banning",
+                        peer_ip, self.rd_violation_count, block.hash(), reason
+                    );
+                    if let Some(cm) = self.ctx.connection_manager() {
+                        cm.ban(peer_ip).await;
+                    }
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "peer banned after {} blocks missing R&D allocation", self.rd_violation_count
+                    )));
+                }
+                warn!(
+                    "Relay block {} has invalid coinbase ({}) — dropping (violation {}/{})",
+                    block.hash(), reason, self.rd_violation_count, RD_VIOLATION_BAN_THRESHOLD
+                );
+                continue;
             }
 
             let blue_work_threshold = session.async_get_virtual_merge_depth_blue_work_threshold().await;
@@ -365,6 +400,29 @@ impl HandleRelayInvsFlow {
             }
         }
         Ok(false)
+    }
+
+    /// Lightweight pre-validation of a relay block's coinbase.
+    ///
+    /// Checks that the coinbase transaction contains an R&D allocation output before
+    /// submitting the block to the full consensus pipeline. This catches miners running
+    /// outdated software (without the R&D allocation) early, preventing their blocks from
+    /// being relayed across the network and wasting validation resources.
+    ///
+    /// Returns `Ok(())` if the coinbase looks valid, or `Err(reason)` if it is obviously wrong.
+    fn check_relay_coinbase(block: &Block) -> Result<(), &'static str> {
+        let coinbase = block.transactions.first().ok_or("block has no transactions")?;
+        // Zero outputs means zero-reward block (all blues had subsidy=0) — no R&D cut expected.
+        if coinbase.outputs.is_empty() {
+            return Ok(());
+        }
+        let rd_address = Address::try_from(RD_ALLOCATION_ADDRESS).map_err(|_| "invalid R&D address constant")?;
+        let rd_script = pay_to_address_script(&rd_address);
+        if coinbase.outputs.iter().any(|o| o.script_public_key == rd_script) {
+            Ok(())
+        } else {
+            Err("missing R&D allocation output")
+        }
     }
 
     // Send the block to IBD flow via the dedicated job channel. If the channel has a pending job, we prefer
