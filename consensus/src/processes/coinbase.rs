@@ -19,7 +19,7 @@ const RD_ALLOCATION_BPS: u64 = 200;
 const RD_ALLOCATION_BPS_DIVISOR: u64 = 10_000;
 
 /// Mainnet address that receives the R&D allocation.
-const RD_ALLOCATION_ADDRESS: &str =
+pub const RD_ALLOCATION_ADDRESS: &str =
     "keryx:qp8zp9wnpqhgygpsv25px8whw0ee7md72s0tgy78x5wt7ryk6w525aqm045zv";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -275,10 +275,10 @@ impl CoinbaseManager {
     /// is deferred to Phase 2 fraud-proofs, which are the authoritative enforcement
     /// mechanism under the Optimistic Proof of Inference design.
     ///
-    /// A block whose coinbase carries no `/ai:v1:` tag is rejected: every miner
-    /// MUST commit to having performed inference.  Hard-fork activation for strict
-    /// value checking will be introduced in Phase 2 once all block-production paths
-    /// generate canonical OPoI payloads.
+    /// Validates the OPoI tag format in a coinbase payload.
+    /// Consensus enforcement is disabled (Phase 1 optimistic); this function is
+    /// kept for Phase 2 fraud-proof verification.
+    #[allow(dead_code)]
     pub fn validate_opoi_tag(&self, payload: &[u8]) -> CoinbaseResult<()> {
         match keryx_inference::parse_opoi(payload) {
             Some(_) => {
