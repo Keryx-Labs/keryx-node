@@ -203,11 +203,14 @@ impl CoinbaseManager {
         if red_reward > 0 {
             let rd_cut = red_reward * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
             rd_total += rd_cut;
+            // R&D output must come before red_reward so that outputs.last() remains the red reward
+            // output — modify_block_template rewrites last() with the miner's address.
+            if rd_total > 0 {
+                outputs.push(TransactionOutput::new(rd_total, self.rd_allocation_script_public_key.clone()));
+            }
             outputs.push(TransactionOutput::new(red_reward - rd_cut, miner_data.script_public_key.clone()));
-        }
-
-        // Single R&D allocation output — 2% of the total block reward, sent to the protocol treasury.
-        if rd_total > 0 {
+        } else if rd_total > 0 {
+            // No red reward — only blue rewards contributed to R&D, push normally.
             outputs.push(TransactionOutput::new(rd_total, self.rd_allocation_script_public_key.clone()));
         }
 
