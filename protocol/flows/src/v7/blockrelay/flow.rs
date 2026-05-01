@@ -398,6 +398,10 @@ impl HandleRelayInvsFlow {
     /// Returns `Ok(())` if the coinbase looks valid, or `Err(reason)` if it is obviously wrong.
     fn check_relay_coinbase(block: &Block) -> Result<(), &'static str> {
         let coinbase = block.transactions.first().ok_or("block has no transactions")?;
+        // Zero outputs means zero-reward block (all blues had subsidy=0) — no R&D cut expected.
+        if coinbase.outputs.is_empty() {
+            return Ok(());
+        }
         let rd_address = Address::try_from(RD_ALLOCATION_ADDRESS).map_err(|_| "invalid R&D address constant")?;
         let rd_script = pay_to_address_script(&rd_address);
         if coinbase.outputs.iter().any(|o| o.script_public_key == rd_script) {
