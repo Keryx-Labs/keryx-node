@@ -264,6 +264,11 @@ impl AddressManager {
             return;
         }
 
+        // Do not re-add banned IPs — they would be re-selected for outbound connections
+        if self.is_banned(address.ip) {
+            return;
+        }
+
         if self.address_store.has(address) {
             return;
         }
