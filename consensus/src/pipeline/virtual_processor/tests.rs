@@ -1,4 +1,5 @@
 use crate::{consensus::test_consensus::TestConsensus, model::services::reachability::ReachabilityService};
+use keryx_inference;
 use keryx_consensus_core::{
     BlockHashSet,
     api::ConsensusApi,
@@ -301,5 +302,5 @@ fn new_miner_data() -> MinerData {
     let mut rng = rand::thread_rng();
     let (_sk, pk) = secp.generate_keypair(&mut rng);
     let script = ScriptVec::from_slice(&pk.serialize());
-    MinerData::new(ScriptPublicKey::new(0, script), vec![])
+    MinerData::new(ScriptPublicKey::new(0, script), keryx_inference::gen_opoi_extra_data(0))
 }

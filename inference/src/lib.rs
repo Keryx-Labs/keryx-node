@@ -120,6 +120,13 @@ pub fn verify_tag_fixed(nonce: u64, claimed_hex16: &str) -> bool {
     tag_fixed(nonce) == claimed_hex16
 }
 
+/// Generates OPoI extra_data bytes for use in test coinbase payloads.
+/// Produces `/{nonce_hex16}/ai:v1:{tag_hex16}` which `parse_opoi` can parse.
+pub fn gen_opoi_extra_data(nonce: u64) -> Vec<u8> {
+    let tag = tag_fixed(nonce);
+    format!("/{:016x}/ai:v1:{}", nonce, tag).into_bytes()
+}
+
 /// Errors returned by the inference engine.
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceError {

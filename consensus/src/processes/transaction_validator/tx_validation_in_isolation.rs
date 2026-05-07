@@ -328,7 +328,7 @@ mod tests {
         tv.validate_tx_in_isolation(&valid_tx).unwrap();
 
         let mut tx: Transaction = valid_tx.clone();
-        tx.subnetwork_id = SubnetworkId::from_byte(3);
+        tx.subnetwork_id = SubnetworkId::from_byte(6); // bytes 3-5 are now AI subnetworks
         assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::SubnetworksDisabled(_)));
 
         let mut tx = valid_tx.clone();
