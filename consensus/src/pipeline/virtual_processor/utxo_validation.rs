@@ -39,7 +39,7 @@ use keryx_consensus_core::{
 use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
-use keryx_inference::AiChallengePayload;
+use keryx_inference::{AiChallengePayload, FraudProofResult, verify_fraud_proof};
 use keryx_muhash::MuHash;
 use keryx_utils::refs::Refs;
 
@@ -441,28 +441,59 @@ impl VirtualStateProcessor {
             }
         }
 
-        // Process AiChallenge txs — slash if valid.
+        // Process AiChallenge txs — slash if proof accepted.
+        //
+        // Phase 3 B behaviour:
+        //   - empty proof_data   → Phase A stub: slash unconditionally within window.
+        //   - non-empty proof_data → verify Groth16 proof; slash only on FraudProofResult::Valid.
+        //     The Phase 3 B stub always returns StubNotImplemented, so no slash occurs for
+        //     ZK challenges until Phase 3 C deploys the circuit verifying key.
         for tx in txs.iter().skip(1) {
             if tx.is_ai_challenge() {
                 if let Some(challenge) = AiChallengePayload::deserialize(&tx.payload) {
                     let rh = Hash::from_bytes(challenge.response_hash);
-                    match self.ai_response_store.get(rh) {
-                        Ok(record) if pov_daa_score <= record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 => {
-                            let key = OutpointKey::new(record.coinbase_tx_id, 1);
-                            if let Err(e) = self.ai_slashed_store.set(key, pov_daa_score) {
-                                warn!("OPoI: failed to record slash in DB: {}", e);
-                            } else {
-                                info!("OPoI: escrow slashed — response_hash={}", hex::encode(challenge.response_hash));
+                    let slash_accepted = if challenge.proof_data.is_empty() {
+                        // Phase A compatibility: treat an empty proof as an unconditional slash signal.
+                        true
+                    } else {
+                        match verify_fraud_proof(&challenge.response_hash, &challenge.proof_data) {
+                            FraudProofResult::Valid => true,
+                            FraudProofResult::StubNotImplemented => {
+                                info!(
+                                    "OPoI: ZK proof received but circuit not yet deployed (Phase 3 B stub) — response_hash={}",
+                                    hex::encode(challenge.response_hash)
+                                );
+                                false
+                            }
+                            FraudProofResult::Invalid => {
+                                warn!(
+                                    "OPoI: malformed ZK proof rejected — response_hash={}",
+                                    hex::encode(challenge.response_hash)
+                                );
+                                false
                             }
                         }
-                        Ok(_) => warn!(
-                            "OPoI: challenge outside window — response_hash={}",
-                            hex::encode(challenge.response_hash)
-                        ),
-                        Err(_) => warn!(
-                            "OPoI: challenge for unknown response — response_hash={}",
-                            hex::encode(challenge.response_hash)
-                        ),
+                    };
+
+                    if slash_accepted {
+                        match self.ai_response_store.get(rh) {
+                            Ok(record) if pov_daa_score <= record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 => {
+                                let key = OutpointKey::new(record.coinbase_tx_id, 1);
+                                if let Err(e) = self.ai_slashed_store.set(key, pov_daa_score) {
+                                    warn!("OPoI: failed to record slash in DB: {}", e);
+                                } else {
+                                    info!("OPoI: escrow slashed — response_hash={}", hex::encode(challenge.response_hash));
+                                }
+                            }
+                            Ok(_) => warn!(
+                                "OPoI: challenge outside window — response_hash={}",
+                                hex::encode(challenge.response_hash)
+                            ),
+                            Err(_) => warn!(
+                                "OPoI: challenge for unknown response — response_hash={}",
+                                hex::encode(challenge.response_hash)
+                            ),
+                        }
                     }
                 }
             }

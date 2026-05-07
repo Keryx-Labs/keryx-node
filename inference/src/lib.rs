@@ -1,11 +1,13 @@
-/// Keryx OPoI (Optimistic Proof of Inference) — Phase 1 + Phase 2
+/// Keryx OPoI (Optimistic Proof of Inference) — Phase 1 + Phase 2 + Phase 3
 ///
 /// Phase 1: synthetic f32 MLP (candle-core), tag embedded in coinbase.
 /// Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
 ///   Tags are verified on-chain; collateral is slashed for fraud.
-/// Phase 3 (future): real SLM weights distributed via IPFS.
+/// Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
+/// Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
 
 pub mod ai_payload;
+pub mod fraud_proof;
 pub mod model;
 pub mod model_fixed;
 pub mod task;
@@ -17,6 +19,7 @@ pub use ai_payload::{
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
     SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
 };
+pub use fraud_proof::{verify_fraud_proof, FraudProofResult, GROTH16_PROOF_LEN};
 
 pub use task::{InferenceResult, InferenceTask};
 
