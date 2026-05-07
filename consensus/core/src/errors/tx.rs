@@ -105,6 +105,9 @@ pub enum TxRuleError {
     #[error("AiResponse transaction has a null (all-zero) request_hash")]
     AiResponseNullRequestHash,
 
+    #[error("AiChallenge transaction has a null (all-zero) response_hash")]
+    AiChallengeNullResponseHash,
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

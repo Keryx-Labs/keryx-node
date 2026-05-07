@@ -54,6 +54,8 @@ pub(crate) struct Mempool {
     counters: Arc<MiningCounters>,
     /// Deduplication index: request_hash → tx_id. One AiResponse per request.
     ai_response_index: HashMap<[u8; 32], TransactionId>,
+    /// Deduplication index: response_hash → tx_id. One AiChallenge per response.
+    ai_challenge_index: HashMap<[u8; 32], TransactionId>,
 }
 
 impl Mempool {
@@ -61,7 +63,15 @@ impl Mempool {
         let transaction_pool = TransactionsPool::new(config.clone());
         let orphan_pool = OrphanPool::new(config.clone());
         let accepted_transactions = AcceptedTransactions::new(config.clone());
-        Self { config, transaction_pool, orphan_pool, accepted_transactions, counters, ai_response_index: HashMap::new() }
+        Self {
+            config,
+            transaction_pool,
+            orphan_pool,
+            accepted_transactions,
+            counters,
+            ai_response_index: HashMap::new(),
+            ai_challenge_index: HashMap::new(),
+        }
     }
 
     pub(crate) fn get_transaction(&self, transaction_id: &TransactionId, query: TransactionQuery) -> Option<MutableTransaction> {

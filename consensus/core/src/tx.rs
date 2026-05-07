@@ -244,6 +244,10 @@ impl Transaction {
         self.subnetwork_id == subnets::SUBNETWORK_ID_AI_RESPONSE
     }
 
+    pub fn is_ai_challenge(&self) -> bool {
+        self.subnetwork_id == subnets::SUBNETWORK_ID_AI_CHALLENGE
+    }
+
     /// Recompute and finalize the tx id based on updated tx fields
     pub fn finalize(&mut self) {
         self.id = hashing::tx::id(self);

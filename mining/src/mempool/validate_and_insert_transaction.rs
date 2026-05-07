@@ -15,7 +15,7 @@ use keryx_consensus_core::{
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
-use keryx_inference::AiResponsePayload;
+use keryx_inference::{AiChallengePayload, AiResponsePayload};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -128,10 +128,15 @@ impl Mempool {
             .tx
             .clone();
 
-        // Register in dedup index so no second AiResponse for the same request gets in.
+        // Register in dedup indexes so no duplicate AI txs for the same hash get in.
         if accepted_transaction.is_ai_response() {
             if let Some(request_hash) = ai_response_request_hash(&accepted_transaction.payload) {
                 self.ai_response_index.insert(request_hash, accepted_transaction.id());
+            }
+        }
+        if accepted_transaction.is_ai_challenge() {
+            if let Some(response_hash) = ai_challenge_response_hash(&accepted_transaction.payload) {
+                self.ai_challenge_index.insert(response_hash, accepted_transaction.id());
             }
         }
 
@@ -159,6 +164,14 @@ impl Mempool {
             if let Some(request_hash) = ai_response_request_hash(&transaction.tx.payload) {
                 if self.ai_response_index.contains_key(&request_hash) {
                     return Err(RuleError::RejectDuplicateAiResponse(hex::encode(request_hash)));
+                }
+            }
+        }
+        // One AiChallenge per response: reject if a challenge for the same response_hash is already pending.
+        if transaction.tx.is_ai_challenge() {
+            if let Some(response_hash) = ai_challenge_response_hash(&transaction.tx.payload) {
+                if self.ai_challenge_index.contains_key(&response_hash) {
+                    return Err(RuleError::RejectDuplicateAiChallenge(hex::encode(response_hash)));
                 }
             }
         }
@@ -264,8 +277,10 @@ impl Mempool {
     }
 }
 
-/// Extracts the `request_hash` field from a raw AiResponse payload (bytes).
-/// Returns `None` if the payload is too short or malformed.
 fn ai_response_request_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiResponsePayload::deserialize(payload).map(|r| r.request_hash)
+}
+
+fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
+    AiChallengePayload::deserialize(payload).map(|c| c.response_hash)
 }

@@ -11,10 +11,11 @@ pub mod model_fixed;
 pub mod task;
 
 pub use ai_payload::{
-    AiRequestPayload, AiResponsePayload,
+    AiRequestPayload, AiResponsePayload, AiChallengePayload,
     MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN,
     MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
-    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX,
+    MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
+    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
 };
 
 pub use task::{InferenceResult, InferenceTask};

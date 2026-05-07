@@ -13,10 +13,17 @@ pub const MAX_AI_REQUEST_PAYLOAD_LEN: usize = 4_096;
 pub const MIN_AI_RESPONSE_PAYLOAD_LEN: usize = 40;
 pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = 8_192;
 
+/// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
+/// `[response_hash: 32] [challenger_deposit: 8 LE] [proof_data…]`
+/// `proof_data` is empty for Phase 3 A2b stubs; filled with Groth16/halo2 bytes in Phase B.
+pub const MIN_AI_CHALLENGE_PAYLOAD_LEN: usize = 40;
+pub const MAX_AI_CHALLENGE_PAYLOAD_LEN: usize = 32_768;
+
 /// Hex-encoded subnetwork IDs as returned by the keryxd gRPC API.
 /// Used by the miner to filter transactions from block templates.
 pub const SUBNETWORK_ID_AI_REQUEST_HEX: &str = "0300000000000000000000000000000000000000";
 pub const SUBNETWORK_ID_AI_RESPONSE_HEX: &str = "0400000000000000000000000000000000000000";
+pub const SUBNETWORK_ID_AI_CHALLENGE_HEX: &str = "0500000000000000000000000000000000000000";
 
 /// Payload of a `SUBNETWORK_ID_AI_REQUEST` transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +111,50 @@ impl AiResponsePayload {
     }
 }
 
+/// Payload of a `SUBNETWORK_ID_AI_CHALLENGE` transaction.
+///
+/// Submitted by anyone who believes a miner published a fraudulent AiResponse.
+/// The `challenger_deposit` is burned if the challenge is invalid; the miner's
+/// escrow is slashed to the challenger if the proof is accepted (Phase B+).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiChallengePayload {
+    /// Transaction payload hash of the disputed `AiResponse` (blake2b-256).
+    pub response_hash: [u8; 32],
+    /// Sompi deposited by the challenger (burned if challenge fails).
+    pub challenger_deposit: u64,
+    /// ZK fraud proof bytes — empty stub in Phase A2b, Groth16/halo2 in Phase B.
+    pub proof_data: Vec<u8>,
+}
+
+impl AiChallengePayload {
+    pub fn new(response_hash: [u8; 32], challenger_deposit: u64, proof_data: Vec<u8>) -> Self {
+        Self { response_hash, challenger_deposit, proof_data }
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(MIN_AI_CHALLENGE_PAYLOAD_LEN + self.proof_data.len());
+        out.extend_from_slice(&self.response_hash);
+        out.extend_from_slice(&self.challenger_deposit.to_le_bytes());
+        out.extend_from_slice(&self.proof_data);
+        out
+    }
+
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() < MIN_AI_CHALLENGE_PAYLOAD_LEN || data.len() > MAX_AI_CHALLENGE_PAYLOAD_LEN {
+            return None;
+        }
+        let response_hash: [u8; 32] = data[0..32].try_into().ok()?;
+        let challenger_deposit = u64::from_le_bytes(data[32..40].try_into().ok()?);
+        let proof_data = data[40..].to_vec();
+        Some(Self { response_hash, challenger_deposit, proof_data })
+    }
+
+    pub fn from_hex(payload_hex: &str) -> Option<Self> {
+        let bytes = hex::decode(payload_hex).ok()?;
+        Self::deserialize(&bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +194,26 @@ mod tests {
     fn ai_request_rejects_oversized() {
         let huge = vec![0u8; MAX_AI_REQUEST_PAYLOAD_LEN + 1];
         assert!(AiRequestPayload::deserialize(&huge).is_none());
+    }
+
+    #[test]
+    fn ai_challenge_roundtrip() {
+        let ch = AiChallengePayload::new([0xABu8; 32], 500_000, b"stub_proof".to_vec());
+        let bytes = ch.serialize();
+        let parsed = AiChallengePayload::deserialize(&bytes).unwrap();
+        assert_eq!(ch, parsed);
+    }
+
+    #[test]
+    fn ai_challenge_empty_proof_roundtrip() {
+        let ch = AiChallengePayload::new([1u8; 32], 1_000, vec![]);
+        let bytes = ch.serialize();
+        let parsed = AiChallengePayload::deserialize(&bytes).unwrap();
+        assert_eq!(ch, parsed);
+    }
+
+    #[test]
+    fn ai_challenge_rejects_too_short() {
+        assert!(AiChallengePayload::deserialize(&[0u8; 10]).is_none());
     }
 }

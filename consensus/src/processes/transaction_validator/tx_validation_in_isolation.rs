@@ -1,9 +1,9 @@
 use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
 use keryx_inference::{
-    AiResponsePayload,
-    MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
-    MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
+    AiChallengePayload, AiResponsePayload,
+    MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    MIN_AI_CHALLENGE_PAYLOAD_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
 };
 use std::collections::HashSet;
 
@@ -29,6 +29,7 @@ impl TransactionValidator {
         check_transaction_subnetwork(tx)?;
         check_ai_payload_len(tx)?;
         check_ai_response_request_hash(tx)?;
+        check_ai_challenge_response_hash(tx)?;
         check_transaction_version(tx)
     }
 
@@ -80,8 +81,8 @@ impl TransactionValidator {
     }
 
     fn check_transaction_inputs_count(&self, tx: &Transaction) -> TxResult<()> {
-        // Coinbase and AiResponse are data-publication transactions with no inputs.
-        if !tx.is_coinbase() && !tx.is_ai_response() && tx.inputs.is_empty() {
+        // Coinbase, AiResponse, and AiChallenge are data-publication transactions with no inputs.
+        if !tx.is_coinbase() && !tx.is_ai_response() && !tx.is_ai_challenge() && tx.inputs.is_empty() {
             return Err(TxRuleError::NoTxInputs);
         }
 
@@ -181,24 +182,34 @@ fn check_ai_response_request_hash(tx: &Transaction) -> TxResult<()> {
 }
 
 fn check_ai_payload_len(tx: &Transaction) -> TxResult<()> {
-    if tx.is_ai_request() {
-        let len = tx.payload.len();
-        if len < MIN_AI_REQUEST_PAYLOAD_LEN {
-            return Err(TxRuleError::AiPayloadTooShort(len, MIN_AI_REQUEST_PAYLOAD_LEN));
-        }
-        if len > MAX_AI_REQUEST_PAYLOAD_LEN {
-            return Err(TxRuleError::AiPayloadTooLong(len, MAX_AI_REQUEST_PAYLOAD_LEN));
-        }
+    let (min, max) = if tx.is_ai_request() {
+        (MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN)
     } else if tx.is_ai_response() {
-        let len = tx.payload.len();
-        if len < MIN_AI_RESPONSE_PAYLOAD_LEN {
-            return Err(TxRuleError::AiPayloadTooShort(len, MIN_AI_RESPONSE_PAYLOAD_LEN));
-        }
-        if len > MAX_AI_RESPONSE_PAYLOAD_LEN {
-            return Err(TxRuleError::AiPayloadTooLong(len, MAX_AI_RESPONSE_PAYLOAD_LEN));
-        }
+        (MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN)
+    } else if tx.is_ai_challenge() {
+        (MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN)
+    } else {
+        return Ok(());
+    };
+    let len = tx.payload.len();
+    if len < min {
+        return Err(TxRuleError::AiPayloadTooShort(len, min));
+    }
+    if len > max {
+        return Err(TxRuleError::AiPayloadTooLong(len, max));
     }
     Ok(())
+}
+
+fn check_ai_challenge_response_hash(tx: &Transaction) -> TxResult<()> {
+    if !tx.is_ai_challenge() {
+        return Ok(());
+    }
+    match AiChallengePayload::deserialize(&tx.payload) {
+        None => Err(TxRuleError::AiPayloadTooShort(tx.payload.len(), MIN_AI_CHALLENGE_PAYLOAD_LEN)),
+        Some(c) if c.response_hash == [0u8; 32] => Err(TxRuleError::AiChallengeNullResponseHash),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
