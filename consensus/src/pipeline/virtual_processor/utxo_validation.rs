@@ -165,9 +165,16 @@ impl VirtualStateProcessor {
             });
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+            let escrow_spk =
+                self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data);
             ctx.mergeset_rewards.insert(
                 merged_block,
-                BlockRewardData::new(coinbase_data.subsidy, block_fee, coinbase_data.miner_data.script_public_key),
+                BlockRewardData::new_with_escrow(
+                    coinbase_data.subsidy,
+                    block_fee,
+                    coinbase_data.miner_data.script_public_key,
+                    escrow_spk,
+                ),
             );
         }
     }

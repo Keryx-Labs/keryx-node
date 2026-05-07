@@ -49,6 +49,9 @@ pub enum DatabaseStorePrefixes {
     // Stores a succinct pruning proof descriptor
     PruningProofDescriptor = 33,
 
+    // ---- OPoI Collateral ----
+    MinerCollateral = 34,
+
     // ---- Ghostdag Proof
     TempGhostdag = 40,
     TempGhostdagCompact = 41,

@@ -1,4 +1,4 @@
-use keryx_addresses::Address;
+use keryx_addresses::{Address, Prefix, Version};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
@@ -6,6 +6,7 @@ use keryx_consensus_core::{
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
 };
+use keryx_hashes::{Hasher, TransactionHash};
 use keryx_txscript::standard::pay_to_address_script;
 use std::convert::TryInto;
 
@@ -14,9 +15,25 @@ use crate::{constants, model::stores::ghostdag::GhostdagData};
 // ── R&D allocation ────────────────────────────────────────────────────────────
 
 /// Protocol-level R&D allocation: 2% of every block reward (200 basis points).
-/// Deducted from each miner output before it is committed to the coinbase transaction.
 const RD_ALLOCATION_BPS: u64 = 200;
 const RD_ALLOCATION_BPS_DIVISOR: u64 = 10_000;
+
+// ── OPoI escrow split ─────────────────────────────────────────────────────────
+
+/// 10 % of each blue-block reward is sent to the miner's escrow SPK (OPoI)
+/// or burned (standard miner).  Applied on the gross reward before the R&D cut.
+const ESCROW_RATE_BPS: u64 = 1_000;
+const ESCROW_RATE_BPS_DIVISOR: u64 = 10_000;
+
+/// Marker searched in coinbase extra_data to locate the escrow public key.
+/// Format: `/escrow:<64-hex-chars-of-32-byte-schnorr-pubkey>`
+const ESCROW_MARKER: &[u8] = b"/escrow:";
+const ESCROW_PUBKEY_HEX_LEN: usize = 64;
+
+/// Seed used to derive the provably-unspendable burn address.
+/// `TransactionHash("KERYX_PROOF_OF_BURN_V1")` is not a valid EC point →
+/// no private key exists → coins sent here are permanently removed from supply.
+const BURN_SEED: &[u8] = b"KERYX_PROOF_OF_BURN_V1";
 
 /// Mainnet address that receives the R&D allocation.
 pub const RD_ALLOCATION_ADDRESS: &str =
@@ -114,6 +131,8 @@ pub struct CoinbaseManager {
     tail_emission_per_block: u64,
     /// Script public key for the protocol R&D allocation output (2% of every block reward).
     rd_allocation_script_public_key: ScriptPublicKey,
+    /// Provably-unspendable burn SPK — receives the 10% escrow cut of standard miners.
+    burn_script_public_key: ScriptPublicKey,
 }
 
 /// Struct used to streamline payload parsing
@@ -149,6 +168,10 @@ impl CoinbaseManager {
             .expect("hardcoded R&D allocation address must be valid");
         let rd_allocation_script_public_key = pay_to_address_script(&rd_address);
 
+        let burn_hash = TransactionHash::hash(BURN_SEED);
+        let burn_address = Address::new(Prefix::Mainnet, Version::PubKey, &burn_hash.as_bytes());
+        let burn_script_public_key = pay_to_address_script(&burn_address);
+
         Self {
             coinbase_payload_script_public_key_max_len,
             max_coinbase_payload_len,
@@ -158,6 +181,7 @@ impl CoinbaseManager {
             emission_schedule,
             tail_emission_per_block,
             rd_allocation_script_public_key,
+            burn_script_public_key,
         }
     }
 
@@ -169,20 +193,29 @@ impl CoinbaseManager {
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
-        // + 1 for possible red reward, + 1 for R&D allocation output
-        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() + 2);
+        // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D allocation
+        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() * 2 + 2);
         let mut rd_total = 0u64;
 
-        // Add an output for each mergeset blue block (∩ DAA window), paying to the script reported by the block.
-        // 2% of each reward is withheld and accumulated into the R&D allocation output.
+        // Add outputs for each mergeset blue block (∩ DAA window).
+        // Per-block split (on gross reward):
+        //   2%  → R&D allocation (accumulated into a single output at the end)
+        //   10% → escrow SPK (OPoI miner) or burn SPK (standard miner)
+        //   88% → miner's script_public_key
         // Note that combinatorically it is nearly impossible for a blue block to be non-DAA.
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
             let total = reward_data.subsidy + reward_data.total_fees;
             if total > 0 {
                 let rd_cut = total * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+                let escrow_cut = total * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
                 rd_total += rd_cut;
-                outputs.push(TransactionOutput::new(total - rd_cut, reward_data.script_public_key.clone()));
+                outputs.push(TransactionOutput::new(total - rd_cut - escrow_cut, reward_data.script_public_key.clone()));
+                let escrow_spk = reward_data
+                    .escrow_script_public_key
+                    .clone()
+                    .unwrap_or_else(|| self.burn_script_public_key.clone());
+                outputs.push(TransactionOutput::new(escrow_cut, escrow_spk));
             }
         }
 
@@ -290,6 +323,27 @@ impl CoinbaseManager {
             }
             None => Err(CoinbaseError::OPoiTagMissing),
         }
+    }
+
+    /// Parses the miner's escrow public key from coinbase `extra_data`.
+    ///
+    /// Looks for `/escrow:` followed by exactly 64 hex chars (32-byte Schnorr pubkey).
+    /// Returns `None` if the marker is absent or the key is malformed — treated as a
+    /// standard miner whose escrow cut is sent to the burn address instead.
+    pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8]) -> Option<ScriptPublicKey> {
+        let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
+        let hex_start = marker_pos + ESCROW_MARKER.len();
+        let hex_end = hex_start + ESCROW_PUBKEY_HEX_LEN;
+        if hex_end > extra_data.len() {
+            return None;
+        }
+        let hex_str = std::str::from_utf8(&extra_data[hex_start..hex_end]).ok()?;
+        let pubkey_bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let address = Address::new(Prefix::Mainnet, Version::PubKey, &pubkey_bytes);
+        Some(pay_to_address_script(&address))
     }
 
     pub fn deserialize_coinbase_payload<'a>(&self, payload: &'a [u8]) -> CoinbaseResult<CoinbaseData<&'a [u8]>> {

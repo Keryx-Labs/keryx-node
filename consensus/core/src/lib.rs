@@ -15,6 +15,7 @@ pub use keryx_hashes::Hash;
 
 pub mod acceptance_data;
 pub mod api;
+pub mod collateral;
 pub mod block;
 pub mod blockhash;
 pub mod blockstatus;
