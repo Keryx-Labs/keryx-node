@@ -1,5 +1,7 @@
 use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
+use keryx_inference::{MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN};
 use std::collections::HashSet;
 
 use super::{
@@ -22,6 +24,7 @@ impl TransactionValidator {
         check_duplicate_transaction_inputs(tx)?;
         check_gas(tx)?;
         check_transaction_subnetwork(tx)?;
+        check_ai_payload_len(tx)?;
         check_transaction_version(tx)
     }
 
@@ -154,11 +157,32 @@ fn check_transaction_output_value_ranges(tx: &Transaction) -> TxResult<()> {
 }
 
 fn check_transaction_subnetwork(tx: &Transaction) -> TxResult<()> {
-    if tx.is_coinbase() || tx.subnetwork_id.is_native() {
+    if tx.is_coinbase() || tx.subnetwork_id.is_native() || tx.subnetwork_id.is_ai() {
         Ok(())
     } else {
         Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()))
     }
+}
+
+fn check_ai_payload_len(tx: &Transaction) -> TxResult<()> {
+    if tx.is_ai_request() {
+        let len = tx.payload.len();
+        if len < MIN_AI_REQUEST_PAYLOAD_LEN {
+            return Err(TxRuleError::AiPayloadTooShort(len, MIN_AI_REQUEST_PAYLOAD_LEN));
+        }
+        if len > MAX_AI_REQUEST_PAYLOAD_LEN {
+            return Err(TxRuleError::AiPayloadTooLong(len, MAX_AI_REQUEST_PAYLOAD_LEN));
+        }
+    } else if tx.is_ai_response() {
+        let len = tx.payload.len();
+        if len < MIN_AI_RESPONSE_PAYLOAD_LEN {
+            return Err(TxRuleError::AiPayloadTooShort(len, MIN_AI_RESPONSE_PAYLOAD_LEN));
+        }
+        if len > MAX_AI_RESPONSE_PAYLOAD_LEN {
+            return Err(TxRuleError::AiPayloadTooLong(len, MAX_AI_RESPONSE_PAYLOAD_LEN));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

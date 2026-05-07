@@ -96,6 +96,12 @@ pub enum TxRuleError {
     #[error("transaction subnetwork id {0} is neither native nor coinbase")]
     SubnetworksDisabled(SubnetworkId),
 
+    #[error("AI transaction payload too short: {0} bytes (minimum {1})")]
+    AiPayloadTooShort(usize, usize),
+
+    #[error("AI transaction payload too long: {0} bytes (maximum {1})")]
+    AiPayloadTooLong(usize, usize),
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

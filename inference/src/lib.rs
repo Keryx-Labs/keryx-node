@@ -5,9 +5,17 @@
 ///   Tags are verified on-chain; collateral is slashed for fraud.
 /// Phase 3 (future): real SLM weights distributed via IPFS.
 
+pub mod ai_payload;
 pub mod model;
 pub mod model_fixed;
 pub mod task;
+
+pub use ai_payload::{
+    AiRequestPayload, AiResponsePayload,
+    MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN,
+    MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX,
+};
 
 pub use task::{InferenceResult, InferenceTask};
 
