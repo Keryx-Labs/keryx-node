@@ -1,0 +1,15 @@
+consensus: implement OPoI Phase 2 real escrow split in coinbase
+
+Each blue-block coinbase is now split three ways on the gross reward: 
+75% -> miner's script_public_key                                        
+20% -> escrow SPK (OPoI miner) or provably-unspendable burn address     
+5% -> R&D allocation 
+
+OPoI miners signal participation by embedding /escrow:<64-hex-pubkey>
+in their coinbase extra_data. The new parse_escrow_from_extra_data                               
+method on CoinbaseManager parses this and routes the 20% to a real, 
+recoverable P2PK output. Standard miners have their 20% burned to
+TransactionHash("KERYX_PROOF_OF_BURN_V1") — not a valid EC point,
+permanently removing coins from supply.                                                                                    
+The red-block reward is excluded from the escrow split to keep modify_block_template 
+compatible (single output rewrite via red_reward_output_index)

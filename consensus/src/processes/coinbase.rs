@@ -2,27 +2,32 @@ use keryx_addresses::{Address, Prefix, Version};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
+    collateral::CHALLENGE_WINDOW_BLOCKS,
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
 };
 use keryx_hashes::{Hasher, TransactionHash};
-use keryx_txscript::standard::pay_to_address_script;
+use keryx_txscript::{
+    opcodes::codes::{OpCheckSequenceVerify, OpCheckSig, OpDrop},
+    script_builder::ScriptBuilder,
+    standard::pay_to_address_script,
+};
 use std::convert::TryInto;
 
 use crate::{constants, model::stores::ghostdag::GhostdagData};
 
 // ── R&D allocation ────────────────────────────────────────────────────────────
 
-/// Protocol-level R&D allocation: 2% of every block reward (200 basis points).
-const RD_ALLOCATION_BPS: u64 = 200;
+/// Protocol-level R&D allocation: 5% of every block reward (500 basis points).
+const RD_ALLOCATION_BPS: u64 = 500;
 const RD_ALLOCATION_BPS_DIVISOR: u64 = 10_000;
 
 // ── OPoI escrow split ─────────────────────────────────────────────────────────
 
-/// 10 % of each blue-block reward is sent to the miner's escrow SPK (OPoI)
+/// 20 % of each blue-block reward is sent to the miner's escrow SPK (OPoI)
 /// or burned (standard miner).  Applied on the gross reward before the R&D cut.
-const ESCROW_RATE_BPS: u64 = 1_000;
+const ESCROW_RATE_BPS: u64 = 2_000;
 const ESCROW_RATE_BPS_DIVISOR: u64 = 10_000;
 
 /// Marker searched in coinbase extra_data to locate the escrow public key.
@@ -90,6 +95,30 @@ const KRX_HALVING_PERIOD_MONTHS: u32 = 48;
 const KRX_TAIL_EMISSION_PER_SECOND: u64 = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Builds a CSV-timelocked P2PK script for the OPoI escrow output.
+///
+/// Script: `<CHALLENGE_WINDOW_BLOCKS> OP_CSV OP_DROP <pubkey_32> OP_CHECKSIG`
+///
+/// The output cannot be spent until the spending transaction's input sequence
+/// satisfies the relative lock (>= CHALLENGE_WINDOW_BLOCKS deep), giving the
+/// network the full challenge window to submit a fraud proof before the miner
+/// claims their collateral.
+fn build_escrow_script(pubkey_bytes: &[u8]) -> Option<ScriptPublicKey> {
+    let script = ScriptBuilder::new()
+        .add_sequence(CHALLENGE_WINDOW_BLOCKS)
+        .ok()?
+        .add_op(OpCheckSequenceVerify)
+        .ok()?
+        .add_op(OpDrop)
+        .ok()?
+        .add_data(pubkey_bytes)
+        .ok()?
+        .add_op(OpCheckSig)
+        .ok()?
+        .drain();
+    Some(ScriptPublicKey::from_vec(0, script))
+}
 
 /// Build the per-block emission schedule at construction time.
 ///
@@ -325,7 +354,8 @@ impl CoinbaseManager {
         }
     }
 
-    /// Parses the miner's escrow public key from coinbase `extra_data`.
+    /// Parses the miner's escrow public key from coinbase `extra_data` and returns a
+    /// CSV-timelocked script for the escrow output.
     ///
     /// Looks for `/escrow:` followed by exactly 64 hex chars (32-byte Schnorr pubkey).
     /// Returns `None` if the marker is absent or the key is malformed — treated as a
@@ -342,8 +372,7 @@ impl CoinbaseManager {
             .map(|i| u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16))
             .collect::<Result<Vec<_>, _>>()
             .ok()?;
-        let address = Address::new(Prefix::Mainnet, Version::PubKey, &pubkey_bytes);
-        Some(pay_to_address_script(&address))
+        build_escrow_script(&pubkey_bytes)
     }
 
     pub fn deserialize_coinbase_payload<'a>(&self, payload: &'a [u8]) -> CoinbaseResult<CoinbaseData<&'a [u8]>> {
