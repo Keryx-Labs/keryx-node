@@ -108,6 +108,9 @@ pub enum TxRuleError {
     #[error("AiChallenge transaction has a null (all-zero) response_hash")]
     AiChallengeNullResponseHash,
 
+    #[error("transaction attempts to spend a slashed escrow outpoint")]
+    SpendingSlashedEscrow,
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

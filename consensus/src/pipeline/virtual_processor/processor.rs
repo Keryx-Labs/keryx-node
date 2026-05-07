@@ -168,6 +168,10 @@ pub struct VirtualStateProcessor {
 
     // Mining Rule
     _mining_rules: Arc<MiningRules>,
+
+    // OPoI slash stores (Phase 3 A4) — persisted to RocksDB
+    pub(super) ai_response_store: Arc<crate::model::stores::ai_slash::DbAiResponseStore>,
+    pub(super) ai_slashed_store: Arc<crate::model::stores::ai_slash::DbAiSlashedStore>,
 }
 
 impl VirtualStateProcessor {
@@ -233,6 +237,8 @@ impl VirtualStateProcessor {
             notification_root,
             counters,
             _mining_rules: mining_rules,
+            ai_response_store: storage.ai_response_store.clone(),
+            ai_slashed_store: storage.ai_slashed_store.clone(),
         }
     }
 

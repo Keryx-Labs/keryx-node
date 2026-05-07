@@ -3,6 +3,7 @@ use crate::{
     model::stores::{
         DB,
         acceptance_data::DbAcceptanceDataStore,
+        ai_slash::{DbAiResponseStore, DbAiSlashedStore},
         block_transactions::DbBlockTransactionsStore,
         block_window_cache::BlockWindowCacheStore,
         daa::DbDaaStore,
@@ -62,6 +63,10 @@ pub struct ConsensusStorage {
     pub utxo_diffs_store: Arc<DbUtxoDiffsStore>,
     pub utxo_multisets_store: Arc<DbUtxoMultisetsStore>,
     pub acceptance_data_store: Arc<DbAcceptanceDataStore>,
+
+    // OPoI slash stores (Phase 3 A4)
+    pub ai_response_store: Arc<DbAiResponseStore>,
+    pub ai_slashed_store: Arc<DbAiSlashedStore>,
 
 
     // Block window caches
@@ -212,6 +217,10 @@ impl ConsensusStorage {
         let utxo_multisets_store = Arc::new(DbUtxoMultisetsStore::new(db.clone(), block_data_builder.build()));
         let acceptance_data_store = Arc::new(DbAcceptanceDataStore::new(db.clone(), acceptance_data_builder.build()));
 
+        // OPoI slash stores
+        let ai_response_store = Arc::new(DbAiResponseStore::new(db.clone(), header_data_builder.build()));
+        let ai_slashed_store = Arc::new(DbAiSlashedStore::new(db.clone(), header_data_builder.build()));
+
         // Tips
         let headers_selected_tip_store = Arc::new(RwLock::new(DbHeadersSelectedTipStore::new(db.clone())));
         let body_tips_store = Arc::new(RwLock::new(DbTipsStore::new(db.clone())));
@@ -245,6 +254,8 @@ impl ConsensusStorage {
             virtual_stores,
             selected_chain_store,
             acceptance_data_store,
+            ai_response_store,
+            ai_slashed_store,
             past_pruning_points_store,
             daa_excluded_store,
             depth_store,

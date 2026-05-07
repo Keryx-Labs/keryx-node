@@ -21,6 +21,7 @@ use crate::{
         },
     },
 };
+use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader, AiSlashedStore, AiSlashedStoreReader, OutpointKey};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -35,8 +36,10 @@ use keryx_consensus_core::{
         utxo_view::{UtxoView, UtxoViewComposition},
     },
 };
-use keryx_core::{info, trace};
+use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
+use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
+use keryx_inference::AiChallengePayload;
 use keryx_muhash::MuHash;
 use keryx_utils::refs::Refs;
 
@@ -176,6 +179,12 @@ impl VirtualStateProcessor {
                     escrow_spk,
                 ),
             );
+
+            // OPoI Phase 3 A3: register AiResponse txs and process AiChallenge txs.
+            // Called after parallel validation so write lock does not overlap with
+            // the read lock taken in validate_transaction_in_utxo_context.
+            let coinbase_tx_id = txs[0].id();
+            self.process_ai_txs_for_slash(&txs, pov_daa_score, coinbase_tx_id);
         }
     }
 
@@ -323,6 +332,14 @@ impl VirtualStateProcessor {
         pov_daa_score: u64,
         flags: TxValidationFlags,
     ) -> TxResult<ValidatedTransaction<'a>> {
+        // OPoI Phase 3 A4: reject any spend of a slashed escrow outpoint (DB-backed, rayon-safe).
+        for input in transaction.inputs.iter() {
+            let key = OutpointKey::new(input.previous_outpoint.transaction_id, input.previous_outpoint.index);
+            if self.ai_slashed_store.is_slashed(key).unwrap_or(false) {
+                return Err(TxRuleError::SpendingSlashedEscrow);
+            }
+        }
+
         let mut entries = Vec::with_capacity(transaction.inputs.len());
         for input in transaction.inputs.iter() {
             if let Some(entry) = utxo_view.get(&input.previous_outpoint) {
@@ -401,6 +418,55 @@ impl VirtualStateProcessor {
         )?;
         mutable_tx.calculated_fee = Some(calculated_fee);
         Ok(())
+    }
+
+    /// Scans a block's transactions for AiResponse and AiChallenge txs and updates the slash state.
+    ///
+    /// Called sequentially AFTER `validate_transactions_with_muhash_in_parallel` so there is no
+    /// lock contention with the read lock in `validate_transaction_in_utxo_context`.
+    fn process_ai_txs_for_slash(&self, txs: &[Transaction], pov_daa_score: u64, coinbase_tx_id: TransactionId) {
+        // Register confirmed AiResponse txs.
+        for tx in txs.iter().skip(1) {
+            if tx.is_ai_response() {
+                let hash = blake2b_simd::blake2b(&tx.payload);
+                let mut response_hash_bytes = [0u8; 32];
+                response_hash_bytes.copy_from_slice(&hash.as_bytes()[..32]);
+                let response_hash = Hash::from_bytes(response_hash_bytes);
+                let record = AiResponseRecord { inclusion_blue_score: pov_daa_score, coinbase_tx_id };
+                if let Err(e) = self.ai_response_store.set(response_hash, record) {
+                    warn!("OPoI: failed to register AiResponse in DB: {}", e);
+                } else {
+                    info!("OPoI: registered AiResponse response_hash={}", hex::encode(response_hash_bytes));
+                }
+            }
+        }
+
+        // Process AiChallenge txs — slash if valid.
+        for tx in txs.iter().skip(1) {
+            if tx.is_ai_challenge() {
+                if let Some(challenge) = AiChallengePayload::deserialize(&tx.payload) {
+                    let rh = Hash::from_bytes(challenge.response_hash);
+                    match self.ai_response_store.get(rh) {
+                        Ok(record) if pov_daa_score <= record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 => {
+                            let key = OutpointKey::new(record.coinbase_tx_id, 1);
+                            if let Err(e) = self.ai_slashed_store.set(key, pov_daa_score) {
+                                warn!("OPoI: failed to record slash in DB: {}", e);
+                            } else {
+                                info!("OPoI: escrow slashed — response_hash={}", hex::encode(challenge.response_hash));
+                            }
+                        }
+                        Ok(_) => warn!(
+                            "OPoI: challenge outside window — response_hash={}",
+                            hex::encode(challenge.response_hash)
+                        ),
+                        Err(_) => warn!(
+                            "OPoI: challenge for unknown response — response_hash={}",
+                            hex::encode(challenge.response_hash)
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     /// Calculates the accepted_id_merkle_root based on the current DAA score and the accepted tx ids
