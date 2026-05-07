@@ -76,7 +76,8 @@ impl TransactionValidator {
     }
 
     fn check_transaction_inputs_count(&self, tx: &Transaction) -> TxResult<()> {
-        if !tx.is_coinbase() && tx.inputs.is_empty() {
+        // Coinbase and AiResponse are data-publication transactions with no inputs.
+        if !tx.is_coinbase() && !tx.is_ai_response() && tx.inputs.is_empty() {
             return Err(TxRuleError::NoTxInputs);
         }
 
