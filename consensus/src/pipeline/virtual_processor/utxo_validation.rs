@@ -21,7 +21,7 @@ use crate::{
         },
     },
 };
-use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader, AiSlashedStore, AiSlashedStoreReader, OutpointKey};
+use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader, AiSlashedStore, AiSlashedStoreReader, OutpointKey, SlashRecord};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -30,7 +30,7 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -40,7 +40,6 @@ use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiChallengePayload, AiResponsePayload, FraudProofResult, FRAUD_PROOF_LEN, verify_fraud_proof};
-use keryx_consensus_core::tx::TransactionOutpoint;
 use keryx_muhash::MuHash;
 use keryx_utils::refs::Refs;
 
@@ -333,50 +332,22 @@ impl VirtualStateProcessor {
         pov_daa_score: u64,
         flags: TxValidationFlags,
     ) -> TxResult<ValidatedTransaction<'a>> {
-        // OPoI Phase 3 A4: reject any spend of a slashed escrow outpoint (DB-backed, rayon-safe).
-        // AiChallenge txs are exempted: they are the legitimate mechanism for spending slashed escrows.
-        if !transaction.is_ai_challenge() {
-            for input in transaction.inputs.iter() {
-                let key = OutpointKey::new(input.previous_outpoint.transaction_id, input.previous_outpoint.index);
-                if self.ai_slashed_store.is_slashed(key).unwrap_or(false) {
+        // OPoI Phase 3: slashed escrow enforcement.
+        //
+        // A slashed escrow CAN be spent (after the CSV lock expires, which is enforced by the
+        // script engine).  However, the spend is only valid if at least one output pays the
+        // registered challenger's script_public_key.  Any other attempt to spend a slashed
+        // outpoint — including sending it back to the miner — is rejected here.
+        for input in transaction.inputs.iter() {
+            let key = OutpointKey::new(input.previous_outpoint.transaction_id, input.previous_outpoint.index);
+            if let Ok(Some(slash)) = self.ai_slashed_store.get_slash(key) {
+                let challenger_spk = ScriptPublicKey::from_vec(
+                    slash.challenger_spk_version,
+                    slash.challenger_spk_script.to_vec(),
+                );
+                let pays_challenger = transaction.outputs.iter().any(|o| o.script_public_key == challenger_spk);
+                if !pays_challenger {
                     return Err(TxRuleError::SpendingSlashedEscrow);
-                }
-            }
-        }
-
-        // OPoI Phase 3 D: AiChallenge with inputs — validate fraud proof and escrow outpoint.
-        // An AiChallenge that has inputs is a spending transaction: the escrow moves to the challenger.
-        // Validation must pass before the standard UTXO population below to give a clear error.
-        if transaction.is_ai_challenge() && !transaction.inputs.is_empty() {
-            if let Some(challenge) = AiChallengePayload::deserialize(&transaction.payload) {
-                let rh = Hash::from_bytes(challenge.response_hash);
-                let record = self.ai_response_store.get(rh).map_err(|_| TxRuleError::AiChallengeUnknownResponse)?;
-
-                // Challenge window must be open.
-                if pov_daa_score > record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 {
-                    return Err(TxRuleError::AiChallengeOutsideWindow);
-                }
-
-                // Fraud proof validation (Phase 3 C re-execution proof).
-                if !challenge.proof_data.is_empty() {
-                    if challenge.proof_data.len() == FRAUD_PROOF_LEN {
-                        let submitted_rh: &[u8; 32] = challenge.proof_data.as_slice().try_into().unwrap();
-                        if submitted_rh != &record.request_hash {
-                            return Err(TxRuleError::AiChallengeBadRequestHash);
-                        }
-                        if verify_fraud_proof(&record.request_hash, &record.claimed_commitment) != FraudProofResult::Valid {
-                            return Err(TxRuleError::AiChallengeProofInvalid);
-                        }
-                    } else {
-                        return Err(TxRuleError::AiChallengeProofInvalid);
-                    }
-                }
-
-                // The tx must spend the correct escrow outpoint: (coinbase_tx_id, index 1).
-                let expected = TransactionOutpoint { transaction_id: record.coinbase_tx_id, index: 1 };
-                let has_correct_input = transaction.inputs.iter().any(|inp| inp.previous_outpoint == expected);
-                if !has_correct_input {
-                    return Err(TxRuleError::AiChallengeWrongEscrowInput);
                 }
             }
         }
@@ -503,98 +474,97 @@ impl VirtualStateProcessor {
 
         // Process AiChallenge txs — update slash state.
         //
-        // AiChallenge with inputs (Phase 3 D): fund transfer already validated in
-        // validate_transaction_in_utxo_context; here we just mark the escrow as slashed
-        // for auditing and to prevent duplicate challenges.
+        // An AiChallenge is always a 0-input metadata transaction.  It records:
+        //   - the response_hash of the disputed AiResponse
+        //   - the challenger's SPK (where the slashed escrow must be sent after CSV expiry)
+        //   - an optional re-execution fraud proof (32-byte request_hash)
         //
-        // AiChallenge with 0 inputs (Phase A compat):
-        //   proof_data empty (0 bytes)       → slash unconditionally within window.
-        //   proof_data 32 bytes (request_hash) → re-execution proof.
+        // After slash is recorded, the escrow's CSV lock (36,000 blocks) prevents any spend.
+        // Once CSV expires, the miner can spend the escrow only if an output goes to
+        // the challenger's SPK — enforced in validate_transaction_in_utxo_context.
+        //
+        // proof_data empty (0 bytes)         → unconditional slash within window (Phase A compat).
+        // proof_data 32 bytes (request_hash) → re-execution fraud proof (Phase 3 C).
         for tx in txs.iter().skip(1) {
-            if tx.is_ai_challenge() {
-                if let Some(challenge) = AiChallengePayload::deserialize(&tx.payload) {
-                    let rh = Hash::from_bytes(challenge.response_hash);
+            if !tx.is_ai_challenge() {
+                continue;
+            }
+            let Some(challenge) = AiChallengePayload::deserialize(&tx.payload) else {
+                continue;
+            };
+            let rh = Hash::from_bytes(challenge.response_hash);
 
-                    // Phase 3 D: spending AiChallenge — escrow already transferred via UTXO.
-                    // Just mark as slashed for auditing / prevent re-challenge.
-                    if !tx.inputs.is_empty() {
-                        if let Ok(record) = self.ai_response_store.get(rh) {
-                            let key = OutpointKey::new(record.coinbase_tx_id, 1);
-                            if let Err(e) = self.ai_slashed_store.set(key, pov_daa_score) {
-                                warn!("OPoI: failed to record slash (spending challenge) in DB: {}", e);
-                            } else {
-                                info!("OPoI: escrow spent by challenger — response_hash={}", hex::encode(challenge.response_hash));
+            let slash_accepted = if challenge.proof_data.is_empty() {
+                // Phase A compat: empty proof → unconditional slash within window.
+                true
+            } else if challenge.proof_data.len() == FRAUD_PROOF_LEN {
+                // Phase 3 C: re-execution proof — proof_data = request_hash (32 bytes).
+                let submitted_request_hash: &[u8; 32] =
+                    challenge.proof_data.as_slice().try_into().unwrap();
+                match self.ai_response_store.get(rh) {
+                    Ok(ref rec) if submitted_request_hash == &rec.request_hash => {
+                        match verify_fraud_proof(&rec.request_hash, &rec.claimed_commitment) {
+                            FraudProofResult::Valid => {
+                                info!(
+                                    "OPoI: fraud proven via re-execution — response_hash={}",
+                                    hex::encode(challenge.response_hash)
+                                );
+                                true
                             }
-                        }
-                        continue; // fund transfer was handled by UTXO; skip 0-input logic below
-                    }
-
-                    // 0-input AiChallenge (Phase A compat + Phase 3 C re-execution).
-                    let slash_accepted = if challenge.proof_data.is_empty() {
-                        // Phase A compatibility: empty proof → unconditional slash within window.
-                        true
-                    } else if challenge.proof_data.len() == FRAUD_PROOF_LEN {
-                        // Phase 3 C: re-execution fraud proof.
-                        // proof_data = request_hash (32 bytes).
-                        let submitted_request_hash: &[u8; 32] =
-                            challenge.proof_data.as_slice().try_into().unwrap();
-                        match self.ai_response_store.get(rh) {
-                            Ok(ref rec) if submitted_request_hash == &rec.request_hash => {
-                                match verify_fraud_proof(&rec.request_hash, &rec.claimed_commitment) {
-                                    FraudProofResult::Valid => {
-                                        info!(
-                                            "OPoI: fraud proven via re-execution — response_hash={}",
-                                            hex::encode(challenge.response_hash)
-                                        );
-                                        true
-                                    }
-                                    FraudProofResult::Invalid => {
-                                        warn!(
-                                            "OPoI: challenge rejected — miner commitment matches re-execution — response_hash={}",
-                                            hex::encode(challenge.response_hash)
-                                        );
-                                        false
-                                    }
-                                }
-                            }
-                            Ok(_) => {
+                            FraudProofResult::Invalid => {
                                 warn!(
-                                    "OPoI: challenger submitted wrong request_hash — response_hash={}",
+                                    "OPoI: challenge rejected — miner commitment matches re-execution — response_hash={}",
                                     hex::encode(challenge.response_hash)
                                 );
                                 false
                             }
-                            Err(_) => false,
                         }
-                    } else {
+                    }
+                    Ok(_) => {
                         warn!(
-                            "OPoI: proof_data length {} not recognised — response_hash={}",
-                            challenge.proof_data.len(),
+                            "OPoI: challenger submitted wrong request_hash — response_hash={}",
                             hex::encode(challenge.response_hash)
                         );
                         false
-                    };
+                    }
+                    Err(_) => false,
+                }
+            } else {
+                warn!(
+                    "OPoI: unrecognised proof_data length {} — response_hash={}",
+                    challenge.proof_data.len(),
+                    hex::encode(challenge.response_hash)
+                );
+                false
+            };
 
-                    if slash_accepted {
-                        match self.ai_response_store.get(rh) {
-                            Ok(record) if pov_daa_score <= record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 => {
-                                let key = OutpointKey::new(record.coinbase_tx_id, 1);
-                                if let Err(e) = self.ai_slashed_store.set(key, pov_daa_score) {
-                                    warn!("OPoI: failed to record slash in DB: {}", e);
-                                } else {
-                                    info!("OPoI: escrow slashed — response_hash={}", hex::encode(challenge.response_hash));
-                                }
-                            }
-                            Ok(_) => warn!(
-                                "OPoI: challenge outside window — response_hash={}",
+            if slash_accepted {
+                match self.ai_response_store.get(rh) {
+                    Ok(record) if pov_daa_score <= record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 => {
+                        let key = OutpointKey::new(record.coinbase_tx_id, 1);
+                        let slash_record = SlashRecord {
+                            slash_blue_score: pov_daa_score,
+                            challenger_spk_version: challenge.challenger_spk_version,
+                            challenger_spk_script: challenge.challenger_spk,
+                        };
+                        if let Err(e) = self.ai_slashed_store.set(key, slash_record) {
+                            warn!("OPoI: failed to record slash in DB: {}", e);
+                        } else {
+                            info!(
+                                "OPoI: escrow slashed, challenger_spk={} — response_hash={}",
+                                hex::encode(challenge.challenger_spk),
                                 hex::encode(challenge.response_hash)
-                            ),
-                            Err(_) => warn!(
-                                "OPoI: challenge for unknown response — response_hash={}",
-                                hex::encode(challenge.response_hash)
-                            ),
+                            );
                         }
                     }
+                    Ok(_) => warn!(
+                        "OPoI: challenge outside window — response_hash={}",
+                        hex::encode(challenge.response_hash)
+                    ),
+                    Err(_) => warn!(
+                        "OPoI: challenge for unknown response — response_hash={}",
+                        hex::encode(challenge.response_hash)
+                    ),
                 }
             }
         }

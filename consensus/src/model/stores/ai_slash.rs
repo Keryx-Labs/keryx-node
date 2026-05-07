@@ -116,19 +116,38 @@ impl fmt::Display for OutpointKey {
     }
 }
 
+/// Data recorded when a slash is confirmed.
+///
+/// The escrow outpoint stays locked via CSV (36,000 blocks).  After CSV expiry, the miner can
+/// spend it, but consensus requires at least one output with `(challenger_spk_version, challenger_spk_script)`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SlashRecord {
+    /// Blue score at which the slash was recorded (audit).
+    pub slash_blue_score: u64,
+    /// SPK version for the challenger's receiving address (standard = 0).
+    pub challenger_spk_version: u16,
+    /// 32-byte script of the challenger's receiving address.
+    pub challenger_spk_script: [u8; 32],
+}
+
+impl MemSizeEstimator for SlashRecord {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
 pub trait AiSlashedStoreReader {
-    fn is_slashed(&self, key: OutpointKey) -> Result<bool, StoreError>;
+    fn get_slash(&self, key: OutpointKey) -> Result<Option<SlashRecord>, StoreError>;
 }
 
 pub trait AiSlashedStore: AiSlashedStoreReader {
-    /// Record a slash. `slash_blue_score` is stored for audit purposes.
-    fn set(&self, key: OutpointKey, slash_blue_score: u64) -> Result<(), StoreError>;
+    fn set(&self, key: OutpointKey, record: SlashRecord) -> Result<(), StoreError>;
 }
 
 #[derive(Clone)]
 pub struct DbAiSlashedStore {
     db: Arc<DB>,
-    access: CachedDbAccess<OutpointKey, u64>,
+    access: CachedDbAccess<OutpointKey, SlashRecord>,
 }
 
 impl DbAiSlashedStore {
@@ -139,25 +158,25 @@ impl DbAiSlashedStore {
         }
     }
 
-    pub fn set_batch(&self, batch: &mut WriteBatch, key: OutpointKey, slash_blue_score: u64) -> Result<(), StoreError> {
-        self.access.write(BatchDbWriter::new(batch), key, slash_blue_score)?;
+    pub fn set_batch(&self, batch: &mut WriteBatch, key: OutpointKey, record: SlashRecord) -> Result<(), StoreError> {
+        self.access.write(BatchDbWriter::new(batch), key, record)?;
         Ok(())
     }
 }
 
 impl AiSlashedStoreReader for DbAiSlashedStore {
-    fn is_slashed(&self, key: OutpointKey) -> Result<bool, StoreError> {
+    fn get_slash(&self, key: OutpointKey) -> Result<Option<SlashRecord>, StoreError> {
         match self.access.read(key) {
-            Ok(_) => Ok(true),
-            Err(StoreError::KeyNotFound(_)) => Ok(false),
+            Ok(record) => Ok(Some(record)),
+            Err(StoreError::KeyNotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
     }
 }
 
 impl AiSlashedStore for DbAiSlashedStore {
-    fn set(&self, key: OutpointKey, slash_blue_score: u64) -> Result<(), StoreError> {
-        self.access.write(DirectDbWriter::new(&self.db), key, slash_blue_score)?;
+    fn set(&self, key: OutpointKey, record: SlashRecord) -> Result<(), StoreError> {
+        self.access.write(DirectDbWriter::new(&self.db), key, record)?;
         Ok(())
     }
 }

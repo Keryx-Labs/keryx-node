@@ -14,9 +14,10 @@ pub const MIN_AI_RESPONSE_PAYLOAD_LEN: usize = 40;
 pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = 8_192;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
-/// `[response_hash: 32] [challenger_deposit: 8 LE] [proof_data…]`
-/// `proof_data` is empty for Phase 3 A2b stubs; filled with Groth16/halo2 bytes in Phase B.
-pub const MIN_AI_CHALLENGE_PAYLOAD_LEN: usize = 40;
+/// `[response_hash: 32] [challenger_deposit: 8 LE] [challenger_spk_version: 2 LE] [challenger_spk: 32] [proof_data…]`
+/// `proof_data` is empty for Phase 3 A2b stubs; 32 bytes (request_hash) for Phase 3 C re-execution.
+/// `challenger_spk_version` + `challenger_spk` identify where the slashed escrow goes after CSV expiry.
+pub const MIN_AI_CHALLENGE_PAYLOAD_LEN: usize = 74;
 pub const MAX_AI_CHALLENGE_PAYLOAD_LEN: usize = 32_768;
 
 /// Hex-encoded subnetwork IDs as returned by the keryxd gRPC API.
@@ -114,27 +115,44 @@ impl AiResponsePayload {
 /// Payload of a `SUBNETWORK_ID_AI_CHALLENGE` transaction.
 ///
 /// Submitted by anyone who believes a miner published a fraudulent AiResponse.
-/// The `challenger_deposit` is burned if the challenge is invalid; the miner's
-/// escrow is slashed to the challenger if the proof is accepted (Phase B+).
+/// The `challenger_deposit` is burned if the challenge is invalid.
+///
+/// If the challenge is accepted (proof validates via re-execution), the miner's escrow outpoint
+/// is recorded as slashed with the challenger's `challenger_spk`.  After the CSV lock (36,000
+/// blocks) expires, the miner can spend the escrow but only if an output goes to `challenger_spk`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiChallengePayload {
     /// Transaction payload hash of the disputed `AiResponse` (blake2b-256).
     pub response_hash: [u8; 32],
     /// Sompi deposited by the challenger (burned if challenge fails).
     pub challenger_deposit: u64,
-    /// ZK fraud proof bytes — empty stub in Phase A2b, Groth16/halo2 in Phase B.
+    /// SPK version for the challenger's receiving address (standard = 0).
+    pub challenger_spk_version: u16,
+    /// 32-byte script identifying the challenger's receiving address.
+    /// After the slash is confirmed and CSV expires, any spend of the escrow must
+    /// include an output with this exact script_public_key.
+    pub challenger_spk: [u8; 32],
+    /// Re-execution fraud proof: `request_hash` (32 bytes) in Phase 3 C, empty in Phase A.
     pub proof_data: Vec<u8>,
 }
 
 impl AiChallengePayload {
-    pub fn new(response_hash: [u8; 32], challenger_deposit: u64, proof_data: Vec<u8>) -> Self {
-        Self { response_hash, challenger_deposit, proof_data }
+    pub fn new(
+        response_hash: [u8; 32],
+        challenger_deposit: u64,
+        challenger_spk_version: u16,
+        challenger_spk: [u8; 32],
+        proof_data: Vec<u8>,
+    ) -> Self {
+        Self { response_hash, challenger_deposit, challenger_spk_version, challenger_spk, proof_data }
     }
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(MIN_AI_CHALLENGE_PAYLOAD_LEN + self.proof_data.len());
         out.extend_from_slice(&self.response_hash);
         out.extend_from_slice(&self.challenger_deposit.to_le_bytes());
+        out.extend_from_slice(&self.challenger_spk_version.to_le_bytes());
+        out.extend_from_slice(&self.challenger_spk);
         out.extend_from_slice(&self.proof_data);
         out
     }
@@ -145,8 +163,10 @@ impl AiChallengePayload {
         }
         let response_hash: [u8; 32] = data[0..32].try_into().ok()?;
         let challenger_deposit = u64::from_le_bytes(data[32..40].try_into().ok()?);
-        let proof_data = data[40..].to_vec();
-        Some(Self { response_hash, challenger_deposit, proof_data })
+        let challenger_spk_version = u16::from_le_bytes(data[40..42].try_into().ok()?);
+        let challenger_spk: [u8; 32] = data[42..74].try_into().ok()?;
+        let proof_data = data[74..].to_vec();
+        Some(Self { response_hash, challenger_deposit, challenger_spk_version, challenger_spk, proof_data })
     }
 
     pub fn from_hex(payload_hex: &str) -> Option<Self> {
@@ -198,7 +218,7 @@ mod tests {
 
     #[test]
     fn ai_challenge_roundtrip() {
-        let ch = AiChallengePayload::new([0xABu8; 32], 500_000, b"stub_proof".to_vec());
+        let ch = AiChallengePayload::new([0xABu8; 32], 500_000, 0, [0xCDu8; 32], b"stub_proof".to_vec());
         let bytes = ch.serialize();
         let parsed = AiChallengePayload::deserialize(&bytes).unwrap();
         assert_eq!(ch, parsed);
@@ -206,7 +226,7 @@ mod tests {
 
     #[test]
     fn ai_challenge_empty_proof_roundtrip() {
-        let ch = AiChallengePayload::new([1u8; 32], 1_000, vec![]);
+        let ch = AiChallengePayload::new([1u8; 32], 1_000, 0, [2u8; 32], vec![]);
         let bytes = ch.serialize();
         let parsed = AiChallengePayload::deserialize(&bytes).unwrap();
         assert_eq!(ch, parsed);
@@ -215,5 +235,16 @@ mod tests {
     #[test]
     fn ai_challenge_rejects_too_short() {
         assert!(AiChallengePayload::deserialize(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn ai_challenge_spk_roundtrip() {
+        let spk = [0x42u8; 32];
+        let ch = AiChallengePayload::new([0u8; 32], 0, 1, spk, [0xAAu8; 32].to_vec());
+        let bytes = ch.serialize();
+        let parsed = AiChallengePayload::deserialize(&bytes).unwrap();
+        assert_eq!(parsed.challenger_spk_version, 1);
+        assert_eq!(parsed.challenger_spk, spk);
+        assert_eq!(parsed.proof_data, [0xAAu8; 32]);
     }
 }
