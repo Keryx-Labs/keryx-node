@@ -111,6 +111,21 @@ pub enum TxRuleError {
     #[error("transaction attempts to spend a slashed escrow outpoint")]
     SpendingSlashedEscrow,
 
+    #[error("AiChallenge references an unknown AiResponse")]
+    AiChallengeUnknownResponse,
+
+    #[error("AiChallenge is outside the challenge window")]
+    AiChallengeOutsideWindow,
+
+    #[error("AiChallenge proof_data contains wrong request_hash")]
+    AiChallengeBadRequestHash,
+
+    #[error("AiChallenge fraud proof is invalid or does not prove fraud")]
+    AiChallengeProofInvalid,
+
+    #[error("AiChallenge input does not match the expected escrow outpoint")]
+    AiChallengeWrongEscrowInput,
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

@@ -40,6 +40,7 @@ use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiChallengePayload, AiResponsePayload, FraudProofResult, FRAUD_PROOF_LEN, verify_fraud_proof};
+use keryx_consensus_core::tx::TransactionOutpoint;
 use keryx_muhash::MuHash;
 use keryx_utils::refs::Refs;
 
@@ -333,10 +334,50 @@ impl VirtualStateProcessor {
         flags: TxValidationFlags,
     ) -> TxResult<ValidatedTransaction<'a>> {
         // OPoI Phase 3 A4: reject any spend of a slashed escrow outpoint (DB-backed, rayon-safe).
-        for input in transaction.inputs.iter() {
-            let key = OutpointKey::new(input.previous_outpoint.transaction_id, input.previous_outpoint.index);
-            if self.ai_slashed_store.is_slashed(key).unwrap_or(false) {
-                return Err(TxRuleError::SpendingSlashedEscrow);
+        // AiChallenge txs are exempted: they are the legitimate mechanism for spending slashed escrows.
+        if !transaction.is_ai_challenge() {
+            for input in transaction.inputs.iter() {
+                let key = OutpointKey::new(input.previous_outpoint.transaction_id, input.previous_outpoint.index);
+                if self.ai_slashed_store.is_slashed(key).unwrap_or(false) {
+                    return Err(TxRuleError::SpendingSlashedEscrow);
+                }
+            }
+        }
+
+        // OPoI Phase 3 D: AiChallenge with inputs — validate fraud proof and escrow outpoint.
+        // An AiChallenge that has inputs is a spending transaction: the escrow moves to the challenger.
+        // Validation must pass before the standard UTXO population below to give a clear error.
+        if transaction.is_ai_challenge() && !transaction.inputs.is_empty() {
+            if let Some(challenge) = AiChallengePayload::deserialize(&transaction.payload) {
+                let rh = Hash::from_bytes(challenge.response_hash);
+                let record = self.ai_response_store.get(rh).map_err(|_| TxRuleError::AiChallengeUnknownResponse)?;
+
+                // Challenge window must be open.
+                if pov_daa_score > record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 {
+                    return Err(TxRuleError::AiChallengeOutsideWindow);
+                }
+
+                // Fraud proof validation (Phase 3 C re-execution proof).
+                if !challenge.proof_data.is_empty() {
+                    if challenge.proof_data.len() == FRAUD_PROOF_LEN {
+                        let submitted_rh: &[u8; 32] = challenge.proof_data.as_slice().try_into().unwrap();
+                        if submitted_rh != &record.request_hash {
+                            return Err(TxRuleError::AiChallengeBadRequestHash);
+                        }
+                        if verify_fraud_proof(&record.request_hash, &record.claimed_commitment) != FraudProofResult::Valid {
+                            return Err(TxRuleError::AiChallengeProofInvalid);
+                        }
+                    } else {
+                        return Err(TxRuleError::AiChallengeProofInvalid);
+                    }
+                }
+
+                // The tx must spend the correct escrow outpoint: (coinbase_tx_id, index 1).
+                let expected = TransactionOutpoint { transaction_id: record.coinbase_tx_id, index: 1 };
+                let has_correct_input = transaction.inputs.iter().any(|inp| inp.previous_outpoint == expected);
+                if !has_correct_input {
+                    return Err(TxRuleError::AiChallengeWrongEscrowInput);
+                }
             }
         }
 
@@ -460,15 +501,35 @@ impl VirtualStateProcessor {
             }
         }
 
-        // Process AiChallenge txs — slash if proof accepted.
+        // Process AiChallenge txs — update slash state.
         //
-        // proof_data dispatch (Phase 3 C):
-        //   empty (0 bytes)       → Phase A compat: slash unconditionally within window.
-        //   32 bytes (request_hash) → re-execution proof: re-run model_fixed::forward and compare.
+        // AiChallenge with inputs (Phase 3 D): fund transfer already validated in
+        // validate_transaction_in_utxo_context; here we just mark the escrow as slashed
+        // for auditing and to prevent duplicate challenges.
+        //
+        // AiChallenge with 0 inputs (Phase A compat):
+        //   proof_data empty (0 bytes)       → slash unconditionally within window.
+        //   proof_data 32 bytes (request_hash) → re-execution proof.
         for tx in txs.iter().skip(1) {
             if tx.is_ai_challenge() {
                 if let Some(challenge) = AiChallengePayload::deserialize(&tx.payload) {
                     let rh = Hash::from_bytes(challenge.response_hash);
+
+                    // Phase 3 D: spending AiChallenge — escrow already transferred via UTXO.
+                    // Just mark as slashed for auditing / prevent re-challenge.
+                    if !tx.inputs.is_empty() {
+                        if let Ok(record) = self.ai_response_store.get(rh) {
+                            let key = OutpointKey::new(record.coinbase_tx_id, 1);
+                            if let Err(e) = self.ai_slashed_store.set(key, pov_daa_score) {
+                                warn!("OPoI: failed to record slash (spending challenge) in DB: {}", e);
+                            } else {
+                                info!("OPoI: escrow spent by challenger — response_hash={}", hex::encode(challenge.response_hash));
+                            }
+                        }
+                        continue; // fund transfer was handled by UTXO; skip 0-input logic below
+                    }
+
+                    // 0-input AiChallenge (Phase A compat + Phase 3 C re-execution).
                     let slash_accepted = if challenge.proof_data.is_empty() {
                         // Phase A compatibility: empty proof → unconditional slash within window.
                         true
