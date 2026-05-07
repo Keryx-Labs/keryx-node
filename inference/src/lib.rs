@@ -19,7 +19,7 @@ pub use ai_payload::{
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
     SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
 };
-pub use fraud_proof::{verify_fraud_proof, FraudProofResult, GROTH16_PROOF_LEN};
+pub use fraud_proof::{verify_fraud_proof, compute_ai_commitment, FraudProofResult, FRAUD_PROOF_LEN};
 
 pub use task::{InferenceResult, InferenceTask};
 

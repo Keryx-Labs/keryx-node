@@ -24,6 +24,13 @@ pub struct AiResponseRecord {
     /// Transaction ID of the coinbase in the same block.
     /// The escrow output is always at index 1 of this coinbase.
     pub coinbase_tx_id: Hash,
+    /// `blake2b(raw_AiRequest_payload)[0..32]` — copied from AiResponse.request_hash.
+    /// Used by Phase 3 C fraud verification to re-derive the expected commitment.
+    pub request_hash: [u8; 32],
+    /// First 32 bytes of `AiResponse.result` as published by the miner.
+    /// Phase 3 C: must equal `model_fixed::forward(request_hash)`.
+    /// A challenger proves fraud by showing this value is wrong.
+    pub claimed_commitment: [u8; 32],
 }
 
 impl MemSizeEstimator for AiResponseRecord {

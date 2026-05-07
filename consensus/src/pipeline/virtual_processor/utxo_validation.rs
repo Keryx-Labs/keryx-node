@@ -39,7 +39,7 @@ use keryx_consensus_core::{
 use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiChallengePayload, FraudProofResult, verify_fraud_proof};
+use keryx_inference::{AiChallengePayload, AiResponsePayload, FraudProofResult, FRAUD_PROOF_LEN, verify_fraud_proof};
 use keryx_muhash::MuHash;
 use keryx_utils::refs::Refs;
 
@@ -432,7 +432,26 @@ impl VirtualStateProcessor {
                 let mut response_hash_bytes = [0u8; 32];
                 response_hash_bytes.copy_from_slice(&hash.as_bytes()[..32]);
                 let response_hash = Hash::from_bytes(response_hash_bytes);
-                let record = AiResponseRecord { inclusion_blue_score: pov_daa_score, coinbase_tx_id };
+
+                // Extract request_hash and claimed_commitment for Phase 3 C fraud verification.
+                let (request_hash, claimed_commitment) =
+                    if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
+                        let commitment: [u8; 32] = if resp.result.len() >= 32 {
+                            resp.result[0..32].try_into().unwrap()
+                        } else {
+                            [0u8; 32] // under-length result → zero commitment → always challengeable
+                        };
+                        (resp.request_hash, commitment)
+                    } else {
+                        ([0u8; 32], [0u8; 32])
+                    };
+
+                let record = AiResponseRecord {
+                    inclusion_blue_score: pov_daa_score,
+                    coinbase_tx_id,
+                    request_hash,
+                    claimed_commitment,
+                };
                 if let Err(e) = self.ai_response_store.set(response_hash, record) {
                     warn!("OPoI: failed to register AiResponse in DB: {}", e);
                 } else {
@@ -443,36 +462,56 @@ impl VirtualStateProcessor {
 
         // Process AiChallenge txs — slash if proof accepted.
         //
-        // Phase 3 B behaviour:
-        //   - empty proof_data   → Phase A stub: slash unconditionally within window.
-        //   - non-empty proof_data → verify Groth16 proof; slash only on FraudProofResult::Valid.
-        //     The Phase 3 B stub always returns StubNotImplemented, so no slash occurs for
-        //     ZK challenges until Phase 3 C deploys the circuit verifying key.
+        // proof_data dispatch (Phase 3 C):
+        //   empty (0 bytes)       → Phase A compat: slash unconditionally within window.
+        //   32 bytes (request_hash) → re-execution proof: re-run model_fixed::forward and compare.
         for tx in txs.iter().skip(1) {
             if tx.is_ai_challenge() {
                 if let Some(challenge) = AiChallengePayload::deserialize(&tx.payload) {
                     let rh = Hash::from_bytes(challenge.response_hash);
                     let slash_accepted = if challenge.proof_data.is_empty() {
-                        // Phase A compatibility: treat an empty proof as an unconditional slash signal.
+                        // Phase A compatibility: empty proof → unconditional slash within window.
                         true
-                    } else {
-                        match verify_fraud_proof(&challenge.response_hash, &challenge.proof_data) {
-                            FraudProofResult::Valid => true,
-                            FraudProofResult::StubNotImplemented => {
-                                info!(
-                                    "OPoI: ZK proof received but circuit not yet deployed (Phase 3 B stub) — response_hash={}",
-                                    hex::encode(challenge.response_hash)
-                                );
-                                false
+                    } else if challenge.proof_data.len() == FRAUD_PROOF_LEN {
+                        // Phase 3 C: re-execution fraud proof.
+                        // proof_data = request_hash (32 bytes).
+                        let submitted_request_hash: &[u8; 32] =
+                            challenge.proof_data.as_slice().try_into().unwrap();
+                        match self.ai_response_store.get(rh) {
+                            Ok(ref rec) if submitted_request_hash == &rec.request_hash => {
+                                match verify_fraud_proof(&rec.request_hash, &rec.claimed_commitment) {
+                                    FraudProofResult::Valid => {
+                                        info!(
+                                            "OPoI: fraud proven via re-execution — response_hash={}",
+                                            hex::encode(challenge.response_hash)
+                                        );
+                                        true
+                                    }
+                                    FraudProofResult::Invalid => {
+                                        warn!(
+                                            "OPoI: challenge rejected — miner commitment matches re-execution — response_hash={}",
+                                            hex::encode(challenge.response_hash)
+                                        );
+                                        false
+                                    }
+                                }
                             }
-                            FraudProofResult::Invalid => {
+                            Ok(_) => {
                                 warn!(
-                                    "OPoI: malformed ZK proof rejected — response_hash={}",
+                                    "OPoI: challenger submitted wrong request_hash — response_hash={}",
                                     hex::encode(challenge.response_hash)
                                 );
                                 false
                             }
+                            Err(_) => false,
                         }
+                    } else {
+                        warn!(
+                            "OPoI: proof_data length {} not recognised — response_hash={}",
+                            challenge.proof_data.len(),
+                            hex::encode(challenge.response_hash)
+                        );
+                        false
                     };
 
                     if slash_accepted {

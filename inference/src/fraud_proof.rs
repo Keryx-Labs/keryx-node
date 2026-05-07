@@ -1,76 +1,97 @@
-/// OPoI ZK Fraud Proof — Phase 3 B stub.
+/// OPoI Fraud Proof — Phase 3 C: deterministic re-execution.
 ///
-/// Defines the wire format and verification API for Groth16 challenges.
-/// Phase 3 B: `verify_fraud_proof` returns `StubNotImplemented` for
-/// well-formed proofs; actual arkworks BN254 Groth16 verification lands
-/// in Phase 3 C once the circuit VK is finalised.
+/// The verifiable component of an AiResponse is a 32-byte commitment:
+///   `commitment = model_fixed::forward(request_hash)`
+/// where `request_hash = blake2b(raw_AiRequest_payload)[0..32]`.
 ///
-/// Wire format of `proof_data` inside `AiChallengePayload`:
-///   A (G1, compressed, 32 bytes) — not A (negated, BN254 convention)
-///   B (G2, compressed, 64 bytes)
-///   C (G1, compressed, 32 bytes)
-///   Total: 128 bytes (arkworks compressed BN254 Groth16 serialisation)
+/// This commitment is deterministic (bit-exact on all hardware) and fast
+/// to re-execute (~microseconds), so there is no need for a ZK circuit.
+/// The miner MUST prepend the commitment to AiResponse.result; fraud is
+/// detected when the on-chain commitment differs from the re-computed one.
 ///
-/// Public inputs (prepended before `proof_data` by the verifier, not on-chain):
-///   nonce_salted: [u8; 8 LE]  — nonce ^ PHASE2_OPOI_SALT
-///   claimed_tag:  [u8; 8]     — the 8 bytes the miner published (hex-decoded)
+/// Wire format of `proof_data` inside `AiChallengePayload` (Phase 3 C):
+///   `[request_hash: 32 bytes]`
 ///
-/// The circuit proves: tag_fixed(nonce_salted) != claimed_tag, i.e.
-/// the miner lied about their OPoI output.
+/// The verifier uses `request_hash` to:
+///   1. Confirm it matches the `request_hash` stored in the AiResponseRecord.
+///   2. Re-compute `model_fixed::forward(request_hash)`.
+///   3. Compare with `claimed_commitment` from the AiResponseRecord.
+///   If they differ, the miner published a fraudulent commitment → slash.
 
-/// Byte length of a compressed arkworks BN254 Groth16 proof.
-/// A (32) + B (64) + C (32) = 128 bytes.
-pub const GROTH16_PROOF_LEN: usize = 128;
+use crate::model_fixed;
+
+/// Byte length of a Phase 3 C fraud proof (= the request_hash, 32 bytes).
+pub const FRAUD_PROOF_LEN: usize = 32;
 
 /// Result returned by `verify_fraud_proof`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FraudProofResult {
-    /// Proof is cryptographically valid: the miner published a wrong OPoI tag.
+    /// Fraud proven: the miner's claimed commitment does not match the
+    /// deterministic re-execution of `model_fixed::forward(request_hash)`.
     Valid,
-    /// Proof bytes are malformed, wrong length, or public inputs are inconsistent.
+    /// The miner was honest: re-execution matches the claimed commitment.
+    /// Also returned for malformed inputs (wrong request_hash).
     Invalid,
-    /// Phase 3 B stub: format is correct but the verifying key is not yet deployed.
-    /// Consensus records the attempt but does not slash.
-    StubNotImplemented,
 }
 
-/// Verify a Groth16 fraud proof submitted in an `AiChallenge` transaction.
+/// Verify a re-execution fraud proof for an AiResponse.
 ///
-/// `response_hash` is the blake2b-256 of the disputed `AiResponse` payload —
-/// used to derive the public inputs for the circuit.
+/// `request_hash` — the 32-byte blake2b prefix of the original AiRequest
+///                  payload, as submitted by the challenger in `proof_data`.
+/// `claimed_commitment` — the first 32 bytes of `AiResponse.result`, stored
+///                        in `AiResponseRecord.claimed_commitment` when the
+///                        AiResponse was indexed on-chain.
 ///
-/// Returns `FraudProofResult`:
-/// - `Invalid` for empty or malformed `proof_data` (wrong byte length)
-/// - `StubNotImplemented` for correctly sized proofs (Phase 3 B)
-/// - `Valid` will be returned by the Phase 3 C implementation
-pub fn verify_fraud_proof(response_hash: &[u8; 32], proof_data: &[u8]) -> FraudProofResult {
-    if proof_data.len() != GROTH16_PROOF_LEN {
-        return FraudProofResult::Invalid;
+/// Returns `Valid` if the miner lied, `Invalid` if honest.
+pub fn verify_fraud_proof(request_hash: &[u8; 32], claimed_commitment: &[u8; 32]) -> FraudProofResult {
+    let expected = model_fixed::forward(request_hash);
+    if expected != *claimed_commitment {
+        FraudProofResult::Valid
+    } else {
+        FraudProofResult::Invalid
     }
-    // Phase 3 C: parse Groth16 proof, load hardcoded VK, verify against
-    // public inputs derived from response_hash.
-    let _ = response_hash;
-    FraudProofResult::StubNotImplemented
+}
+
+/// Compute the OPoI commitment for a given AiRequest payload hash.
+///
+/// Miners call this to prepend the commitment to `AiResponse.result`.
+/// Consensus calls this (via `verify_fraud_proof`) to detect fraud.
+pub fn compute_ai_commitment(request_hash: &[u8; 32]) -> [u8; 32] {
+    model_fixed::forward(request_hash)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_proof_is_invalid() {
-        assert_eq!(verify_fraud_proof(&[0u8; 32], &[]), FraudProofResult::Invalid);
+    fn dummy_commitment(request_hash: &[u8; 32]) -> [u8; 32] {
+        compute_ai_commitment(request_hash)
     }
 
     #[test]
-    fn wrong_length_proof_is_invalid() {
-        assert_eq!(verify_fraud_proof(&[0u8; 32], &[0u8; 64]), FraudProofResult::Invalid);
-        assert_eq!(verify_fraud_proof(&[0u8; 32], &[0u8; 256]), FraudProofResult::Invalid);
+    fn honest_miner_returns_invalid() {
+        let req = [1u8; 32];
+        let commitment = dummy_commitment(&req);
+        assert_eq!(verify_fraud_proof(&req, &commitment), FraudProofResult::Invalid);
     }
 
     #[test]
-    fn correctly_sized_proof_is_stub() {
-        let proof = vec![0xABu8; GROTH16_PROOF_LEN];
-        assert_eq!(verify_fraud_proof(&[1u8; 32], &proof), FraudProofResult::StubNotImplemented);
+    fn lying_miner_returns_valid() {
+        let req = [2u8; 32];
+        let wrong_commitment = [0xFFu8; 32];
+        assert_eq!(verify_fraud_proof(&req, &wrong_commitment), FraudProofResult::Valid);
+    }
+
+    #[test]
+    fn different_request_hashes_produce_different_commitments() {
+        let c1 = compute_ai_commitment(&[1u8; 32]);
+        let c2 = compute_ai_commitment(&[2u8; 32]);
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn commitment_is_deterministic() {
+        let req = [42u8; 32];
+        assert_eq!(compute_ai_commitment(&req), compute_ai_commitment(&req));
     }
 }
