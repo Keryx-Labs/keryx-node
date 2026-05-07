@@ -268,33 +268,27 @@ impl CoinbaseManager {
         Ok(payload)
     }
 
-    /// OPoI Phase 1 — verifies that the coinbase payload carries an inference tag.
+    /// OPoI Phase 2 — verifies the coinbase inference tag against the fixed-point MLP.
     ///
     /// Parses the `extra_data` portion of `payload` looking for the pattern
-    /// `/{nonce_hex16}/ai:v1:{tag_hex16}`.
+    /// `/{nonce_hex16}/ai:v1:{tag_hex16}`, then checks that the claimed tag
+    /// matches the output of the deterministic fixed-point model for that nonce.
     ///
-    /// **Phase 1 policy (Optimistic)**: only the *presence* and *format* of the
-    /// tag are checked, not the MLP output value.  Checking the exact value here
-    /// causes false rejections during IBD because the MLP result depends on the
-    /// floating-point implementation (candle-core vs. bare Rust vs. GPU kernels)
-    /// and may differ across hardware even for the same nonce.  Value verification
-    /// is deferred to Phase 2 fraud-proofs, which are the authoritative enforcement
-    /// mechanism under the Optimistic Proof of Inference design.
+    /// The fixed-point model (`model_fixed`) uses pure i32/i64 arithmetic and
+    /// produces bit-exact results on every CPU — eliminating the floating-point
+    /// non-determinism that blocked Phase 1 value verification.
     ///
-    /// Validates the OPoI tag format in a coinbase payload.
-    /// Consensus enforcement is disabled (Phase 1 optimistic); this function is
-    /// kept for Phase 2 fraud-proof verification.
-    #[allow(dead_code)]
+    /// Active from genesis (chain relaunch — no fork activation needed).
     pub fn validate_opoi_tag(&self, payload: &[u8]) -> CoinbaseResult<()> {
         match keryx_inference::parse_opoi(payload) {
-            Some(_) => {
-                // Tag is present and well-formed — value check deferred to Phase 2 fraud-proofs.
-                Ok(())
+            Some((nonce, claimed_tag)) => {
+                if keryx_inference::verify_tag_fixed(nonce, &claimed_tag) {
+                    Ok(())
+                } else {
+                    Err(CoinbaseError::OPoiTagInvalid(nonce, claimed_tag))
+                }
             }
-            None => {
-                // No OPoI marker — every miner must commit to inference.
-                Err(CoinbaseError::OPoiTagMissing)
-            }
+            None => Err(CoinbaseError::OPoiTagMissing),
         }
     }
 

@@ -19,8 +19,7 @@ impl BlockBodyProcessor {
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
         self.check_no_chained_transactions(block)?;
-        // OPoI tag enforcement is deferred to Phase 2 fraud-proofs.
-        // Miners still embed the tag; consensus does not reject blocks based on it.
+        self.check_opoi_tag(block)?;
         Ok(mass)
     }
 
@@ -118,6 +117,13 @@ impl BlockBodyProcessor {
             }
         }
         Ok(())
+    }
+
+    fn check_opoi_tag(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let coinbase_payload = &block.transactions[0].payload;
+        self.coinbase_manager
+            .validate_opoi_tag(coinbase_payload)
+            .map_err(RuleError::BadCoinbasePayload)
     }
 
     fn check_duplicate_transactions(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {

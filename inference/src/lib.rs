@@ -1,15 +1,12 @@
-/// Keryx OPoI (Optimistic Proof of Inference) — Phase 1
+/// Keryx OPoI (Optimistic Proof of Inference) — Phase 1 + Phase 2
 ///
-/// Provides a deterministic synthetic MLP that every miner must execute
-/// per block template.  The result is committed in the coinbase `extra_data`
-/// field, making inference mandatory for block production.
-///
-/// Phase 1 is CPU-only and uses no downloaded model — weights are derived
-/// deterministically from `MODEL_SEED`.  Future phases will:
-///   - Verify outputs on-chain via optimistic fraud proofs (Phase 2)
-///   - Swap the synthetic MLP for real SLM inference via IPFS (Phase 3)
+/// Phase 1: synthetic f32 MLP (candle-core), tag embedded in coinbase.
+/// Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
+///   Tags are verified on-chain; collateral is slashed for fraud.
+/// Phase 3 (future): real SLM weights distributed via IPFS.
 
 pub mod model;
+pub mod model_fixed;
 pub mod task;
 
 pub use task::{InferenceResult, InferenceTask};
@@ -74,13 +71,34 @@ pub fn parse_opoi(payload: &[u8]) -> Option<(u64, String)> {
     Some((nonce, claimed_tag.to_string()))
 }
 
-/// Verifies that `claimed_hex8` matches the expected inference output for `nonce`.
-/// Returns `false` if inference fails or if the tag does not match.
+/// Phase 1 — verifies via candle-core f32 MLP (non-deterministic across hardware).
+/// Kept for reference only; NOT used in consensus after Phase 2 activation.
 pub fn verify_tag(nonce: u64, claimed_hex8: &str) -> bool {
     match run_inference(nonce) {
         Ok(result) => result.as_hex8() == claimed_hex8,
         Err(_) => false,
     }
+}
+
+// ── Phase 2 — Fixed-point verification ───────────────────────────────────────
+
+/// Runs the fixed-point MLP on `nonce` and returns the 32-byte output.
+/// Bit-exact on every platform — used for on-chain tag verification in Phase 2.
+pub fn run_inference_fixed(nonce: u64) -> [u8; 32] {
+    let task = InferenceTask::from_nonce(nonce);
+    model_fixed::forward(&task.input)
+}
+
+/// Returns the 16-char hex OPoI tag produced by the fixed-point model for `nonce`.
+pub fn tag_fixed(nonce: u64) -> String {
+    let output = run_inference_fixed(nonce);
+    hex::encode(&output[..8])
+}
+
+/// Verifies that `claimed_hex16` matches the fixed-point model output for `nonce`.
+/// This is the authoritative check used by consensus during Phase 2.
+pub fn verify_tag_fixed(nonce: u64, claimed_hex16: &str) -> bool {
+    tag_fixed(nonce) == claimed_hex16
 }
 
 /// Errors returned by the inference engine.
