@@ -90,6 +90,14 @@ pub fn verify_tag(nonce: u64, claimed_hex8: &str) -> bool {
 
 // ── Phase 2 — Fixed-point verification ───────────────────────────────────────
 
+/// Protocol version salt for Phase 2 OPoI tags.
+///
+/// XORed into the nonce before the fixed-point MLP forward pass. Any miner
+/// compiled against an older keryx-inference (without this salt) will produce
+/// wrong OPoI tags and have their blocks rejected at consensus level —
+/// cryptographically enforced, impossible to spoof without updating the crate.
+pub const PHASE2_OPOI_SALT: u64 = u64::from_le_bytes(*b"KERYX:2\0");
+
 /// Runs the fixed-point MLP on `nonce` and returns the 32-byte output.
 /// Bit-exact on every platform — used for on-chain tag verification in Phase 2.
 pub fn run_inference_fixed(nonce: u64) -> [u8; 32] {
@@ -98,8 +106,10 @@ pub fn run_inference_fixed(nonce: u64) -> [u8; 32] {
 }
 
 /// Returns the 16-char hex OPoI tag produced by the fixed-point model for `nonce`.
+/// The nonce is salted with `PHASE2_OPOI_SALT` before inference — miners compiled
+/// against older versions of this crate will produce incompatible tags.
 pub fn tag_fixed(nonce: u64) -> String {
-    let output = run_inference_fixed(nonce);
+    let output = run_inference_fixed(nonce ^ PHASE2_OPOI_SALT);
     hex::encode(&output[..8])
 }
 
