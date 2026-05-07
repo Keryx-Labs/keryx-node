@@ -15,6 +15,7 @@ use keryx_consensus_core::{
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
+use keryx_inference::AiResponsePayload;
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -126,6 +127,14 @@ impl Mempool {
             .mtx
             .tx
             .clone();
+
+        // Register in dedup index so no second AiResponse for the same request gets in.
+        if accepted_transaction.is_ai_response() {
+            if let Some(request_hash) = ai_response_request_hash(&accepted_transaction.payload) {
+                self.ai_response_index.insert(request_hash, accepted_transaction.id());
+            }
+        }
+
         Ok(TransactionPostValidation { removed: removed_transaction, accepted: Some(accepted_transaction) })
     }
 
@@ -143,6 +152,15 @@ impl Mempool {
         let transaction_id = transaction.id();
         if self.transaction_pool.has(&transaction_id) {
             return Err(RuleError::RejectDuplicate(transaction_id));
+        }
+
+        // One AiResponse per request: reject if a response for the same request_hash is already pending.
+        if transaction.tx.is_ai_response() {
+            if let Some(request_hash) = ai_response_request_hash(&transaction.tx.payload) {
+                if self.ai_response_index.contains_key(&request_hash) {
+                    return Err(RuleError::RejectDuplicateAiResponse(hex::encode(request_hash)));
+                }
+            }
         }
 
         if !self.config.accept_non_standard {
@@ -244,4 +262,10 @@ impl Mempool {
             Priority::Low => RbfPolicy::Allowed,
         }
     }
+}
+
+/// Extracts the `request_hash` field from a raw AiResponse payload (bytes).
+/// Returns `None` if the payload is too short or malformed.
+fn ai_response_request_hash(payload: &[u8]) -> Option<[u8; 32]> {
+    AiResponsePayload::deserialize(payload).map(|r| r.request_hash)
 }

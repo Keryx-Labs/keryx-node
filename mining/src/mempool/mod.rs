@@ -16,6 +16,7 @@ use keryx_consensus_core::{
     block::TemplateTransactionSelector,
     tx::{MutableTransaction, TransactionId},
 };
+use std::collections::HashMap;
 use keryx_core::time::Stopwatch;
 use std::sync::Arc;
 
@@ -51,6 +52,8 @@ pub(crate) struct Mempool {
     orphan_pool: OrphanPool,
     accepted_transactions: AcceptedTransactions,
     counters: Arc<MiningCounters>,
+    /// Deduplication index: request_hash → tx_id. One AiResponse per request.
+    ai_response_index: HashMap<[u8; 32], TransactionId>,
 }
 
 impl Mempool {
@@ -58,7 +61,7 @@ impl Mempool {
         let transaction_pool = TransactionsPool::new(config.clone());
         let orphan_pool = OrphanPool::new(config.clone());
         let accepted_transactions = AcceptedTransactions::new(config.clone());
-        Self { config, transaction_pool, orphan_pool, accepted_transactions, counters }
+        Self { config, transaction_pool, orphan_pool, accepted_transactions, counters, ai_response_index: HashMap::new() }
     }
 
     pub(crate) fn get_transaction(&self, transaction_id: &TransactionId, query: TransactionQuery) -> Option<MutableTransaction> {

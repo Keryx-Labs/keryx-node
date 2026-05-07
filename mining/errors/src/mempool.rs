@@ -72,6 +72,9 @@ pub enum RuleError {
     #[error("transactions in mempool form a cycle")]
     RejectCycleInMempoolTransactions,
 
+    #[error("an AiResponse for request {0} is already in the mempool")]
+    RejectDuplicateAiResponse(String),
+
     // TODO: This error is added for the tx_relay flow but is never constructed neither in the golang nor in this version. Discuss if it can be removed.
     #[error("transaction {0} is invalid")]
     RejectInvalid(TransactionId),

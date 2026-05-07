@@ -1,7 +1,10 @@
 use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
-use keryx_inference::{MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
-    MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN};
+use keryx_inference::{
+    AiResponsePayload,
+    MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
+};
 use std::collections::HashSet;
 
 use super::{
@@ -25,6 +28,7 @@ impl TransactionValidator {
         check_gas(tx)?;
         check_transaction_subnetwork(tx)?;
         check_ai_payload_len(tx)?;
+        check_ai_response_request_hash(tx)?;
         check_transaction_version(tx)
     }
 
@@ -162,6 +166,17 @@ fn check_transaction_subnetwork(tx: &Transaction) -> TxResult<()> {
         Ok(())
     } else {
         Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()))
+    }
+}
+
+fn check_ai_response_request_hash(tx: &Transaction) -> TxResult<()> {
+    if !tx.is_ai_response() {
+        return Ok(());
+    }
+    match AiResponsePayload::deserialize(&tx.payload) {
+        None => Err(TxRuleError::AiPayloadTooShort(tx.payload.len(), MIN_AI_RESPONSE_PAYLOAD_LEN)),
+        Some(r) if r.request_hash == [0u8; 32] => Err(TxRuleError::AiResponseNullRequestHash),
+        _ => Ok(()),
     }
 }
 

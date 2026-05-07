@@ -102,6 +102,9 @@ pub enum TxRuleError {
     #[error("AI transaction payload too long: {0} bytes (maximum {1})")]
     AiPayloadTooLong(usize, usize),
 
+    #[error("AiResponse transaction has a null (all-zero) request_hash")]
+    AiResponseNullRequestHash,
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]
