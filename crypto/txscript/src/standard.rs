@@ -80,6 +80,8 @@ pub fn extract_script_pub_key_address(script_public_key: &ScriptPublicKey, prefi
         ScriptClass::PubKey => Ok(Address::new(prefix, Version::PubKey, &script[1..33])),
         ScriptClass::PubKeyECDSA => Ok(Address::new(prefix, Version::PubKeyECDSA, &script[1..34])),
         ScriptClass::ScriptHash => Ok(Address::new(prefix, Version::ScriptHash, &script[2..34])),
+        // CSV-timelocked escrow — not a standard wallet address.
+        ScriptClass::CsvPubKey => Err(TxScriptError::PubKeyFormat),
     }
 }
 

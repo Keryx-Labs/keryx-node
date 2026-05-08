@@ -9,7 +9,7 @@ use keryx_consensus_core::{
 };
 use keryx_hashes::{Hasher, TransactionHash};
 use keryx_txscript::{
-    opcodes::codes::{OpCheckSequenceVerify, OpCheckSig, OpDrop},
+    opcodes::codes::{OpCheckSequenceVerify, OpCheckSig},
     script_builder::ScriptBuilder,
     standard::pay_to_address_script,
 };
@@ -105,12 +105,11 @@ const KRX_TAIL_EMISSION_PER_SECOND: u64 = 10;
 /// network the full challenge window to submit a fraud proof before the miner
 /// claims their collateral.
 fn build_escrow_script(pubkey_bytes: &[u8]) -> Option<ScriptPublicKey> {
+    // Keryx's OP_CSV pops its argument — no OP_DROP needed after it.
     let script = ScriptBuilder::new()
         .add_sequence(CHALLENGE_WINDOW_BLOCKS)
         .ok()?
         .add_op(OpCheckSequenceVerify)
-        .ok()?
-        .add_op(OpDrop)
         .ok()?
         .add_data(pubkey_bytes)
         .ok()?
