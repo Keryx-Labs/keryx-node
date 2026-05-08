@@ -56,7 +56,19 @@ impl SubnetworkId {
     /// always use 0 gas.
     #[inline]
     pub fn is_builtin(&self) -> bool {
-        *self == SUBNETWORK_ID_COINBASE || *self == SUBNETWORK_ID_REGISTRY
+        *self == SUBNETWORK_ID_COINBASE
+            || *self == SUBNETWORK_ID_REGISTRY
+            || *self == SUBNETWORK_ID_AI_REQUEST
+            || *self == SUBNETWORK_ID_AI_RESPONSE
+            || *self == SUBNETWORK_ID_AI_CHALLENGE
+    }
+
+    /// Returns true if this is an OPoI AI transaction subnetwork.
+    #[inline]
+    pub fn is_ai(&self) -> bool {
+        *self == SUBNETWORK_ID_AI_REQUEST
+            || *self == SUBNETWORK_ID_AI_RESPONSE
+            || *self == SUBNETWORK_ID_AI_CHALLENGE
     }
 
     /// Returns true if the subnetwork is the native subnetwork
@@ -135,3 +147,12 @@ pub const SUBNETWORK_ID_COINBASE: SubnetworkId = SubnetworkId::from_byte(1);
 
 /// The subnetwork ID which is used for adding new sub networks to the registry
 pub const SUBNETWORK_ID_REGISTRY: SubnetworkId = SubnetworkId::from_byte(2);
+
+/// Subnetwork ID for OPoI AI inference requests.
+pub const SUBNETWORK_ID_AI_REQUEST: SubnetworkId = SubnetworkId::from_byte(3);
+
+/// Subnetwork ID for OPoI AI inference responses.
+pub const SUBNETWORK_ID_AI_RESPONSE: SubnetworkId = SubnetworkId::from_byte(4);
+
+/// Subnetwork ID for OPoI fraud challenges.
+pub const SUBNETWORK_ID_AI_CHALLENGE: SubnetworkId = SubnetworkId::from_byte(5);

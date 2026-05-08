@@ -1,8 +1,10 @@
 use crate::constants::{MAX_SOMPI, SEQUENCE_LOCK_TIME_DISABLED, SEQUENCE_LOCK_TIME_MASK};
+use crate::processes::coinbase;
 use keryx_consensus_core::{
     hashing::sighash::{SigHashReusedValuesSync, SigHashReusedValuesUnsync},
     tx::{TransactionInput, VerifiableTransaction},
 };
+use keryx_inference::AiChallengePayload;
 use keryx_txscript::{SigCacheKey, TxScriptEngine, caches::Cache};
 use keryx_txscript_errors::TxScriptError;
 use rayon::ThreadPool;
@@ -40,6 +42,7 @@ impl TransactionValidator {
     ) -> TxResult<u64> {
         self.check_transaction_coinbase_maturity(tx, pov_daa_score)?;
         let total_in = self.check_transaction_input_amounts(tx)?;
+        self.check_ai_challenge_deposit(tx, total_in)?;
         let total_out = Self::check_transaction_output_values(tx, total_in)?;
         let fee = total_in - total_out;
         if flags != TxValidationFlags::SkipMassCheck {
@@ -123,6 +126,27 @@ impl TransactionValidator {
         let committed_contextual_mass = tx.tx().mass();
         if committed_contextual_mass != calculated_contextual_mass {
             return Err(TxRuleError::WrongMass(calculated_contextual_mass, committed_contextual_mass));
+        }
+        Ok(())
+    }
+
+    fn check_ai_challenge_deposit(&self, tx: &impl VerifiableTransaction, total_in: u64) -> TxResult<()> {
+        if !tx.tx().is_ai_challenge() {
+            return Ok(());
+        }
+        let Some(challenge) = AiChallengePayload::deserialize(&tx.tx().payload) else {
+            return Ok(());
+        };
+        if challenge.challenger_deposit == 0 {
+            return Ok(());
+        }
+        let deposit = challenge.challenger_deposit;
+        if total_in < deposit {
+            return Err(TxRuleError::AiChallengeDepositInsufficientInputs(deposit, total_in));
+        }
+        let burn_spk = coinbase::burn_script_public_key();
+        if !tx.outputs().iter().any(|out| out.script_public_key == burn_spk && out.value >= deposit) {
+            return Err(TxRuleError::AiChallengeDepositMissingBurnOutput(deposit));
         }
         Ok(())
     }

@@ -1,4 +1,11 @@
-use crate::{consensus::test_consensus::TestConsensus, model::services::reachability::ReachabilityService};
+use crate::{
+    consensus::test_consensus::TestConsensus,
+    model::{
+        services::reachability::ReachabilityService,
+        stores::ai_slash::{AiResponseStoreReader, AiSlashedStoreReader, OutpointKey},
+    },
+};
+use keryx_inference::{self, AiChallengePayload, AiResponsePayload, compute_ai_commitment};
 use keryx_consensus_core::{
     BlockHashSet,
     api::ConsensusApi,
@@ -7,8 +14,10 @@ use keryx_consensus_core::{
     blockstatus::BlockStatus,
     coinbase::MinerData,
     config::{ConfigBuilder, params::MAINNET_PARAMS},
+    subnets::{SUBNETWORK_ID_AI_CHALLENGE, SUBNETWORK_ID_AI_RESPONSE},
     tx::{ScriptPublicKey, ScriptVec, Transaction},
 };
+use crate::constants::TX_VERSION;
 use keryx_hashes::Hash;
 use std::{collections::VecDeque, thread::JoinHandle};
 
@@ -301,5 +310,202 @@ fn new_miner_data() -> MinerData {
     let mut rng = rand::thread_rng();
     let (_sk, pk) = secp.generate_keypair(&mut rng);
     let script = ScriptVec::from_slice(&pk.serialize());
-    MinerData::new(ScriptPublicKey::new(0, script), vec![])
+    MinerData::new(ScriptPublicKey::new(0, script), keryx_inference::gen_opoi_extra_data(0))
+}
+
+// ── OPoI E2E helpers ──────────────────────────────────────────────────────────
+
+fn opoi_config() -> keryx_consensus_core::config::Config {
+    ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build()
+}
+
+/// Build an AiResponse TX with a specific 32-byte commitment prepended to result.
+fn make_ai_response_tx(request_hash: [u8; 32], commitment: [u8; 32]) -> Transaction {
+    let mut result = commitment.to_vec();
+    result.extend_from_slice(b"opoi_test_result");
+    let payload = AiResponsePayload::new(request_hash, 0, result).serialize();
+    Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload)
+}
+
+/// Compute the response_hash key used by the consensus: blake2b(tx.payload)[0..32].
+fn response_hash_of(tx: &Transaction) -> Hash {
+    let h = blake2b_simd::blake2b(&tx.payload);
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&h.as_bytes()[..32]);
+    Hash::from_bytes(bytes)
+}
+
+/// Build an AiChallenge TX (Phase 3 C: proof_data = request_hash).
+fn make_ai_challenge_tx(
+    response_hash: Hash,
+    challenger_spk: [u8; 32],
+    request_hash: [u8; 32],
+) -> Transaction {
+    let rh_bytes: [u8; 32] = response_hash.as_bytes().try_into().unwrap();
+    let payload = AiChallengePayload::new(rh_bytes, 0, 0, challenger_spk, request_hash.to_vec()).serialize();
+    Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_CHALLENGE, 0, payload)
+}
+
+// ── OPoI E2E tests ────────────────────────────────────────────────────────────
+
+/// After a block containing an AiResponse TX is accepted, the consensus must
+/// have registered the response in the ai_response_store so challengers can
+/// look it up by response_hash.
+#[tokio::test]
+async fn opoi_response_registered_on_chain() {
+    let config = opoi_config();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let genesis = config.genesis.hash;
+    let request_hash = [0x01u8; 32];
+    let commitment = compute_ai_commitment(&request_hash);
+    let response_tx = make_ai_response_tx(request_hash, commitment);
+    let rh = response_hash_of(&response_tx);
+
+    tc.add_utxo_valid_block_with_parents(1u64.into(), vec![genesis], vec![response_tx]).await.unwrap();
+
+    let record = tc.ai_response_store().get(rh).expect("AiResponse must be registered");
+    assert_eq!(record.request_hash, request_hash);
+    assert_eq!(record.claimed_commitment, commitment);
+
+    tc.shutdown(handles);
+}
+
+/// A miner that publishes a fraudulent commitment (wrong value) should have
+/// their escrow slashed once a valid AiChallenge is included in a later block.
+#[tokio::test]
+async fn opoi_fraud_challenge_slashes_escrow() {
+    let config = opoi_config();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let genesis = config.genesis.hash;
+    let request_hash = [0x02u8; 32];
+    let wrong_commitment = [0xFFu8; 32]; // does not match compute_ai_commitment
+
+    let response_tx = make_ai_response_tx(request_hash, wrong_commitment);
+    let rh = response_hash_of(&response_tx);
+    let challenger_spk = [0xABu8; 32];
+    let challenge_tx = make_ai_challenge_tx(rh, challenger_spk, request_hash);
+
+    // Block 1: fraudulent AiResponse
+    tc.add_utxo_valid_block_with_parents(1u64.into(), vec![genesis], vec![response_tx]).await.unwrap();
+
+    // Retrieve coinbase_tx_id from the registered record to build the outpoint key
+    let record = tc.ai_response_store().get(rh).expect("AiResponse must be registered");
+    let outpoint_key = OutpointKey::new(record.coinbase_tx_id, 1);
+
+    // Block 2: valid AiChallenge proving fraud
+    tc.add_utxo_valid_block_with_parents(2u64.into(), vec![1u64.into()], vec![challenge_tx]).await.unwrap();
+
+    let slash = tc.ai_slashed_store().get_slash(outpoint_key).expect("store error");
+    assert!(slash.is_some(), "escrow must be slashed after valid fraud proof");
+    let slash = slash.unwrap();
+    assert_eq!(slash.challenger_spk_script, challenger_spk);
+
+    tc.shutdown(handles);
+}
+
+/// A challenger submitting a proof against an *honest* miner (correct commitment)
+/// must be rejected: no slash record should be written.
+#[tokio::test]
+async fn opoi_honest_miner_challenge_no_slash() {
+    let config = opoi_config();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let genesis = config.genesis.hash;
+    let request_hash = [0x03u8; 32];
+    let honest_commitment = compute_ai_commitment(&request_hash); // correct value
+
+    let response_tx = make_ai_response_tx(request_hash, honest_commitment);
+    let rh = response_hash_of(&response_tx);
+    let challenger_spk = [0xCDu8; 32];
+    let challenge_tx = make_ai_challenge_tx(rh, challenger_spk, request_hash);
+
+    tc.add_utxo_valid_block_with_parents(10u64.into(), vec![genesis], vec![response_tx]).await.unwrap();
+    let record = tc.ai_response_store().get(rh).expect("AiResponse must be registered");
+    let outpoint_key = OutpointKey::new(record.coinbase_tx_id, 1);
+
+    tc.add_utxo_valid_block_with_parents(11u64.into(), vec![10u64.into()], vec![challenge_tx]).await.unwrap();
+
+    let slash = tc.ai_slashed_store().get_slash(outpoint_key).expect("store error");
+    assert!(slash.is_none(), "honest miner must NOT be slashed");
+
+    tc.shutdown(handles);
+}
+
+/// A challenge referencing an unknown response_hash (no prior AiResponse on chain)
+/// must be silently ignored — no slash recorded.
+#[tokio::test]
+async fn opoi_challenge_unknown_response_no_slash() {
+    let config = opoi_config();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let genesis = config.genesis.hash;
+    let unknown_rh = Hash::from_bytes([0xBEu8; 32]);
+    let challenge_tx = make_ai_challenge_tx(unknown_rh, [0x11u8; 32], [0x22u8; 32]);
+
+    tc.add_utxo_valid_block_with_parents(20u64.into(), vec![genesis], vec![challenge_tx]).await.unwrap();
+
+    // The response was never registered, so no outpoint can be slashed.
+    // We verify no slash was recorded under the fake outpoint used in the challenge.
+    let fake_key = OutpointKey::new(Hash::from_bytes([0xFFu8; 32]), 1);
+    let slash = tc.ai_slashed_store().get_slash(fake_key).expect("store error");
+    assert!(slash.is_none(), "challenge for unknown response must not produce a slash");
+
+    tc.shutdown(handles);
+}
+
+/// An AiChallenge submitted outside the challenge window (> CHALLENGE_WINDOW_BLOCKS
+/// after the AiResponse) must be silently ignored — no slash recorded.
+///
+/// NOTE: This test inserts 36,002 blocks and takes ~100 s. Run manually with:
+///   cargo test -p keryx-consensus --lib -- opoi_challenge_outside_window_no_slash --ignored
+#[tokio::test]
+#[ignore]
+async fn opoi_challenge_outside_window_no_slash() {
+    use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
+
+    let config = opoi_config();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let genesis = config.genesis.hash;
+    let request_hash = [0x04u8; 32];
+    let wrong_commitment = [0xEEu8; 32];
+
+    let response_tx = make_ai_response_tx(request_hash, wrong_commitment);
+    let rh = response_hash_of(&response_tx);
+    let challenger_spk = [0xDEu8; 32];
+    let challenge_tx = make_ai_challenge_tx(rh, challenger_spk, request_hash);
+
+    // Block 100: AiResponse
+    tc.add_utxo_valid_block_with_parents(100u64.into(), vec![genesis], vec![response_tx]).await.unwrap();
+    let record = tc.ai_response_store().get(rh).expect("AiResponse must be registered");
+
+    // The challenge window is CHALLENGE_WINDOW_BLOCKS. We need to advance the
+    // blue score far enough that the challenge lands outside the window.
+    // We do this by building a chain of (CHALLENGE_WINDOW_BLOCKS + 2) empty blocks.
+    let window = CHALLENGE_WINDOW_BLOCKS as u64;
+    let mut parent = 100u64.into();
+    // Hash range 200..200+window+2, well clear of 100 and the challenge
+    for i in 0..window + 2 {
+        let next: Hash = (200u64 + i).into();
+        tc.add_utxo_valid_block_with_parents(next, vec![parent], vec![]).await.unwrap();
+        parent = next;
+    }
+
+    let outpoint_key = OutpointKey::new(record.coinbase_tx_id, 1);
+
+    // Challenge block appended after the window has closed
+    let challenge_hash: Hash = (200u64 + window + 3).into();
+    tc.add_utxo_valid_block_with_parents(challenge_hash, vec![parent], vec![challenge_tx]).await.unwrap();
+
+    let slash = tc.ai_slashed_store().get_slash(outpoint_key).expect("store error");
+    assert!(slash.is_none(), "challenge outside window must NOT produce a slash");
+
+    tc.shutdown(handles);
 }

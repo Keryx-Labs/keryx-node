@@ -1,5 +1,6 @@
 use crate::mempool::{
     Mempool,
+    config::MINIMUM_FLAT_TX_FEE_SOMPI,
     errors::{NonStandardError, NonStandardResult},
 };
 use keryx_consensus_core::{
@@ -175,6 +176,13 @@ impl Mempool {
         if contextual_mass > MAXIMUM_STANDARD_TRANSACTION_MASS {
             return Err(NonStandardError::RejectStorageMass(transaction_id, contextual_mass, MAXIMUM_STANDARD_TRANSACTION_MASS));
         }
+
+        // Enforce flat minimum fee of 0.3 KRX regardless of transaction mass.
+        let fee = transaction.calculated_fee.unwrap();
+        if fee < MINIMUM_FLAT_TX_FEE_SOMPI {
+            return Err(NonStandardError::RejectInsufficientFee(transaction_id, fee, MINIMUM_FLAT_TX_FEE_SOMPI));
+        }
+
         for (i, input) in transaction.tx.inputs.iter().enumerate() {
             // It is safe to elide existence and index checks here since
             // they have already been checked prior to calling this
@@ -186,6 +194,7 @@ impl Mempool {
                 }
                 ScriptClass::PubKey => {}
                 ScriptClass::PubKeyECDSA => {}
+                ScriptClass::CsvPubKey => {}
                 ScriptClass::ScriptHash => {
                     // todo relax due to on fly calculation
                     let num_sig_ops = get_sig_op_count_upper_bound::<PopulatedTransaction, SigHashReusedValuesUnsync>(

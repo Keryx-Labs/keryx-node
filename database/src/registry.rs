@@ -49,6 +49,15 @@ pub enum DatabaseStorePrefixes {
     // Stores a succinct pruning proof descriptor
     PruningProofDescriptor = 33,
 
+    // ---- OPoI Collateral ----
+    MinerCollateral = 34,
+
+    // ---- OPoI Slash (Phase 3 A4) ----
+    /// Confirmed AiResponse txs: response_hash → AiResponseRecord
+    AiResponse = 35,
+    /// Slashed escrow outpoints: outpoint_bytes → slash_blue_score
+    AiSlashed = 36,
+
     // ---- Ghostdag Proof
     TempGhostdag = 40,
     TempGhostdagCompact = 41,

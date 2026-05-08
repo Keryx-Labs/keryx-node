@@ -1,4 +1,8 @@
 pub use crate::cli::KaspaCli;
+
+/// Minimum fee enforced by the Keryx mempool (0.3 KRX). Used as the default
+/// priority fee for all CLI send/transfer/estimate commands.
+pub const MINIMUM_FEE_SOMPI: u64 = 30_000_000;
 pub use crate::error::Error;
 pub use crate::extensions::*;
 pub(crate) use crate::helpers;

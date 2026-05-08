@@ -96,6 +96,39 @@ pub enum TxRuleError {
     #[error("transaction subnetwork id {0} is neither native nor coinbase")]
     SubnetworksDisabled(SubnetworkId),
 
+    #[error("AI transaction payload too short: {0} bytes (minimum {1})")]
+    AiPayloadTooShort(usize, usize),
+
+    #[error("AI transaction payload too long: {0} bytes (maximum {1})")]
+    AiPayloadTooLong(usize, usize),
+
+    #[error("AiResponse transaction has a null (all-zero) request_hash")]
+    AiResponseNullRequestHash,
+
+    #[error("AiChallenge transaction has a null (all-zero) response_hash")]
+    AiChallengeNullResponseHash,
+
+    #[error("transaction attempts to spend a slashed escrow outpoint")]
+    SpendingSlashedEscrow,
+
+    #[error("AiChallenge references an unknown AiResponse")]
+    AiChallengeUnknownResponse,
+
+    #[error("AiChallenge is outside the challenge window")]
+    AiChallengeOutsideWindow,
+
+    #[error("AiChallenge proof_data contains wrong request_hash")]
+    AiChallengeBadRequestHash,
+
+    #[error("AiChallenge fraud proof is invalid or does not prove fraud")]
+    AiChallengeProofInvalid,
+
+    #[error("AiChallenge challenger_deposit is {0} sompi but total inputs are only {1} sompi")]
+    AiChallengeDepositInsufficientInputs(u64, u64),
+
+    #[error("AiChallenge challenger_deposit is {0} sompi but no output to the burn address covers that amount")]
+    AiChallengeDepositMissingBurnOutput(u64),
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

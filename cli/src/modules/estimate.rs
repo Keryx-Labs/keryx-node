@@ -19,7 +19,9 @@ impl Estimate {
         let amount_sompi = try_parse_required_nonzero_kaspa_as_sompi_u64(argv.first())?;
         // TODO fee_rate
         let fee_rate = None;
-        let priority_fee_sompi = try_parse_optional_kaspa_as_sompi_i64(argv.get(1))?.unwrap_or(0);
+        let priority_fee_sompi = try_parse_optional_kaspa_as_sompi_i64(argv.get(1))?
+            .unwrap_or(MINIMUM_FEE_SOMPI as i64)
+            .max(MINIMUM_FEE_SOMPI as i64);
         let abortable = Abortable::default();
 
         // just use any address for an estimate (change address)

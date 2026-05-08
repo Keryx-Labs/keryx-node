@@ -19,8 +19,7 @@ impl BlockBodyProcessor {
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
         self.check_no_chained_transactions(block)?;
-        // OPoI tag enforcement is deferred to Phase 2 fraud-proofs.
-        // Miners still embed the tag; consensus does not reject blocks based on it.
+        self.check_opoi_tag(block)?;
         Ok(mass)
     }
 
@@ -120,6 +119,16 @@ impl BlockBodyProcessor {
         Ok(())
     }
 
+    fn check_opoi_tag(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if self.skip_opoi {
+            return Ok(());
+        }
+        let coinbase_payload = &block.transactions[0].payload;
+        self.coinbase_manager
+            .validate_opoi_tag(coinbase_payload)
+            .map_err(RuleError::BadCoinbasePayload)
+    }
+
     fn check_duplicate_transactions(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let mut ids = HashSet::new();
         for tx in block.transactions.iter() {
@@ -150,6 +159,7 @@ mod tests {
     };
     use keryx_core::assert_match;
     use keryx_hashes::Hash;
+    use keryx_inference;
 
     #[test]
     fn validate_body_in_isolation_test() {
@@ -157,54 +167,33 @@ mod tests {
         let wait_handles = consensus.init();
 
         let body_processor = consensus.block_body_processor();
-        let example_block = MutableBlock::new(
-            Header::new_finalized(
+
+        // Build coinbase payload: binary header (19 bytes) + valid OPoI extra_data.
+        let coinbase_payload: Vec<u8> = {
+            let mut p = vec![9u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // blue_score=9, subsidy=0, spk_ver=0, spk_len=0
+            p.extend_from_slice(&keryx_inference::gen_opoi_extra_data(0));
+            p
+        };
+
+        let txs = vec![
+            Transaction::new(
                 0,
-                vec![vec![
-                    Hash::from_slice(&[
-                        0x16, 0x5e, 0x38, 0xe8, 0xb3, 0x91, 0x45, 0x95, 0xd9, 0xc6, 0x41, 0xf3, 0xb8, 0xee, 0xc2, 0xf3, 0x46, 0x11,
-                        0x89, 0x6b, 0x82, 0x1a, 0x68, 0x3b, 0x7a, 0x4e, 0xde, 0xfe, 0x2c, 0x00, 0x00, 0x00,
-                    ]),
-                    Hash::from_slice(&[
-                        0x4b, 0xb0, 0x75, 0x35, 0xdf, 0xd5, 0x8e, 0x0b, 0x3c, 0xd6, 0x4f, 0xd7, 0x15, 0x52, 0x80, 0x87, 0x2a, 0x04,
-                        0x71, 0xbc, 0xf8, 0x30, 0x95, 0x52, 0x6a, 0xce, 0x0e, 0x38, 0xc6, 0x00, 0x00, 0x00,
-                    ]),
-                ]]
-                .try_into()
-                .unwrap(),
-                Hash::from_slice(&[
-                    0x46, 0xec, 0xf4, 0x5b, 0xe3, 0xba, 0xca, 0x34, 0x9d, 0xfe, 0x8a, 0x78, 0xde, 0xaf, 0x05, 0x3b, 0x0a, 0xa6, 0xd5,
-                    0x38, 0x97, 0x4d, 0xa5, 0x0f, 0xd6, 0xef, 0xb4, 0xd2, 0x66, 0xbc, 0x8d, 0x21,
-                ]),
-                Default::default(),
-                Default::default(),
-                0x17305aa654a,
-                0x207fffff,
-                1,
-                0,
-                0.into(),
-                9,
-                Default::default(),
-            ),
-            vec![
-                Transaction::new(
-                    0,
-                    vec![],
-                    vec![TransactionOutput {
-                        value: 0x12a05f200,
-                        script_public_key: ScriptPublicKey::new(
-                            0,
-                            scriptvec!(
-                                0xa9, 0x14, 0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
-                                0xba, 0x30, 0xcd, 0x5a, 0x4b, 0x87
-                            ),
+                vec![],
+                vec![TransactionOutput {
+                    value: 0x12a05f200,
+                    script_public_key: ScriptPublicKey::new(
+                        0,
+                        scriptvec!(
+                            0xa9, 0x14, 0xda, 0x17, 0x45, 0xe9, 0xb5, 0x49, 0xbd, 0x0b, 0xfa, 0x1a, 0x56, 0x99, 0x71, 0xc7, 0x7e,
+                            0xba, 0x30, 0xcd, 0x5a, 0x4b, 0x87
                         ),
-                    }],
-                    0,
-                    SUBNETWORK_ID_COINBASE,
-                    0,
-                    vec![9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                ),
+                    ),
+                }],
+                0,
+                SUBNETWORK_ID_COINBASE,
+                0,
+                coinbase_payload,
+            ),
                 Transaction::new(
                     0,
                     vec![
@@ -405,7 +394,36 @@ mod tests {
                     0,
                     vec![],
                 ),
-            ],
+        ];
+
+        let hash_merkle_root = calc_hash_merkle_root(txs.iter());
+        let example_block = MutableBlock::new(
+            Header::new_finalized(
+                0,
+                vec![vec![
+                    Hash::from_slice(&[
+                        0x16, 0x5e, 0x38, 0xe8, 0xb3, 0x91, 0x45, 0x95, 0xd9, 0xc6, 0x41, 0xf3, 0xb8, 0xee, 0xc2, 0xf3, 0x46, 0x11,
+                        0x89, 0x6b, 0x82, 0x1a, 0x68, 0x3b, 0x7a, 0x4e, 0xde, 0xfe, 0x2c, 0x00, 0x00, 0x00,
+                    ]),
+                    Hash::from_slice(&[
+                        0x4b, 0xb0, 0x75, 0x35, 0xdf, 0xd5, 0x8e, 0x0b, 0x3c, 0xd6, 0x4f, 0xd7, 0x15, 0x52, 0x80, 0x87, 0x2a, 0x04,
+                        0x71, 0xbc, 0xf8, 0x30, 0x95, 0x52, 0x6a, 0xce, 0x0e, 0x38, 0xc6, 0x00, 0x00, 0x00,
+                    ]),
+                ]]
+                .try_into()
+                .unwrap(),
+                hash_merkle_root,
+                Default::default(),
+                Default::default(),
+                0x17305aa654a,
+                0x207fffff,
+                1,
+                0,
+                0.into(),
+                9,
+                Default::default(),
+            ),
+            txs,
         );
 
         body_processor.validate_body_in_isolation(&example_block.clone().to_immutable()).unwrap();

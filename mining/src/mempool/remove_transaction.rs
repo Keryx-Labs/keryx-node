@@ -5,6 +5,7 @@ use crate::mempool::{
 };
 use keryx_consensus_core::tx::TransactionId;
 use keryx_core::debug;
+use keryx_inference::{AiChallengePayload, AiResponsePayload};
 use keryx_utils::iter::IterExtensions;
 
 impl Mempool {
@@ -33,6 +34,17 @@ impl Mempool {
         for tx_id in removed_transactions.iter() {
             // Remove the tx from the transaction pool and the UTXO set (handled within the pool)
             let tx = self.transaction_pool.remove_transaction(tx_id)?;
+            // Clean up AI dedup indexes when a tx is evicted.
+            if tx.mtx.tx.is_ai_response() {
+                if let Some(rh) = AiResponsePayload::deserialize(&tx.mtx.tx.payload).map(|r| r.request_hash) {
+                    self.ai_response_index.remove(&rh);
+                }
+            }
+            if tx.mtx.tx.is_ai_challenge() {
+                if let Some(rh) = AiChallengePayload::deserialize(&tx.mtx.tx.payload).map(|c| c.response_hash) {
+                    self.ai_challenge_index.remove(&rh);
+                }
+            }
             // Update/remove descendent orphan txs (depending on `remove_redeemers`)
             let txs = self.orphan_pool.update_orphans_after_transaction_removed(&tx, remove_redeemers)?;
             removed_orphans.extend(txs.into_iter().map(|x| x.id()));

@@ -18,6 +18,11 @@ pub(crate) const DEFAULT_MAXIMUM_ORPHAN_TRANSACTION_COUNT: u64 = 500;
 /// the mempool and relayed. It is specified in sompi per 1kg (or 1000 grams) of transaction mass.
 pub(crate) const DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1000;
 
+/// Flat minimum fee enforced on every transaction regardless of mass.
+/// 0.3 KRX = 30_000_000 sompi. Combined with 100% fee burn this creates guaranteed
+/// deflationary pressure on every on-chain transaction.
+pub(crate) const MINIMUM_FLAT_TX_FEE_SOMPI: u64 = 30_000_000;
+
 /// Standard transaction version range might be different from what consensus accepts, therefore
 /// we define separate values in mempool.
 /// However, currently there's exactly one transaction version, so mempool accepts the same version

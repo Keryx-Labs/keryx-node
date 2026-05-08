@@ -1,22 +1,44 @@
-use keryx_addresses::Address;
+use keryx_addresses::{Address, Prefix, Version};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
+    collateral::CHALLENGE_WINDOW_BLOCKS,
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
 };
-use keryx_txscript::standard::pay_to_address_script;
+use keryx_hashes::{Hasher, TransactionHash};
+use keryx_txscript::{
+    opcodes::codes::{OpCheckSequenceVerify, OpCheckSig},
+    script_builder::ScriptBuilder,
+    standard::pay_to_address_script,
+};
 use std::convert::TryInto;
 
 use crate::{constants, model::stores::ghostdag::GhostdagData};
 
 // ── R&D allocation ────────────────────────────────────────────────────────────
 
-/// Protocol-level R&D allocation: 2% of every block reward (200 basis points).
-/// Deducted from each miner output before it is committed to the coinbase transaction.
-const RD_ALLOCATION_BPS: u64 = 200;
+/// Protocol-level R&D allocation: 5% of every block reward (500 basis points).
+const RD_ALLOCATION_BPS: u64 = 500;
 const RD_ALLOCATION_BPS_DIVISOR: u64 = 10_000;
+
+// ── OPoI escrow split ─────────────────────────────────────────────────────────
+
+/// 20 % of each blue-block reward is sent to the miner's escrow SPK (OPoI)
+/// or burned (standard miner).  Applied on the gross reward before the R&D cut.
+const ESCROW_RATE_BPS: u64 = 2_000;
+const ESCROW_RATE_BPS_DIVISOR: u64 = 10_000;
+
+/// Marker searched in coinbase extra_data to locate the escrow public key.
+/// Format: `/escrow:<64-hex-chars-of-32-byte-schnorr-pubkey>`
+const ESCROW_MARKER: &[u8] = b"/escrow:";
+const ESCROW_PUBKEY_HEX_LEN: usize = 64;
+
+/// Seed used to derive the provably-unspendable burn address.
+/// `TransactionHash("KERYX_PROOF_OF_BURN_V1")` is not a valid EC point →
+/// no private key exists → coins sent here are permanently removed from supply.
+const BURN_SEED: &[u8] = b"KERYX_PROOF_OF_BURN_V1";
 
 /// Mainnet address that receives the R&D allocation.
 pub const RD_ALLOCATION_ADDRESS: &str =
@@ -74,6 +96,39 @@ const KRX_TAIL_EMISSION_PER_SECOND: u64 = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Builds a CSV-timelocked P2PK script for the OPoI escrow output.
+///
+/// Script: `<CHALLENGE_WINDOW_BLOCKS> OP_CSV OP_DROP <pubkey_32> OP_CHECKSIG`
+///
+/// The output cannot be spent until the spending transaction's input sequence
+/// satisfies the relative lock (>= CHALLENGE_WINDOW_BLOCKS deep), giving the
+/// network the full challenge window to submit a fraud proof before the miner
+/// claims their collateral.
+fn build_escrow_script(pubkey_bytes: &[u8]) -> Option<ScriptPublicKey> {
+    // Keryx's OP_CSV pops its argument — no OP_DROP needed after it.
+    let script = ScriptBuilder::new()
+        .add_sequence(CHALLENGE_WINDOW_BLOCKS)
+        .ok()?
+        .add_op(OpCheckSequenceVerify)
+        .ok()?
+        .add_data(pubkey_bytes)
+        .ok()?
+        .add_op(OpCheckSig)
+        .ok()?
+        .drain();
+    Some(ScriptPublicKey::from_vec(0, script))
+}
+
+/// Returns the provably-unspendable burn SPK derived from BURN_SEED.
+///
+/// Called by the AiChallenge deposit validator to verify that a challenger's
+/// deposit output actually targets the canonical burn address.
+pub(crate) fn burn_script_public_key() -> ScriptPublicKey {
+    let burn_hash = TransactionHash::hash(BURN_SEED);
+    let burn_address = Address::new(Prefix::Mainnet, Version::PubKey, &burn_hash.as_bytes());
+    pay_to_address_script(&burn_address)
+}
+
 /// Build the per-block emission schedule at construction time.
 ///
 /// Each entry in the returned Vec covers one calendar month starting from
@@ -114,6 +169,8 @@ pub struct CoinbaseManager {
     tail_emission_per_block: u64,
     /// Script public key for the protocol R&D allocation output (2% of every block reward).
     rd_allocation_script_public_key: ScriptPublicKey,
+    /// Provably-unspendable burn SPK — receives the 10% escrow cut of standard miners.
+    burn_script_public_key: ScriptPublicKey,
 }
 
 /// Struct used to streamline payload parsing
@@ -149,6 +206,10 @@ impl CoinbaseManager {
             .expect("hardcoded R&D allocation address must be valid");
         let rd_allocation_script_public_key = pay_to_address_script(&rd_address);
 
+        let burn_hash = TransactionHash::hash(BURN_SEED);
+        let burn_address = Address::new(Prefix::Mainnet, Version::PubKey, &burn_hash.as_bytes());
+        let burn_script_public_key = pay_to_address_script(&burn_address);
+
         Self {
             coinbase_payload_script_public_key_max_len,
             max_coinbase_payload_len,
@@ -158,6 +219,7 @@ impl CoinbaseManager {
             emission_schedule,
             tail_emission_per_block,
             rd_allocation_script_public_key,
+            burn_script_public_key,
         }
     }
 
@@ -169,46 +231,69 @@ impl CoinbaseManager {
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
-        // + 1 for possible red reward, + 1 for R&D allocation output
-        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() + 2);
+        // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D allocation
+        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() * 2 + 2);
         let mut rd_total = 0u64;
 
-        // Add an output for each mergeset blue block (∩ DAA window), paying to the script reported by the block.
-        // 2% of each reward is withheld and accumulated into the R&D allocation output.
+        // Add outputs for each mergeset blue block (∩ DAA window).
+        // Transaction fees: 100% burned — no miner benefit, maximum supply destruction.
+        // Block subsidy split:
+        //   5%  → R&D allocation (accumulated into a single output at the end)
+        //   20% → escrow SPK (OPoI miner) or burn SPK (standard miner)
+        //   75% → miner's script_public_key
         // Note that combinatorically it is nearly impossible for a blue block to be non-DAA.
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
-            let total = reward_data.subsidy + reward_data.total_fees;
-            if total > 0 {
-                let rd_cut = total * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+            // 100% of transaction fees go to the burn address.
+            if reward_data.total_fees > 0 {
+                outputs.push(TransactionOutput::new(reward_data.total_fees, self.burn_script_public_key.clone()));
+            }
+            // Block subsidy follows the normal OPoI split.
+            if reward_data.subsidy > 0 {
+                let rd_cut = reward_data.subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+                let escrow_cut = reward_data.subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
                 rd_total += rd_cut;
-                outputs.push(TransactionOutput::new(total - rd_cut, reward_data.script_public_key.clone()));
+                outputs.push(TransactionOutput::new(reward_data.subsidy - rd_cut - escrow_cut, reward_data.script_public_key.clone()));
+                let escrow_spk = reward_data
+                    .escrow_script_public_key
+                    .clone()
+                    .unwrap_or_else(|| self.burn_script_public_key.clone());
+                outputs.push(TransactionOutput::new(escrow_cut, escrow_spk));
             }
         }
 
         // Collect all rewards from mergeset reds ∩ DAA window and create a
-        // single output rewarding all to the current block (the "merging" block).
-        // The same 2% R&D cut applies to the merged red reward.
-        let mut red_reward = 0u64;
+        // single output rewarding the subsidy to the current block (the "merging" block).
+        // Fees from red blocks are burned like all other fees.
+        let mut red_subsidy = 0u64;
+        let mut red_fees = 0u64;
 
         for red in ghostdag_data.mergeset_reds.iter() {
             let reward_data = mergeset_rewards.get(red).unwrap();
             if mergeset_non_daa.contains(red) {
-                red_reward += reward_data.total_fees;
+                // Non-DAA red: subsidy forfeited, fees burned.
+                red_fees += reward_data.total_fees;
             } else {
-                red_reward += reward_data.subsidy + reward_data.total_fees;
+                // DAA red: subsidy goes to merging miner, fees burned.
+                red_subsidy += reward_data.subsidy;
+                red_fees += reward_data.total_fees;
             }
+        }
+
+        // Burn 100% of fees from red blocks.
+        if red_fees > 0 {
+            outputs.push(TransactionOutput::new(red_fees, self.burn_script_public_key.clone()));
         }
 
         // Track the index of the red reward output so modify_block_template can rewrite
         // the correct output when the miner address changes, regardless of output ordering.
         let mut red_reward_output_index: Option<usize> = None;
 
-        if red_reward > 0 {
-            let rd_cut = red_reward * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+        if red_subsidy > 0 {
+            let rd_cut = red_subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
             rd_total += rd_cut;
             red_reward_output_index = Some(outputs.len());
-            outputs.push(TransactionOutput::new(red_reward - rd_cut, miner_data.script_public_key.clone()));
+            outputs.push(TransactionOutput::new(red_subsidy - rd_cut, miner_data.script_public_key.clone()));
         }
 
         // Single R&D allocation output — 2% of the total block reward, sent to the protocol treasury.
@@ -222,7 +307,7 @@ impl CoinbaseManager {
 
         Ok(CoinbaseTransactionTemplate {
             tx: Transaction::new(constants::TX_VERSION, vec![], outputs, 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload),
-            has_red_reward: red_reward > 0,
+            has_red_reward: red_subsidy > 0 || red_fees > 0,
             red_reward_output_index,
         })
     }
@@ -268,34 +353,49 @@ impl CoinbaseManager {
         Ok(payload)
     }
 
-    /// OPoI Phase 1 — verifies that the coinbase payload carries an inference tag.
+    /// OPoI Phase 2 — verifies the coinbase inference tag against the fixed-point MLP.
     ///
     /// Parses the `extra_data` portion of `payload` looking for the pattern
-    /// `/{nonce_hex16}/ai:v1:{tag_hex16}`.
+    /// `/{nonce_hex16}/ai:v1:{tag_hex16}`, then checks that the claimed tag
+    /// matches the output of the deterministic fixed-point model for that nonce.
     ///
-    /// **Phase 1 policy (Optimistic)**: only the *presence* and *format* of the
-    /// tag are checked, not the MLP output value.  Checking the exact value here
-    /// causes false rejections during IBD because the MLP result depends on the
-    /// floating-point implementation (candle-core vs. bare Rust vs. GPU kernels)
-    /// and may differ across hardware even for the same nonce.  Value verification
-    /// is deferred to Phase 2 fraud-proofs, which are the authoritative enforcement
-    /// mechanism under the Optimistic Proof of Inference design.
+    /// The fixed-point model (`model_fixed`) uses pure i32/i64 arithmetic and
+    /// produces bit-exact results on every CPU — eliminating the floating-point
+    /// non-determinism that blocked Phase 1 value verification.
     ///
-    /// Validates the OPoI tag format in a coinbase payload.
-    /// Consensus enforcement is disabled (Phase 1 optimistic); this function is
-    /// kept for Phase 2 fraud-proof verification.
-    #[allow(dead_code)]
+    /// Active from genesis (chain relaunch — no fork activation needed).
     pub fn validate_opoi_tag(&self, payload: &[u8]) -> CoinbaseResult<()> {
         match keryx_inference::parse_opoi(payload) {
-            Some(_) => {
-                // Tag is present and well-formed — value check deferred to Phase 2 fraud-proofs.
-                Ok(())
+            Some((nonce, claimed_tag)) => {
+                if keryx_inference::verify_tag_fixed(nonce, &claimed_tag) {
+                    Ok(())
+                } else {
+                    Err(CoinbaseError::OPoiTagInvalid(nonce, claimed_tag))
+                }
             }
-            None => {
-                // No OPoI marker — every miner must commit to inference.
-                Err(CoinbaseError::OPoiTagMissing)
-            }
+            None => Err(CoinbaseError::OPoiTagMissing),
         }
+    }
+
+    /// Parses the miner's escrow public key from coinbase `extra_data` and returns a
+    /// CSV-timelocked script for the escrow output.
+    ///
+    /// Looks for `/escrow:` followed by exactly 64 hex chars (32-byte Schnorr pubkey).
+    /// Returns `None` if the marker is absent or the key is malformed — treated as a
+    /// standard miner whose escrow cut is sent to the burn address instead.
+    pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8]) -> Option<ScriptPublicKey> {
+        let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
+        let hex_start = marker_pos + ESCROW_MARKER.len();
+        let hex_end = hex_start + ESCROW_PUBKEY_HEX_LEN;
+        if hex_end > extra_data.len() {
+            return None;
+        }
+        let hex_str = std::str::from_utf8(&extra_data[hex_start..hex_end]).ok()?;
+        let pubkey_bytes: Vec<u8> = (0..32)
+            .map(|i| u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        build_escrow_script(&pubkey_bytes)
     }
 
     pub fn deserialize_coinbase_payload<'a>(&self, payload: &'a [u8]) -> CoinbaseResult<CoinbaseData<&'a [u8]>> {

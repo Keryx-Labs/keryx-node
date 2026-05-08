@@ -1,16 +1,25 @@
-/// Keryx OPoI (Optimistic Proof of Inference) — Phase 1
+/// Keryx OPoI (Optimistic Proof of Inference) — Phase 1 + Phase 2 + Phase 3
 ///
-/// Provides a deterministic synthetic MLP that every miner must execute
-/// per block template.  The result is committed in the coinbase `extra_data`
-/// field, making inference mandatory for block production.
-///
-/// Phase 1 is CPU-only and uses no downloaded model — weights are derived
-/// deterministically from `MODEL_SEED`.  Future phases will:
-///   - Verify outputs on-chain via optimistic fraud proofs (Phase 2)
-///   - Swap the synthetic MLP for real SLM inference via IPFS (Phase 3)
+/// Phase 1: synthetic f32 MLP (candle-core), tag embedded in coinbase.
+/// Phase 2: fixed-point i32/i64 MLP — bit-exact on all hardware.
+///   Tags are verified on-chain; collateral is slashed for fraud.
+/// Phase 3 A: AiResponse/AiChallenge as on-chain txs, RocksDB slash state.
+/// Phase 3 B: ZK fraud proof API (Groth16 stub — circuit VK lands in Phase 3 C).
 
+pub mod ai_payload;
+pub mod fraud_proof;
 pub mod model;
+pub mod model_fixed;
 pub mod task;
+
+pub use ai_payload::{
+    AiRequestPayload, AiResponsePayload, AiChallengePayload,
+    MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN,
+    MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
+    SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
+};
+pub use fraud_proof::{verify_fraud_proof, compute_ai_commitment, FraudProofResult, FRAUD_PROOF_LEN};
 
 pub use task::{InferenceResult, InferenceTask};
 
@@ -74,13 +83,51 @@ pub fn parse_opoi(payload: &[u8]) -> Option<(u64, String)> {
     Some((nonce, claimed_tag.to_string()))
 }
 
-/// Verifies that `claimed_hex8` matches the expected inference output for `nonce`.
-/// Returns `false` if inference fails or if the tag does not match.
+/// Phase 1 — verifies via candle-core f32 MLP (non-deterministic across hardware).
+/// Kept for reference only; NOT used in consensus after Phase 2 activation.
 pub fn verify_tag(nonce: u64, claimed_hex8: &str) -> bool {
     match run_inference(nonce) {
         Ok(result) => result.as_hex8() == claimed_hex8,
         Err(_) => false,
     }
+}
+
+// ── Phase 2 — Fixed-point verification ───────────────────────────────────────
+
+/// Protocol version salt for Phase 2 OPoI tags.
+///
+/// XORed into the nonce before the fixed-point MLP forward pass. Any miner
+/// compiled against an older keryx-inference (without this salt) will produce
+/// wrong OPoI tags and have their blocks rejected at consensus level —
+/// cryptographically enforced, impossible to spoof without updating the crate.
+pub const PHASE2_OPOI_SALT: u64 = u64::from_le_bytes(*b"KERYX:2\0");
+
+/// Runs the fixed-point MLP on `nonce` and returns the 32-byte output.
+/// Bit-exact on every platform — used for on-chain tag verification in Phase 2.
+pub fn run_inference_fixed(nonce: u64) -> [u8; 32] {
+    let task = InferenceTask::from_nonce(nonce);
+    model_fixed::forward(&task.input)
+}
+
+/// Returns the 16-char hex OPoI tag produced by the fixed-point model for `nonce`.
+/// The nonce is salted with `PHASE2_OPOI_SALT` before inference — miners compiled
+/// against older versions of this crate will produce incompatible tags.
+pub fn tag_fixed(nonce: u64) -> String {
+    let output = run_inference_fixed(nonce ^ PHASE2_OPOI_SALT);
+    hex::encode(&output[..8])
+}
+
+/// Verifies that `claimed_hex16` matches the fixed-point model output for `nonce`.
+/// This is the authoritative check used by consensus during Phase 2.
+pub fn verify_tag_fixed(nonce: u64, claimed_hex16: &str) -> bool {
+    tag_fixed(nonce) == claimed_hex16
+}
+
+/// Generates OPoI extra_data bytes for use in test coinbase payloads.
+/// Produces `/{nonce_hex16}/ai:v1:{tag_hex16}` which `parse_opoi` can parse.
+pub fn gen_opoi_extra_data(nonce: u64) -> Vec<u8> {
+    let tag = tag_fixed(nonce);
+    format!("/{:016x}/ai:v1:{}", nonce, tag).into_bytes()
 }
 
 /// Errors returned by the inference engine.

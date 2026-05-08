@@ -152,7 +152,7 @@ impl TestConsensus {
         parents: Vec<Hash>,
         txs: Vec<Transaction>,
     ) -> impl Future<Output = BlockProcessResult<BlockStatus>> {
-        let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![]), vec![]);
+        let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![]), keryx_inference::gen_opoi_extra_data(0));
         self.validate_and_insert_block(self.build_utxo_valid_block_with_parents(hash, parents, miner_data, txs).to_immutable())
             .virtual_state_task
     }
@@ -190,10 +190,12 @@ impl TestConsensus {
         mut txs: Vec<Transaction>,
     ) -> MutableBlock {
         let mut header = self.build_header_with_parents(hash, parents);
+        let opoi_extra = keryx_inference::gen_opoi_extra_data(header.nonce);
         let cb_payload: Vec<u8> = header.blue_score.to_le_bytes().iter().copied() // Blue score
             .chain(self.consensus.services.coinbase_manager.calc_block_subsidy(header.daa_score).to_le_bytes().iter().copied()) // Subsidy
             .chain((0_u16).to_le_bytes().iter().copied()) // Script public key version
             .chain((0_u8).to_le_bytes().iter().copied()) // Script public key length
+            .chain(opoi_extra.iter().copied())
             .collect();
 
         let cb = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_COINBASE, 0, cb_payload);
@@ -252,6 +254,20 @@ impl TestConsensus {
 
     pub fn virtual_processor(&self) -> &Arc<VirtualStateProcessor> {
         &self.consensus.virtual_processor
+    }
+
+    #[cfg(test)]
+    pub fn ai_response_store(
+        &self,
+    ) -> &Arc<crate::model::stores::ai_slash::DbAiResponseStore> {
+        self.consensus.virtual_processor.test_ai_response_store()
+    }
+
+    #[cfg(test)]
+    pub fn ai_slashed_store(
+        &self,
+    ) -> &Arc<crate::model::stores::ai_slash::DbAiSlashedStore> {
+        self.consensus.virtual_processor.test_ai_slashed_store()
     }
 
     pub fn ghostdag_manager(&self) -> &DbGhostdagManager {

@@ -1,5 +1,10 @@
 use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
+use keryx_inference::{
+    AiChallengePayload, AiResponsePayload,
+    MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    MIN_AI_CHALLENGE_PAYLOAD_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
+};
 use std::collections::HashSet;
 
 use super::{
@@ -22,6 +27,9 @@ impl TransactionValidator {
         check_duplicate_transaction_inputs(tx)?;
         check_gas(tx)?;
         check_transaction_subnetwork(tx)?;
+        check_ai_payload_len(tx)?;
+        check_ai_response_request_hash(tx)?;
+        check_ai_challenge_response_hash(tx)?;
         check_transaction_version(tx)
     }
 
@@ -73,7 +81,8 @@ impl TransactionValidator {
     }
 
     fn check_transaction_inputs_count(&self, tx: &Transaction) -> TxResult<()> {
-        if !tx.is_coinbase() && tx.inputs.is_empty() {
+        // Coinbase, AiResponse, and AiChallenge are data-publication transactions with no inputs.
+        if !tx.is_coinbase() && !tx.is_ai_response() && !tx.is_ai_challenge() && tx.inputs.is_empty() {
             return Err(TxRuleError::NoTxInputs);
         }
 
@@ -154,10 +163,52 @@ fn check_transaction_output_value_ranges(tx: &Transaction) -> TxResult<()> {
 }
 
 fn check_transaction_subnetwork(tx: &Transaction) -> TxResult<()> {
-    if tx.is_coinbase() || tx.subnetwork_id.is_native() {
+    if tx.is_coinbase() || tx.subnetwork_id.is_native() || tx.subnetwork_id.is_ai() {
         Ok(())
     } else {
         Err(TxRuleError::SubnetworksDisabled(tx.subnetwork_id.clone()))
+    }
+}
+
+fn check_ai_response_request_hash(tx: &Transaction) -> TxResult<()> {
+    if !tx.is_ai_response() {
+        return Ok(());
+    }
+    match AiResponsePayload::deserialize(&tx.payload) {
+        None => Err(TxRuleError::AiPayloadTooShort(tx.payload.len(), MIN_AI_RESPONSE_PAYLOAD_LEN)),
+        Some(r) if r.request_hash == [0u8; 32] => Err(TxRuleError::AiResponseNullRequestHash),
+        _ => Ok(()),
+    }
+}
+
+fn check_ai_payload_len(tx: &Transaction) -> TxResult<()> {
+    let (min, max) = if tx.is_ai_request() {
+        (MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN)
+    } else if tx.is_ai_response() {
+        (MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN)
+    } else if tx.is_ai_challenge() {
+        (MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN)
+    } else {
+        return Ok(());
+    };
+    let len = tx.payload.len();
+    if len < min {
+        return Err(TxRuleError::AiPayloadTooShort(len, min));
+    }
+    if len > max {
+        return Err(TxRuleError::AiPayloadTooLong(len, max));
+    }
+    Ok(())
+}
+
+fn check_ai_challenge_response_hash(tx: &Transaction) -> TxResult<()> {
+    if !tx.is_ai_challenge() {
+        return Ok(());
+    }
+    match AiChallengePayload::deserialize(&tx.payload) {
+        None => Err(TxRuleError::AiPayloadTooShort(tx.payload.len(), MIN_AI_CHALLENGE_PAYLOAD_LEN)),
+        Some(c) if c.response_hash == [0u8; 32] => Err(TxRuleError::AiChallengeNullResponseHash),
+        _ => Ok(()),
     }
 }
 
@@ -277,7 +328,7 @@ mod tests {
         tv.validate_tx_in_isolation(&valid_tx).unwrap();
 
         let mut tx: Transaction = valid_tx.clone();
-        tx.subnetwork_id = SubnetworkId::from_byte(3);
+        tx.subnetwork_id = SubnetworkId::from_byte(6); // bytes 3-5 are now AI subnetworks
         assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::SubnetworksDisabled(_)));
 
         let mut tx = valid_tx.clone();

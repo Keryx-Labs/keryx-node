@@ -58,6 +58,7 @@ pub struct BlockBodyProcessor {
     pub(super) max_block_mass: u64,
     pub(super) genesis: GenesisBlock,
     pub(super) _ghostdag_k: KType,
+    pub(super) skip_opoi: bool,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -110,6 +111,7 @@ impl BlockBodyProcessor {
             max_block_mass: params.max_block_mass,
             genesis: params.genesis.clone(),
             _ghostdag_k: params.ghostdag_k(),
+            skip_opoi: params.skip_proof_of_work,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),

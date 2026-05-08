@@ -28,12 +28,15 @@ pub enum ScriptClass {
     PubKeyECDSA,
     /// Pay to script hash
     ScriptHash,
+    /// CSV-timelocked pay to pubkey (OPoI escrow outputs)
+    CsvPubKey = 4,
 }
 
 const NON_STANDARD: &str = "nonstandard";
 const PUB_KEY: &str = "pubkey";
 const PUB_KEY_ECDSA: &str = "pubkeyecdsa";
 const SCRIPT_HASH: &str = "scripthash";
+const CSV_PUB_KEY: &str = "csvpubkey";
 
 impl ScriptClass {
     pub fn from_script(script_public_key: &ScriptPublicKey) -> Self {
@@ -45,6 +48,8 @@ impl ScriptClass {
                 Self::PubKeyECDSA
             } else if Self::is_pay_to_script_hash(script_public_key_) {
                 Self::ScriptHash
+            } else if Self::is_csv_pay_to_pubkey(script_public_key_) {
+                Self::CsvPubKey
             } else {
                 ScriptClass::NonStandard
             }
@@ -81,12 +86,28 @@ impl ScriptClass {
         (script_public_key[34] == opcodes::codes::OpEqual)
     }
 
+    /// Returns true if the script is a CSV-timelocked pay-to-pubkey (OPoI escrow).
+    /// Pattern: <seq_len> <seq_bytes[1..=8]> OP_CSV OpData32 <pubkey_32> OP_CHECKSIG
+    #[inline(always)]
+    pub fn is_csv_pay_to_pubkey(script_public_key: &[u8]) -> bool {
+        let len = script_public_key.len();
+        // seq_len in 1..=8, total = seq_len + 1(len_byte) + 1(CSV) + 1(OpData32) + 32(key) + 1(CHECKSIG)
+        if len < 37 || len > 44 { return false; }
+        let seq_len = script_public_key[0] as usize;
+        if seq_len == 0 || seq_len > 8 { return false; }
+        if len != seq_len + 36 { return false; }
+        script_public_key[seq_len + 1] == opcodes::codes::OpCheckSequenceVerify
+            && script_public_key[seq_len + 2] == opcodes::codes::OpData32
+            && script_public_key[len - 1] == opcodes::codes::OpCheckSig
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             ScriptClass::NonStandard => NON_STANDARD,
             ScriptClass::PubKey => PUB_KEY,
             ScriptClass::PubKeyECDSA => PUB_KEY_ECDSA,
             ScriptClass::ScriptHash => SCRIPT_HASH,
+            ScriptClass::CsvPubKey => CSV_PUB_KEY,
         }
     }
 
@@ -96,6 +117,7 @@ impl ScriptClass {
             ScriptClass::PubKey => MAX_SCRIPT_PUBLIC_KEY_VERSION,
             ScriptClass::PubKeyECDSA => MAX_SCRIPT_PUBLIC_KEY_VERSION,
             ScriptClass::ScriptHash => MAX_SCRIPT_PUBLIC_KEY_VERSION,
+            ScriptClass::CsvPubKey => MAX_SCRIPT_PUBLIC_KEY_VERSION,
         }
     }
 }
@@ -115,6 +137,7 @@ impl FromStr for ScriptClass {
             PUB_KEY => Ok(ScriptClass::PubKey),
             PUB_KEY_ECDSA => Ok(ScriptClass::PubKeyECDSA),
             SCRIPT_HASH => Ok(ScriptClass::ScriptHash),
+            CSV_PUB_KEY => Ok(ScriptClass::CsvPubKey),
             _ => Err(Error::InvalidScriptClass(script_class.to_string())),
         }
     }
