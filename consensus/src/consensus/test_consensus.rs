@@ -256,6 +256,20 @@ impl TestConsensus {
         &self.consensus.virtual_processor
     }
 
+    #[cfg(test)]
+    pub fn ai_response_store(
+        &self,
+    ) -> &Arc<crate::model::stores::ai_slash::DbAiResponseStore> {
+        self.consensus.virtual_processor.test_ai_response_store()
+    }
+
+    #[cfg(test)]
+    pub fn ai_slashed_store(
+        &self,
+    ) -> &Arc<crate::model::stores::ai_slash::DbAiSlashedStore> {
+        self.consensus.virtual_processor.test_ai_slashed_store()
+    }
+
     pub fn ghostdag_manager(&self) -> &DbGhostdagManager {
         &self.consensus.services.ghostdag_manager
     }

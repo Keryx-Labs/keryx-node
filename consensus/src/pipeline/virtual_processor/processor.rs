@@ -1243,6 +1243,20 @@ impl VirtualStateProcessor {
     {
         self.thread_pool.install(op)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_ai_response_store(
+        &self,
+    ) -> &Arc<crate::model::stores::ai_slash::DbAiResponseStore> {
+        &self.ai_response_store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_ai_slashed_store(
+        &self,
+    ) -> &Arc<crate::model::stores::ai_slash::DbAiSlashedStore> {
+        &self.ai_slashed_store
+    }
 }
 
 enum MergesetIncreaseResult {

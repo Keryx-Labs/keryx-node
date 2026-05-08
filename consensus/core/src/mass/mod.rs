@@ -364,6 +364,12 @@ pub fn calc_storage_mass(
         },
     )?;
 
+    // Metadata TXs (e.g. AiResponse, AiChallenge) have 0 outputs.
+    // max(0, 0 - anything) = 0 — no need to touch the input side.
+    if outs_plurality == 0 {
+        return Some(0);
+    }
+
     /*
         KIP-0009 defines a relaxed formula for the cases:
             |O| = 1  or  |O| <= |I| <= 2
