@@ -120,6 +120,16 @@ fn build_escrow_script(pubkey_bytes: &[u8]) -> Option<ScriptPublicKey> {
     Some(ScriptPublicKey::from_vec(0, script))
 }
 
+/// Returns the provably-unspendable burn SPK derived from BURN_SEED.
+///
+/// Called by the AiChallenge deposit validator to verify that a challenger's
+/// deposit output actually targets the canonical burn address.
+pub(crate) fn burn_script_public_key() -> ScriptPublicKey {
+    let burn_hash = TransactionHash::hash(BURN_SEED);
+    let burn_address = Address::new(Prefix::Mainnet, Version::PubKey, &burn_hash.as_bytes());
+    pay_to_address_script(&burn_address)
+}
+
 /// Build the per-block emission schedule at construction time.
 ///
 /// Each entry in the returned Vec covers one calendar month starting from

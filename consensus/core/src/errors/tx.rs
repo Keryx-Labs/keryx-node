@@ -123,6 +123,12 @@ pub enum TxRuleError {
     #[error("AiChallenge fraud proof is invalid or does not prove fraud")]
     AiChallengeProofInvalid,
 
+    #[error("AiChallenge challenger_deposit is {0} sompi but total inputs are only {1} sompi")]
+    AiChallengeDepositInsufficientInputs(u64, u64),
+
+    #[error("AiChallenge challenger_deposit is {0} sompi but no output to the burn address covers that amount")]
+    AiChallengeDepositMissingBurnOutput(u64),
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]
