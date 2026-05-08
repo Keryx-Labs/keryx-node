@@ -237,19 +237,24 @@ impl CoinbaseManager {
         let mut rd_total = 0u64;
 
         // Add outputs for each mergeset blue block (∩ DAA window).
-        // Per-block split (on gross reward):
-        //   2%  → R&D allocation (accumulated into a single output at the end)
-        //   10% → escrow SPK (OPoI miner) or burn SPK (standard miner)
-        //   88% → miner's script_public_key
+        // Transaction fees: 100% burned — no miner benefit, maximum supply destruction.
+        // Block subsidy split:
+        //   5%  → R&D allocation (accumulated into a single output at the end)
+        //   20% → escrow SPK (OPoI miner) or burn SPK (standard miner)
+        //   75% → miner's script_public_key
         // Note that combinatorically it is nearly impossible for a blue block to be non-DAA.
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
-            let total = reward_data.subsidy + reward_data.total_fees;
-            if total > 0 {
-                let rd_cut = total * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
-                let escrow_cut = total * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
+            // 100% of transaction fees go to the burn address.
+            if reward_data.total_fees > 0 {
+                outputs.push(TransactionOutput::new(reward_data.total_fees, self.burn_script_public_key.clone()));
+            }
+            // Block subsidy follows the normal OPoI split.
+            if reward_data.subsidy > 0 {
+                let rd_cut = reward_data.subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+                let escrow_cut = reward_data.subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
                 rd_total += rd_cut;
-                outputs.push(TransactionOutput::new(total - rd_cut - escrow_cut, reward_data.script_public_key.clone()));
+                outputs.push(TransactionOutput::new(reward_data.subsidy - rd_cut - escrow_cut, reward_data.script_public_key.clone()));
                 let escrow_spk = reward_data
                     .escrow_script_public_key
                     .clone()
@@ -259,28 +264,37 @@ impl CoinbaseManager {
         }
 
         // Collect all rewards from mergeset reds ∩ DAA window and create a
-        // single output rewarding all to the current block (the "merging" block).
-        // The same 2% R&D cut applies to the merged red reward.
-        let mut red_reward = 0u64;
+        // single output rewarding the subsidy to the current block (the "merging" block).
+        // Fees from red blocks are burned like all other fees.
+        let mut red_subsidy = 0u64;
+        let mut red_fees = 0u64;
 
         for red in ghostdag_data.mergeset_reds.iter() {
             let reward_data = mergeset_rewards.get(red).unwrap();
             if mergeset_non_daa.contains(red) {
-                red_reward += reward_data.total_fees;
+                // Non-DAA red: subsidy forfeited, fees burned.
+                red_fees += reward_data.total_fees;
             } else {
-                red_reward += reward_data.subsidy + reward_data.total_fees;
+                // DAA red: subsidy goes to merging miner, fees burned.
+                red_subsidy += reward_data.subsidy;
+                red_fees += reward_data.total_fees;
             }
+        }
+
+        // Burn 100% of fees from red blocks.
+        if red_fees > 0 {
+            outputs.push(TransactionOutput::new(red_fees, self.burn_script_public_key.clone()));
         }
 
         // Track the index of the red reward output so modify_block_template can rewrite
         // the correct output when the miner address changes, regardless of output ordering.
         let mut red_reward_output_index: Option<usize> = None;
 
-        if red_reward > 0 {
-            let rd_cut = red_reward * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+        if red_subsidy > 0 {
+            let rd_cut = red_subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
             rd_total += rd_cut;
             red_reward_output_index = Some(outputs.len());
-            outputs.push(TransactionOutput::new(red_reward - rd_cut, miner_data.script_public_key.clone()));
+            outputs.push(TransactionOutput::new(red_subsidy - rd_cut, miner_data.script_public_key.clone()));
         }
 
         // Single R&D allocation output — 2% of the total block reward, sent to the protocol treasury.
@@ -294,7 +308,7 @@ impl CoinbaseManager {
 
         Ok(CoinbaseTransactionTemplate {
             tx: Transaction::new(constants::TX_VERSION, vec![], outputs, 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload),
-            has_red_reward: red_reward > 0,
+            has_red_reward: red_subsidy > 0 || red_fees > 0,
             red_reward_output_index,
         })
     }
