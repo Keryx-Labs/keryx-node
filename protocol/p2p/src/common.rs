@@ -85,6 +85,12 @@ impl ProtocolError {
         matches!(self, Self::ConnectionClosed)
     }
 
+    /// Returns true when the peer sent structurally invalid data that warrants a ban
+    /// (e.g. missing or invalid OPoI tag in coinbase), rather than a simple disconnect.
+    pub fn is_ban_worthy(&self) -> bool {
+        matches!(self, ProtocolError::RuleError(RuleError::BadCoinbasePayload(_)))
+    }
+
     pub fn can_send_outgoing_message(&self) -> bool {
         !matches!(self, Self::ConnectionClosed | Self::OutgoingRouteCapacityReached(_))
     }

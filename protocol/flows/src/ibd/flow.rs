@@ -76,7 +76,6 @@ struct QueueChunkOutput {
     daa_score: u64,
     timestamp: u64,
 }
-// TODO: define a peer banning strategy
 
 impl IbdFlow {
     pub fn new(
@@ -99,6 +98,11 @@ impl IbdFlow {
                     Ok(_) => info!("IBD with peer {} completed successfully", self.router),
                     Err(e) => {
                         info!("IBD with peer {} completed with error: {}", self.router, e);
+                        if e.is_ban_worthy() {
+                            let peer_ip = self.router.net_address().ip();
+                            self.ctx.address_manager.lock().ban(peer_ip.into());
+                            warn!("Banned peer {} for protocol violation (bad coinbase payload)", self.router);
+                        }
                         return Err(e);
                     }
                 }
