@@ -519,7 +519,12 @@ impl PruningProcessor {
                         &staging_reachability,
                         current,
                     );
-                    reachability::delete_block(&mut staging_reachability, current, &mut mergeset.iter().copied()).unwrap();
+                    // Past pruning points (keep_headers) must be kept in the reachability tree.
+                    // Deleting them causes KeyNotFound panics when relay blocks in the early DAG
+                    // trigger is_chain_ancestor_of(past_pp, ...) queries.
+                    if !keep_headers.contains(&current) {
+                        reachability::delete_block(&mut staging_reachability, current, &mut mergeset.iter().copied()).unwrap();
+                    }
                     let mut staging_relations = StagingRelationsStore::new(&mut relations_write);
                     relations::delete_level_relations(MemoryWriter, &mut staging_relations, current).optional().unwrap();
                     staging_relations.commit(&mut batch).unwrap();
