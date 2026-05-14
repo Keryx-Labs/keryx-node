@@ -168,8 +168,9 @@ impl VirtualStateProcessor {
             });
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+            // Lock the escrow to the miner's own mining key — no separate escrow key needed.
             let escrow_spk =
-                self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data);
+                self.coinbase_manager.escrow_spk_from_miner_spk(&coinbase_data.miner_data.script_public_key);
             ctx.mergeset_rewards.insert(
                 merged_block,
                 BlockRewardData::new_with_escrow(

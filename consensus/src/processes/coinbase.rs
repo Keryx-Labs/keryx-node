@@ -380,9 +380,26 @@ impl CoinbaseManager {
     /// Parses the miner's escrow public key from coinbase `extra_data` and returns a
     /// CSV-timelocked script for the escrow output.
     ///
+    /// Build an escrow SPK from the miner's P2PK script public key.
+    ///
+    /// Extracts the 32-byte Schnorr pubkey from a standard P2PK script
+    /// (`OP_DATA32 <pubkey_32> OP_CHECKSIG`, 34 bytes) and wraps it in the
+    /// CSV escrow script.  Returns `None` for non-standard or too-short scripts
+    /// (escrow cut falls back to the burn address).
+    pub fn escrow_spk_from_miner_spk(&self, miner_spk: &ScriptPublicKey) -> Option<ScriptPublicKey> {
+        let script = miner_spk.script();
+        // Standard P2PK: 0x20 (OpData32) | 32-byte pubkey | 0xAC (OpCheckSig)
+        if script.len() == 34 && script[0] == 0x20 && script[33] == 0xAC {
+            build_escrow_script(&script[1..33])
+        } else {
+            None
+        }
+    }
+
     /// Looks for `/escrow:` followed by exactly 64 hex chars (32-byte Schnorr pubkey).
     /// Returns `None` if the marker is absent or the key is malformed — treated as a
     /// standard miner whose escrow cut is sent to the burn address instead.
+    #[deprecated(note = "use escrow_spk_from_miner_spk — escrow is now always linked to the mining key")]
     pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8]) -> Option<ScriptPublicKey> {
         let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
         let hex_start = marker_pos + ESCROW_MARKER.len();
