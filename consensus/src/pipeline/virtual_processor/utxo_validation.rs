@@ -740,8 +740,15 @@ mod tests {
         Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload)
     }
 
+    fn dummy_cid() -> [u8; 34] {
+        let mut cid = [0u8; 34];
+        cid[0] = 0x12;
+        cid[1] = 0x20;
+        cid
+    }
+
     fn make_ai_request(model_id: [u8; 32]) -> Transaction {
-        let req = AiRequestPayload::new(model_id, 100, 1_000_000, b"test prompt".to_vec());
+        let req = AiRequestPayload::new(model_id, 100, 1_000_000, 30_000_000, b"test prompt".to_vec());
         Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize())
     }
 
@@ -749,12 +756,12 @@ mod tests {
         let digest = blake2b_simd::blake2b(&request_tx.payload);
         let mut request_hash = [0u8; 32];
         request_hash.copy_from_slice(&digest.as_bytes()[..32]);
-        let resp = AiResponsePayload::new(request_hash, 1000, vec![0u8; 32]);
+        let resp = AiResponsePayload::new(request_hash, 1000, dummy_cid(), 128);
         Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
     }
 
     fn make_ai_response_orphan(request_hash: [u8; 32]) -> Transaction {
-        let resp = AiResponsePayload::new(request_hash, 1000, vec![0u8; 32]);
+        let resp = AiResponsePayload::new(request_hash, 1000, dummy_cid(), 128);
         Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
     }
 
