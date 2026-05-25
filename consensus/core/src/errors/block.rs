@@ -156,6 +156,15 @@ pub enum RuleError {
     #[error("AiRequest tx {0} fee {1} sompi is less than inference_reward + priority_fee = {2} sompi")]
     AiRequestFeeBelowInferenceReward(TransactionId, u64, u64),
 
+    #[error("AiRequest tx {0} is missing escrow output[1] (required for UTXO escrow design)")]
+    AiRequestMissingEscrowOutput(TransactionId),
+
+    #[error("AiRequest tx {0} output[1] script is not a valid CSV P2PK escrow script")]
+    AiRequestInvalidEscrowScript(TransactionId),
+
+    #[error("AiRequest tx {0} escrow output value {1} sompi is below inference_reward {2} sompi")]
+    AiRequestEscrowBelowInferenceReward(TransactionId, u64, u64),
+
     #[error("invalid transactions in new block template")]
     InvalidTransactionsInNewBlock(HashMap<TransactionId, TxRuleError>),
 

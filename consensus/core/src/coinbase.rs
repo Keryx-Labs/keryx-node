@@ -26,16 +26,13 @@ pub struct BlockRewardData {
     pub total_fees: u64,
     pub script_public_key: ScriptPublicKey,
     /// Escrow SPK parsed from the block's coinbase extra_data.
-    /// `Some` = OPoI miner (10 % escrow output), `None` = standard miner (10 % burned).
+    /// `Some` = OPoI miner (20 % escrow output), `None` = standard miner (20 % burned).
     pub escrow_script_public_key: Option<ScriptPublicKey>,
-    /// Sum of inference_reward values from AiRequest txs fulfilled by AiResponse txs in this block.
-    /// Redirected from the fee burn to the responding miner's payout.
-    pub inference_reward_total: u64,
 }
 
 impl BlockRewardData {
     pub fn new(subsidy: u64, total_fees: u64, script_public_key: ScriptPublicKey) -> Self {
-        Self { subsidy, total_fees, script_public_key, escrow_script_public_key: None, inference_reward_total: 0 }
+        Self { subsidy, total_fees, script_public_key, escrow_script_public_key: None }
     }
 
     pub fn new_with_escrow(
@@ -44,17 +41,7 @@ impl BlockRewardData {
         script_public_key: ScriptPublicKey,
         escrow_script_public_key: Option<ScriptPublicKey>,
     ) -> Self {
-        Self { subsidy, total_fees, script_public_key, escrow_script_public_key, inference_reward_total: 0 }
-    }
-
-    pub fn new_with_inference_reward(
-        subsidy: u64,
-        total_fees: u64,
-        script_public_key: ScriptPublicKey,
-        escrow_script_public_key: Option<ScriptPublicKey>,
-        inference_reward_total: u64,
-    ) -> Self {
-        Self { subsidy, total_fees, script_public_key, escrow_script_public_key, inference_reward_total }
+        Self { subsidy, total_fees, script_public_key, escrow_script_public_key }
     }
 }
 

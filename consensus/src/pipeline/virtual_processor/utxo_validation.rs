@@ -3,8 +3,9 @@ use crate::{
     errors::{
         BlockProcessResult,
         RuleError::{
-            AiRequestFeeBelowInferenceReward, AiRequestInferenceRewardBelowMinimum,
-            AiRequestPriorityFeeBelowMinimum,
+            AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
+            AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
+            AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
             AiResponseModelCapMissing, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment,
             InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
         },
@@ -43,6 +44,7 @@ use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, FraudProofResult, FRAUD_PROOF_LEN, parse_ai_caps, verify_fraud_proof};
 use keryx_muhash::MuHash;
+use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
 
 use rayon::prelude::*;
@@ -149,38 +151,11 @@ impl VirtualStateProcessor {
             ctx.multiset_hash.combine(&inner_multiset);
 
             let mut block_fee = 0u64;
-            // Build request_hash → inference_reward map for AiRequest txs in this block.
-            let mut request_reward_map: std::collections::HashMap<[u8; 32], u64> =
-                std::collections::HashMap::new();
-            if self.model_cap_enforcement_activation.is_active(pov_daa_score) {
-                for tx in txs.iter().skip(1) {
-                    if tx.is_ai_request() {
-                        if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                            let digest = blake2b_simd::blake2b(&tx.payload);
-                            let mut key = [0u8; 32];
-                            key.copy_from_slice(&digest.as_bytes()[..32]);
-                            request_reward_map.insert(key, req.inference_reward);
-                        }
-                    }
-                }
-            }
-
-            let mut inference_reward_total = 0u64;
             for (validated_tx, _) in validated_transactions.iter() {
                 ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score).unwrap();
                 ctx.accepted_tx_ids.push(validated_tx.id());
                 block_fee += validated_tx.calculated_fee;
-                // Sum inference_rewards for AiResponse txs whose request is in this block.
-                if !request_reward_map.is_empty() && validated_tx.tx.is_ai_response() {
-                    if let Some(resp) = AiResponsePayload::deserialize(&validated_tx.tx.payload) {
-                        if let Some(&reward) = request_reward_map.get(&resp.request_hash) {
-                            inference_reward_total += reward;
-                        }
-                    }
-                }
             }
-            // Safety cap: never redirect more than the total collected fees.
-            inference_reward_total = inference_reward_total.min(block_fee);
 
             ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData {
                 block_hash: merged_block,
@@ -201,12 +176,11 @@ impl VirtualStateProcessor {
                 self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data);
             ctx.mergeset_rewards.insert(
                 merged_block,
-                BlockRewardData::new_with_inference_reward(
+                BlockRewardData::new_with_escrow(
                     coinbase_data.subsidy,
                     block_fee,
                     coinbase_data.miner_data.script_public_key,
                     escrow_spk,
-                    inference_reward_total,
                 ),
             );
 
@@ -625,10 +599,11 @@ impl VirtualStateProcessor {
     }
 }
 
-/// Rejects the block if any AiRequest tx violates inference_reward/priority_fee rules:
+/// Rejects the block if any AiRequest tx violates inference_reward/priority_fee/escrow rules:
 /// - inference_reward below the per-model minimum
 /// - priority_fee below MIN_AI_REQUEST_PRIORITY_FEE
-/// - UTXO fee < inference_reward + priority_fee
+/// - UTXO fee < priority_fee (inference_reward now goes to output[1] escrow, not fee)
+/// - output[1] missing, not a CSV P2PK script, or value < inference_reward
 fn check_ai_request_inference_rewards(
     txs: &[Transaction],
     validated: &[(keryx_consensus_core::tx::ValidatedTransaction<'_>, u32)],
@@ -653,7 +628,7 @@ fn check_ai_request_inference_rewards(
                     ));
                 }
             }
-            // Check priority_fee minimum.
+            // Check priority_fee minimum (burned as TX fee).
             if req.priority_fee < keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE {
                 return Err(AiRequestPriorityFeeBelowMinimum(
                     tx.id(),
@@ -661,12 +636,22 @@ fn check_ai_request_inference_rewards(
                     keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE,
                 ));
             }
-            // Check UTXO fee covers inference_reward + priority_fee.
+            // Check UTXO fee covers at least priority_fee (inference_reward is in output[1]).
             if let Some(&calculated_fee) = fee_map.get(&tx.id()) {
-                let required = req.inference_reward.saturating_add(req.priority_fee);
-                if calculated_fee < required {
-                    return Err(AiRequestFeeBelowInferenceReward(tx.id(), calculated_fee, required));
+                if calculated_fee < req.priority_fee {
+                    return Err(AiRequestFeeBelowInferenceReward(tx.id(), calculated_fee, req.priority_fee));
                 }
+            }
+            // Validate escrow output[1]: CSV P2PK script with value >= inference_reward.
+            if tx.outputs.len() < 2 {
+                return Err(AiRequestMissingEscrowOutput(tx.id()));
+            }
+            let escrow_out = &tx.outputs[1];
+            if !ScriptClass::is_csv_pay_to_pubkey(escrow_out.script_public_key.script()) {
+                return Err(AiRequestInvalidEscrowScript(tx.id()));
+            }
+            if escrow_out.value < req.inference_reward {
+                return Err(AiRequestEscrowBelowInferenceReward(tx.id(), escrow_out.value, req.inference_reward));
             }
         }
     }
