@@ -244,16 +244,16 @@ impl CoinbaseManager {
         // Note that combinatorically it is nearly impossible for a blue block to be non-DAA.
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let reward_data = mergeset_rewards.get(blue).unwrap();
-            // 100% of transaction fees go to the burn address.
+            // All fees burn 100% — deflationary by design.
             if reward_data.total_fees > 0 {
                 outputs.push(TransactionOutput::new(reward_data.total_fees, self.burn_script_public_key.clone()));
             }
-            // Block subsidy follows the normal OPoI split.
             if reward_data.subsidy > 0 {
                 let rd_cut = reward_data.subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
                 let escrow_cut = reward_data.subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
                 rd_total += rd_cut;
-                outputs.push(TransactionOutput::new(reward_data.subsidy - rd_cut - escrow_cut, reward_data.script_public_key.clone()));
+                let miner_subsidy = reward_data.subsidy - rd_cut - escrow_cut;
+                outputs.push(TransactionOutput::new(miner_subsidy, reward_data.script_public_key.clone()));
                 let escrow_spk = reward_data
                     .escrow_script_public_key
                     .clone()

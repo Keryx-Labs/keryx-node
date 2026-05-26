@@ -177,10 +177,13 @@ impl Mempool {
             return Err(NonStandardError::RejectStorageMass(transaction_id, contextual_mass, MAXIMUM_STANDARD_TRANSACTION_MASS));
         }
 
-        // Enforce flat minimum fee of 0.3 KRX regardless of transaction mass.
-        let fee = transaction.calculated_fee.unwrap();
-        if fee < MINIMUM_FLAT_TX_FEE_SOMPI {
-            return Err(NonStandardError::RejectInsufficientFee(transaction_id, fee, MINIMUM_FLAT_TX_FEE_SOMPI));
+        // AiResponse and AiChallenge transactions carry no inputs/outputs and are feeless by design.
+        // All other transactions must pay the flat minimum fee of 0.3 KRX.
+        if !transaction.tx.is_ai_response() && !transaction.tx.is_ai_challenge() {
+            let fee = transaction.calculated_fee.unwrap();
+            if fee < MINIMUM_FLAT_TX_FEE_SOMPI {
+                return Err(NonStandardError::RejectInsufficientFee(transaction_id, fee, MINIMUM_FLAT_TX_FEE_SOMPI));
+            }
         }
 
         for (i, input) in transaction.tx.inputs.iter().enumerate() {

@@ -26,7 +26,7 @@ pub struct BlockRewardData {
     pub total_fees: u64,
     pub script_public_key: ScriptPublicKey,
     /// Escrow SPK parsed from the block's coinbase extra_data.
-    /// `Some` = OPoI miner (10 % escrow output), `None` = standard miner (10 % burned).
+    /// `Some` = OPoI miner (20 % escrow output), `None` = standard miner (20 % burned).
     pub escrow_script_public_key: Option<ScriptPublicKey>,
 }
 

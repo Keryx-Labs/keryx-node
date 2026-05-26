@@ -3,6 +3,49 @@ pub use super::{
     constants::consensus::*,
     genesis::{DEVNET_GENESIS, GENESIS, GenesisBlock, SIMNET_GENESIS, TESTNET_GENESIS, TESTNET11_GENESIS},
 };
+
+// ── Inference reward minimums ─────────────────────────────────────────────────
+// model_id = sha2-256(primary_weight_file) = CIDv0_decoded_bytes[2..34].
+
+/// TinyLlama 1.1B — sha2-256(QmdqcmS8aMngiZWYYdeZEaW22N6XRTd9zK5ZCJG1MPmrQ3)
+pub const TINYLLAMA_MODEL_ID: [u8; 32] = [
+    0xe6, 0x4a, 0xf3, 0x68, 0xec, 0x93, 0x51, 0xa5,
+    0xa4, 0xc0, 0xec, 0x7a, 0xe4, 0x7d, 0x42, 0xad,
+    0xa7, 0xf6, 0xb3, 0xf1, 0xa6, 0xe6, 0x0f, 0xc7,
+    0x3d, 0x0e, 0xb6, 0xca, 0x29, 0x53, 0x64, 0x5c,
+];
+
+/// DeepSeek-R1-8B — sha2-256(QmYK1faUGNMYZ2UKeSpUoUoFpRarZQEwfPCHbYNG2ib2mR)
+pub const DEEPSEEK_R1_8B_MODEL_ID: [u8; 32] = [
+    0x94, 0x29, 0x67, 0x33, 0x16, 0xbc, 0x40, 0xec,
+    0x06, 0x67, 0x89, 0x45, 0x34, 0x57, 0x8b, 0x41,
+    0x23, 0x6f, 0xc7, 0xee, 0xa4, 0xd9, 0x31, 0xf1,
+    0x48, 0x9c, 0x34, 0xc5, 0x83, 0x7f, 0x42, 0xf4,
+];
+
+/// DeepSeek-R1-32B — sha2-256(model.gguf) computed locally
+pub const DEEPSEEK_R1_32B_MODEL_ID: [u8; 32] = [
+    0xbe, 0xd9, 0xb0, 0xf5, 0x51, 0xf5, 0xb9, 0x5b,
+    0xf9, 0xda, 0x58, 0x88, 0xa4, 0x8f, 0x0f, 0x87,
+    0xc3, 0x7a, 0xd6, 0xb7, 0x25, 0x19, 0xc4, 0xcb,
+    0xd7, 0x75, 0xf5, 0x4a, 0xc0, 0xb9, 0xfc, 0x62,
+];
+
+/// LLaMA-3.3-70B — sha2-256(model.gguf) computed locally
+pub const LLAMA_3_3_70B_MODEL_ID: [u8; 32] = [
+    0xaa, 0xd2, 0xcf, 0x33, 0x48, 0xd8, 0xc7, 0xfd,
+    0xbd, 0x2c, 0x0d, 0xd5, 0x8e, 0x0d, 0x99, 0x36,
+    0x84, 0x50, 0xd4, 0x3c, 0x95, 0x84, 0xae, 0xf8,
+    0x1a, 0x46, 0x7d, 0xd3, 0x47, 0x56, 0x13, 0x44,
+];
+
+/// Per-model minimum inference_reward in sompi.
+pub const INFERENCE_REWARD_MINIMUMS: &[([u8; 32], u64)] = &[
+    (TINYLLAMA_MODEL_ID,         50_000_000),   // 0.5 KRX
+    (DEEPSEEK_R1_8B_MODEL_ID,   150_000_000),   // 1.5 KRX
+    (DEEPSEEK_R1_32B_MODEL_ID,  250_000_000),   // 2.5 KRX
+    (LLAMA_3_3_70B_MODEL_ID,   400_000_000),   // 4.0 KRX
+];
 use crate::{
     BlockLevel, KType,
     constants::STORAGE_MASS_PARAMETER,
@@ -221,6 +264,12 @@ pub struct OverrideParams {
 
     /// Crescendo activation DAA score
     pub crescendo_activation: Option<ForkActivation>,
+
+    /// Model capability enforcement hardfork activation DAA score
+    pub model_cap_enforcement_activation: Option<ForkActivation>,
+
+    #[serde(skip)]
+    pub inference_reward_minimums: Option<&'static [([u8; 32], u64)]>,
 }
 
 impl From<Params> for OverrideParams {
@@ -249,6 +298,8 @@ impl From<Params> for OverrideParams {
             pruning_proof_m: Some(p.pruning_proof_m),
             blockrate: Some(p.blockrate),
             crescendo_activation: Some(p.crescendo_activation),
+            model_cap_enforcement_activation: Some(p.model_cap_enforcement_activation),
+            inference_reward_minimums: Some(p.inference_reward_minimums),
         }
     }
 }
@@ -313,6 +364,16 @@ pub struct Params {
 
     /// Crescendo activation DAA score
     pub crescendo_activation: ForkActivation,
+
+    /// Model capability enforcement hardfork activation DAA score.
+    /// After this score, blocks containing AiResponse txs whose model_id is not
+    /// declared in the coinbase ai:cap: field are rejected by consensus.
+    pub model_cap_enforcement_activation: ForkActivation,
+
+    /// Per-model minimum inference_reward (sompi) enforced from `model_cap_enforcement_activation`.
+    /// AiRequest txs below the minimum for their model_id are rejected.
+    /// Fulfilled inference_rewards are redirected from the fee burn to the responding miner.
+    pub inference_reward_minimums: &'static [([u8; 32], u64)],
 }
 
 impl Params {
@@ -481,6 +542,14 @@ impl Params {
                 .unwrap_or(self.pre_crescendo_target_time_per_block),
 
             crescendo_activation: overrides.crescendo_activation.unwrap_or(self.crescendo_activation),
+
+            model_cap_enforcement_activation: overrides
+                .model_cap_enforcement_activation
+                .unwrap_or(self.model_cap_enforcement_activation),
+
+            inference_reward_minimums: overrides
+                .inference_reward_minimums
+                .unwrap_or(self.inference_reward_minimums),
         }
     }
 }
@@ -567,6 +636,10 @@ pub const MAINNET_PARAMS: Params = Params {
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
     crescendo_activation: ForkActivation::new(0),
+
+    // Hardfork activation: 2026-05-28 15:00 UTC — DAA 11_409_033 + ~4_140_000 (115h × 10 BPS).
+    model_cap_enforcement_activation: ForkActivation::new(15_550_000),
+    inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -610,6 +683,10 @@ pub const TESTNET_PARAMS: Params = Params {
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
     crescendo_activation: ForkActivation::new(0),
+
+    // Testnet: activate ~5 min after genesis (3_000 blocks at 10 BPS) to observe the transition.
+    model_cap_enforcement_activation: ForkActivation::new(3_000),
+    inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -650,6 +727,9 @@ pub const SIMNET_PARAMS: Params = Params {
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
     crescendo_activation: ForkActivation::always(),
+
+    model_cap_enforcement_activation: ForkActivation::always(),
+    inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -688,4 +768,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
     crescendo_activation: ForkActivation::always(),
+
+    model_cap_enforcement_activation: ForkActivation::always(),
+    inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 };

@@ -3,8 +3,11 @@ use crate::{
     errors::{
         BlockProcessResult,
         RuleError::{
-            BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext,
-            WrongHeaderPruningPoint,
+            AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
+            AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
+            AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
+            AiResponseModelCapMissing, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment,
+            InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -39,8 +42,9 @@ use keryx_consensus_core::{
 use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiChallengePayload, AiResponsePayload, FraudProofResult, FRAUD_PROOF_LEN, verify_fraud_proof};
+use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, FraudProofResult, FRAUD_PROOF_LEN, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps, verify_fraud_proof};
 use keryx_muhash::MuHash;
+use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
 
 use rayon::prelude::*;
@@ -231,6 +235,17 @@ impl VirtualStateProcessor {
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
         ctx.pruning_sample_from_pov = Some(reply.pruning_sample);
 
+        // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
+        if self.model_cap_enforcement_activation.is_active(header.daa_score) {
+            if header.daa_score == self.model_cap_enforcement_activation.daa_score() {
+                info!(
+                    "=== OPoI HARDFORK ACTIVATED at DAA {} — UTXO escrow + model cap enforcement now live ===",
+                    header.daa_score
+                );
+            }
+            self.check_ai_response_model_caps(&txs)?;
+        }
+
         // Verify all transactions are valid in context
         let current_utxo_view = selected_parent_utxo_view.compose(&ctx.mergeset_diff);
         let validated_transactions =
@@ -238,6 +253,11 @@ impl VirtualStateProcessor {
         if validated_transactions.len() < txs.len() - 1 {
             // Some non-coinbase transactions are invalid
             return Err(InvalidTransactionsInUtxoContext(txs.len() - 1 - validated_transactions.len(), txs.len() - 1));
+        }
+
+        // Enforce AiRequest inference_reward minimums and fee coverage after activation.
+        if self.model_cap_enforcement_activation.is_active(header.daa_score) {
+            check_ai_request_inference_rewards(&txs, &validated_transactions, self.inference_reward_minimums)?;
         }
 
         Ok(())
@@ -271,6 +291,10 @@ impl VirtualStateProcessor {
             .unwrap()
             .tx;
         if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) { Err(BadCoinbaseTransaction) } else { Ok(()) }
+    }
+
+    fn check_ai_response_model_caps(&self, txs: &[Transaction]) -> BlockProcessResult<()> {
+        check_ai_response_model_caps(txs)
     }
 
     /// Validates transactions against the provided `utxo_view` and returns a vector with all transactions
@@ -446,13 +470,10 @@ impl VirtualStateProcessor {
                 let response_hash = Hash::from_bytes(response_hash_bytes);
 
                 // Extract request_hash and claimed_commitment for Phase 3 C fraud verification.
+                // Commitment = sha2-256 digest embedded in the IPFS multihash (bytes [2..34]).
                 let (request_hash, claimed_commitment) =
                     if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-                        let commitment: [u8; 32] = if resp.result.len() >= 32 {
-                            resp.result[0..32].try_into().unwrap()
-                        } else {
-                            [0u8; 32] // under-length result → zero commitment → always challengeable
-                        };
+                        let commitment: [u8; 32] = resp.response_ipfs_cid[2..34].try_into().unwrap();
                         (resp.request_hash, commitment)
                     } else {
                         ([0u8; 32], [0u8; 32])
@@ -584,11 +605,210 @@ impl VirtualStateProcessor {
     }
 }
 
+/// Rejects the block if any AiRequest tx violates inference_reward/priority_fee/escrow rules:
+/// - inference_reward below the per-model minimum
+/// - priority_fee below MIN_AI_REQUEST_PRIORITY_FEE
+/// - UTXO fee < priority_fee (inference_reward now goes to output[1] escrow, not fee)
+/// - output[1] missing, not a CSV P2PK script, or value < inference_reward
+fn check_ai_request_inference_rewards(
+    txs: &[Transaction],
+    validated: &[(keryx_consensus_core::tx::ValidatedTransaction<'_>, u32)],
+    minimums: &[([u8; 32], u64)],
+) -> BlockProcessResult<()> {
+    let fee_map: std::collections::HashMap<TransactionId, u64> =
+        validated.iter().map(|(vt, _)| (vt.id(), vt.calculated_fee)).collect();
+
+    for tx in txs.iter().skip(1) {
+        if !tx.is_ai_request() {
+            continue;
+        }
+        if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+            // Check inference_reward minimum per model_id, including token-count surcharge.
+            // effective_min = base[model] + ceil(max_tokens / 64) * TOKEN_STEP
+            if let Some(&(_, base_reward)) = minimums.iter().find(|(id, _)| *id == req.model_id) {
+                let token_surcharge = ((req.max_tokens as u64 + 63) / 64) * INFERENCE_REWARD_TOKEN_STEP;
+                let effective_min = base_reward + token_surcharge;
+                if req.inference_reward < effective_min {
+                    return Err(AiRequestInferenceRewardBelowMinimum(
+                        tx.id(),
+                        req.inference_reward,
+                        effective_min,
+                        hex::encode(req.model_id),
+                    ));
+                }
+            }
+            // Check priority_fee minimum (burned as TX fee).
+            if req.priority_fee < keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE {
+                return Err(AiRequestPriorityFeeBelowMinimum(
+                    tx.id(),
+                    req.priority_fee,
+                    keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE,
+                ));
+            }
+            // Check UTXO fee covers at least priority_fee (inference_reward is in output[1]).
+            if let Some(&calculated_fee) = fee_map.get(&tx.id()) {
+                if calculated_fee < req.priority_fee {
+                    return Err(AiRequestFeeBelowInferenceReward(tx.id(), calculated_fee, req.priority_fee));
+                }
+            }
+            // Validate escrow output[1]: CSV P2PK script with value >= inference_reward.
+            if tx.outputs.len() < 2 {
+                return Err(AiRequestMissingEscrowOutput(tx.id()));
+            }
+            let escrow_out = &tx.outputs[1];
+            if !ScriptClass::is_csv_pay_to_pubkey(escrow_out.script_public_key.script()) {
+                return Err(AiRequestInvalidEscrowScript(tx.id()));
+            }
+            if escrow_out.value < req.inference_reward {
+                return Err(AiRequestEscrowBelowInferenceReward(tx.id(), escrow_out.value, req.inference_reward));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rejects the block if any `AiResponse` tx uses a model_id not declared in the coinbase
+/// `/ai:cap:` field.  Only runs after `model_cap_enforcement_activation`.
+///
+/// Strategy: build a map `blake2b(AiRequest_payload)[0..32] → model_id` from the
+/// AiRequest txs in this block (miners include the requests they answer), then for
+/// each AiResponse check its `request_hash` against that map.  If the AiRequest lives
+/// in an earlier block the response is skipped — cross-block enforcement is Phase 4.
+/// If the miner declared no caps at all (not yet upgraded), enforcement is also skipped.
+fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
+    let declared_caps = parse_ai_caps(&txs[0].payload);
+    if declared_caps.is_empty() {
+        return Ok(());
+    }
+
+    // blake2b(AiRequest_payload)[0..32] → model_id
+    let mut request_model_map: std::collections::HashMap<[u8; 32], [u8; 32]> =
+        std::collections::HashMap::new();
+    for tx in txs.iter().skip(1) {
+        if tx.is_ai_request() {
+            if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+                let digest = blake2b_simd::blake2b(&tx.payload);
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&digest.as_bytes()[..32]);
+                request_model_map.insert(key, req.model_id);
+            }
+        }
+    }
+
+    for tx in txs.iter().skip(1) {
+        if !tx.is_ai_response() {
+            continue;
+        }
+        if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
+            if let Some(&model_id) = request_model_map.get(&resp.request_hash) {
+                if !declared_caps.contains(&model_id) {
+                    return Err(AiResponseModelCapMissing(tx.id(), hex::encode(model_id)));
+                }
+            }
+            // request not in same block → AiRequest came from an earlier block → skip
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
+    use keryx_consensus_core::subnets;
 
     use super::*;
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn make_coinbase_with_caps(model_ids: &[[u8; 32]]) -> Transaction {
+        let mut payload = vec![0u8; 53];
+        let caps_str = model_ids.iter().map(hex::encode).collect::<Vec<_>>().join(",");
+        let extra = format!("0.2.8/2025-01-01/00000000deadbeef/ai:v1:aabbccdd11223344/ai:cap:{}", caps_str);
+        payload.extend_from_slice(extra.as_bytes());
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload)
+    }
+
+    fn make_coinbase_no_caps() -> Transaction {
+        let mut payload = vec![0u8; 53];
+        payload.extend_from_slice(b"0.2.8/2025-01-01/00000000deadbeef/ai:v1:aabbccdd11223344");
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload)
+    }
+
+    fn dummy_cid() -> [u8; 34] {
+        let mut cid = [0u8; 34];
+        cid[0] = 0x12;
+        cid[1] = 0x20;
+        cid
+    }
+
+    fn make_ai_request(model_id: [u8; 32]) -> Transaction {
+        let req = AiRequestPayload::new(model_id, 100, 1_000_000, 30_000_000, b"test prompt".to_vec());
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize())
+    }
+
+    fn make_ai_response_for(request_tx: &Transaction) -> Transaction {
+        let digest = blake2b_simd::blake2b(&request_tx.payload);
+        let mut request_hash = [0u8; 32];
+        request_hash.copy_from_slice(&digest.as_bytes()[..32]);
+        let resp = AiResponsePayload::new(request_hash, 1000, dummy_cid(), 128);
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
+    }
+
+    fn make_ai_response_orphan(request_hash: [u8; 32]) -> Transaction {
+        let resp = AiResponsePayload::new(request_hash, 1000, dummy_cid(), 128);
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
+    }
+
+    // ── check_ai_response_model_caps ─────────────────────────────────────────
+
+    #[test]
+    fn no_caps_declared_skips_enforcement() {
+        let model_id = [0xAAu8; 32];
+        let req = make_ai_request(model_id);
+        let resp = make_ai_response_for(&req);
+        let txs = vec![make_coinbase_no_caps(), req, resp];
+        assert!(check_ai_response_model_caps(&txs).is_ok());
+    }
+
+    #[test]
+    fn declared_model_is_accepted() {
+        let model_id = [0x11u8; 32];
+        let req = make_ai_request(model_id);
+        let resp = make_ai_response_for(&req);
+        let txs = vec![make_coinbase_with_caps(&[model_id]), req, resp];
+        assert!(check_ai_response_model_caps(&txs).is_ok());
+    }
+
+    #[test]
+    fn undeclared_model_is_rejected() {
+        let declared = [0x22u8; 32];
+        let used = [0x33u8; 32];
+        let req = make_ai_request(used);
+        let resp = make_ai_response_for(&req);
+        let txs = vec![make_coinbase_with_caps(&[declared]), req, resp];
+        assert!(matches!(check_ai_response_model_caps(&txs), Err(AiResponseModelCapMissing(_, _))));
+    }
+
+    #[test]
+    fn response_for_request_from_earlier_block_is_skipped() {
+        let model_id = [0x44u8; 32];
+        let orphan_hash = [0xFFu8; 32];
+        let resp = make_ai_response_orphan(orphan_hash);
+        let txs = vec![make_coinbase_with_caps(&[model_id]), resp];
+        assert!(check_ai_response_model_caps(&txs).is_ok());
+    }
+
+    #[test]
+    fn multiple_responses_one_undeclared_is_rejected() {
+        let declared = [0x55u8; 32];
+        let undeclared = [0x66u8; 32];
+        let req_ok = make_ai_request(declared);
+        let req_bad = make_ai_request(undeclared);
+        let resp_ok = make_ai_response_for(&req_ok);
+        let resp_bad = make_ai_response_for(&req_bad);
+        let txs = vec![make_coinbase_with_caps(&[declared]), req_ok, req_bad, resp_ok, resp_bad];
+        assert!(matches!(check_ai_response_model_caps(&txs), Err(AiResponseModelCapMissing(_, _))));
+    }
 
     #[test]
     fn test_rayon_reduce_retains_order() {

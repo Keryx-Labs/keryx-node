@@ -129,6 +129,9 @@ pub enum TxRuleError {
     #[error("AiChallenge challenger_deposit is {0} sompi but no output to the burn address covers that amount")]
     AiChallengeDepositMissingBurnOutput(u64),
 
+    #[error("AiResponse references model_id {0} not declared in coinbase ai:cap: field")]
+    AiResponseModelCapMissing(String),
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

@@ -55,7 +55,7 @@ use keryx_consensus_core::{
     block::{BlockTemplate, MutableBlock, TemplateBuildMode, TemplateTransactionSelector},
     blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusUTXOValid},
     coinbase::MinerData,
-    config::genesis::GenesisBlock,
+    config::{genesis::GenesisBlock, params::ForkActivation},
     header::Header,
     merkle::calc_hash_merkle_root,
     mining_rules::MiningRules,
@@ -172,6 +172,10 @@ pub struct VirtualStateProcessor {
     // OPoI slash stores (Phase 3 A4) — persisted to RocksDB
     pub(super) ai_response_store: Arc<crate::model::stores::ai_slash::DbAiResponseStore>,
     pub(super) ai_slashed_store: Arc<crate::model::stores::ai_slash::DbAiSlashedStore>,
+
+    // OPoI Phase 3 hardfork: model capability enforcement activation score
+    pub(super) model_cap_enforcement_activation: ForkActivation,
+    pub(super) inference_reward_minimums: &'static [([u8; 32], u64)],
 }
 
 impl VirtualStateProcessor {
@@ -239,6 +243,9 @@ impl VirtualStateProcessor {
             _mining_rules: mining_rules,
             ai_response_store: storage.ai_response_store.clone(),
             ai_slashed_store: storage.ai_slashed_store.clone(),
+
+            model_cap_enforcement_activation: params.model_cap_enforcement_activation,
+            inference_reward_minimums: params.inference_reward_minimums,
         }
     }
 

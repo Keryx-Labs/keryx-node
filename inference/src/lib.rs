@@ -15,6 +15,7 @@ pub mod task;
 pub use ai_payload::{
     AiRequestPayload, AiResponsePayload, AiChallengePayload,
     MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN,
+    MIN_AI_REQUEST_PRIORITY_FEE, INFERENCE_REWARD_TOKEN_STEP,
     MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN,
     SUBNETWORK_ID_AI_REQUEST_HEX, SUBNETWORK_ID_AI_RESPONSE_HEX, SUBNETWORK_ID_AI_CHALLENGE_HEX,
@@ -81,6 +82,47 @@ pub fn parse_opoi(payload: &[u8]) -> Option<(u64, String)> {
     let nonce = u64::from_str_radix(nonce_hex, 16).ok()?;
 
     Some((nonce, claimed_tag.to_string()))
+}
+
+/// Scans raw coinbase payload bytes for the `/ai:cap:` field and returns the
+/// list of model_ids the miner declared as loaded.
+///
+/// Format: `/ai:cap:<hex64_1>,<hex64_2>,...`
+/// Each model_id is a 64-char lowercase hex string (32 bytes).
+/// Returns an empty Vec if the field is absent or malformed — absence means
+/// the miner has not upgraded and declared no capabilities.
+pub fn parse_ai_caps(payload: &[u8]) -> Vec<[u8; 32]> {
+    const MARKER: &[u8] = b"/ai:cap:";
+    const MODEL_ID_HEX_LEN: usize = 64;
+
+    let search_start = COINBASE_MIN_BINARY_HEADER.min(payload.len());
+    let search_slice = &payload[search_start..];
+
+    let relative_pos = match search_slice.windows(MARKER.len()).position(|w| w == MARKER) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let caps_start = search_start + relative_pos + MARKER.len();
+
+    // Read until next '/' or end of payload.
+    let caps_end = payload[caps_start..]
+        .iter()
+        .position(|&b| b == b'/')
+        .map(|p| caps_start + p)
+        .unwrap_or(payload.len());
+
+    let caps_str = match std::str::from_utf8(&payload[caps_start..caps_end]) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    caps_str.split(',')
+        .filter(|s| s.len() == MODEL_ID_HEX_LEN)
+        .filter_map(|s| {
+            let bytes = hex::decode(s).ok()?;
+            bytes.try_into().ok()
+        })
+        .collect()
 }
 
 /// Phase 1 — verifies via candle-core f32 MLP (non-deterministic across hardware).
@@ -214,5 +256,65 @@ mod tests {
     fn verify_tag_rejects_wrong_tag() {
         let nonce = 42u64;
         assert!(!verify_tag(nonce, "0000000000000000"));
+    }
+
+    // ── parse_ai_caps tests ───────────────────────────────────────────────────
+
+    fn make_payload_with_caps(caps: &str) -> Vec<u8> {
+        let mut payload = vec![0u8; 19 + 34];
+        let extra = format!("0.2.8/2025-01-01/00000000deadbeef/ai:v1:aabbccdd11223344/ai:cap:{}/ai:r:hello", caps);
+        payload.extend_from_slice(extra.as_bytes());
+        payload
+    }
+
+    #[test]
+    fn parse_ai_caps_single_model() {
+        let model_id = [0xabu8; 32];
+        let hex_id = hex::encode(model_id);
+        let payload = make_payload_with_caps(&hex_id);
+        let caps = parse_ai_caps(&payload);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0], model_id);
+    }
+
+    #[test]
+    fn parse_ai_caps_two_models() {
+        let model_a = [0x11u8; 32];
+        let model_b = [0x22u8; 32];
+        let caps_str = format!("{},{}", hex::encode(model_a), hex::encode(model_b));
+        let payload = make_payload_with_caps(&caps_str);
+        let caps = parse_ai_caps(&payload);
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0], model_a);
+        assert_eq!(caps[1], model_b);
+    }
+
+    #[test]
+    fn parse_ai_caps_absent_returns_empty() {
+        let payload = make_coinbase_payload(1, "aabbccdd11223344");
+        let caps = parse_ai_caps(&payload);
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn parse_ai_caps_ignores_malformed_entry() {
+        // Mix one valid and one invalid (too short) entry — only valid one returned.
+        let model_a = [0xffu8; 32];
+        let caps_str = format!("{},tooshort", hex::encode(model_a));
+        let payload = make_payload_with_caps(&caps_str);
+        let caps = parse_ai_caps(&payload);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0], model_a);
+    }
+
+    #[test]
+    fn parse_ai_caps_stops_at_next_slash() {
+        // The field is delimited by the next '/' (the /ai:r: segment).
+        // Ensure nothing from ai:r: leaks into the cap list.
+        let model_id = [0x99u8; 32];
+        let hex_id = hex::encode(model_id);
+        let payload = make_payload_with_caps(&hex_id);
+        let caps = parse_ai_caps(&payload);
+        assert_eq!(caps.len(), 1);
     }
 }
