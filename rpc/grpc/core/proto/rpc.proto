@@ -169,6 +169,8 @@ message GetBlockTemplateRequestMessage {
   // Which kaspa address should the coinbase block reward transaction pay into
   string payAddress = 1;
   string extraData = 2;
+  // Inference challenge response: "<model_id_hex>:<result_text>" — empty when no challenge pending
+  string inferenceResult = 3;
 }
 
 message GetBlockTemplateResponseMessage {
@@ -179,6 +181,11 @@ message GetBlockTemplateResponseMessage {
   // That is because when kaspad isn't in sync with the rest of the network there's a high
   // chance the block will never be accepted, thus the solving effort would have been wasted.
   bool isSynced = 2;
+
+  // Inference capability challenge: "<model_id_hex>:<nonce_hex>" — empty when no challenge required.
+  // Miner must run inference on the specified model and return the result in the next
+  // GetBlockTemplateRequest.inferenceResult field. Mining is suspended (isSynced=false) until passed.
+  string inferenceChallenge = 10;
 
   RPCError error = 1000;
 }

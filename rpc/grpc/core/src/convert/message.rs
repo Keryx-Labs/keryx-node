@@ -157,10 +157,11 @@ from!(item: &keryx_rpc_core::GetBlockTemplateRequest, protowire::GetBlockTemplat
     Self {
         pay_address: (&item.pay_address).into(),
         extra_data: String::from_utf8(item.extra_data.clone()).expect("extra data has to be valid UTF-8"),
+        inference_result: item.inference_result.clone(),
     }
 });
 from!(item: RpcResult<&keryx_rpc_core::GetBlockTemplateResponse>, protowire::GetBlockTemplateResponseMessage, {
-    Self { block: Some((&item.block).into()), is_synced: item.is_synced, error: None }
+    Self { block: Some((&item.block).into()), is_synced: item.is_synced, inference_challenge: item.inference_challenge.clone(), error: None }
 });
 
 from!(item: &keryx_rpc_core::GetBlockRequest, protowire::GetBlockRequestMessage, {
@@ -624,7 +625,11 @@ impl TryFrom<&protowire::SubmitBlockResponseMessage> for keryx_rpc_core::SubmitB
 }
 
 try_from!(item: &protowire::GetBlockTemplateRequestMessage, keryx_rpc_core::GetBlockTemplateRequest, {
-    Self { pay_address: item.pay_address.clone().try_into()?, extra_data: RpcExtraData::from_iter(item.extra_data.bytes()) }
+    Self {
+        pay_address: item.pay_address.clone().try_into()?,
+        extra_data: RpcExtraData::from_iter(item.extra_data.bytes()),
+        inference_result: item.inference_result.clone(),
+    }
 });
 try_from!(item: &protowire::GetBlockTemplateResponseMessage, RpcResult<keryx_rpc_core::GetBlockTemplateResponse>, {
     Self {
@@ -634,6 +639,7 @@ try_from!(item: &protowire::GetBlockTemplateResponseMessage, RpcResult<keryx_rpc
             .ok_or_else(|| RpcError::MissingRpcFieldError("GetBlockTemplateResponseMessage".to_string(), "block".to_string()))?
             .try_into()?,
         is_synced: item.is_synced,
+        inference_challenge: item.inference_challenge.clone(),
     }
 });
 

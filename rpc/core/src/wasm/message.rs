@@ -864,6 +864,7 @@ try_from! ( args: IGetBlockTemplateRequest, GetBlockTemplateRequest, {
     Ok(GetBlockTemplateRequest {
         pay_address,
         extra_data,
+        inference_result: Default::default(),
     })
 });
 

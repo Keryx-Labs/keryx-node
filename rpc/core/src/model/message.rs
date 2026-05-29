@@ -123,10 +123,12 @@ pub struct GetBlockTemplateRequest {
     pub pay_address: RpcAddress,
     // TODO: replace with hex serialization
     pub extra_data: RpcExtraData,
+    /// Inference challenge response from miner: "<model_id_hex>:<result_text>", empty if none
+    pub inference_result: String,
 }
 impl GetBlockTemplateRequest {
     pub fn new(pay_address: RpcAddress, extra_data: RpcExtraData) -> Self {
-        Self { pay_address, extra_data }
+        Self { pay_address, extra_data, inference_result: String::new() }
     }
 }
 
@@ -146,7 +148,7 @@ impl Deserializer for GetBlockTemplateRequest {
         let pay_address = load!(RpcAddress, reader)?;
         let extra_data = load!(RpcExtraData, reader)?;
 
-        Ok(Self { pay_address, extra_data })
+        Ok(Self { pay_address, extra_data, inference_result: Default::default() })
     }
 }
 
@@ -160,13 +162,19 @@ pub struct GetBlockTemplateResponse {
     /// That is because when keryxd isn't in sync with the rest of the network there's a high
     /// chance the block will never be accepted, thus the solving effort would have been wasted.
     pub is_synced: bool,
+
+    /// Inference capability challenge for the miner: "<model_id_hex>:<nonce_hex>", empty if none.
+    /// While non-empty, is_synced is forced false and mining is suspended until the miner
+    /// responds with the inference result in the next GetBlockTemplateRequest.inference_result.
+    pub inference_challenge: String,
 }
 
 impl Serializer for GetBlockTemplateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         serialize!(RpcRawBlock, &self.block, writer)?;
         store!(bool, &self.is_synced, writer)?;
+        store!(String, &self.inference_challenge, writer)?;
 
         Ok(())
     }
@@ -174,11 +182,12 @@ impl Serializer for GetBlockTemplateResponse {
 
 impl Deserializer for GetBlockTemplateResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let block = deserialize!(RpcRawBlock, reader)?;
         let is_synced = load!(bool, reader)?;
+        let inference_challenge = if version >= 2 { load!(String, reader)? } else { String::new() };
 
-        Ok(Self { block, is_synced })
+        Ok(Self { block, is_synced, inference_challenge })
     }
 }
 

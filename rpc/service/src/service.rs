@@ -76,7 +76,7 @@ use std::time::Duration;
 use std::{
     collections::HashMap,
     iter::once,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
     vec,
 };
 use tokio::join;
@@ -122,9 +122,27 @@ pub struct RpcCoreService {
     fee_estimate_cache: ExpiringCache<RpcFeeEstimate>,
     fee_estimate_verbose_cache: ExpiringCache<keryx_mining::errors::MiningManagerResult<GetFeeEstimateExperimentalResponse>>,
     mining_rule_engine: Arc<MiningRuleEngine>,
+    /// Per-connection inference challenge state, keyed by connection id.
+    inference_challenge_states: Arc<Mutex<HashMap<u64, ChallengeState>>>,
 }
 
 const RPC_CORE: &str = "rpc-core";
+
+/// Re-challenge interval: issue a new inference challenge every N DAA scores (~6 min at 10 BPS).
+const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 3_600;
+
+/// A per-connection inference challenge issued by the node to verify the miner can actually run
+/// inference on the model it announced in ai:cap.
+struct ChallengeState {
+    /// Hex-encoded model_id that was challenged.
+    model_id_hex: String,
+    /// Random nonce included in the prompt so the miner cannot pre-compute the answer.
+    nonce_hex: String,
+    /// DAA score at which the challenge was issued — used to expire and re-issue.
+    issued_at_daa: u64,
+    /// True once the miner submitted a non-empty, non-garbage inference result.
+    passed: bool,
+}
 
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
@@ -227,6 +245,7 @@ impl RpcCoreService {
             fee_estimate_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             fee_estimate_verbose_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             mining_rule_engine,
+            inference_challenge_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -358,7 +377,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
     async fn get_block_template_call(
         &self,
-        _connection: Option<&DynRpcConnection>,
+        connection: Option<&DynRpcConnection>,
         request: GetBlockTemplateRequest,
     ) -> RpcResult<GetBlockTemplateResponse> {
         trace!("incoming GetBlockTemplate request");
@@ -380,8 +399,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::ConsensusInTransitionalIbdState);
         }
         let script_public_key = keryx_txscript::pay_to_address_script(&request.pay_address);
-        let extra_data = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
-        let miner_data: MinerData = MinerData::new(script_public_key, extra_data);
+        let extra_data_bytes = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
+        let miner_data: MinerData = MinerData::new(script_public_key, extra_data_bytes);
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 
         // Check coinbase tx payload length
@@ -389,12 +408,90 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::CoinbasePayloadLengthAboveMax(self.config.max_coinbase_payload_len));
         }
 
-        Ok(GetBlockTemplateResponse {
-            block: block_template.block.into(),
-            is_synced: self.mining_rule_engine.should_mine(DaaScoreTimestamp {
+        let current_daa = block_template.selected_parent_daa_score;
+        let extra_data_str = String::from_utf8_lossy(&request.extra_data);
+
+        // Parse ai:cap model IDs declared by the miner (e.g. "/ai:cap:aabbcc...,ddeeff...").
+        let declared_model_ids: Vec<String> = extra_data_str
+            .split('/')
+            .find(|s| s.starts_with("ai:cap:"))
+            .map(|s| s["ai:cap:".len()..].split(',').map(|id| id.trim().to_string()).filter(|id| id.len() == 64).collect())
+            .unwrap_or_default();
+
+        // Only challenge miners who declare AI capabilities (i.e. gRPC solo miners).
+        let inference_challenge = if declared_model_ids.is_empty() {
+            String::new()
+        } else if let Some(conn) = connection {
+            let conn_id = conn.id();
+            let mut states = self.inference_challenge_states.lock().expect("challenge states lock");
+
+            // Validate challenge result submitted by the miner in this request.
+            if !request.inference_result.is_empty() {
+                if let Some(state) = states.get_mut(&conn_id) {
+                    // Format: "<model_id_hex>:<result_text>"
+                    let result_valid = request.inference_result
+                        .split_once(':')
+                        .map(|(model_hex, result_text)| {
+                            model_hex == state.model_id_hex
+                                && !result_text.is_empty()
+                                && !result_text.starts_with('[')
+                        })
+                        .unwrap_or(false);
+                    if result_valid {
+                        log::info!("OPoI challenge: connection {} passed for model {}", conn_id, state.model_id_hex);
+                        state.passed = true;
+                    } else {
+                        log::warn!("OPoI challenge: connection {} submitted invalid result", conn_id);
+                    }
+                }
+            }
+
+            // Determine if a new challenge should be issued.
+            let needs_challenge = match states.get(&conn_id) {
+                None => true,
+                Some(state) => !state.passed || current_daa.saturating_sub(state.issued_at_daa) >= INFERENCE_CHALLENGE_INTERVAL_DAA,
+            };
+
+            if needs_challenge {
+                use rand::{Rng, RngCore};
+                let idx = rand::thread_rng().gen_range(0..declared_model_ids.len());
+                let model_id_hex = declared_model_ids[idx].clone();
+                let nonce_hex = format!("{:016x}", rand::thread_rng().next_u64());
+                let challenge = format!("{}:{}", model_id_hex, nonce_hex);
+                states.insert(conn_id, ChallengeState {
+                    model_id_hex,
+                    nonce_hex,
+                    issued_at_daa: current_daa,
+                    passed: false,
+                });
+                challenge
+            } else {
+                // Challenge already passed and not yet expired — no challenge needed.
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        // While a challenge is pending (issued but not yet answered), suspend mining.
+        let challenge_pending = !inference_challenge.is_empty()
+            || connection.and_then(|c| {
+                self.inference_challenge_states.lock().ok()?.get(&c.id()).map(|s| !s.passed)
+            }).unwrap_or(false);
+
+        let is_synced = if challenge_pending {
+            false
+        } else {
+            self.mining_rule_engine.should_mine(DaaScoreTimestamp {
                 timestamp: block_template.selected_parent_timestamp,
                 daa_score: block_template.selected_parent_daa_score,
-            }),
+            })
+        };
+
+        Ok(GetBlockTemplateResponse {
+            block: block_template.block.into(),
+            is_synced,
+            inference_challenge,
         })
     }
 

@@ -641,7 +641,7 @@ mod mockery {
 
     impl Mock for GetBlockTemplateRequest {
         fn mock() -> Self {
-            GetBlockTemplateRequest { pay_address: mock(), extra_data: vec![4, 2] }
+            GetBlockTemplateRequest { pay_address: mock(), extra_data: vec![4, 2], inference_result: Default::default() }
         }
     }
 

@@ -3441,6 +3441,7 @@ dependencies = [
  "keryx-utils-tower",
  "keryx-utxoindex",
  "log",
+ "rand 0.8.5",
  "tokio",
  "triggered",
  "workflow-rpc",
