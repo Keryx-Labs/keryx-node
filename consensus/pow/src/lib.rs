@@ -7,11 +7,28 @@ pub mod wasm;
 pub mod xoshiro;
 
 use std::cmp::max;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::matrix::Matrix;
 use keryx_consensus_core::{BlockLevel, hashing, header::Header};
 use keryx_hashes::PowHash;
 use keryx_math::Uint256;
+
+/// DAA score at which the PoW SALT switches from v1 to v2.
+/// u64::MAX means "never" (default — disabled until explicitly initialised from params).
+/// Set once at node/miner startup via [`init_pow_salt_v2_activation`].
+static POW_SALT_V2_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::pow_salt_v2_activation`.
+/// After this point every PoW computation automatically picks the correct salt.
+pub fn init_pow_salt_v2_activation(daa_score: u64) {
+    POW_SALT_V2_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub(crate) fn use_v2_salt(daa_score: u64) -> bool {
+    daa_score >= POW_SALT_V2_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
 
 /// State is an intermediate data structure with pre-computed values to speed up mining.
 pub struct State {
@@ -29,7 +46,7 @@ impl State {
         let pre_pow_hash = hashing::header::hash_override_nonce_time(header, 0, 0);
         // PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
         let hasher = PowHash::new(pre_pow_hash, header.timestamp);
-        let matrix = Matrix::generate(pre_pow_hash);
+        let matrix = Matrix::generate(pre_pow_hash, use_v2_salt(header.daa_score));
 
         Self { matrix, target, hasher }
     }

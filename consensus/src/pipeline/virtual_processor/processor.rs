@@ -176,6 +176,9 @@ pub struct VirtualStateProcessor {
     // OPoI Phase 3 hardfork: model capability enforcement activation score
     pub(super) model_cap_enforcement_activation: ForkActivation,
     pub(super) inference_reward_minimums: &'static [([u8; 32], u64)],
+
+    // SALT v2 hardfork: KeryxHash domain separation switch activation score
+    pub(super) pow_salt_v2_activation: ForkActivation,
 }
 
 impl VirtualStateProcessor {
@@ -246,6 +249,8 @@ impl VirtualStateProcessor {
 
             model_cap_enforcement_activation: params.model_cap_enforcement_activation,
             inference_reward_minimums: params.inference_reward_minimums,
+
+            pow_salt_v2_activation: params.pow_salt_v2_activation,
         }
     }
 

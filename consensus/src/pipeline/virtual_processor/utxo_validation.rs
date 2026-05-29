@@ -235,6 +235,14 @@ impl VirtualStateProcessor {
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
         ctx.pruning_sample_from_pov = Some(reply.pruning_sample);
 
+        // SALT v2 hardfork: log once at the exact activation DAA score.
+        if header.daa_score == self.pow_salt_v2_activation.daa_score() {
+            info!(
+                "=== SALT v2 HARDFORK ACTIVATED at DAA {} — KeryxHash domain salt switched to v2, pre-v1.2.2 miners now rejected ===",
+                header.daa_score
+            );
+        }
+
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() {

@@ -45,7 +45,7 @@ impl PoW {
         let pre_pow_hash = hashing::header::hash_override_nonce_time(header, 0, 0);
         // PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
         let hasher = PowHash::new(pre_pow_hash, timestamp.unwrap_or(header.timestamp));
-        let matrix = Matrix::generate(pre_pow_hash);
+        let matrix = Matrix::generate(pre_pow_hash, crate::use_v2_salt(header.daa_score));
 
         Ok(Self { inner: crate::State { matrix, target, hasher }, pre_pow_hash })
     }
@@ -84,7 +84,7 @@ impl PoW {
         let target = Uint256::from_compact_target_bits(target_bits.unwrap_or_default());
 
         // Initialize the matrix and hasher using pre_pow_hash and timestamp
-        let matrix = Matrix::generate(pre_pow_hash);
+        let matrix = Matrix::generate(pre_pow_hash, false); // from_raw has no daa_score; stratum always uses v1 salt
         let hasher = PowHash::new(pre_pow_hash, timestamp);
 
         Ok(PoW { inner: crate::State { matrix, target, hasher }, pre_pow_hash })

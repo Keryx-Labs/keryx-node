@@ -374,6 +374,13 @@ pub struct Params {
     /// AiRequest txs below the minimum for their model_id are rejected.
     /// Fulfilled inference_rewards are redirected from the fee burn to the responding miner.
     pub inference_reward_minimums: &'static [([u8; 32], u64)],
+
+    /// PoW SALT v2 hardfork activation DAA score.
+    /// After this score, `KERYX_MATRIX_SALT_V2` is used for matrix generation instead of v1.
+    /// Any miner binary compiled against v1 will compute a different matrix and its blocks
+    /// will fail PoW validation — this is the forced-update mechanism.
+    /// Set to `ForkActivation::never()` to disable (default for mainnet until announced).
+    pub pow_salt_v2_activation: ForkActivation,
 }
 
 impl Params {
@@ -550,6 +557,8 @@ impl Params {
             inference_reward_minimums: overrides
                 .inference_reward_minimums
                 .unwrap_or(self.inference_reward_minimums),
+
+            pow_salt_v2_activation: self.pow_salt_v2_activation,
         }
     }
 }
@@ -640,6 +649,10 @@ pub const MAINNET_PARAMS: Params = Params {
     // Hardfork activation: 2026-05-28 15:00 UTC — DAA 11_409_033 + ~4_140_000 (115h × 10 BPS).
     model_cap_enforcement_activation: ForkActivation::new(15_550_000),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+
+    // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
+    // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
+    pow_salt_v2_activation: ForkActivation::new(17_275_000),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -687,6 +700,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // Testnet: activate ~5 min after genesis (3_000 blocks at 10 BPS) to observe the transition.
     model_cap_enforcement_activation: ForkActivation::new(3_000),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+
+    // PoW SALT v2: testnet activation at DAA 6_000.
+    pow_salt_v2_activation: ForkActivation::new(6_000),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -730,6 +746,7 @@ pub const SIMNET_PARAMS: Params = Params {
 
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+    pow_salt_v2_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -771,4 +788,5 @@ pub const DEVNET_PARAMS: Params = Params {
 
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+    pow_salt_v2_activation: ForkActivation::never(),
 };

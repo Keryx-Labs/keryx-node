@@ -173,6 +173,9 @@ impl Consensus {
         let perf_params = &config.perf;
         let is_consensus_exiting: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
+        // Initialise the PoW SALT v2 activation threshold once, before any block processing.
+        keryx_pow::init_pow_salt_v2_activation(params.pow_salt_v2_activation.daa_score());
+
         //
         // Storage layer
         //
