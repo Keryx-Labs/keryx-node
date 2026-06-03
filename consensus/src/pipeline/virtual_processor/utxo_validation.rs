@@ -493,9 +493,16 @@ impl VirtualStateProcessor {
                     request_hash,
                     claimed_commitment,
                 };
+                // Log only the first registration of a given response_hash. The same
+                // AiResponse is re-included in many block bodies across the DAG, so an
+                // unconditional log spams INFO once per body. The .set() itself stays
+                // unconditional (last-writer-wins): the record's inclusion_blue_score and
+                // coinbase_tx_id are consensus-critical and must keep their original
+                // semantics — only the logging is gated, so this is consensus-neutral.
+                let already_known = self.ai_response_store.has(response_hash).unwrap_or(false);
                 if let Err(e) = self.ai_response_store.set(response_hash, record) {
                     warn!("OPoI: failed to register AiResponse in DB: {}", e);
-                } else {
+                } else if !already_known {
                     info!("OPoI: registered AiResponse response_hash={}", hex::encode(response_hash_bytes));
                 }
             }
