@@ -454,6 +454,24 @@ impl ShareHandler {
         debug!("[SUBMIT] Parsed nonce value (u64): {}", nonce_val);
         debug!("[SUBMIT] Nonce hex: {:016x}", nonce_val);
 
+        // OPoI validation — mandatory for every share.
+        // Standard Keryx submit: [address, job_id, nonce, opoi_tag] = 4 params.
+        // The tag must be the 16-char hex output of tag_fixed(nonce ^ PHASE2_OPOI_SALT).
+        let opoi_tag_idx = nonce_param_idx + 1;
+        match event.params.get(opoi_tag_idx).and_then(|v| v.as_str()) {
+            None => {
+                let _ = ctx.reply_missing_inference(event.id.clone()).await;
+                return Ok(());
+            }
+            Some(tag) => {
+                if !crate::opoi::verify_tag(nonce_val, tag) {
+                    let _ = ctx.reply_invalid_inference(event.id.clone()).await;
+                    return Ok(());
+                }
+                debug!("[SUBMIT] OPoI tag verified: {}", tag);
+            }
+        }
+
         let worker_id = {
             let worker_name = ctx.worker_name.lock();
             if !worker_name.is_empty() { worker_name.clone() } else { format!("{}:{}", ctx.remote_addr(), ctx.remote_port()) }

@@ -19,6 +19,10 @@ pub const SIGNATURE_SIZE: u64 = 1 + 64 + 1; //1 byte for OP_DATA_65 + 64 (length
 /// the mempool and relayed. It is specified in sompi per 1kg (or 1000 grams) of transaction mass.
 pub(crate) const MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1000;
 
+/// Flat fee floor applied on every transaction regardless of mass (0.3 KRX).
+/// Must match MINIMUM_FLAT_TX_FEE_SOMPI in the mempool config.
+pub(crate) const MINIMUM_FLAT_FEE_SOMPI: u64 = 30_000_000;
+
 /// MAXIMUM_STANDARD_TRANSACTION_MASS is the maximum mass allowed for transactions that
 /// are considered standard and will therefore be relayed and considered for mining.
 pub const MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
@@ -35,6 +39,9 @@ pub fn calc_minimum_required_transaction_relay_fee(mass: u64) -> u64 {
     if minimum_fee == 0 {
         minimum_fee = MINIMUM_RELAY_TRANSACTION_FEE;
     }
+
+    // Enforce flat minimum regardless of mass (must match mempool MINIMUM_FLAT_TX_FEE_SOMPI).
+    minimum_fee = minimum_fee.max(MINIMUM_FLAT_FEE_SOMPI);
 
     // Set the minimum fee to the maximum possible value if the calculated
     // fee is not in the valid range for monetary amounts.

@@ -523,6 +523,28 @@ impl VirtualStateProcessor {
             };
             let rh = Hash::from_bytes(challenge.response_hash);
 
+            // Performance guard (consensus-neutral): skip the expensive verify_fraud_proof
+            // re-execution when this escrow is already slashed by the SAME challenger_spk.
+            // A single AiResponse is re-included in many block bodies across the DAG, so the
+            // same AiChallenge would otherwise re-run the full inference once per body.
+            //
+            // We deliberately do NOT skip when a DIFFERENT challenger_spk is recorded: the
+            // original last-writer-wins semantics for challenger_spk (the only SlashRecord
+            // field read during validation, see validate_transaction_in_utxo_context) are
+            // preserved, so post-patch nodes stay bit-identical to pre-patch nodes — no
+            // hardfork required. slash_blue_score is write-only (never read), so not
+            // re-writing it has no consensus effect.
+            if let Ok(rec) = self.ai_response_store.get(rh) {
+                let key = OutpointKey::new(rec.coinbase_tx_id, 1);
+                if let Ok(Some(existing)) = self.ai_slashed_store.get_slash(key) {
+                    if existing.challenger_spk_version == challenge.challenger_spk_version
+                        && existing.challenger_spk_script == challenge.challenger_spk
+                    {
+                        continue;
+                    }
+                }
+            }
+
             let slash_accepted = if challenge.proof_data.is_empty() {
                 // Phase A compat: empty proof → unconditional slash within window.
                 true

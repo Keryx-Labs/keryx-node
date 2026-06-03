@@ -548,6 +548,18 @@ impl StratumContext {
         self.reply(JsonRpcResponse::error(id, 20, "Unknown problem", None)).await
     }
 
+    /// Reply when the OPoI tag is absent from mining.submit (error 26).
+    pub async fn reply_missing_inference(&self, id: Option<Value>) -> Result<(), ErrorDisconnected> {
+        tracing::warn!("[BRIDGE->MINER] OPoI tag missing — share rejected (Error Code: 26)");
+        self.reply(JsonRpcResponse::error(id, 26, "OPoI tag required", None)).await
+    }
+
+    /// Reply when the submitted OPoI tag does not match the expected tag (error 27).
+    pub async fn reply_invalid_inference(&self, id: Option<Value>) -> Result<(), ErrorDisconnected> {
+        tracing::warn!("[BRIDGE->MINER] OPoI tag invalid — share rejected (Error Code: 27)");
+        self.reply(JsonRpcResponse::error(id, 27, "OPoI tag invalid", None)).await
+    }
+
     /// Reply with low difficulty share error
     pub async fn reply_low_diff_share(&self, id: &serde_json::Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tracing::debug!("[BRIDGE->ASIC] Preparing LOW DIFFICULTY SHARE response (Error Code: 23, Invalid difficulty)");

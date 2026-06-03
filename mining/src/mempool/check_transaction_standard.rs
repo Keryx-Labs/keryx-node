@@ -235,6 +235,9 @@ impl Mempool {
             minimum_fee = self.config.minimum_relay_transaction_fee;
         }
 
+        // Enforce flat minimum regardless of mass (0.3 KRX — deflationary floor).
+        minimum_fee = minimum_fee.max(MINIMUM_FLAT_TX_FEE_SOMPI);
+
         // Set the minimum fee to the maximum possible value if the calculated
         // fee is not in the valid range for monetary amounts.
         minimum_fee = minimum_fee.min(MAX_SOMPI);
