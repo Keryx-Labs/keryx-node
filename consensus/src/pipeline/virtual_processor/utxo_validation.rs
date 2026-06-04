@@ -24,7 +24,7 @@ use crate::{
         },
     },
 };
-use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader, AiSlashedStore, AiSlashedStoreReader, OutpointKey, SlashRecord};
+use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -33,16 +33,15 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
     },
 };
-use keryx_consensus_core::collateral::CHALLENGE_WINDOW_BLOCKS;
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, FraudProofResult, FRAUD_PROOF_LEN, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps, verify_fraud_proof};
+use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
@@ -364,25 +363,12 @@ impl VirtualStateProcessor {
         pov_daa_score: u64,
         flags: TxValidationFlags,
     ) -> TxResult<ValidatedTransaction<'a>> {
-        // OPoI Phase 3: slashed escrow enforcement.
-        //
-        // A slashed escrow CAN be spent (after the CSV lock expires, which is enforced by the
-        // script engine).  However, the spend is only valid if at least one output pays the
-        // registered challenger's script_public_key.  Any other attempt to spend a slashed
-        // outpoint — including sending it back to the miner — is rejected here.
-        for input in transaction.inputs.iter() {
-            let key = OutpointKey::new(input.previous_outpoint.transaction_id, input.previous_outpoint.index);
-            if let Ok(Some(slash)) = self.ai_slashed_store.get_slash(key) {
-                let challenger_spk = ScriptPublicKey::from_vec(
-                    slash.challenger_spk_version,
-                    slash.challenger_spk_script.to_vec(),
-                );
-                let pays_challenger = transaction.outputs.iter().any(|o| o.script_public_key == challenger_spk);
-                if !pays_challenger {
-                    return Err(TxRuleError::SpendingSlashedEscrow);
-                }
-            }
-        }
+        // OPoI slashing removed (v1.2.3): the slashed-escrow enforcement was non-deterministic
+        // under a multi-challenger flood — the recorded challenger_spk is last-writer-wins, so
+        // different nodes accepted/rejected the same escrow spend differently, producing diverging
+        // UTXO commitments and fragmenting consensus. On top of that the verifiable commitment was
+        // lost in the result->ipfs_cid migration, so every honest AiResponse was slashable by anyone.
+        // Escrows are therefore always spendable now; no slashed-escrow check is performed.
 
         let mut entries = Vec::with_capacity(transaction.inputs.len());
         for input in transaction.inputs.iter() {
@@ -508,124 +494,11 @@ impl VirtualStateProcessor {
             }
         }
 
-        // Process AiChallenge txs — update slash state.
-        //
-        // An AiChallenge is always a 0-input metadata transaction.  It records:
-        //   - the response_hash of the disputed AiResponse
-        //   - the challenger's SPK (where the slashed escrow must be sent after CSV expiry)
-        //   - an optional re-execution fraud proof (32-byte request_hash)
-        //
-        // After slash is recorded, the escrow's CSV lock (36,000 blocks) prevents any spend.
-        // Once CSV expires, the miner can spend the escrow only if an output goes to
-        // the challenger's SPK — enforced in validate_transaction_in_utxo_context.
-        //
-        // proof_data empty (0 bytes)         → unconditional slash within window (Phase A compat).
-        // proof_data 32 bytes (request_hash) → re-execution fraud proof (Phase 3 C).
-        for tx in txs.iter().skip(1) {
-            if !tx.is_ai_challenge() {
-                continue;
-            }
-            let Some(challenge) = AiChallengePayload::deserialize(&tx.payload) else {
-                continue;
-            };
-            let rh = Hash::from_bytes(challenge.response_hash);
-
-            // Performance guard (consensus-neutral): skip the expensive verify_fraud_proof
-            // re-execution when this escrow is already slashed by the SAME challenger_spk.
-            // A single AiResponse is re-included in many block bodies across the DAG, so the
-            // same AiChallenge would otherwise re-run the full inference once per body.
-            //
-            // We deliberately do NOT skip when a DIFFERENT challenger_spk is recorded: the
-            // original last-writer-wins semantics for challenger_spk (the only SlashRecord
-            // field read during validation, see validate_transaction_in_utxo_context) are
-            // preserved, so post-patch nodes stay bit-identical to pre-patch nodes — no
-            // hardfork required. slash_blue_score is write-only (never read), so not
-            // re-writing it has no consensus effect.
-            if let Ok(rec) = self.ai_response_store.get(rh) {
-                let key = OutpointKey::new(rec.coinbase_tx_id, 1);
-                if let Ok(Some(existing)) = self.ai_slashed_store.get_slash(key) {
-                    if existing.challenger_spk_version == challenge.challenger_spk_version
-                        && existing.challenger_spk_script == challenge.challenger_spk
-                    {
-                        continue;
-                    }
-                }
-            }
-
-            let slash_accepted = if challenge.proof_data.is_empty() {
-                // Phase A compat: empty proof → unconditional slash within window.
-                true
-            } else if challenge.proof_data.len() == FRAUD_PROOF_LEN {
-                // Phase 3 C: re-execution proof — proof_data = request_hash (32 bytes).
-                let submitted_request_hash: &[u8; 32] =
-                    challenge.proof_data.as_slice().try_into().unwrap();
-                match self.ai_response_store.get(rh) {
-                    Ok(ref rec) if submitted_request_hash == &rec.request_hash => {
-                        match verify_fraud_proof(&rec.request_hash, &rec.claimed_commitment) {
-                            FraudProofResult::Valid => {
-                                info!(
-                                    "OPoI: fraud proven via re-execution — response_hash={}",
-                                    hex::encode(challenge.response_hash)
-                                );
-                                true
-                            }
-                            FraudProofResult::Invalid => {
-                                warn!(
-                                    "OPoI: challenge rejected — miner commitment matches re-execution — response_hash={}",
-                                    hex::encode(challenge.response_hash)
-                                );
-                                false
-                            }
-                        }
-                    }
-                    Ok(_) => {
-                        warn!(
-                            "OPoI: challenger submitted wrong request_hash — response_hash={}",
-                            hex::encode(challenge.response_hash)
-                        );
-                        false
-                    }
-                    Err(_) => false,
-                }
-            } else {
-                warn!(
-                    "OPoI: unrecognised proof_data length {} — response_hash={}",
-                    challenge.proof_data.len(),
-                    hex::encode(challenge.response_hash)
-                );
-                false
-            };
-
-            if slash_accepted {
-                match self.ai_response_store.get(rh) {
-                    Ok(record) if pov_daa_score <= record.inclusion_blue_score + CHALLENGE_WINDOW_BLOCKS as u64 => {
-                        let key = OutpointKey::new(record.coinbase_tx_id, 1);
-                        let slash_record = SlashRecord {
-                            slash_blue_score: pov_daa_score,
-                            challenger_spk_version: challenge.challenger_spk_version,
-                            challenger_spk_script: challenge.challenger_spk,
-                        };
-                        if let Err(e) = self.ai_slashed_store.set(key, slash_record) {
-                            warn!("OPoI: failed to record slash in DB: {}", e);
-                        } else {
-                            info!(
-                                "OPoI: escrow slashed, challenger_spk={} — response_hash={}",
-                                hex::encode(challenge.challenger_spk),
-                                hex::encode(challenge.response_hash)
-                            );
-                        }
-                    }
-                    Ok(_) => warn!(
-                        "OPoI: challenge outside window — response_hash={}",
-                        hex::encode(challenge.response_hash)
-                    ),
-                    Err(_) => warn!(
-                        "OPoI: challenge for unknown response — response_hash={}",
-                        hex::encode(challenge.response_hash)
-                    ),
-                }
-            }
-        }
+        // OPoI slashing removed (v1.2.3): AiChallenge txs are no longer processed. The fraud-proof
+        // slash was non-deterministic (last-writer-wins challenger_spk under a multi-challenger
+        // flood) and slashed honest AiResponses (commitment lost in the result->ipfs_cid migration),
+        // which fragmented consensus. No slash is recorded and verify_fraud_proof is never run.
+        // AiResponses are still registered above for record-keeping only (no longer consensus-read).
     }
 
     /// Calculates the accepted_id_merkle_root based on the current DAA score and the accepted tx ids
