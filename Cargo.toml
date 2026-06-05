@@ -67,7 +67,7 @@ members = [
 
 [workspace.package]
 rust-version = "1.88.0"
-version = "1.2.2"
+version = "1.2.3"
 authors = ["Keryx developers"]
 license = "ISC"
 repository = "https://github.com/Keryx-Labs/keryx-node"
