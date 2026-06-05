@@ -178,6 +178,9 @@ pub struct VirtualStateProcessor {
 
     // SALT v2 hardfork: KeryxHash domain separation switch activation score
     pub(super) pow_salt_v2_activation: ForkActivation,
+
+    // SALT v3 + difficulty-reset hardfork (chain relaunch) activation score
+    pub(super) pow_salt_v3_activation: ForkActivation,
 }
 
 impl VirtualStateProcessor {
@@ -249,6 +252,7 @@ impl VirtualStateProcessor {
             inference_reward_minimums: params.inference_reward_minimums,
 
             pow_salt_v2_activation: params.pow_salt_v2_activation,
+            pow_salt_v3_activation: params.pow_salt_v3_activation,
         }
     }
 

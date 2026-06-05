@@ -242,6 +242,14 @@ impl VirtualStateProcessor {
             );
         }
 
+        // SALT v3 + difficulty-reset hardfork (chain relaunch): log once at activation.
+        if header.daa_score == self.pow_salt_v3_activation.daa_score() {
+            info!(
+                "=== SALT v3 HARDFORK ACTIVATED at DAA {} — KeryxHash salt switched to v3 and difficulty reset to genesis; chain relaunched, older binaries now rejected ===",
+                header.daa_score
+            );
+        }
+
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() {

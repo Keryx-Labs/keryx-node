@@ -16,12 +16,24 @@ use std::{
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering as AtomicOrdering},
+        atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering},
     },
 };
 
 use super::ghostdag::ordering::SortableBlock;
 use itertools::Itertools;
+
+/// DAA score at which the difficulty window is reset (chain relaunch). At/after this
+/// score the difficulty calculation ignores pre-activation blocks, so difficulty drops
+/// back to `genesis_bits` and re-adjusts to the post-relaunch hashrate instead of
+/// inheriting the pre-fork target. `u64::MAX` means "never" (default until initialised).
+/// Set once at startup from `Params::pow_salt_v3_activation` (same DAA as the salt switch).
+static DIFF_RESET_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at node startup with the value from `Params::pow_salt_v3_activation`.
+pub fn init_diff_reset_activation(daa_score: u64) {
+    DIFF_RESET_ACTIVATION_DAA.store(daa_score, AtomicOrdering::Relaxed);
+}
 
 trait DifficultyManagerExtension {
     fn headers_store(&self) -> &dyn HeaderStoreReader;
@@ -38,7 +50,7 @@ trait DifficultyManagerExtension {
             .iter()
             .map(|item| {
                 let data = self.headers_store().get_compact_header_data(item.0.hash).unwrap();
-                DifficultyBlock { timestamp: data.timestamp, bits: data.bits, sortable_block: item.0.clone() }
+                DifficultyBlock { daa_score: data.daa_score, timestamp: data.timestamp, bits: data.bits, sortable_block: item.0.clone() }
             })
             .collect()
     }
@@ -213,11 +225,26 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         (self.internal_calc_daa_score(ghostdag_data, &mergeset_non_daa), mergeset_non_daa)
     }
 
-    pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData) -> u32 {
+    pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData, block_daa_score: u64) -> u32 {
         let mut difficulty_blocks = self.get_difficulty_blocks(window);
+
+        // Difficulty-reset hardfork: at/after the activation DAA the window drops all
+        // pre-activation blocks, so difficulty restarts from `genesis_bits` and re-adjusts
+        // to the post-relaunch hashrate instead of inheriting the pre-fork target.
+        let reset_daa = DIFF_RESET_ACTIVATION_DAA.load(AtomicOrdering::Relaxed);
+        let in_reset = block_daa_score >= reset_daa;
+        if in_reset {
+            difficulty_blocks.retain(|b| b.daa_score >= reset_daa);
+        }
 
         // Until there are enough blocks for a valid calculation the difficulty should remain constant.
         if difficulty_blocks.len() < self.min_difficulty_window_size {
+            // Right after the reset there are not yet enough post-activation blocks: fall back
+            // to genesis difficulty (NOT the selected parent's bits) to actually drop the
+            // inherited high target at the fork boundary.
+            if in_reset {
+                return self.genesis_bits;
+            }
             let selected_parent = ghostdag_data.selected_parent;
             if selected_parent == self.genesis_hash {
                 return self.genesis_bits;
@@ -282,6 +309,7 @@ pub fn level_work(level: u8, max_block_level: u8) -> BlueWorkType {
 
 #[derive(Eq)]
 struct DifficultyBlock {
+    daa_score: u64,
     timestamp: u64,
     bits: u32,
     sortable_block: SortableBlock,

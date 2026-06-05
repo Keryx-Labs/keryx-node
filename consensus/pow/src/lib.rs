@@ -19,15 +19,33 @@ use keryx_math::Uint256;
 /// Set once at node/miner startup via [`init_pow_salt_v2_activation`].
 static POW_SALT_V2_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// DAA score at which the PoW SALT switches from v2 to v3.
+/// u64::MAX means "never" (default). Set once at startup via [`init_pow_salt_v3_activation`].
+static POW_SALT_V3_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Called once at startup with the value from `Params::pow_salt_v2_activation`.
 /// After this point every PoW computation automatically picks the correct salt.
 pub fn init_pow_salt_v2_activation(daa_score: u64) {
     POW_SALT_V2_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
 }
 
+/// Called once at startup with the value from `Params::pow_salt_v3_activation`.
+pub fn init_pow_salt_v3_activation(daa_score: u64) {
+    POW_SALT_V3_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Returns the active matrix-salt version (1, 2 or 3) for a block at `daa_score`.
+/// Thresholds are monotonic and compared with `>=`, so the first block whose
+/// `daa_score` reaches an activation already uses the new salt.
 #[inline(always)]
-pub(crate) fn use_v2_salt(daa_score: u64) -> bool {
-    daa_score >= POW_SALT_V2_ACTIVATION_DAA.load(Ordering::Relaxed)
+pub(crate) fn active_salt_version(daa_score: u64) -> u8 {
+    if daa_score >= POW_SALT_V3_ACTIVATION_DAA.load(Ordering::Relaxed) {
+        3
+    } else if daa_score >= POW_SALT_V2_ACTIVATION_DAA.load(Ordering::Relaxed) {
+        2
+    } else {
+        1
+    }
 }
 
 /// State is an intermediate data structure with pre-computed values to speed up mining.
@@ -46,7 +64,7 @@ impl State {
         let pre_pow_hash = hashing::header::hash_override_nonce_time(header, 0, 0);
         // PRE_POW_HASH || TIME || 32 zero byte padding || NONCE
         let hasher = PowHash::new(pre_pow_hash, header.timestamp);
-        let matrix = Matrix::generate(pre_pow_hash, use_v2_salt(header.daa_score));
+        let matrix = Matrix::generate(pre_pow_hash, active_salt_version(header.daa_score));
 
         Self { matrix, target, hasher }
     }

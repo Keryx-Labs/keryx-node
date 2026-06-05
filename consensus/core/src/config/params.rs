@@ -381,6 +381,14 @@ pub struct Params {
     /// will fail PoW validation — this is the forced-update mechanism.
     /// Set to `ForkActivation::never()` to disable (default for mainnet until announced).
     pub pow_salt_v2_activation: ForkActivation,
+
+    /// PoW SALT v3 hardfork activation DAA score (chain relaunch).
+    /// At this score `KERYX_MATRIX_SALT_V3` replaces v2 AND the difficulty window is
+    /// reset to `genesis_bits` (see `difficulty::init_diff_reset_activation`), so the
+    /// relaunched chain isolates from older binaries and restarts difficulty from a low
+    /// target instead of inheriting the pre-fork value.
+    /// Set to `ForkActivation::never()` to disable.
+    pub pow_salt_v3_activation: ForkActivation,
 }
 
 impl Params {
@@ -559,6 +567,8 @@ impl Params {
                 .unwrap_or(self.inference_reward_minimums),
 
             pow_salt_v2_activation: self.pow_salt_v2_activation,
+
+            pow_salt_v3_activation: self.pow_salt_v3_activation,
         }
     }
 }
@@ -653,6 +663,12 @@ pub const MAINNET_PARAMS: Params = Params {
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
     pow_salt_v2_activation: ForkActivation::new(17_275_000),
+
+    // PoW SALT v3 + difficulty reset: chain relaunch, gated at the frozen tip's virtual DAA.
+    // virtual_daa_score read from the relaunch snapshot = 21_932_751. With `>=`, all pre-relaunch
+    // blocks (daa < this) keep their v1/v2 salt and inherited difficulty, while the first mined
+    // block (daa = this) switches to v3 salt and resets difficulty to genesis_bits.
+    pow_salt_v3_activation: ForkActivation::new(21_932_751),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -703,6 +719,7 @@ pub const TESTNET_PARAMS: Params = Params {
 
     // PoW SALT v2: testnet activation at DAA 6_000.
     pow_salt_v2_activation: ForkActivation::new(6_000),
+    pow_salt_v3_activation: ForkActivation::never(),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -747,6 +764,7 @@ pub const SIMNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
+    pow_salt_v3_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -789,4 +807,5 @@ pub const DEVNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
+    pow_salt_v3_activation: ForkActivation::never(),
 };

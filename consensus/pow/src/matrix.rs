@@ -17,6 +17,11 @@ const KERYX_MATRIX_SALT_V1: [u8; 32] = *b"KERYX:KeryxHash-v1:2026-04-12:xx";
 /// be rejected by any node running v2 — this is the forced-update mechanism.
 const KERYX_MATRIX_SALT_V2: [u8; 32] = *b"KERYX:KeryxHash-v2:2026-05-29:xx";
 
+/// Salt for PoW algorithm v3, activated via `pow_salt_v3_activation` in network params.
+/// Same forced-update mechanism as v2: after activation, only v3-salt blocks are valid,
+/// isolating the relaunched chain from any node/miner still running an older salt.
+const KERYX_MATRIX_SALT_V3: [u8; 32] = *b"KERYX:KeryxHash-v3:2026-06-05:xx";
+
 /// Rotation amounts for the `wave_mix` ARX (Add-Rotate-XOR) rounds.
 /// Values are coprime to 64 so no degenerate fixed-point cycles exist.
 const WAVE_MIX_ROTATIONS: [u32; 4] = [17, 31, 47, 13];
@@ -59,12 +64,17 @@ impl Matrix {
     // }
 
     #[inline(always)]
-    pub fn generate(hash: Hash, use_v2_salt: bool) -> Self {
+    pub fn generate(hash: Hash, salt_version: u8) -> Self {
         // XOR the block-hash-derived seed with the active Keryx domain salt before
-        // feeding it to the PRNG.  After pow_salt_v2_activation, the v2 salt is used;
-        // any miner still running v1 will derive a different matrix and its blocks will
-        // fail PoW validation — this is the hard-fork forced-update mechanism.
-        let salt = if use_v2_salt { &KERYX_MATRIX_SALT_V2 } else { &KERYX_MATRIX_SALT_V1 };
+        // feeding it to the PRNG.  The salt version (1/2/3) is selected by DAA score
+        // via `active_salt_version`; any miner still running an older salt will derive a
+        // different matrix and its blocks will fail PoW validation — this is the
+        // hard-fork forced-update mechanism.
+        let salt: &[u8; 32] = match salt_version {
+            1 => &KERYX_MATRIX_SALT_V1,
+            2 => &KERYX_MATRIX_SALT_V2,
+            _ => &KERYX_MATRIX_SALT_V3,
+        };
         let salted = {
             let mut bytes = hash.as_bytes();
             bytes.iter_mut().zip(salt.iter()).for_each(|(b, s)| *b ^= s);
@@ -269,7 +279,7 @@ mod tests {
             178, 101, 253, 94, 61, 63, 163, 211, 32, 243, 219, 71, 156, 142, 30, 187, 110, 120, 204, 88, 234, 105, 27, 70, 148, 93,
             226, 28, 116, 230, 27, 246,
         ]);
-        let test_matrix = Matrix::generate(Hash::from_bytes([42; 32]), false);
+        let test_matrix = Matrix::generate(Hash::from_bytes([42; 32]), 1);
         let hash = Hash::from_bytes([
             82, 46, 212, 218, 28, 192, 143, 92, 213, 66, 86, 63, 245, 241, 155, 189, 73, 159, 229, 180, 202, 105, 159, 166, 109, 172,
             128, 136, 169, 195, 97, 41,
@@ -349,7 +359,7 @@ mod tests {
             [15, 8, 8, 15, 10, 0, 2, 15, 10, 8, 13, 9, 0, 13, 0, 6, 2, 7, 11, 1, 13, 15, 7, 9, 5, 7, 7, 12, 0, 10, 14, 11, 3, 5, 13, 15, 11, 0, 12, 4, 7, 1, 10, 8, 10, 11, 0, 5, 3, 0, 7, 11, 8, 14, 9, 4, 2, 3, 0, 7, 14, 10, 5, 12]
         ]);
         let hash = Hash::from_bytes([42; 32]);
-        let matrix = Matrix::generate(hash, false);
+        let matrix = Matrix::generate(hash, 1);
         assert_eq!(matrix, expected_matrix);
     }
 
@@ -386,7 +396,7 @@ mod tests {
         let seed = Hash::from_bytes([42; 32]);
 
         // Matrix generated with the Keryx salt (current behaviour).
-        let keryx_matrix = Matrix::generate(seed, false);
+        let keryx_matrix = Matrix::generate(seed, 1);
 
         // Matrix that Kaspa would generate from the same seed (no salt).
         let mut kaspa_gen = XoShiRo256PlusPlus::new(seed);
@@ -421,7 +431,7 @@ mod tests {
         let hash = Hash::from_bytes([42; 32]);
 
         // Vector for test_generate_matrix
-        let matrix = Matrix::generate(hash, false);
+        let matrix = Matrix::generate(hash, 1);
         println!("=== New expected_matrix (Matrix::generate) ===");
         println!("{:?}", matrix);
 
