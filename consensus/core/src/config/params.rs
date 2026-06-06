@@ -383,12 +383,18 @@ pub struct Params {
     pub pow_salt_v2_activation: ForkActivation,
 
     /// PoW SALT v3 hardfork activation DAA score (chain relaunch).
-    /// At this score `KERYX_MATRIX_SALT_V3` replaces v2 AND the difficulty window is
-    /// reset to `genesis_bits` (see `difficulty::init_diff_reset_activation`), so the
-    /// relaunched chain isolates from older binaries and restarts difficulty from a low
-    /// target instead of inheriting the pre-fork value.
+    /// At this score `KERYX_MATRIX_SALT_V3` replaces v2, isolating the relaunched chain
+    /// from older binaries. Difficulty uses the stock Kaspa auto-adjustment (no reset).
     /// Set to `ForkActivation::never()` to disable.
     pub pow_salt_v3_activation: ForkActivation,
+
+    /// Difficulty re-anchor recovery hardfork activation DAA score.
+    /// At/after this score the difficulty window drops all pre-activation blocks and restarts
+    /// from `RELAUNCH_ANCHOR_BITS` (a sane value, NOT genesis), letting the chain escape the
+    /// diff-1 death spiral left by the v1.2.4 genesis reset. The sampled adjustment then
+    /// converges to the real hashrate. Gated at a FUTURE DAA so nodes upgrade in advance.
+    /// Set to `ForkActivation::never()` to disable.
+    pub diff_reanchor_activation: ForkActivation,
 }
 
 impl Params {
@@ -569,6 +575,8 @@ impl Params {
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v3_activation: self.pow_salt_v3_activation,
+
+            diff_reanchor_activation: self.diff_reanchor_activation,
         }
     }
 }
@@ -664,11 +672,16 @@ pub const MAINNET_PARAMS: Params = Params {
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
     pow_salt_v2_activation: ForkActivation::new(17_275_000),
 
-    // PoW SALT v3 + difficulty reset: chain relaunch, gated at the frozen tip's virtual DAA.
-    // virtual_daa_score read from the relaunch snapshot = 21_932_751. With `>=`, all pre-relaunch
-    // blocks (daa < this) keep their v1/v2 salt and inherited difficulty, while the first mined
-    // block (daa = this) switches to v3 salt and resets difficulty to genesis_bits.
+    // PoW SALT v3: chain relaunch, gated at the frozen tip's virtual DAA (21_932_751).
+    // With `>=`, pre-relaunch blocks keep their v1/v2 salt; the first mined block at this DAA
+    // switches to v3 salt. (Difficulty handling is the separate re-anchor gate below.)
     pow_salt_v3_activation: ForkActivation::new(21_932_751),
+
+    // Difficulty re-anchor recovery: gated at a FUTURE DAA so all nodes upgrade in advance.
+    // At this score the difficulty window restarts from RELAUNCH_ANCHOR_BITS (0x1d080000),
+    // breaking the diff-1 spiral left by the original v1.2.4 genesis reset; the sampled
+    // adjustment then tracks the real hashrate. Announce "update keryxd before this DAA".
+    diff_reanchor_activation: ForkActivation::new(22_012_500),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -720,6 +733,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoW SALT v2: testnet activation at DAA 6_000.
     pow_salt_v2_activation: ForkActivation::new(6_000),
     pow_salt_v3_activation: ForkActivation::never(),
+    diff_reanchor_activation: ForkActivation::never(),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -765,6 +779,7 @@ pub const SIMNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v3_activation: ForkActivation::never(),
+    diff_reanchor_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -808,4 +823,5 @@ pub const DEVNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v3_activation: ForkActivation::never(),
+    diff_reanchor_activation: ForkActivation::never(),
 };

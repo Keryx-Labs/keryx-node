@@ -176,9 +176,12 @@ impl Consensus {
         // Initialise the PoW SALT v2 activation threshold once, before any block processing.
         keryx_pow::init_pow_salt_v2_activation(params.pow_salt_v2_activation.daa_score());
 
-        // SALT v3 + difficulty-reset hardfork (chain relaunch): both gated at the same DAA.
+        // SALT v3 hardfork (chain relaunch).
         keryx_pow::init_pow_salt_v3_activation(params.pow_salt_v3_activation.daa_score());
-        crate::processes::difficulty::init_diff_reset_activation(params.pow_salt_v3_activation.daa_score());
+
+        // Difficulty re-anchor recovery hardfork (gated at a future DAA): breaks the diff-1
+        // death spiral left by the v1.2.4 genesis reset by restarting difficulty from a sane anchor.
+        crate::processes::difficulty::init_diff_reanchor_activation(params.diff_reanchor_activation.daa_score());
 
         //
         // Storage layer
