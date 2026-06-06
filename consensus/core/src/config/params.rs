@@ -681,7 +681,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // At this score the difficulty window restarts from RELAUNCH_ANCHOR_BITS (0x1d080000),
     // breaking the diff-1 spiral left by the original v1.2.4 genesis reset; the sampled
     // adjustment then tracks the real hashrate. Announce "update keryxd before this DAA".
-    diff_reanchor_activation: ForkActivation::new(22_012_500),
+    diff_reanchor_activation: ForkActivation::new(22_035_000),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
