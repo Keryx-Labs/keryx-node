@@ -242,10 +242,10 @@ impl VirtualStateProcessor {
             );
         }
 
-        // SALT v3 + difficulty-reset hardfork (chain relaunch): log once at activation.
-        if header.daa_score == self.pow_salt_v3_activation.daa_score() {
+        // SALT v4 hardfork (chain relaunch on stock difficulty): log once at activation.
+        if header.daa_score == self.pow_salt_v4_activation.daa_score() {
             info!(
-                "=== SALT v3 HARDFORK ACTIVATED at DAA {} — KeryxHash salt switched to v3 and difficulty reset to genesis; chain relaunched, older binaries now rejected ===",
+                "=== SALT v4 HARDFORK ACTIVATED at DAA {} — KeryxHash salt switched to v4, stock difficulty (no reset); chain relaunched off the abandoned SALT-v3 spiral, older binaries now rejected ===",
                 header.daa_score
             );
         }

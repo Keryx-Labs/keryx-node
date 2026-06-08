@@ -17,10 +17,12 @@ const KERYX_MATRIX_SALT_V1: [u8; 32] = *b"KERYX:KeryxHash-v1:2026-04-12:xx";
 /// be rejected by any node running v2 — this is the forced-update mechanism.
 const KERYX_MATRIX_SALT_V2: [u8; 32] = *b"KERYX:KeryxHash-v2:2026-05-29:xx";
 
-/// Salt for PoW algorithm v3, activated via `pow_salt_v3_activation` in network params.
-/// Same forced-update mechanism as v2: after activation, only v3-salt blocks are valid,
-/// isolating the relaunched chain from any node/miner still running an older salt.
-const KERYX_MATRIX_SALT_V3: [u8; 32] = *b"KERYX:KeryxHash-v3:2026-06-05:xx";
+/// Salt for PoW algorithm v4, activated via `pow_salt_v4_activation` in network params.
+/// Same forced-update mechanism as v2: after activation only v4-salt blocks are valid,
+/// isolating the relaunched chain (stock difficulty, no genesis reset) from the broken
+/// SALT-v3 / diff-spiral chain. v3 is intentionally skipped — it was never part of this
+/// lineage and its salt bytes are burned on the abandoned chain.
+const KERYX_MATRIX_SALT_V4: [u8; 32] = *b"KERYX:KeryxHash-v4:2026-06-07:xx";
 
 /// Rotation amounts for the `wave_mix` ARX (Add-Rotate-XOR) rounds.
 /// Values are coprime to 64 so no degenerate fixed-point cycles exist.
@@ -66,14 +68,13 @@ impl Matrix {
     #[inline(always)]
     pub fn generate(hash: Hash, salt_version: u8) -> Self {
         // XOR the block-hash-derived seed with the active Keryx domain salt before
-        // feeding it to the PRNG.  The salt version (1/2/3) is selected by DAA score
-        // via `active_salt_version`; any miner still running an older salt will derive a
-        // different matrix and its blocks will fail PoW validation — this is the
-        // hard-fork forced-update mechanism.
+        // feeding it to the PRNG.  The salt version (1/2/4) is selected by DAA score via
+        // `active_salt_version`; any miner still running an older salt derives a different
+        // matrix and its blocks fail PoW validation — the hard-fork forced-update mechanism.
         let salt: &[u8; 32] = match salt_version {
             1 => &KERYX_MATRIX_SALT_V1,
             2 => &KERYX_MATRIX_SALT_V2,
-            _ => &KERYX_MATRIX_SALT_V3,
+            _ => &KERYX_MATRIX_SALT_V4,
         };
         let salted = {
             let mut bytes = hash.as_bytes();

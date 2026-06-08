@@ -345,7 +345,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
     }
 
     fn calculate_difficulty_bits(&self, ghostdag_data: &GhostdagData, daa_window: &DaaWindow) -> u32 {
-        self.difficulty_manager.calculate_difficulty_bits(&daa_window.window, ghostdag_data, daa_window.daa_score)
+        self.difficulty_manager.calculate_difficulty_bits(&daa_window.window, ghostdag_data)
     }
 
     fn calc_past_median_time(&self, ghostdag_data: &GhostdagData) -> Result<(u64, Arc<BlockWindowHeap>), RuleError> {

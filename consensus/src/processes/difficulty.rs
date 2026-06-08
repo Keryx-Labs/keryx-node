@@ -16,31 +16,12 @@ use std::{
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicU8, Ordering as AtomicOrdering},
     },
 };
 
 use super::ghostdag::ordering::SortableBlock;
 use itertools::Itertools;
-
-/// DAA score at which the difficulty window is re-anchored (recovery hardfork). At/after
-/// this score the difficulty calculation drops all pre-activation blocks from the window
-/// and restarts from `RELAUNCH_ANCHOR_BITS`, so the chain escapes the diff-1 death spiral
-/// left by the v1.2.4 genesis reset. `u64::MAX` means "never" (default until initialised).
-/// Set once at startup from `Params::diff_reanchor_activation`.
-static DIFF_REANCHOR_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
-
-/// Difficulty bits the window restarts from at the re-anchor.
-/// ~4096x harder than genesis (0x1e7fffff): targets ~10 BPS at a few GH/s — high enough to
-/// avoid the block flood that overwhelms the single-threaded virtual processor, low enough
-/// to converge to the real hashrate within ~1-2h via the normal sampled adjustment.
-/// NOT genesis_bits: that floor is exactly what caused the diff-1 spiral.
-const RELAUNCH_ANCHOR_BITS: u32 = 0x1d080000;
-
-/// Called once at node startup with the value from `Params::diff_reanchor_activation`.
-pub fn init_diff_reanchor_activation(daa_score: u64) {
-    DIFF_REANCHOR_ACTIVATION_DAA.store(daa_score, AtomicOrdering::Relaxed);
-}
 
 trait DifficultyManagerExtension {
     fn headers_store(&self) -> &dyn HeaderStoreReader;
@@ -57,7 +38,7 @@ trait DifficultyManagerExtension {
             .iter()
             .map(|item| {
                 let data = self.headers_store().get_compact_header_data(item.0.hash).unwrap();
-                DifficultyBlock { daa_score: data.daa_score, timestamp: data.timestamp, bits: data.bits, sortable_block: item.0.clone() }
+                DifficultyBlock { timestamp: data.timestamp, bits: data.bits, sortable_block: item.0.clone() }
             })
             .collect()
     }
@@ -232,26 +213,11 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         (self.internal_calc_daa_score(ghostdag_data, &mergeset_non_daa), mergeset_non_daa)
     }
 
-    pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData, block_daa_score: u64) -> u32 {
+    pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData) -> u32 {
         let mut difficulty_blocks = self.get_difficulty_blocks(window);
-
-        // Difficulty re-anchor recovery hardfork: at/after the activation DAA the window drops
-        // all pre-activation blocks, so difficulty restarts from `RELAUNCH_ANCHOR_BITS` and
-        // re-adjusts to the real hashrate instead of staying stuck at the diff-1 floor.
-        let reanchor_daa = DIFF_REANCHOR_ACTIVATION_DAA.load(AtomicOrdering::Relaxed);
-        let in_reanchor = block_daa_score >= reanchor_daa;
-        if in_reanchor {
-            difficulty_blocks.retain(|b| b.daa_score >= reanchor_daa);
-        }
 
         // Until there are enough blocks for a valid calculation the difficulty should remain constant.
         if difficulty_blocks.len() < self.min_difficulty_window_size {
-            // Right after the re-anchor there are not yet enough post-activation blocks: fall back
-            // to the sane anchor bits (NOT the selected parent's inherited diff-1 bits) so the
-            // chain actually leaves the floor at the fork boundary.
-            if in_reanchor {
-                return RELAUNCH_ANCHOR_BITS;
-            }
             let selected_parent = ghostdag_data.selected_parent;
             if selected_parent == self.genesis_hash {
                 return self.genesis_bits;
@@ -316,7 +282,6 @@ pub fn level_work(level: u8, max_block_level: u8) -> BlueWorkType {
 
 #[derive(Eq)]
 struct DifficultyBlock {
-    daa_score: u64,
     timestamp: u64,
     bits: u32,
     sortable_block: SortableBlock,
