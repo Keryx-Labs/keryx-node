@@ -142,6 +142,15 @@ struct ChallengeState {
     issued_at_daa: u64,
     /// True once the miner submitted a valid inference result with matching nonce.
     passed: bool,
+    /// Consecutive failures (invalid results or expired-unanswered) on the current model.
+    /// A failed model is re-challenged until proven (layer-B capability gate) — the miner
+    /// cannot escape to an easier model by waiting out the interval or reconnecting.
+    fail_count: u32,
+}
+
+/// Lowercase hex of a 32-byte model id (this crate has no hex dependency).
+fn model_id_to_hex(id: &[u8; 32]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl RpcCoreService {
@@ -441,12 +450,21 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                         log::info!("OPoI challenge: connection {} passed for model {}", conn_id, state.model_id_hex);
                         state.passed = true;
                     } else {
+                        state.fail_count += 1;
                         log::warn!(
-                            "OPoI challenge: connection {} invalid result (model_match={}, nonce_match={})",
+                            "OPoI challenge: connection {} invalid result (model_match={}, nonce_match={}, failures={})",
                             conn_id,
                             model_hex == state.model_id_hex,
                             nonce_echo == state.nonce_hex,
+                            state.fail_count,
                         );
+                        if state.fail_count >= 3 {
+                            log::error!(
+                                "OPoI cap-check: connection {} cannot serve announced model {} after {} challenges — \
+                                 mining stays suspended until the capability is proven or removed from ai:cap",
+                                conn_id, state.model_id_hex, state.fail_count,
+                            );
+                        }
                     }
                 }
             }
@@ -463,8 +481,47 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
             if issue_new {
                 use rand::{Rng, RngCore};
-                let idx = rand::thread_rng().gen_range(0..declared_model_ids.len());
-                let model_id_hex = declared_model_ids[idx].clone();
+                // The most expensive declared model (by consensus min reward) is the one
+                // most worth faking — probe it first on any fresh state, so reconnecting
+                // never skips the hard proof.
+                let most_expensive = || -> String {
+                    declared_model_ids
+                        .iter()
+                        .max_by_key(|declared| {
+                            self.config
+                                .inference_reward_minimums
+                                .iter()
+                                .find(|(id, _)| model_id_to_hex(id).eq_ignore_ascii_case(declared))
+                                .map(|(_, min_reward)| *min_reward)
+                                .unwrap_or(0)
+                        })
+                        .expect("declared_model_ids is non-empty")
+                        .clone()
+                };
+                // Layer-B capability gate: pick the model to challenge.
+                let (model_id_hex, fail_count) = match states.get(&conn_id) {
+                    // Sticky re-challenge: a model that failed (or expired unanswered) must
+                    // be re-proven before mining resumes — no random escape to an easier one.
+                    Some(prev)
+                        if !prev.passed
+                            && declared_model_ids.iter().any(|m| m.eq_ignore_ascii_case(&prev.model_id_hex)) =>
+                    {
+                        let count = prev.fail_count + 1;
+                        log::warn!(
+                            "OPoI cap-check: connection {} re-challenged on unproven model {} (failures: {})",
+                            conn_id, prev.model_id_hex, count,
+                        );
+                        (prev.model_id_hex.clone(), count)
+                    }
+                    // Previous challenge passed: rotate randomly across declared models.
+                    Some(prev) if prev.passed => {
+                        let idx = rand::thread_rng().gen_range(0..declared_model_ids.len());
+                        (declared_model_ids[idx].clone(), 0)
+                    }
+                    // New connection, or the unproven model vanished from ai:cap (caps
+                    // changed mid-connection): start from the most expensive model.
+                    _ => (most_expensive(), 0),
+                };
                 let nonce_hex = format!("{:016x}", rand::thread_rng().next_u64());
                 let challenge = format!("{}:{}", model_id_hex, nonce_hex);
                 states.insert(conn_id, ChallengeState {
@@ -472,6 +529,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                     nonce_hex,
                     issued_at_daa: current_daa,
                     passed: false,
+                    fail_count,
                 });
                 challenge
             } else if let Some(state) = states.get(&conn_id) {
