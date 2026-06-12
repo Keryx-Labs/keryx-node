@@ -666,17 +666,6 @@ impl VirtualStateProcessor {
         // (and it can't be in the future by induction)
         loop {
             let candidate = heap.pop().expect("valid sink must exist").hash;
-            // Skip candidates that can never be the sink: header-only blocks (no body => no UTXO
-            // state) and blocks already disqualified from the chain. Crucially we do NOT walk into
-            // their parents — doing so would traverse an entire header-only / invalid branch (e.g. an
-            // abandoned higher-blue-work salt overhang left in the datadir after a relaunch) on every
-            // virtual resolve, an O(branch length) blow-up. The valid sink is always reachable through
-            // the body tips already present in the heap, so skipping these branches yields the
-            // identical sink and candidate set without the wasted walk.
-            let candidate_status = self.statuses_store.read().get(candidate).unwrap();
-            if candidate_status.is_header_only() || candidate_status == StatusDisqualifiedFromChain {
-                continue;
-            }
             if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
                 diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate);
                 if diff_point == candidate {
