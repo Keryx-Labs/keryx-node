@@ -181,6 +181,9 @@ pub struct VirtualStateProcessor {
 
     // SALT v4 hardfork (chain relaunch on stock difficulty) activation score
     pub(super) pow_salt_v4_activation: ForkActivation,
+
+    // OPoI v2 hardfork: response commitment + embedded model_id + 70B Q4_K_M swap
+    pub(super) opoi_v2_activation: ForkActivation,
 }
 
 impl VirtualStateProcessor {
@@ -253,6 +256,7 @@ impl VirtualStateProcessor {
 
             pow_salt_v2_activation: params.pow_salt_v2_activation,
             pow_salt_v4_activation: params.pow_salt_v4_activation,
+            opoi_v2_activation: params.opoi_v2_activation,
         }
     }
 

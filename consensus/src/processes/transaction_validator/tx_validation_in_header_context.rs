@@ -35,11 +35,42 @@ impl TransactionValidator {
                 LockTimeType::DaaScore => LockTimeArg::DaaScore(ctx_daa_score),
                 LockTimeType::Time => LockTimeArg::MedianTime(ctx_block_time),
             },
+            ctx_daa_score,
         )
     }
 
-    pub(crate) fn validate_tx_in_header_context(&self, tx: &Transaction, lock_time_arg: LockTimeArg) -> TxResult<()> {
-        self.check_tx_is_finalized(tx, lock_time_arg)
+    pub(crate) fn validate_tx_in_header_context(
+        &self,
+        tx: &Transaction,
+        lock_time_arg: LockTimeArg,
+        ctx_daa_score: u64,
+    ) -> TxResult<()> {
+        self.check_tx_is_finalized(tx, lock_time_arg)?;
+        self.check_ai_response_payload_era(tx, ctx_daa_score)
+    }
+
+    /// AiResponse payloads have an exact length per era: 78 bytes before `opoi_v2_activation`
+    /// (matches what pre-v2 binaries enforce statelessly), 142 bytes from it (model_id +
+    /// result_commitment). Runs with the containing-block DAA in consensus paths and with
+    /// the virtual DAA in mempool/template paths, so stale-format txs are evicted from
+    /// templates at the gate crossing instead of producing an invalid block.
+    fn check_ai_response_payload_era(&self, tx: &Transaction, ctx_daa_score: u64) -> TxResult<()> {
+        if !tx.is_ai_response() {
+            return Ok(());
+        }
+        let expected = if self.opoi_v2_activation.is_active(ctx_daa_score) {
+            keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN
+        } else {
+            keryx_inference::AI_RESPONSE_PAYLOAD_LEN
+        };
+        let len = tx.payload.len();
+        if len < expected {
+            return Err(TxRuleError::AiPayloadTooShort(len, expected));
+        }
+        if len > expected {
+            return Err(TxRuleError::AiPayloadTooLong(len, expected));
+        }
+        Ok(())
     }
 
     pub(crate) fn get_lock_time_type(tx: &Transaction) -> LockTimeType {

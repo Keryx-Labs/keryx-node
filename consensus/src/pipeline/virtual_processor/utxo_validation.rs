@@ -6,8 +6,8 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiResponseModelCapMissing, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment,
-            InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
+            AiResponseModelCapMissing, AiResponseModelMismatch, AiResponsePayloadMalformed, BadAcceptedIDMerkleRoot,
+            BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -250,8 +250,18 @@ impl VirtualStateProcessor {
             );
         }
 
-        // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
-        if self.model_cap_enforcement_activation.is_active(header.daa_score) {
+        // OPoI v2 hardfork: response commitment + embedded model_id (cross-block cap).
+        // Supersedes the Phase 3 same-block-only cap check below.
+        if self.opoi_v2_activation.is_active(header.daa_score) {
+            if header.daa_score == self.opoi_v2_activation.daa_score() {
+                info!(
+                    "=== OPoI V2 HARDFORK ACTIVATED at DAA {} — AiResponse commitment + cross-block model cap enforcement now live, 70B model swapped to Q4_K_M ===",
+                    header.daa_score
+                );
+            }
+            check_ai_response_v2(&txs)?;
+        } else if self.model_cap_enforcement_activation.is_active(header.daa_score) {
+            // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() {
                 info!(
                     "=== OPoI HARDFORK ACTIVATED at DAA {} — UTXO escrow + model cap enforcement now live ===",
@@ -271,8 +281,15 @@ impl VirtualStateProcessor {
         }
 
         // Enforce AiRequest inference_reward minimums and fee coverage after activation.
+        // The 70B entry differs across the OPoI v2 gate (legacy IQ3 id before, Q4_K_M after),
+        // so historical blocks revalidate against the table the network enforced at the time.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
-            check_ai_request_inference_rewards(&txs, &validated_transactions, self.inference_reward_minimums)?;
+            let minimums = if self.opoi_v2_activation.is_active(header.daa_score) {
+                self.inference_reward_minimums
+            } else {
+                keryx_consensus_core::config::params::INFERENCE_REWARD_MINIMUMS_LEGACY
+            };
+            check_ai_request_inference_rewards(&txs, &validated_transactions, minimums)?;
         }
 
         Ok(())
@@ -471,11 +488,14 @@ impl VirtualStateProcessor {
                 response_hash_bytes.copy_from_slice(&hash.as_bytes()[..32]);
                 let response_hash = Hash::from_bytes(response_hash_bytes);
 
-                // Extract request_hash and claimed_commitment for Phase 3 C fraud verification.
-                // Commitment = sha2-256 digest embedded in the IPFS multihash (bytes [2..34]).
+                // Extract request_hash and claimed_commitment (record-only, not consensus-read).
+                // V2 payloads carry a real result_commitment; v1 records fall back to the
+                // sha2-256 digest embedded in the IPFS multihash (bytes [2..34]).
                 let (request_hash, claimed_commitment) =
                     if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-                        let commitment: [u8; 32] = resp.response_ipfs_cid[2..34].try_into().unwrap();
+                        let commitment: [u8; 32] = resp
+                            .result_commitment
+                            .unwrap_or_else(|| resp.response_ipfs_cid[2..34].try_into().unwrap());
                         (resp.request_hash, commitment)
                     } else {
                         ([0u8; 32], [0u8; 32])
@@ -629,6 +649,57 @@ fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     Ok(())
 }
 
+/// OPoI v2 (from `opoi_v2_activation`) — supersedes `check_ai_response_model_caps`.
+///
+/// Every `AiResponse` tx must:
+///   1. parse as the 142-byte v2 payload (model_id + result_commitment present) — the
+///      commitment binds the off-chain IPFS content to the chain for the future challenger;
+///   2. declare a model_id present in the coinbase `ai:cap:` field — unconditional, so the
+///      cross-block escape of the Phase 3 check (request in an earlier block ⇒ no check)
+///      is closed without any store lookup (deterministic, block-local);
+///   3. when the matching AiRequest is in the same block, claim the same model_id the
+///      request asked for. Cross-block, a lying model_id is on-chain provable fraud for
+///      the v2 challenger (reveal the request payload hashing to `request_hash`).
+fn check_ai_response_v2(txs: &[Transaction]) -> BlockProcessResult<()> {
+    let declared_caps = parse_ai_caps(&txs[0].payload);
+
+    // blake2b(AiRequest_payload)[0..32] → model_id, for the same-block consistency check.
+    let mut request_model_map: std::collections::HashMap<[u8; 32], [u8; 32]> =
+        std::collections::HashMap::new();
+    for tx in txs.iter().skip(1) {
+        if tx.is_ai_request() {
+            if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+                let digest = blake2b_simd::blake2b(&tx.payload);
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&digest.as_bytes()[..32]);
+                request_model_map.insert(key, req.model_id);
+            }
+        }
+    }
+
+    for tx in txs.iter().skip(1) {
+        if !tx.is_ai_response() {
+            continue;
+        }
+        let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else {
+            return Err(AiResponsePayloadMalformed(tx.id()));
+        };
+        let (Some(model_id), Some(_commitment)) = (resp.model_id, resp.result_commitment) else {
+            // v1 (78-byte) responses are no longer acceptable past the gate.
+            return Err(AiResponsePayloadMalformed(tx.id()));
+        };
+        if !declared_caps.contains(&model_id) {
+            return Err(AiResponseModelCapMissing(tx.id(), hex::encode(model_id)));
+        }
+        if let Some(&req_model) = request_model_map.get(&resp.request_hash) {
+            if req_model != model_id {
+                return Err(AiResponseModelMismatch(tx.id(), hex::encode(model_id), hex::encode(req_model)));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use itertools::Itertools;
@@ -726,6 +797,78 @@ mod tests {
         let resp_bad = make_ai_response_for(&req_bad);
         let txs = vec![make_coinbase_with_caps(&[declared]), req_ok, req_bad, resp_ok, resp_bad];
         assert!(matches!(check_ai_response_model_caps(&txs), Err(AiResponseModelCapMissing(_, _))));
+    }
+
+    // ── check_ai_response_v2 ─────────────────────────────────────────────────
+
+    fn make_ai_response_v2_for(request_tx: &Transaction, model_id: [u8; 32]) -> Transaction {
+        let digest = blake2b_simd::blake2b(&request_tx.payload);
+        let mut request_hash = [0u8; 32];
+        request_hash.copy_from_slice(&digest.as_bytes()[..32]);
+        let resp = AiResponsePayload::new_v2(request_hash, 1000, dummy_cid(), 128, model_id, [0xCCu8; 32]);
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
+    }
+
+    fn make_ai_response_v2_orphan(request_hash: [u8; 32], model_id: [u8; 32]) -> Transaction {
+        let resp = AiResponsePayload::new_v2(request_hash, 1000, dummy_cid(), 128, model_id, [0xCCu8; 32]);
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
+    }
+
+    #[test]
+    fn v2_accepts_declared_model_same_block() {
+        let model = [1u8; 32];
+        let req = make_ai_request(model);
+        let resp = make_ai_response_v2_for(&req, model);
+        let txs = vec![make_coinbase_with_caps(&[model]), req, resp];
+        assert!(check_ai_response_v2(&txs).is_ok());
+    }
+
+    #[test]
+    fn v2_rejects_v1_payload_past_gate() {
+        let model = [1u8; 32];
+        let req = make_ai_request(model);
+        let resp_v1 = make_ai_response_for(&req);
+        let txs = vec![make_coinbase_with_caps(&[model]), req, resp_v1];
+        assert!(matches!(check_ai_response_v2(&txs), Err(AiResponsePayloadMalformed(_))));
+    }
+
+    #[test]
+    fn v2_rejects_undeclared_model_cross_block() {
+        // Request lives in an earlier block (orphan response here) — Phase 3 skipped
+        // this case entirely; v2 must still reject an undeclared model_id.
+        let declared = [1u8; 32];
+        let undeclared = [2u8; 32];
+        let resp = make_ai_response_v2_orphan([0xABu8; 32], undeclared);
+        let txs = vec![make_coinbase_with_caps(&[declared]), resp];
+        assert!(matches!(check_ai_response_v2(&txs), Err(AiResponseModelCapMissing(_, _))));
+    }
+
+    #[test]
+    fn v2_accepts_declared_model_cross_block() {
+        let declared = [1u8; 32];
+        let resp = make_ai_response_v2_orphan([0xABu8; 32], declared);
+        let txs = vec![make_coinbase_with_caps(&[declared]), resp];
+        assert!(check_ai_response_v2(&txs).is_ok());
+    }
+
+    #[test]
+    fn v2_rejects_model_mismatch_same_block() {
+        // Miner declares both models, request asks for A, response claims B → mismatch.
+        let model_a = [1u8; 32];
+        let model_b = [2u8; 32];
+        let req = make_ai_request(model_a);
+        let resp = make_ai_response_v2_for(&req, model_b);
+        let txs = vec![make_coinbase_with_caps(&[model_a, model_b]), req, resp];
+        assert!(matches!(check_ai_response_v2(&txs), Err(AiResponseModelMismatch(_, _, _))));
+    }
+
+    #[test]
+    fn v2_rejects_response_when_no_caps_declared() {
+        // A non-upgraded miner (no ai:cap field) cannot carry AiResponse txs past the gate.
+        let model = [1u8; 32];
+        let resp = make_ai_response_v2_orphan([0xABu8; 32], model);
+        let txs = vec![make_coinbase_no_caps(), resp];
+        assert!(matches!(check_ai_response_v2(&txs), Err(AiResponseModelCapMissing(_, _))));
     }
 
     #[test]

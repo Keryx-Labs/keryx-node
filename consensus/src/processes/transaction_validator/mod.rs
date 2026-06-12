@@ -23,6 +23,10 @@ pub struct TransactionValidator {
     sig_cache: Cache<SigCacheKey, bool>,
 
     pub(crate) mass_calculator: MassCalculator,
+
+    /// OPoI v2 gate — AiResponse payloads must be exactly 78 bytes before it and
+    /// exactly 142 bytes (model_id + result_commitment) from it.
+    opoi_v2_activation: keryx_consensus_core::config::params::ForkActivation,
 }
 
 impl TransactionValidator {
@@ -36,6 +40,7 @@ impl TransactionValidator {
         ghostdag_k: KType,
         counters: Arc<TxScriptCacheCounters>,
         mass_calculator: MassCalculator,
+        opoi_v2_activation: keryx_consensus_core::config::params::ForkActivation,
     ) -> Self {
         Self {
             max_tx_inputs,
@@ -47,6 +52,7 @@ impl TransactionValidator {
             ghostdag_k,
             sig_cache: Cache::with_counters(10_000, counters),
             mass_calculator,
+            opoi_v2_activation,
         }
     }
 
@@ -70,6 +76,8 @@ impl TransactionValidator {
             ghostdag_k,
             sig_cache: Cache::with_counters(10_000, counters),
             mass_calculator: MassCalculator::new(0, 0, 0, 0),
+            // Tests target pre-v2 behaviour unless they construct a full validator.
+            opoi_v2_activation: keryx_consensus_core::config::params::ForkActivation::never(),
         }
     }
 }

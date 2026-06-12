@@ -147,6 +147,12 @@ pub enum RuleError {
     #[error("AiResponse tx {0} references model_id {1} not declared in coinbase ai:cap:")]
     AiResponseModelCapMissing(TransactionId, String),
 
+    #[error("AiResponse tx {0} payload is not in the OPoI v2 format (142 bytes with model_id + result_commitment)")]
+    AiResponsePayloadMalformed(TransactionId),
+
+    #[error("AiResponse tx {0} declares model_id {1} but the matching AiRequest in this block asked for model_id {2}")]
+    AiResponseModelMismatch(TransactionId, String, String),
+
     #[error("AiRequest tx {0} inference_reward {1} sompi is below minimum {2} sompi for model {3}")]
     AiRequestInferenceRewardBelowMinimum(TransactionId, u64, u64, String),
 
