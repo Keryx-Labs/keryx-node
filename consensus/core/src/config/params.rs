@@ -40,12 +40,42 @@ pub const LLAMA_3_3_70B_MODEL_ID: [u8; 32] = [
     0x29, 0x35, 0xb0, 0xb3, 0x43, 0xae, 0xb3, 0x3e,
 ];
 
-/// Per-model minimum inference_reward in sompi.
+/// LLaMA-3.3-70B — legacy IQ3 weights id, recognised only BEFORE `opoi_v2_activation`.
+/// Kept so pre-hardfork blocks revalidate identically (the deployed network enforces
+/// the IQ3 id); the Q4_K_M id above takes over at the gate.
+pub const LLAMA_3_3_70B_MODEL_ID_LEGACY: [u8; 32] = [
+    0xaa, 0xd2, 0xcf, 0x33, 0x48, 0xd8, 0xc7, 0xfd,
+    0xbd, 0x2c, 0x0d, 0xd5, 0x8e, 0x0d, 0x99, 0x36,
+    0x84, 0x50, 0xd4, 0x3c, 0x95, 0x84, 0xae, 0xf8,
+    0x1a, 0x46, 0x7d, 0xd3, 0x47, 0x56, 0x13, 0x44,
+];
+
+/// Qwen3-32B — Q6_K, CIDv0[2..34] of model.gguf. Must match keryx-miner models.rs QWEN3_32B.
+/// Recognised only from `opoi_v2_activation` (5090 tier model added at the hardfork).
+pub const QWEN3_32B_MODEL_ID: [u8; 32] = [
+    0xf0, 0x7e, 0x57, 0xb1, 0x1e, 0xd6, 0xcc, 0xe5,
+    0x63, 0x31, 0xae, 0xff, 0x60, 0xcf, 0xdb, 0x36,
+    0x24, 0xbd, 0x97, 0xe7, 0x03, 0x78, 0x8c, 0xba,
+    0x02, 0xce, 0x00, 0xfa, 0xe7, 0x9a, 0xb0, 0x43,
+];
+
+/// Per-model minimum inference_reward in sompi (from `opoi_v2_activation`: Q4_K_M 70B id,
+/// Qwen3-32B added, 70B floor raised to 5.0 KRX).
 pub const INFERENCE_REWARD_MINIMUMS: &[([u8; 32], u64)] = &[
     (TINYLLAMA_MODEL_ID,         50_000_000),   // 0.5 KRX
     (DEEPSEEK_R1_8B_MODEL_ID,   150_000_000),   // 1.5 KRX
     (DEEPSEEK_R1_32B_MODEL_ID,  250_000_000),   // 2.5 KRX
-    (LLAMA_3_3_70B_MODEL_ID,   400_000_000),   // 4.0 KRX
+    (QWEN3_32B_MODEL_ID,        350_000_000),   // 3.5 KRX
+    (LLAMA_3_3_70B_MODEL_ID,    500_000_000),   // 5.0 KRX
+];
+
+/// Pre-`opoi_v2_activation` table — identical except the 70B entry uses the legacy IQ3 id.
+/// Matches what the network enforced before the hardfork, so historical blocks revalidate.
+pub const INFERENCE_REWARD_MINIMUMS_LEGACY: &[([u8; 32], u64)] = &[
+    (TINYLLAMA_MODEL_ID,              50_000_000),   // 0.5 KRX
+    (DEEPSEEK_R1_8B_MODEL_ID,        150_000_000),   // 1.5 KRX
+    (DEEPSEEK_R1_32B_MODEL_ID,       250_000_000),   // 2.5 KRX
+    (LLAMA_3_3_70B_MODEL_ID_LEGACY, 400_000_000),   // 4.0 KRX
 ];
 use crate::{
     BlockLevel, KType,
@@ -388,6 +418,14 @@ pub struct Params {
     /// This forks cleanly away from the abandoned SALT-v3 / diff-spiral chain while keeping
     /// stock difficulty (no genesis reset). Same forced-update mechanism as v2.
     pub pow_salt_v4_activation: ForkActivation,
+
+    /// OPoI v2 hardfork activation DAA score. From this score:
+    /// - AiResponse payloads must be in the 142-byte v2 format (model_id + result_commitment),
+    ///   making every response bindable to its off-chain content (future challenger v2);
+    /// - the model cap check uses the embedded model_id (cross-block enforcement, no store reads);
+    /// - the 70B model_id switches from the legacy IQ3 weights to the Q4_K_M re-quantization.
+    /// Slashing/challenge processing stays disabled — this gate only lays the v2 foundations.
+    pub opoi_v2_activation: ForkActivation,
 }
 
 impl Params {
@@ -568,6 +606,8 @@ impl Params {
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
+
+            opoi_v2_activation: self.opoi_v2_activation,
         }
     }
 }
@@ -667,6 +707,9 @@ pub const MAINNET_PARAMS: Params = Params {
     // forking cleanly away from the abandoned SALT-v3 / diff-1-spiral chain. Same DAA as the
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
+
+    // TODO(hardfork): set to a concrete DAA (~5-7 days ahead) just before the v1.3.0 release.
+    opoi_v2_activation: ForkActivation::never(),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -720,6 +763,7 @@ pub const TESTNET_PARAMS: Params = Params {
 
     // PoW SALT v4: not needed on testnet (mainnet-only chain relaunch).
     pow_salt_v4_activation: ForkActivation::never(),
+    opoi_v2_activation: ForkActivation::never(),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -765,6 +809,7 @@ pub const SIMNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    opoi_v2_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -808,4 +853,5 @@ pub const DEVNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    opoi_v2_activation: ForkActivation::never(),
 };
