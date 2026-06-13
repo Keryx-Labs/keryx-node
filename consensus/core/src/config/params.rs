@@ -59,6 +59,18 @@ pub const QWEN3_32B_MODEL_ID: [u8; 32] = [
     0x02, 0xce, 0x00, 0xfa, 0xe7, 0x9a, 0xb0, 0x43,
 ];
 
+/// Qwen3-235B-A22B — Q4_K_M, CIDv0[2..34] of model.gguf. Must match keryx-miner
+/// models.rs QWEN3_235B. Recognised only from `opoi_v2_activation` (--very-ultra
+/// multi-GPU tier added at the hardfork).
+/// TODO(release): replace this all-zero PLACEHOLDER with the real weight CID's
+/// CIDv0[2..34] once the Q4_K_M gguf is pinned to IPFS (must equal the miner's).
+pub const QWEN3_235B_MODEL_ID: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 /// Per-model minimum inference_reward in sompi (from `opoi_v2_activation`: Q4_K_M 70B id,
 /// Qwen3-32B added, 70B floor raised to 5.0 KRX).
 pub const INFERENCE_REWARD_MINIMUMS: &[([u8; 32], u64)] = &[
@@ -67,6 +79,7 @@ pub const INFERENCE_REWARD_MINIMUMS: &[([u8; 32], u64)] = &[
     (DEEPSEEK_R1_32B_MODEL_ID,  250_000_000),   // 2.5 KRX
     (QWEN3_32B_MODEL_ID,        350_000_000),   // 3.5 KRX
     (LLAMA_3_3_70B_MODEL_ID,    500_000_000),   // 5.0 KRX
+    (QWEN3_235B_MODEL_ID,       700_000_000),   // 7.0 KRX — flagship multi-GPU tier
 ];
 
 /// Pre-`opoi_v2_activation` table — identical except the 70B entry uses the legacy IQ3 id.
