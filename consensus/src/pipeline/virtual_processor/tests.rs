@@ -364,6 +364,87 @@ async fn opoi_response_registered_on_chain() {
     tc.shutdown(handles);
 }
 
+// ── OPoI synthetic-liveness E2E (Level-1, option C) ───────────────────────────
+
+/// Coinbase miner_data carrying `/escrow:<pk>`, the declared `/ai:cap:<model>`, and
+/// optionally a `/live:<H>` reference.
+fn liveness_miner_data(pk: &[u8; 32], model: [u8; 32], live: Option<Hash>) -> keryx_consensus_core::coinbase::MinerData {
+    use keryx_consensus_core::tx::ScriptPublicKey;
+    let mut extra = format!("test/escrow:{}/ai:cap:{}", hex::encode(pk), hex::encode(model));
+    if let Some(h) = live {
+        extra.push_str(&format!("/live:{}", hex::encode(h.as_bytes())));
+    }
+    keryx_consensus_core::coinbase::MinerData::new(ScriptPublicKey::from_vec(0, vec![]), extra.into_bytes())
+}
+
+/// A payload-only v2 AiResponse answering the synthetic task for `(epoch, pk, model)`.
+fn synthetic_answer_tx(epoch: u64, pk: &[u8; 32], model: [u8; 32]) -> Transaction {
+    use keryx_inference::synthetic::{derive_synthetic_request, synthetic_seed};
+    let seed = synthetic_seed(epoch, pk);
+    let req = derive_synthetic_request(&seed, &[model], epoch).unwrap();
+    let mut request_hash = [0u8; 32];
+    request_hash.copy_from_slice(&blake2b_simd::blake2b(&req.serialize()).as_bytes()[..32]);
+    let mut cid = [0u8; 34];
+    cid[0] = 0x12;
+    cid[1] = 0x20;
+    let resp = AiResponsePayload::new_v2(request_hash, 0, cid, 16, model, [0u8; 32]);
+    Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
+}
+
+/// With the gate active: a self-contained synthetic answer and a `/live:` ancestor
+/// reference both keep a block on the chain, while a block proving neither is
+/// disqualified — "no inference = no mining", now enforced at consensus.
+#[tokio::test]
+async fn synthetic_liveness_enforcement_e2e() {
+    use keryx_consensus_core::config::params::ForkActivation;
+    let mut params = MAINNET_PARAMS;
+    params.synthetic_liveness_activation = ForkActivation::always();
+    params.opoi_v2_activation = ForkActivation::always(); // allow 142-byte v2 AiResponse payloads
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let genesis = config.genesis.hash;
+    let pk = [0x11u8; 32];
+    let model = [0x22u8; 32];
+
+    // (a) self-contained answer for epoch 0 → stays on the chain.
+    let a: Hash = 1u64.into();
+    tc.validate_and_insert_block(
+        tc.build_utxo_valid_block_with_parents(a, vec![genesis], liveness_miner_data(&pk, model, None), vec![synthetic_answer_tx(0, &pk, model)])
+            .to_immutable(),
+    )
+    .virtual_state_task
+    .await
+    .unwrap();
+    assert_eq!(tc.get_block_status(a), Some(BlockStatus::StatusUTXOValid), "self-contained answer must be accepted");
+
+    // (b) no answer, but /live:<A> referencing the annotated ancestor → accepted.
+    let b: Hash = 2u64.into();
+    tc.validate_and_insert_block(
+        tc.build_utxo_valid_block_with_parents(b, vec![a], liveness_miner_data(&pk, model, Some(a)), vec![]).to_immutable(),
+    )
+    .virtual_state_task
+    .await
+    .unwrap();
+    assert_eq!(tc.get_block_status(b), Some(BlockStatus::StatusUTXOValid), "/live: ancestor reference must be accepted");
+
+    // (c) no answer and no /live: → disqualified from the virtual chain.
+    let c: Hash = 3u64.into();
+    tc.validate_and_insert_block(
+        tc.build_utxo_valid_block_with_parents(c, vec![a], liveness_miner_data(&pk, model, None), vec![]).to_immutable(),
+    )
+    .virtual_state_task
+    .await
+    .unwrap();
+    assert_eq!(
+        tc.get_block_status(c),
+        Some(BlockStatus::StatusDisqualifiedFromChain),
+        "a block proving no synthetic liveness must be disqualified"
+    );
+
+    tc.shutdown(handles);
+}
+
 // OPoI slashing removed (v1.2.3): the slash-behavior tests (fraud→slash, honest→no-slash,
 // unknown→no-slash, outside-window→no-slash) were dropped together with the slashing mechanism.
 // Escrows are now always spendable; there is no slash state to assert.
