@@ -445,6 +445,63 @@ async fn synthetic_liveness_enforcement_e2e() {
     tc.shutdown(handles);
 }
 
+// ── OPoI tier-reward E2E (miner-cut scaling by declared model tier) ───────────
+
+/// With the gate active, only the *miner's* cut of a merged block's subsidy is
+/// scaled by the highest model tier it declared in `ai:cap`; escrow, R&D and the
+/// total block reward are untouched, the shortfall being burned. A block merging
+/// a floor-tier (TinyLlama) ancestor pays its miner only 85% of the 75% cut vs a
+/// top-tier (Qwen3-235B) ancestor, yet both coinbases pay out the same total.
+#[tokio::test]
+async fn tier_reward_scales_miner_cut_e2e() {
+    use keryx_consensus_core::config::params::{
+        ForkActivation, QWEN3_235B_MODEL_ID, TINYLLAMA_MODEL_ID, TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR,
+    };
+    use keryx_consensus_core::tx::ScriptPublicKey;
+
+    // Inserts A declaring `model` in ai:cap, then builds child B and returns
+    // (total coinbase payout, the part going to A's miner SPK).
+    async fn payout_for_tier(model: [u8; 32]) -> (u64, u64) {
+        let mut params = MAINNET_PARAMS;
+        params.tier_reward_activation = ForkActivation::always();
+        params.opoi_v2_activation = ForkActivation::always(); // ai:cap context, no AiResponse needed
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let handles = tc.init();
+        let genesis = config.genesis.hash;
+        let pk = [0x11u8; 32];
+
+        let a: Hash = 1u64.into();
+        let status = tc
+            .validate_and_insert_block(
+                tc.build_utxo_valid_block_with_parents(a, vec![genesis], liveness_miner_data(&pk, model, None), vec![])
+                    .to_immutable(),
+            )
+            .virtual_state_task
+            .await
+            .unwrap();
+        assert_eq!(status, BlockStatus::StatusUTXOValid, "merged block A must be UTXO-valid");
+
+        let b = tc.build_utxo_valid_block_with_parents(2u64.into(), vec![a], liveness_miner_data(&pk, model, None), vec![]);
+        let miner_spk = ScriptPublicKey::from_vec(0, vec![]); // liveness_miner_data uses an empty SPK
+        let outs = &b.transactions[0].outputs;
+        let total: u64 = outs.iter().map(|o| o.value).sum();
+        let miner: u64 = outs.iter().filter(|o| o.script_public_key == miner_spk).map(|o| o.value).sum();
+        tc.shutdown(handles);
+        (total, miner)
+    }
+
+    let (total_top, miner_top) = payout_for_tier(QWEN3_235B_MODEL_ID).await; // rank 5 → 100%
+    let (total_floor, miner_floor) = payout_for_tier(TINYLLAMA_MODEL_ID).await; // rank 0 → 85%
+
+    assert!(miner_top > 0, "top-tier block must still pay its miner");
+    // Total block reward is identical across tiers — only the split changes (delta burned).
+    assert_eq!(total_top, total_floor, "tier penalty must not change the total block reward");
+    // Top tier is the 100% reference, so the floor miner gets exactly 85% of the top miner's cut.
+    assert_eq!(miner_floor, miner_top * TIER_REWARD_BPS[0] / TIER_REWARD_BPS_DIVISOR, "floor miner must get 85% of the cut");
+    assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
+}
+
 // OPoI slashing removed (v1.2.3): the slash-behavior tests (fraud→slash, honest→no-slash,
 // unknown→no-slash, outside-window→no-slash) were dropped together with the slashing mechanism.
 // Escrows are now always spendable; there is no slash state to assert.

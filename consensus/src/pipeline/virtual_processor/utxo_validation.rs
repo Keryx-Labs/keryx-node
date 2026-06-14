@@ -47,9 +47,7 @@ use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_inference::synthetic::{derive_synthetic_request, synthetic_seed, SYNTHETIC_EPOCH_BLOCKS};
 use keryx_consensus_core::config::params::SYNTHETIC_LIVENESS_GRACE_EPOCHS;
-use keryx_consensus_core::config::params::{
-    LLAMA_3_3_70B_MODEL_ID_LEGACY, TIER_MODEL_IDS, TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR,
-};
+use keryx_consensus_core::config::params::{LLAMA_3_3_70B_MODEL_ID_LEGACY, TIER_MODEL_IDS, TIER_REWARD_BPS};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
@@ -181,19 +179,10 @@ impl VirtualStateProcessor {
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
             let escrow_spk =
                 self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data);
-            // Tier-reward: from `tier_reward_activation`, the paid subsidy is scaled by the
-            // highest model tier the block declares (delta unminted). Both the coinbase template
-            // builder and the validator consume this same `mergeset_rewards`, so they agree
-            // deterministically; before the gate the full schedule subsidy is paid.
-            let paid_subsidy = if self.tier_reward_activation.is_active(pov_daa_score) {
-                coinbase_data.subsidy * tier_reward_bps(&txs[0].payload) / TIER_REWARD_BPS_DIVISOR
-            } else {
-                coinbase_data.subsidy
-            };
             ctx.mergeset_rewards.insert(
                 merged_block,
                 BlockRewardData::new_with_escrow(
-                    paid_subsidy,
+                    coinbase_data.subsidy,
                     block_fee,
                     coinbase_data.miner_data.script_public_key,
                     escrow_spk,
@@ -344,12 +333,42 @@ impl VirtualStateProcessor {
     ) -> BlockProcessResult<()> {
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
+        let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
         let expected_coinbase = self
             .coinbase_manager
-            .expected_coinbase_transaction(daa_score, miner_data, ghostdag_data, mergeset_rewards, mergeset_non_daa)
+            .expected_coinbase_transaction(
+                daa_score,
+                miner_data,
+                ghostdag_data,
+                mergeset_rewards,
+                mergeset_non_daa,
+                &tier_bps_by_block,
+            )
             .unwrap()
             .tx;
         if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) { Err(BadCoinbaseTransaction) } else { Ok(()) }
+    }
+
+    /// Tier-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue,
+    /// the subsidy multiplier (bps) of the highest model tier it declares in `ai:cap`. Both
+    /// the validator and the template builder derive it the same way from immutable block
+    /// bodies, so the coinbase they produce agrees deterministically. Returns an empty map
+    /// before `tier_reward_activation` (⇒ every cut paid in full, no penalty, no burn).
+    pub(super) fn tier_bps_by_block(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        pov_daa_score: u64,
+    ) -> BlockHashMap<u64> {
+        let mut map = BlockHashMap::new();
+        if !self.tier_reward_activation.is_active(pov_daa_score) {
+            return map;
+        }
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            let txs = self.block_transactions_store.get(*blue).unwrap();
+            map.insert(*blue, tier_reward_bps(&txs[0].payload));
+        }
+        map
     }
 
     fn check_ai_response_model_caps(&self, txs: &[Transaction]) -> BlockProcessResult<()> {
@@ -948,7 +967,11 @@ mod tests {
         // No ai:cap field at all, and a declared-but-unrecognised id, both floor.
         assert_eq!(tier_reward_bps(b"HDR_padding_19+++++++/no/caps/here"), TIER_REWARD_BPS[0]);
         assert_eq!(tier_reward_bps(&caps_payload(&[[0xEEu8; 32]])), TIER_REWARD_BPS[0]);
-        assert_eq!(TIER_REWARD_BPS[5], TIER_REWARD_BPS_DIVISOR, "top tier must be the 100% reference");
+        assert_eq!(
+            TIER_REWARD_BPS[5],
+            keryx_consensus_core::config::params::TIER_REWARD_BPS_DIVISOR,
+            "top tier must be the 100% reference"
+        );
     }
 
     #[test]
