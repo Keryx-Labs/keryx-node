@@ -43,8 +43,7 @@ use keryx_consensus_core::{
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
-use keryx_inference::synthetic::{derive_synthetic_request, SYNTHETIC_SEED_DOMAIN};
-use keryx_consensus_core::config::params::SYNTHETIC_EPOCH_BLOCKS;
+use keryx_inference::synthetic::{derive_synthetic_request, synthetic_seed, SYNTHETIC_EPOCH_BLOCKS};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
@@ -540,14 +539,20 @@ impl VirtualStateProcessor {
     ///
     /// A miner proves it is online and serving a model it declared by posting a v2
     /// `AiResponse` whose `request_hash` matches the synthetic task derived for its
-    /// escrow pubkey and the current epoch. The miner's identity (1a) is the bare
-    /// pay-to-pubkey key in the response's `output[0]`. The current and previous
+    /// escrow pubkey and the current epoch. `AiResponse` txs are payload-only (no
+    /// inputs/outputs), so the miner's identity (1a) is the escrow pubkey declared
+    /// in **this block's own coinbase** (`/escrow:`): a synthetic answer only counts
+    /// when included in a block produced by the same miner that derived it — a
+    /// response gossiped into someone else's block won't match their coinbase key,
+    /// so liveness can't be stolen by mere inclusion. The current and previous
     /// epoch are both accepted, to absorb inclusion lag across an epoch boundary.
     ///
     /// This only writes the liveness store; rejecting stale miners is gated by
     /// `synthetic_liveness_activation` and lives in body validation (Step 4).
     fn record_synthetic_liveness(&self, txs: &[Transaction], pov_daa_score: u64) {
         let epoch = pov_daa_score / SYNTHETIC_EPOCH_BLOCKS;
+        // Identity: the escrow pubkey this block's own coinbase declares.
+        let Some(pubkey) = parse_coinbase_escrow_pubkey(&txs[0].payload) else { return };
         for tx in txs.iter().skip(1) {
             if !tx.is_ai_response() {
                 continue;
@@ -555,10 +560,6 @@ impl VirtualStateProcessor {
             // Synthetic answers must be v2 (carry the model_id the miner served).
             let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else { continue };
             let Some(model_id) = resp.model_id else { continue };
-            // Identity (1a): bare-P2PK pubkey in output[0].
-            let Some(pubkey) = tx.outputs.first().and_then(|o| extract_p2pk_pubkey(o.script_public_key.script())) else {
-                continue;
-            };
             // Match the response against this epoch, then the previous (inclusion lag).
             let matched = if resp.request_hash == expected_synthetic_request_hash(epoch, &pubkey, model_id) {
                 Some(epoch)
@@ -596,31 +597,23 @@ impl VirtualStateProcessor {
     }
 }
 
-/// Extracts a 32-byte Schnorr pubkey from a bare pay-to-pubkey script
-/// `OP_DATA_32 <pubkey:32> OP_CHECKSIG`. Returns `None` for any other script.
-/// Used to read a synthetic AiResponse's claimed miner identity from `output[0]`.
-fn extract_p2pk_pubkey(script: &[u8]) -> Option<[u8; 32]> {
-    const OP_DATA_32: u8 = 0x20;
-    const OP_CHECKSIG: u8 = 0xac;
-    if script.len() == 34 && script[0] == OP_DATA_32 && script[33] == OP_CHECKSIG {
-        script[1..33].try_into().ok()
-    } else {
-        None
+/// Parses the 32-byte miner escrow Schnorr pubkey from a coinbase payload's
+/// `/escrow:<64-hex>` marker. Returns `None` when the marker is absent or
+/// malformed — such a block declares no escrow identity and records no liveness.
+/// Mirrors `CoinbaseManager::parse_escrow_from_extra_data` but yields raw bytes.
+fn parse_coinbase_escrow_pubkey(coinbase_payload: &[u8]) -> Option<[u8; 32]> {
+    const MARKER: &[u8] = b"/escrow:";
+    const HEX_LEN: usize = 64;
+    let pos = coinbase_payload.windows(MARKER.len()).position(|w| w == MARKER)?;
+    let hex_start = pos + MARKER.len();
+    let hex_end = hex_start + HEX_LEN;
+    if hex_end > coinbase_payload.len() {
+        return None;
     }
-}
-
-/// Synthetic-task seed for `(epoch, escrow_pubkey)`.
-/// 2a: `blake2b(SYNTHETIC_SEED_DOMAIN || epoch_le || escrow_pubkey)[..32]` —
-/// predictable per epoch+miner. The 2b hardening will mix in a finalized chain
-/// anchor here (and bump `SYNTHETIC_SEED_DOMAIN`), with no other call-site change.
-fn synthetic_seed(epoch: u64, escrow_pubkey: &[u8; 32]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(SYNTHETIC_SEED_DOMAIN.len() + 8 + 32);
-    buf.extend_from_slice(SYNTHETIC_SEED_DOMAIN);
-    buf.extend_from_slice(&epoch.to_le_bytes());
-    buf.extend_from_slice(escrow_pubkey);
+    let hex_str = std::str::from_utf8(&coinbase_payload[hex_start..hex_end]).ok()?;
     let mut out = [0u8; 32];
-    out.copy_from_slice(&blake2b_simd::blake2b(&buf).as_bytes()[..32]);
-    out
+    hex::decode_to_slice(hex_str, &mut out).ok()?;
+    Some(out)
 }
 
 /// Expected `request_hash` (= `blake2b(payload)[..32]`) of the synthetic task for
@@ -839,14 +832,14 @@ mod tests {
     }
 
     #[test]
-    fn p2pk_pubkey_extraction() {
+    fn coinbase_escrow_pubkey_parsing() {
         let pk = [0xABu8; 32];
-        let mut script = vec![0x20u8];
-        script.extend_from_slice(&pk);
-        script.push(0xac);
-        assert_eq!(extract_p2pk_pubkey(&script), Some(pk));
-        assert_eq!(extract_p2pk_pubkey(&script[..33]), None); // truncated
-        assert_eq!(extract_p2pk_pubkey(&[0u8; 34]), None); // wrong opcodes
+        let payload = format!("0.2.8/2025-01-01/deadbeef/ai:v1:aabbccdd11223344/escrow:{}", hex::encode(pk));
+        assert_eq!(parse_coinbase_escrow_pubkey(payload.as_bytes()), Some(pk));
+        // No marker, and a truncated hex tail, both yield None.
+        assert_eq!(parse_coinbase_escrow_pubkey(b"0.2.8/no/escrow/here"), None);
+        let truncated = "x/escrow:abcd";
+        assert_eq!(parse_coinbase_escrow_pubkey(truncated.as_bytes()), None);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

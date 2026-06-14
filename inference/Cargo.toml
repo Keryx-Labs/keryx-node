@@ -9,5 +9,6 @@ description = "OPoI (Optimistic Proof of Inference) — synthetic MLP engine for
 
 [dependencies]
 candle-core = { version = "0.9", default-features = false }
+blake2b_simd = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }

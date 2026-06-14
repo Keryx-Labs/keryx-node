@@ -14,6 +14,12 @@
 /// pulling a hashing dependency into the inference engine.
 use crate::ai_payload::AiRequestPayload;
 
+/// Length of a synthetic-liveness epoch, in blocks. The protocol issues exactly
+/// one synthetic task per epoch; `epoch = daa_score / SYNTHETIC_EPOCH_BLOCKS`.
+/// Shared by the node (recording/enforcement) and the miner (scheduling) so both
+/// agree on epoch boundaries. ~36k blocks ≈ 1 hour at 10 BPS.
+pub const SYNTHETIC_EPOCH_BLOCKS: u64 = 36_000;
+
 /// Tokens the synthetic task asks for. Deliberately small — this proves
 /// liveness ("you are online and serving the model you declared"), not a real
 /// workload. Correctness of the answer is the (future) Level-2 challenger's job.
@@ -69,6 +75,24 @@ fn synthetic_prompt(seed: &[u8; 32], epoch: u64) -> Vec<u8> {
 /// carries zero `inference_reward`/`priority_fee`: it is protocol-issued, never
 /// posted as a transaction, and never paid — `request_hash` is only a binding
 /// label that the answering `AiResponse` must reference.
+/// Canonical synthetic-task seed for `(epoch, escrow_pubkey)`, shared verbatim by
+/// the node (recording/enforcement) and the miner (answering) so both sides always
+/// derive byte-identical tasks. A drift here would brick honest miners, so this is
+/// the single source of truth.
+///
+/// 2a: `blake2b(SYNTHETIC_SEED_DOMAIN || epoch_le || escrow_pubkey)[..32]` —
+/// predictable per epoch+miner. The 2b hardening mixes a finalized chain anchor in
+/// here and bumps `SYNTHETIC_SEED_DOMAIN`; no call site changes.
+pub fn synthetic_seed(epoch: u64, escrow_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(SYNTHETIC_SEED_DOMAIN.len() + 8 + 32);
+    buf.extend_from_slice(SYNTHETIC_SEED_DOMAIN);
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(escrow_pubkey);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&blake2b_simd::blake2b(&buf).as_bytes()[..32]);
+    out
+}
+
 pub fn derive_synthetic_request(
     seed: &[u8; 32],
     declared_models: &[[u8; 32]],

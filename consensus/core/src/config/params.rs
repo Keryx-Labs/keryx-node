@@ -90,12 +90,6 @@ pub const INFERENCE_REWARD_MINIMUMS_LEGACY: &[([u8; 32], u64)] = &[
     (LLAMA_3_3_70B_MODEL_ID_LEGACY, 400_000_000),   // 4.0 KRX
 ];
 
-/// Length of a synthetic-liveness epoch, in blocks. The protocol issues exactly
-/// one synthetic OPoI task per epoch (see `keryx_inference::synthetic`), derived
-/// from the epoch's anchor. ~36k blocks ≈ 1 hour at 10 BPS: a miner must prove
-/// inference roughly hourly. Used to compute `epoch = daa_score / EPOCH_BLOCKS`.
-pub const SYNTHETIC_EPOCH_BLOCKS: u64 = 36_000;
-
 /// Grace, in epochs, before a miner's stale liveness invalidates its blocks.
 /// A block is acceptable if its miner answered the synthetic task within the
 /// last `1 + GRACE` epochs — tolerates a short outage / model reload without
