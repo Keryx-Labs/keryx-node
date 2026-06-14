@@ -7,7 +7,8 @@ use crate::{
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
             AiResponseModelCapMissing, AiResponseModelMismatch, AiResponsePayloadMalformed, BadAcceptedIDMerkleRoot,
-            BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
+            BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext,
+            SyntheticLivenessNoEscrow, SyntheticLivenessStale, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -25,7 +26,8 @@ use crate::{
     },
 };
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
-use crate::model::stores::miner_liveness::{EscrowPubkeyKey, MinerLivenessStore, MinerLivenessStoreReader};
+use crate::model::services::reachability::ReachabilityService;
+use crate::model::stores::miner_liveness::{LivenessAnnotation, MinerLivenessStore, MinerLivenessStoreReader};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -44,6 +46,7 @@ use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_inference::synthetic::{derive_synthetic_request, synthetic_seed, SYNTHETIC_EPOCH_BLOCKS};
+use keryx_consensus_core::config::params::SYNTHETIC_LIVENESS_GRACE_EPOCHS;
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
@@ -189,7 +192,7 @@ impl VirtualStateProcessor {
             // Called after parallel validation so write lock does not overlap with
             // the read lock taken in validate_transaction_in_utxo_context.
             let coinbase_tx_id = txs[0].id();
-            self.process_ai_txs_for_slash(&txs, pov_daa_score, coinbase_tx_id);
+            self.process_ai_txs_for_slash(&txs, pov_daa_score, coinbase_tx_id, merged_block);
         }
     }
 
@@ -272,6 +275,16 @@ impl VirtualStateProcessor {
             }
             self.check_ai_response_model_caps(&txs)?;
         }
+
+        // OPoI synthetic-liveness (Level-1): reject a chain block whose miner proves no
+        // fresh synthetic answer. Gated by `synthetic_liveness_activation` (no-op before).
+        if header.daa_score == self.synthetic_liveness_activation.daa_score() {
+            info!(
+                "=== OPoI SYNTHETIC-LIVENESS HARDFORK ACTIVATED at DAA {} — blocks now require a fresh synthetic inference answer (self-contained or /live: ancestor) ===",
+                header.daa_score
+            );
+        }
+        self.enforce_synthetic_liveness(&txs, header)?;
 
         // Verify all transactions are valid in context
         let current_utxo_view = selected_parent_utxo_view.compose(&ctx.mergeset_diff);
@@ -481,7 +494,7 @@ impl VirtualStateProcessor {
     ///
     /// Called sequentially AFTER `validate_transactions_with_muhash_in_parallel` so there is no
     /// lock contention with the read lock in `validate_transaction_in_utxo_context`.
-    fn process_ai_txs_for_slash(&self, txs: &[Transaction], pov_daa_score: u64, coinbase_tx_id: TransactionId) {
+    fn process_ai_txs_for_slash(&self, txs: &[Transaction], pov_daa_score: u64, coinbase_tx_id: TransactionId, block_hash: Hash) {
         // Register confirmed AiResponse txs.
         for tx in txs.iter().skip(1) {
             if tx.is_ai_response() {
@@ -530,57 +543,58 @@ impl VirtualStateProcessor {
         // which fragmented consensus. No slash is recorded and verify_fraud_proof is never run.
         // AiResponses are still registered above for record-keeping only (no longer consensus-read).
 
-        // OPoI synthetic-liveness recording (Level-1). Unconditional: the store fills
-        // before `synthetic_liveness_activation` so enforcement (Step 4) has history.
-        self.record_synthetic_liveness(txs, pov_daa_score);
-    }
-
-    /// Records synthetic-task answers for the OPoI liveness net (Level-1).
-    ///
-    /// A miner proves it is online and serving a model it declared by posting a v2
-    /// `AiResponse` whose `request_hash` matches the synthetic task derived for its
-    /// escrow pubkey and the current epoch. `AiResponse` txs are payload-only (no
-    /// inputs/outputs), so the miner's identity (1a) is the escrow pubkey declared
-    /// in **this block's own coinbase** (`/escrow:`): a synthetic answer only counts
-    /// when included in a block produced by the same miner that derived it — a
-    /// response gossiped into someone else's block won't match their coinbase key,
-    /// so liveness can't be stolen by mere inclusion. The current and previous
-    /// epoch are both accepted, to absorb inclusion lag across an epoch boundary.
-    ///
-    /// This only writes the liveness store; rejecting stale miners is gated by
-    /// `synthetic_liveness_activation` and lives in body validation (Step 4).
-    fn record_synthetic_liveness(&self, txs: &[Transaction], pov_daa_score: u64) {
-        let epoch = pov_daa_score / SYNTHETIC_EPOCH_BLOCKS;
-        // Identity: the escrow pubkey this block's own coinbase declares.
-        let Some(pubkey) = parse_coinbase_escrow_pubkey(&txs[0].payload) else { return };
-        for tx in txs.iter().skip(1) {
-            if !tx.is_ai_response() {
-                continue;
-            }
-            // Synthetic answers must be v2 (carry the model_id the miner served).
-            let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else { continue };
-            let Some(model_id) = resp.model_id else { continue };
-            // Match the response against this epoch, then the previous (inclusion lag).
-            let matched = if resp.request_hash == expected_synthetic_request_hash(epoch, &pubkey, model_id) {
-                Some(epoch)
-            } else if epoch > 0 && resp.request_hash == expected_synthetic_request_hash(epoch - 1, &pubkey, model_id) {
-                Some(epoch - 1)
-            } else {
-                None
-            };
-            let Some(answered_epoch) = matched else { continue };
-
-            // Monotonic: only ever advance a miner's recorded epoch.
-            let key = EscrowPubkeyKey::new(pubkey);
-            let prev = self.miner_liveness_store.last_epoch(key.clone()).unwrap_or(None);
-            if prev.map_or(true, |p| answered_epoch > p) {
-                if let Err(e) = self.miner_liveness_store.set(key, answered_epoch) {
-                    warn!("OPoI: failed to record synthetic liveness: {}", e);
+        // OPoI synthetic-liveness annotation (Level-1, option C). Unconditional: if this
+        // accepted block's own body answers the synthetic task for its own coinbase miner,
+        // annotate the block hash with (escrow_pubkey, epoch). The annotation is an
+        // immutable function of the block, so a descendant can later prove its liveness by
+        // referencing this block (`/live:<hash>`) + a deterministic reachability check.
+        if let Some(pubkey) = parse_coinbase_escrow_pubkey(&txs[0].payload) {
+            let epoch = pov_daa_score / SYNTHETIC_EPOCH_BLOCKS;
+            if let Some(answered_epoch) = synthetic_answer_epoch(txs, &pubkey, epoch) {
+                let annotation = LivenessAnnotation { escrow_pubkey: pubkey, epoch: answered_epoch };
+                if let Err(e) = self.miner_liveness_store.set(block_hash, annotation) {
+                    warn!("OPoI: failed to record liveness annotation: {}", e);
                 } else {
-                    trace!("OPoI: synthetic liveness recorded for {} at epoch {}", hex::encode(pubkey), answered_epoch);
+                    trace!("OPoI: liveness annotation block={} miner={} epoch={}", block_hash, hex::encode(pubkey), answered_epoch);
                 }
             }
         }
+    }
+
+    /// Enforces OPoI synthetic liveness for a selected-chain block (Level-1, option C).
+    /// Gated by `synthetic_liveness_activation`. A block is liveness-valid iff its
+    /// coinbase miner proves a fresh synthetic answer, either:
+    ///   (a) self-contained — this block's own body answers for this/last epoch; or
+    ///   (b) by reference — its coinbase carries `/live:<H>` pointing to a reachable
+    ///       ancestor block `H` that answered for the same miner within the grace window.
+    /// Both paths read only deterministic state (the block's own body, plus immutable
+    /// per-block annotations consulted via reachability), so no reorg-dependent split.
+    fn enforce_synthetic_liveness(&self, txs: &[Transaction], header: &Header) -> BlockProcessResult<()> {
+        if !self.synthetic_liveness_activation.is_active(header.daa_score) {
+            return Ok(());
+        }
+        let epoch = header.daa_score / SYNTHETIC_EPOCH_BLOCKS;
+        let Some(pubkey) = parse_coinbase_escrow_pubkey(&txs[0].payload) else {
+            return Err(SyntheticLivenessNoEscrow(header.hash));
+        };
+        // (a) self-contained: recomputed on this block's own (immutable) body.
+        if synthetic_answer_epoch(txs, &pubkey, epoch).is_some() {
+            return Ok(());
+        }
+        // (b) /live:<H> reference to a reachable, recent ancestor for the same miner.
+        if let Some(anchor) = parse_coinbase_live_ref(&txs[0].payload) {
+            // Read the cheap immutable annotation first; only known (annotated) ancestors
+            // reach the reachability check, so it never sees an unknown hash.
+            if let Ok(Some(annot)) = self.miner_liveness_store.get(anchor) {
+                if annot.escrow_pubkey == pubkey
+                    && epoch.saturating_sub(annot.epoch) <= 1 + SYNTHETIC_LIVENESS_GRACE_EPOCHS
+                    && self.reachability_service.is_dag_ancestor_of(anchor, header.hash)
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Err(SyntheticLivenessStale(header.hash, hex::encode(pubkey), epoch))
     }
 
     /// Calculates the accepted_id_merkle_root based on the current DAA score and the accepted tx ids
@@ -627,6 +641,45 @@ fn expected_synthetic_request_hash(epoch: u64, escrow_pubkey: &[u8; 32], model_i
     let mut out = [0u8; 32];
     out.copy_from_slice(&blake2b_simd::blake2b(&req.serialize()).as_bytes()[..32]);
     out
+}
+
+/// Returns the synthetic epoch in `{epoch, epoch-1}` that `txs` (a block body)
+/// answers for `pubkey`, or `None`. Scans the block's v2 `AiResponse` txs for one
+/// whose `request_hash` matches the synthetic task derived for `(pubkey, e, model_id)`.
+/// Accepting `epoch-1` absorbs inclusion lag across an epoch boundary. Pure over the
+/// block body — deterministic and immutable.
+fn synthetic_answer_epoch(txs: &[Transaction], pubkey: &[u8; 32], epoch: u64) -> Option<u64> {
+    for tx in txs.iter().skip(1) {
+        if !tx.is_ai_response() {
+            continue;
+        }
+        let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else { continue };
+        let Some(model_id) = resp.model_id else { continue };
+        if resp.request_hash == expected_synthetic_request_hash(epoch, pubkey, model_id) {
+            return Some(epoch);
+        }
+        if epoch > 0 && resp.request_hash == expected_synthetic_request_hash(epoch - 1, pubkey, model_id) {
+            return Some(epoch - 1);
+        }
+    }
+    None
+}
+
+/// Parses a `/live:<64-hex block hash>` liveness reference from a coinbase payload.
+/// Returns `None` when the marker is absent or malformed.
+fn parse_coinbase_live_ref(coinbase_payload: &[u8]) -> Option<Hash> {
+    const MARKER: &[u8] = b"/live:";
+    const HEX_LEN: usize = 64;
+    let pos = coinbase_payload.windows(MARKER.len()).position(|w| w == MARKER)?;
+    let hex_start = pos + MARKER.len();
+    let hex_end = hex_start + HEX_LEN;
+    if hex_end > coinbase_payload.len() {
+        return None;
+    }
+    let hex_str = std::str::from_utf8(&coinbase_payload[hex_start..hex_end]).ok()?;
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hex_str, &mut out).ok()?;
+    Some(Hash::from_bytes(out))
 }
 
 /// Rejects the block if any AiRequest tx violates inference_reward/priority_fee/escrow rules:
@@ -840,6 +893,34 @@ mod tests {
         assert_eq!(parse_coinbase_escrow_pubkey(b"0.2.8/no/escrow/here"), None);
         let truncated = "x/escrow:abcd";
         assert_eq!(parse_coinbase_escrow_pubkey(truncated.as_bytes()), None);
+    }
+
+    #[test]
+    fn coinbase_live_ref_parsing() {
+        let h = [0xCDu8; 32];
+        let payload = format!("0.2.8/escrow:{}/live:{}", hex::encode([1u8; 32]), hex::encode(h));
+        assert_eq!(parse_coinbase_live_ref(payload.as_bytes()), Some(Hash::from_bytes(h)));
+        assert_eq!(parse_coinbase_live_ref(b"no live ref"), None);
+        assert_eq!(parse_coinbase_live_ref(b"/live:abcd"), None); // truncated
+    }
+
+    #[test]
+    fn synthetic_answer_epoch_matches_only_right_miner_and_epoch() {
+        let pubkey = [9u8; 32];
+        let model = [3u8; 32];
+        let epoch = 5u64;
+        // Build a v2 AiResponse carrying the synthetic request_hash for (epoch, pubkey, model).
+        let request_hash = expected_synthetic_request_hash(epoch, &pubkey, model);
+        let resp = AiResponsePayload::new_v2(request_hash, 1000, dummy_cid(), 16, model, [0u8; 32]);
+        let resp_tx = Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize());
+        let txs = vec![make_coinbase_no_caps(), resp_tx];
+
+        assert_eq!(synthetic_answer_epoch(&txs, &pubkey, epoch), Some(epoch));
+        // One epoch ahead still matches the answer as the previous epoch (inclusion lag).
+        assert_eq!(synthetic_answer_epoch(&txs, &pubkey, epoch + 1), Some(epoch));
+        // Wrong miner or an unrelated epoch ⇒ no match.
+        assert_eq!(synthetic_answer_epoch(&txs, &[7u8; 32], epoch), None);
+        assert_eq!(synthetic_answer_epoch(&txs, &pubkey, epoch + 5), None);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

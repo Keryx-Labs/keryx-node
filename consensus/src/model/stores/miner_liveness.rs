@@ -1,68 +1,55 @@
-/// RocksDB-backed store for OPoI synthetic-liveness tracking (Level-1).
+/// RocksDB-backed store for OPoI synthetic-liveness annotations (Level-1, option C).
 ///
-/// Maps a miner's escrow public key (the 32-byte Schnorr key it publishes in its
-/// coinbase `/escrow:` field) to the last synthetic-task epoch it answered.
+/// Keyed by **block hash**: records that block H's own body provided a valid
+/// synthetic OPoI answer for H's coinbase miner, and at which epoch. The value is
+/// an immutable function of H's content, so reading it for an ancestor block is
+/// fully deterministic (no mutable global state, no reorg-dependent split risk) —
+/// this is what lets enforcement (Step 4, option C) verify a miner's liveness by
+/// following a `/live:<H>` coinbase reference + a reachability ancestor check,
+/// instead of reading a mutable per-miner map.
 ///
-/// Recording is unconditional (the store fills before the hardfork gate so the
-/// network has history at activation). Enforcement — rejecting a block whose
-/// coinbase escrow miner has a stale epoch — is gated separately by
-/// `synthetic_liveness_activation` and lives in body validation (Step 4).
-use std::{fmt, mem::size_of, sync::Arc};
+/// Recording is unconditional (fills before the hardfork gate). Enforcement —
+/// rejecting a block whose miner has no fresh self/ancestor answer — is gated by
+/// `synthetic_liveness_activation`.
+use std::{mem::size_of, sync::Arc};
 
+use keryx_consensus_core::BlockHasher;
 use keryx_database::prelude::{BatchDbWriter, CachedDbAccess, CachePolicy, DirectDbWriter, StoreError, DB};
 use keryx_database::registry::DatabaseStorePrefixes;
+use keryx_hashes::Hash;
 use keryx_utils::mem_size::MemSizeEstimator;
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 
-/// 32-byte key: a miner's escrow Schnorr public key.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct EscrowPubkeyKey([u8; 32]);
-
-impl EscrowPubkeyKey {
-    pub fn new(pubkey: [u8; 32]) -> Self {
-        Self(pubkey)
-    }
-}
-
-impl AsRef<[u8]> for EscrowPubkeyKey {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl fmt::Display for EscrowPubkeyKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(self.0))
-    }
-}
-
-/// Per-miner liveness record: the most recent synthetic-task epoch answered.
+/// What a block contributes to OPoI liveness: a valid synthetic answer for
+/// `escrow_pubkey` (the block's own coinbase miner) at `epoch`.
 #[derive(Clone, Copy, Serialize, Deserialize)]
-pub struct MinerLivenessRecord {
-    pub last_epoch: u64,
+pub struct LivenessAnnotation {
+    /// The block's coinbase escrow Schnorr pubkey — the miner this answer proves live.
+    pub escrow_pubkey: [u8; 32],
+    /// The synthetic epoch the answer satisfied (`daa / SYNTHETIC_EPOCH_BLOCKS`).
+    pub epoch: u64,
 }
 
-impl MemSizeEstimator for MinerLivenessRecord {
+impl MemSizeEstimator for LivenessAnnotation {
     fn estimate_mem_bytes(&self) -> usize {
         size_of::<Self>()
     }
 }
 
 pub trait MinerLivenessStoreReader {
-    /// Returns the last synthetic-task epoch answered by `pubkey`, or `None` if
-    /// the miner has never answered (so it has no recorded liveness yet).
-    fn last_epoch(&self, pubkey: EscrowPubkeyKey) -> Result<Option<u64>, StoreError>;
+    /// Returns block `H`'s liveness annotation, or `None` if `H` provided none.
+    fn get(&self, block: Hash) -> Result<Option<LivenessAnnotation>, StoreError>;
 }
 
 pub trait MinerLivenessStore: MinerLivenessStoreReader {
-    fn set(&self, pubkey: EscrowPubkeyKey, last_epoch: u64) -> Result<(), StoreError>;
+    fn set(&self, block: Hash, annotation: LivenessAnnotation) -> Result<(), StoreError>;
 }
 
 #[derive(Clone)]
 pub struct DbMinerLivenessStore {
     db: Arc<DB>,
-    access: CachedDbAccess<EscrowPubkeyKey, MinerLivenessRecord>,
+    access: CachedDbAccess<Hash, LivenessAnnotation, BlockHasher>,
 }
 
 impl DbMinerLivenessStore {
@@ -73,16 +60,16 @@ impl DbMinerLivenessStore {
         }
     }
 
-    pub fn set_batch(&self, batch: &mut WriteBatch, pubkey: EscrowPubkeyKey, last_epoch: u64) -> Result<(), StoreError> {
-        self.access.write(BatchDbWriter::new(batch), pubkey, MinerLivenessRecord { last_epoch })?;
+    pub fn set_batch(&self, batch: &mut WriteBatch, block: Hash, annotation: LivenessAnnotation) -> Result<(), StoreError> {
+        self.access.write(BatchDbWriter::new(batch), block, annotation)?;
         Ok(())
     }
 }
 
 impl MinerLivenessStoreReader for DbMinerLivenessStore {
-    fn last_epoch(&self, pubkey: EscrowPubkeyKey) -> Result<Option<u64>, StoreError> {
-        match self.access.read(pubkey) {
-            Ok(record) => Ok(Some(record.last_epoch)),
+    fn get(&self, block: Hash) -> Result<Option<LivenessAnnotation>, StoreError> {
+        match self.access.read(block) {
+            Ok(annotation) => Ok(Some(annotation)),
             Err(StoreError::KeyNotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
@@ -90,8 +77,8 @@ impl MinerLivenessStoreReader for DbMinerLivenessStore {
 }
 
 impl MinerLivenessStore for DbMinerLivenessStore {
-    fn set(&self, pubkey: EscrowPubkeyKey, last_epoch: u64) -> Result<(), StoreError> {
-        self.access.write(DirectDbWriter::new(&self.db), pubkey, MinerLivenessRecord { last_epoch })?;
+    fn set(&self, block: Hash, annotation: LivenessAnnotation) -> Result<(), StoreError> {
+        self.access.write(DirectDbWriter::new(&self.db), block, annotation)?;
         Ok(())
     }
 }

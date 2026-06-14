@@ -153,6 +153,12 @@ pub enum RuleError {
     #[error("AiResponse tx {0} declares model_id {1} but the matching AiRequest in this block asked for model_id {2}")]
     AiResponseModelMismatch(TransactionId, String, String),
 
+    #[error("block {0} declares no /escrow: identity but synthetic-liveness enforcement is active")]
+    SyntheticLivenessNoEscrow(Hash),
+
+    #[error("block {0} miner {1} proves no synthetic-liveness answer: neither a self-contained answer nor a fresh /live: ancestor (epoch {2})")]
+    SyntheticLivenessStale(Hash, String, u64),
+
     #[error("AiRequest tx {0} inference_reward {1} sompi is below minimum {2} sompi for model {3}")]
     AiRequestInferenceRewardBelowMinimum(TransactionId, u64, u64, String),
 

@@ -186,6 +186,10 @@ pub struct VirtualStateProcessor {
 
     // OPoI v2 hardfork: response commitment + embedded model_id + 70B Q4_K_M swap
     pub(super) opoi_v2_activation: ForkActivation,
+
+    // OPoI synthetic-liveness hardfork (Level-1): reject blocks whose miner proves
+    // no fresh synthetic answer (self-contained or via a /live: ancestor reference)
+    pub(super) synthetic_liveness_activation: ForkActivation,
 }
 
 impl VirtualStateProcessor {
@@ -260,6 +264,7 @@ impl VirtualStateProcessor {
             pow_salt_v2_activation: params.pow_salt_v2_activation,
             pow_salt_v4_activation: params.pow_salt_v4_activation,
             opoi_v2_activation: params.opoi_v2_activation,
+            synthetic_liveness_activation: params.synthetic_liveness_activation,
         }
     }
 
