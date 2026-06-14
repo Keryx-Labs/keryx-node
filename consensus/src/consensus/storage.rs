@@ -4,6 +4,7 @@ use crate::{
         DB,
         acceptance_data::DbAcceptanceDataStore,
         ai_slash::{DbAiResponseStore, DbAiSlashedStore},
+        miner_liveness::DbMinerLivenessStore,
         block_transactions::DbBlockTransactionsStore,
         block_window_cache::BlockWindowCacheStore,
         daa::DbDaaStore,
@@ -67,6 +68,7 @@ pub struct ConsensusStorage {
     // OPoI slash stores (Phase 3 A4)
     pub ai_response_store: Arc<DbAiResponseStore>,
     pub ai_slashed_store: Arc<DbAiSlashedStore>,
+    pub miner_liveness_store: Arc<DbMinerLivenessStore>,
 
 
     // Block window caches
@@ -220,6 +222,7 @@ impl ConsensusStorage {
         // OPoI slash stores
         let ai_response_store = Arc::new(DbAiResponseStore::new(db.clone(), header_data_builder.build()));
         let ai_slashed_store = Arc::new(DbAiSlashedStore::new(db.clone(), header_data_builder.build()));
+        let miner_liveness_store = Arc::new(DbMinerLivenessStore::new(db.clone(), header_data_builder.build()));
 
         // Tips
         let headers_selected_tip_store = Arc::new(RwLock::new(DbHeadersSelectedTipStore::new(db.clone())));
@@ -256,6 +259,7 @@ impl ConsensusStorage {
             acceptance_data_store,
             ai_response_store,
             ai_slashed_store,
+            miner_liveness_store,
             past_pruning_points_store,
             daa_excluded_store,
             depth_store,

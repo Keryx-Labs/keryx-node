@@ -171,6 +171,8 @@ pub struct VirtualStateProcessor {
 
     // OPoI slash stores (Phase 3 A4) — persisted to RocksDB
     pub(super) ai_response_store: Arc<crate::model::stores::ai_slash::DbAiResponseStore>,
+    // OPoI synthetic-liveness store (Level-1) — escrow_pubkey → last answered epoch
+    pub(super) miner_liveness_store: Arc<crate::model::stores::miner_liveness::DbMinerLivenessStore>,
 
     // OPoI Phase 3 hardfork: model capability enforcement activation score
     pub(super) model_cap_enforcement_activation: ForkActivation,
@@ -250,6 +252,7 @@ impl VirtualStateProcessor {
             counters,
             _mining_rules: mining_rules,
             ai_response_store: storage.ai_response_store.clone(),
+            miner_liveness_store: storage.miner_liveness_store.clone(),
 
             model_cap_enforcement_activation: params.model_cap_enforcement_activation,
             inference_reward_minimums: params.inference_reward_minimums,

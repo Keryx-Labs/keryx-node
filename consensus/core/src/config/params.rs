@@ -89,6 +89,19 @@ pub const INFERENCE_REWARD_MINIMUMS_LEGACY: &[([u8; 32], u64)] = &[
     (DEEPSEEK_R1_32B_MODEL_ID,       250_000_000),   // 2.5 KRX
     (LLAMA_3_3_70B_MODEL_ID_LEGACY, 400_000_000),   // 4.0 KRX
 ];
+
+/// Length of a synthetic-liveness epoch, in blocks. The protocol issues exactly
+/// one synthetic OPoI task per epoch (see `keryx_inference::synthetic`), derived
+/// from the epoch's anchor. ~36k blocks ≈ 1 hour at 10 BPS: a miner must prove
+/// inference roughly hourly. Used to compute `epoch = daa_score / EPOCH_BLOCKS`.
+pub const SYNTHETIC_EPOCH_BLOCKS: u64 = 36_000;
+
+/// Grace, in epochs, before a miner's stale liveness invalidates its blocks.
+/// A block is acceptable if its miner answered the synthetic task within the
+/// last `1 + GRACE` epochs — tolerates a short outage / model reload without
+/// kicking an honest miner. Only consulted once `synthetic_liveness_activation`
+/// is live (enforcement is in Step 4; recording is unconditional).
+pub const SYNTHETIC_LIVENESS_GRACE_EPOCHS: u64 = 1;
 use crate::{
     BlockLevel, KType,
     constants::STORAGE_MASS_PARAMETER,
@@ -438,6 +451,13 @@ pub struct Params {
     /// - the 70B model_id switches from the legacy IQ3 weights to the Q4_K_M re-quantization.
     /// Slashing/challenge processing stays disabled — this gate only lays the v2 foundations.
     pub opoi_v2_activation: ForkActivation,
+
+    /// Synthetic-liveness hardfork activation DAA score (Level-1 anti "zero-inference").
+    /// From this score, a block is rejected unless its coinbase escrow miner has
+    /// answered the protocol's synthetic OPoI task within the last
+    /// `1 + SYNTHETIC_LIVENESS_GRACE_EPOCHS` epochs. Recording of synthetic
+    /// answers happens regardless of this gate; only the rejection is gated here.
+    pub synthetic_liveness_activation: ForkActivation,
 }
 
 impl Params {
@@ -620,6 +640,8 @@ impl Params {
             pow_salt_v4_activation: self.pow_salt_v4_activation,
 
             opoi_v2_activation: self.opoi_v2_activation,
+
+            synthetic_liveness_activation: self.synthetic_liveness_activation,
         }
     }
 }
@@ -722,6 +744,9 @@ pub const MAINNET_PARAMS: Params = Params {
 
     // TODO(hardfork): set to a concrete DAA (~5-7 days ahead) just before the v1.3.0 release.
     opoi_v2_activation: ForkActivation::never(),
+
+    // TODO(hardfork): set to a concrete DAA (~5-7 days ahead) just before the v1.3.0 release.
+    synthetic_liveness_activation: ForkActivation::never(),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -776,6 +801,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoW SALT v4: not needed on testnet (mainnet-only chain relaunch).
     pow_salt_v4_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
+    synthetic_liveness_activation: ForkActivation::never(),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -822,6 +848,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
+    synthetic_liveness_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -866,4 +893,5 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
+    synthetic_liveness_activation: ForkActivation::never(),
 };

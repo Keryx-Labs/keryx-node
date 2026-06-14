@@ -23,6 +23,13 @@ pub const SYNTHETIC_MAX_TOKENS: u32 = 16;
 /// a protocol-issued liveness task versus an organic, fee-bearing AiRequest.
 pub const SYNTHETIC_PROMPT_PREFIX: &[u8] = b"keryx-opoi-liveness:";
 
+/// Domain-separation tag mixed into the synthetic-task seed (versioned).
+/// The seed is `blake2b(SYNTHETIC_SEED_DOMAIN || epoch_le || escrow_pubkey)`
+/// today (2a: predictable per epoch+miner). The 2b hardening mixes in a
+/// finalized chain anchor by bumping this tag to `…-v2` — the bump alone
+/// guarantees old and new seeds never collide across the upgrade.
+pub const SYNTHETIC_SEED_DOMAIN: &[u8] = b"keryx-opoi-synthetic-seed-v1";
+
 /// Picks one `model_id` from the miner's declared set, indexed by the seed.
 ///
 /// `declared_models` MUST be the miner's on-chain `ai:cap:` set in its canonical

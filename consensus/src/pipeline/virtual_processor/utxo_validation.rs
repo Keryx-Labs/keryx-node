@@ -25,6 +25,7 @@ use crate::{
     },
 };
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
+use crate::model::stores::miner_liveness::{EscrowPubkeyKey, MinerLivenessStore, MinerLivenessStoreReader};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -42,6 +43,8 @@ use keryx_consensus_core::{
 use keryx_core::{info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
+use keryx_inference::synthetic::{derive_synthetic_request, SYNTHETIC_SEED_DOMAIN};
+use keryx_consensus_core::config::params::SYNTHETIC_EPOCH_BLOCKS;
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
@@ -527,6 +530,56 @@ impl VirtualStateProcessor {
         // flood) and slashed honest AiResponses (commitment lost in the result->ipfs_cid migration),
         // which fragmented consensus. No slash is recorded and verify_fraud_proof is never run.
         // AiResponses are still registered above for record-keeping only (no longer consensus-read).
+
+        // OPoI synthetic-liveness recording (Level-1). Unconditional: the store fills
+        // before `synthetic_liveness_activation` so enforcement (Step 4) has history.
+        self.record_synthetic_liveness(txs, pov_daa_score);
+    }
+
+    /// Records synthetic-task answers for the OPoI liveness net (Level-1).
+    ///
+    /// A miner proves it is online and serving a model it declared by posting a v2
+    /// `AiResponse` whose `request_hash` matches the synthetic task derived for its
+    /// escrow pubkey and the current epoch. The miner's identity (1a) is the bare
+    /// pay-to-pubkey key in the response's `output[0]`. The current and previous
+    /// epoch are both accepted, to absorb inclusion lag across an epoch boundary.
+    ///
+    /// This only writes the liveness store; rejecting stale miners is gated by
+    /// `synthetic_liveness_activation` and lives in body validation (Step 4).
+    fn record_synthetic_liveness(&self, txs: &[Transaction], pov_daa_score: u64) {
+        let epoch = pov_daa_score / SYNTHETIC_EPOCH_BLOCKS;
+        for tx in txs.iter().skip(1) {
+            if !tx.is_ai_response() {
+                continue;
+            }
+            // Synthetic answers must be v2 (carry the model_id the miner served).
+            let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else { continue };
+            let Some(model_id) = resp.model_id else { continue };
+            // Identity (1a): bare-P2PK pubkey in output[0].
+            let Some(pubkey) = tx.outputs.first().and_then(|o| extract_p2pk_pubkey(o.script_public_key.script())) else {
+                continue;
+            };
+            // Match the response against this epoch, then the previous (inclusion lag).
+            let matched = if resp.request_hash == expected_synthetic_request_hash(epoch, &pubkey, model_id) {
+                Some(epoch)
+            } else if epoch > 0 && resp.request_hash == expected_synthetic_request_hash(epoch - 1, &pubkey, model_id) {
+                Some(epoch - 1)
+            } else {
+                None
+            };
+            let Some(answered_epoch) = matched else { continue };
+
+            // Monotonic: only ever advance a miner's recorded epoch.
+            let key = EscrowPubkeyKey::new(pubkey);
+            let prev = self.miner_liveness_store.last_epoch(key.clone()).unwrap_or(None);
+            if prev.map_or(true, |p| answered_epoch > p) {
+                if let Err(e) = self.miner_liveness_store.set(key, answered_epoch) {
+                    warn!("OPoI: failed to record synthetic liveness: {}", e);
+                } else {
+                    trace!("OPoI: synthetic liveness recorded for {} at epoch {}", hex::encode(pubkey), answered_epoch);
+                }
+            }
+        }
     }
 
     /// Calculates the accepted_id_merkle_root based on the current DAA score and the accepted tx ids
@@ -541,6 +594,46 @@ impl VirtualStateProcessor {
             keryx_merkle::calc_merkle_root(accepted_tx_ids),
         )
     }
+}
+
+/// Extracts a 32-byte Schnorr pubkey from a bare pay-to-pubkey script
+/// `OP_DATA_32 <pubkey:32> OP_CHECKSIG`. Returns `None` for any other script.
+/// Used to read a synthetic AiResponse's claimed miner identity from `output[0]`.
+fn extract_p2pk_pubkey(script: &[u8]) -> Option<[u8; 32]> {
+    const OP_DATA_32: u8 = 0x20;
+    const OP_CHECKSIG: u8 = 0xac;
+    if script.len() == 34 && script[0] == OP_DATA_32 && script[33] == OP_CHECKSIG {
+        script[1..33].try_into().ok()
+    } else {
+        None
+    }
+}
+
+/// Synthetic-task seed for `(epoch, escrow_pubkey)`.
+/// 2a: `blake2b(SYNTHETIC_SEED_DOMAIN || epoch_le || escrow_pubkey)[..32]` —
+/// predictable per epoch+miner. The 2b hardening will mix in a finalized chain
+/// anchor here (and bump `SYNTHETIC_SEED_DOMAIN`), with no other call-site change.
+fn synthetic_seed(epoch: u64, escrow_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(SYNTHETIC_SEED_DOMAIN.len() + 8 + 32);
+    buf.extend_from_slice(SYNTHETIC_SEED_DOMAIN);
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(escrow_pubkey);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&blake2b_simd::blake2b(&buf).as_bytes()[..32]);
+    out
+}
+
+/// Expected `request_hash` (= `blake2b(payload)[..32]`) of the synthetic task for
+/// `(epoch, escrow_pubkey, model_id)`. A v2 AiResponse matching this proves the
+/// miner answered its protocol-issued liveness task for that epoch.
+fn expected_synthetic_request_hash(epoch: u64, escrow_pubkey: &[u8; 32], model_id: [u8; 32]) -> [u8; 32] {
+    let seed = synthetic_seed(epoch, escrow_pubkey);
+    // Single-element model set ⇒ the picker always returns `model_id`, so the
+    // hash binds the task to exactly the model the miner claims it served.
+    let req = derive_synthetic_request(&seed, &[model_id], epoch).expect("single-element model set is non-empty");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&blake2b_simd::blake2b(&req.serialize()).as_bytes()[..32]);
+    out
 }
 
 /// Rejects the block if any AiRequest tx violates inference_reward/priority_fee/escrow rules:
@@ -706,6 +799,55 @@ mod tests {
     use keryx_consensus_core::subnets;
 
     use super::*;
+
+    // ── synthetic-liveness helper tests (Level-1) ─────────────────────────────
+
+    #[test]
+    fn synthetic_request_hash_is_deterministic() {
+        let pk = [9u8; 32];
+        let model = [3u8; 32];
+        assert_eq!(
+            expected_synthetic_request_hash(7, &pk, model),
+            expected_synthetic_request_hash(7, &pk, model)
+        );
+    }
+
+    #[test]
+    fn synthetic_request_hash_binds_epoch_miner_and_model() {
+        let pk = [9u8; 32];
+        let other_pk = [10u8; 32];
+        let model = [3u8; 32];
+        let other_model = [4u8; 32];
+        let base = expected_synthetic_request_hash(7, &pk, model);
+        assert_ne!(base, expected_synthetic_request_hash(8, &pk, model), "epoch must change the hash");
+        assert_ne!(base, expected_synthetic_request_hash(7, &other_pk, model), "miner must change the hash");
+        assert_ne!(base, expected_synthetic_request_hash(7, &pk, other_model), "model must change the hash");
+    }
+
+    #[test]
+    fn node_hash_matches_miner_side_derivation() {
+        // A compliant miner derives the same request_hash from the shared seed,
+        // so its AiResponse.request_hash will match what the node recomputes.
+        let pk = [5u8; 32];
+        let model = [2u8; 32];
+        let epoch = 42u64;
+        let seed = synthetic_seed(epoch, &pk);
+        let req = derive_synthetic_request(&seed, &[model], epoch).unwrap();
+        let mut miner_side = [0u8; 32];
+        miner_side.copy_from_slice(&blake2b_simd::blake2b(&req.serialize()).as_bytes()[..32]);
+        assert_eq!(miner_side, expected_synthetic_request_hash(epoch, &pk, model));
+    }
+
+    #[test]
+    fn p2pk_pubkey_extraction() {
+        let pk = [0xABu8; 32];
+        let mut script = vec![0x20u8];
+        script.extend_from_slice(&pk);
+        script.push(0xac);
+        assert_eq!(extract_p2pk_pubkey(&script), Some(pk));
+        assert_eq!(extract_p2pk_pubkey(&script[..33]), None); // truncated
+        assert_eq!(extract_p2pk_pubkey(&[0u8; 34]), None); // wrong opcodes
+    }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 

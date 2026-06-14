@@ -58,6 +58,10 @@ pub enum DatabaseStorePrefixes {
     /// Slashed escrow outpoints: outpoint_bytes → slash_blue_score
     AiSlashed = 36,
 
+    // ---- OPoI Synthetic Liveness (Level-1) ----
+    /// Last synthetic-task epoch answered per miner: escrow_pubkey(32) → epoch(u64)
+    MinerLiveness = 37,
+
     // ---- Ghostdag Proof
     TempGhostdag = 40,
     TempGhostdagCompact = 41,
