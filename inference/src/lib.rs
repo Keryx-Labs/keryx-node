@@ -10,6 +10,7 @@ pub mod ai_payload;
 pub mod fraud_proof;
 pub mod model;
 pub mod model_fixed;
+pub mod synthetic;
 pub mod task;
 
 pub use ai_payload::{
