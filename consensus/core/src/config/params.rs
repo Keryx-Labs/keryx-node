@@ -90,6 +90,37 @@ pub const INFERENCE_REWARD_MINIMUMS_LEGACY: &[([u8; 32], u64)] = &[
     (LLAMA_3_3_70B_MODEL_ID_LEGACY, 400_000_000),   // 4.0 KRX
 ];
 
+/// Tier-reward — coinbase-subsidy multiplier in basis points per declared model
+/// tier, applied from `tier_reward_activation`. Index = tier rank, ordered by
+/// `TIER_MODEL_IDS` (0 = lightest model, 5 = heaviest). Monotone: serving a
+/// heavier model earns a larger share of the block subsidy. The un-earned delta
+/// is never minted — a deflationary "burn" with no burn output. The top tier is
+/// the 100% reference so the scheme never inflates emission beyond the schedule.
+pub const TIER_REWARD_BPS: [u64; 6] = [
+    8_500,  // 0  --light       TinyLlama      -15%
+    8_800,  // 1  default       DeepSeek-8B    -12%
+    9_100,  // 2  --high        DeepSeek-32B    -9%
+    9_400,  // 3  --very-high   Qwen3-32B       -6%
+    9_700,  // 4  --ultra       LLaMA-3.3-70B   -3%
+    10_000, // 5  --very-ultra  Qwen3-235B       0%
+];
+
+/// Basis-points divisor for `TIER_REWARD_BPS`.
+pub const TIER_REWARD_BPS_DIVISOR: u64 = 10_000;
+
+/// Canonical model ids ordered lightest → heaviest. A block's tier rank is the
+/// highest position among the model_ids it declares in its coinbase `ai:cap`
+/// field. The legacy IQ3 70B id is mapped to the same rank as the Q4_K_M id by
+/// the lookup helper, so a miner straddling the hardfork is not misranked.
+pub const TIER_MODEL_IDS: [[u8; 32]; 6] = [
+    TINYLLAMA_MODEL_ID,
+    DEEPSEEK_R1_8B_MODEL_ID,
+    DEEPSEEK_R1_32B_MODEL_ID,
+    QWEN3_32B_MODEL_ID,
+    LLAMA_3_3_70B_MODEL_ID,
+    QWEN3_235B_MODEL_ID,
+];
+
 /// Grace, in epochs, before a miner's stale liveness invalidates its blocks.
 /// A block is acceptable if its miner answered the synthetic task within the
 /// last `1 + GRACE` epochs — tolerates a short outage / model reload without
@@ -452,6 +483,13 @@ pub struct Params {
     /// `1 + SYNTHETIC_LIVENESS_GRACE_EPOCHS` epochs. Recording of synthetic
     /// answers happens regardless of this gate; only the rejection is gated here.
     pub synthetic_liveness_activation: ForkActivation,
+
+    /// Tier-reward hardfork activation DAA score. From this score, each block's
+    /// coinbase subsidy is scaled by the multiplier of the highest model tier it
+    /// declares in its `ai:cap` field (see `TIER_REWARD_BPS` / `TIER_MODEL_IDS`).
+    /// The un-earned delta is never minted (deflationary). Before this gate the
+    /// full schedule subsidy is paid, so historical blocks revalidate identically.
+    pub tier_reward_activation: ForkActivation,
 }
 
 impl Params {
@@ -636,6 +674,8 @@ impl Params {
             opoi_v2_activation: self.opoi_v2_activation,
 
             synthetic_liveness_activation: self.synthetic_liveness_activation,
+
+            tier_reward_activation: self.tier_reward_activation,
         }
     }
 }
@@ -741,6 +781,7 @@ pub const MAINNET_PARAMS: Params = Params {
 
     // TODO(hardfork): set to a concrete DAA (~5-7 days ahead) just before the v1.3.0 release.
     synthetic_liveness_activation: ForkActivation::never(),
+    tier_reward_activation: ForkActivation::never(),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -796,6 +837,7 @@ pub const TESTNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
     synthetic_liveness_activation: ForkActivation::never(),
+    tier_reward_activation: ForkActivation::never(),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -843,6 +885,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
     synthetic_liveness_activation: ForkActivation::never(),
+    tier_reward_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -888,4 +931,5 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
     synthetic_liveness_activation: ForkActivation::never(),
+    tier_reward_activation: ForkActivation::never(),
 };

@@ -190,6 +190,10 @@ pub struct VirtualStateProcessor {
     // OPoI synthetic-liveness hardfork (Level-1): reject blocks whose miner proves
     // no fresh synthetic answer (self-contained or via a /live: ancestor reference)
     pub(super) synthetic_liveness_activation: ForkActivation,
+
+    // Tier-reward hardfork: scale each block's coinbase subsidy by the multiplier
+    // of the highest model tier it declares in its `ai:cap` field (delta unminted)
+    pub(super) tier_reward_activation: ForkActivation,
 }
 
 impl VirtualStateProcessor {
@@ -265,6 +269,7 @@ impl VirtualStateProcessor {
             pow_salt_v4_activation: params.pow_salt_v4_activation,
             opoi_v2_activation: params.opoi_v2_activation,
             synthetic_liveness_activation: params.synthetic_liveness_activation,
+            tier_reward_activation: params.tier_reward_activation,
         }
     }
 

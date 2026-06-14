@@ -47,6 +47,9 @@ use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_inference::synthetic::{derive_synthetic_request, synthetic_seed, SYNTHETIC_EPOCH_BLOCKS};
 use keryx_consensus_core::config::params::SYNTHETIC_LIVENESS_GRACE_EPOCHS;
+use keryx_consensus_core::config::params::{
+    LLAMA_3_3_70B_MODEL_ID_LEGACY, TIER_MODEL_IDS, TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR,
+};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
@@ -178,10 +181,19 @@ impl VirtualStateProcessor {
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
             let escrow_spk =
                 self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data);
+            // Tier-reward: from `tier_reward_activation`, the paid subsidy is scaled by the
+            // highest model tier the block declares (delta unminted). Both the coinbase template
+            // builder and the validator consume this same `mergeset_rewards`, so they agree
+            // deterministically; before the gate the full schedule subsidy is paid.
+            let paid_subsidy = if self.tier_reward_activation.is_active(pov_daa_score) {
+                coinbase_data.subsidy * tier_reward_bps(&txs[0].payload) / TIER_REWARD_BPS_DIVISOR
+            } else {
+                coinbase_data.subsidy
+            };
             ctx.mergeset_rewards.insert(
                 merged_block,
                 BlockRewardData::new_with_escrow(
-                    coinbase_data.subsidy,
+                    paid_subsidy,
                     block_fee,
                     coinbase_data.miner_data.script_public_key,
                     escrow_spk,
@@ -630,6 +642,25 @@ fn parse_coinbase_escrow_pubkey(coinbase_payload: &[u8]) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Tier-reward multiplier (basis points) for a block, derived from the highest
+/// model tier it declares in its coinbase `ai:cap` field. Heavier model ⇒ larger
+/// share of the subsidy; an unknown / absent declaration falls back to the floor
+/// tier. The legacy IQ3 70B id maps to the same rank as the Q4_K_M id. Pure and
+/// deterministic over immutable block content — safe as a consensus input.
+fn tier_reward_bps(coinbase_payload: &[u8]) -> u64 {
+    let rank = parse_ai_caps(coinbase_payload)
+        .iter()
+        .filter_map(|id| {
+            TIER_MODEL_IDS
+                .iter()
+                .position(|m| m == id)
+                .or_else(|| (*id == LLAMA_3_3_70B_MODEL_ID_LEGACY).then_some(4))
+        })
+        .max()
+        .unwrap_or(0);
+    TIER_REWARD_BPS[rank]
+}
+
 /// Expected `request_hash` (= `blake2b(payload)[..32]`) of the synthetic task for
 /// `(epoch, escrow_pubkey, model_id)`. A v2 AiResponse matching this proves the
 /// miner answered its protocol-issued liveness task for that epoch.
@@ -882,6 +913,42 @@ mod tests {
         let mut miner_side = [0u8; 32];
         miner_side.copy_from_slice(&blake2b_simd::blake2b(&req.serialize()).as_bytes()[..32]);
         assert_eq!(miner_side, expected_synthetic_request_hash(epoch, &pk, model));
+    }
+
+    // ── tier-reward helper tests ──────────────────────────────────────────────
+
+    /// Builds a coinbase-shaped payload declaring the given model_ids in `ai:cap`.
+    /// The 21-byte prefix clears the 19-byte binary header `parse_ai_caps` skips.
+    fn caps_payload(ids: &[[u8; 32]]) -> Vec<u8> {
+        let caps = ids.iter().map(hex::encode).collect::<Vec<_>>().join(",");
+        format!("HDR_padding_19+++++++/ai:cap:{caps}/").into_bytes()
+    }
+
+    #[test]
+    fn tier_reward_bps_maps_each_tier() {
+        for (rank, id) in TIER_MODEL_IDS.iter().enumerate() {
+            assert_eq!(tier_reward_bps(&caps_payload(&[*id])), TIER_REWARD_BPS[rank], "rank {rank}");
+        }
+    }
+
+    #[test]
+    fn tier_reward_bps_takes_the_highest_declared_tier() {
+        // Declaring a light model alongside the flagship earns the flagship's share.
+        let payload = caps_payload(&[TIER_MODEL_IDS[0], TIER_MODEL_IDS[5], TIER_MODEL_IDS[2]]);
+        assert_eq!(tier_reward_bps(&payload), TIER_REWARD_BPS[5]);
+    }
+
+    #[test]
+    fn tier_reward_bps_legacy_70b_maps_to_ultra_rank() {
+        assert_eq!(tier_reward_bps(&caps_payload(&[LLAMA_3_3_70B_MODEL_ID_LEGACY])), TIER_REWARD_BPS[4]);
+    }
+
+    #[test]
+    fn tier_reward_bps_floors_unknown_or_absent() {
+        // No ai:cap field at all, and a declared-but-unrecognised id, both floor.
+        assert_eq!(tier_reward_bps(b"HDR_padding_19+++++++/no/caps/here"), TIER_REWARD_BPS[0]);
+        assert_eq!(tier_reward_bps(&caps_payload(&[[0xEEu8; 32]])), TIER_REWARD_BPS[0]);
+        assert_eq!(TIER_REWARD_BPS[5], TIER_REWARD_BPS_DIVISOR, "top tier must be the 100% reference");
     }
 
     #[test]
