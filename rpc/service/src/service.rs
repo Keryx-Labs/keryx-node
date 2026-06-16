@@ -128,8 +128,11 @@ pub struct RpcCoreService {
 
 const RPC_CORE: &str = "rpc-core";
 
-/// Re-challenge interval: issue a new inference challenge every N DAA scores (~6 min at 10 BPS).
-const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 3_600;
+/// Re-challenge interval: issue a new inference challenge every N DAA scores (~1 h at 10 BPS).
+/// Kept well above a cold model (re)load so a multi-GPU rig serving a large declared
+/// model spends its time mining, not reloading: one challenge per hour on a model
+/// picked at random from the miner's declared set.
+const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 36_000;
 
 /// A per-connection inference challenge issued by the node to verify the miner can actually run
 /// inference on the model it announced in ai:cap.
