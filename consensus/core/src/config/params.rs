@@ -469,6 +469,11 @@ pub struct Params {
     /// stock difficulty (no genesis reset). Same forced-update mechanism as v2.
     pub pow_salt_v4_activation: ForkActivation,
 
+    /// PoW SALT v5 hardfork activation DAA score. Shipped at the same DAA as `opoi_v2`
+    /// so the OPoI hardfork also bumps the matrix salt (`KERYX_MATRIX_SALT_V5`), forcing
+    /// every miner onto the updated binary at the cutover. Same forced-update mechanism as v4.
+    pub pow_salt_v5_activation: ForkActivation,
+
     /// OPoI v2 hardfork activation DAA score. From this score:
     /// - AiResponse payloads must be in the 142-byte v2 format (model_id + result_commitment),
     ///   making every response bindable to its off-chain content (future challenger v2);
@@ -671,6 +676,8 @@ impl Params {
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
 
+            pow_salt_v5_activation: self.pow_salt_v5_activation,
+
             opoi_v2_activation: self.opoi_v2_activation,
 
             synthetic_liveness_activation: self.synthetic_liveness_activation,
@@ -775,6 +782,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // forking cleanly away from the abandoned SALT-v3 / diff-1-spiral chain. Same DAA as the
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
+    pow_salt_v5_activation: ForkActivation::never(), // set to the opoi_v2 H DAA at the hardfork
 
     // TODO(hardfork): set to a concrete DAA (~5-7 days ahead) just before the v1.3.0 release.
     opoi_v2_activation: ForkActivation::never(),
@@ -833,6 +841,7 @@ pub const TESTNET_PARAMS: Params = Params {
 
     pow_salt_v2_activation: ForkActivation::new(0),
     pow_salt_v4_activation: ForkActivation::new(0),
+    pow_salt_v5_activation: ForkActivation::new(1_000), // same DAA as opoi_v2 (testnet cutover)
 
     // New OPoI-v2-era gates: all activate together at 1_000.
     opoi_v2_activation: ForkActivation::new(1_000),
@@ -883,6 +892,7 @@ pub const SIMNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    pow_salt_v5_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
     synthetic_liveness_activation: ForkActivation::never(),
     tier_reward_activation: ForkActivation::never(),
@@ -929,6 +939,7 @@ pub const DEVNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    pow_salt_v5_activation: ForkActivation::never(),
     opoi_v2_activation: ForkActivation::never(),
     synthetic_liveness_activation: ForkActivation::never(),
     tier_reward_activation: ForkActivation::never(),

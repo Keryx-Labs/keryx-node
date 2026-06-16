@@ -256,6 +256,14 @@ impl VirtualStateProcessor {
             );
         }
 
+        // SALT v5 hardfork (shipped with opoi_v2): log once at activation.
+        if header.daa_score == self.pow_salt_v5_activation.daa_score() {
+            info!(
+                "=== SALT v5 HARDFORK ACTIVATED at DAA {} — KeryxHash salt switched to v5 alongside opoi_v2; pre-hardfork miners now rejected ===",
+                header.daa_score
+            );
+        }
+
         // OPoI v2 hardfork: response commitment + embedded model_id (cross-block cap).
         // Supersedes the Phase 3 same-block-only cap check below.
         if self.opoi_v2_activation.is_active(header.daa_score) {

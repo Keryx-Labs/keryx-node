@@ -24,6 +24,11 @@ const KERYX_MATRIX_SALT_V2: [u8; 32] = *b"KERYX:KeryxHash-v2:2026-05-29:xx";
 /// lineage and its salt bytes are burned on the abandoned chain.
 const KERYX_MATRIX_SALT_V4: [u8; 32] = *b"KERYX:KeryxHash-v4:2026-06-07:xx";
 
+/// Salt for PoW algorithm v5, activated via `pow_salt_v5_activation` in network params.
+/// Shipped at the same DAA as `opoi_v2` so the OPoI hardfork also bumps the PoW salt,
+/// forcing every miner onto the updated binary at the cutover (old-salt blocks rejected).
+const KERYX_MATRIX_SALT_V5: [u8; 32] = *b"KERYX:KeryxHash-v5:2026-06-16:xx";
+
 /// Rotation amounts for the `wave_mix` ARX (Add-Rotate-XOR) rounds.
 /// Values are coprime to 64 so no degenerate fixed-point cycles exist.
 const WAVE_MIX_ROTATIONS: [u32; 4] = [17, 31, 47, 13];
@@ -74,6 +79,7 @@ impl Matrix {
         let salt: &[u8; 32] = match salt_version {
             1 => &KERYX_MATRIX_SALT_V1,
             2 => &KERYX_MATRIX_SALT_V2,
+            5 => &KERYX_MATRIX_SALT_V5,
             _ => &KERYX_MATRIX_SALT_V4,
         };
         let salted = {

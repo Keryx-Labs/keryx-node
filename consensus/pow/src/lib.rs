@@ -24,6 +24,10 @@ static POW_SALT_V2_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
 /// v3 is skipped on purpose: it belongs to the abandoned diff-spiral chain.
 static POW_SALT_V4_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// DAA score at which the PoW SALT switches from v4 to v5 (shipped with the opoi_v2
+/// hardfork to force a clean fleet upgrade). u64::MAX means "never" (default).
+static POW_SALT_V5_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Called once at startup with the value from `Params::pow_salt_v2_activation`.
 /// After this point every PoW computation automatically picks the correct salt.
 pub fn init_pow_salt_v2_activation(daa_score: u64) {
@@ -35,12 +39,19 @@ pub fn init_pow_salt_v4_activation(daa_score: u64) {
     POW_SALT_V4_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
 }
 
-/// Returns the active matrix-salt version (1, 2 or 4) for a block at `daa_score`.
+/// Called once at startup with the value from `Params::pow_salt_v5_activation`.
+pub fn init_pow_salt_v5_activation(daa_score: u64) {
+    POW_SALT_V5_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Returns the active matrix-salt version (1, 2, 4 or 5) for a block at `daa_score`.
 /// Thresholds are monotonic and compared with `>=`, so the first block whose
 /// `daa_score` reaches an activation already uses the new salt.
 #[inline(always)]
 pub(crate) fn active_salt_version(daa_score: u64) -> u8 {
-    if daa_score >= POW_SALT_V4_ACTIVATION_DAA.load(Ordering::Relaxed) {
+    if daa_score >= POW_SALT_V5_ACTIVATION_DAA.load(Ordering::Relaxed) {
+        5
+    } else if daa_score >= POW_SALT_V4_ACTIVATION_DAA.load(Ordering::Relaxed) {
         4
     } else if daa_score >= POW_SALT_V2_ACTIVATION_DAA.load(Ordering::Relaxed) {
         2
