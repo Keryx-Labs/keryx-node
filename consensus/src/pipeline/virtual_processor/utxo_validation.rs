@@ -240,58 +240,35 @@ impl VirtualStateProcessor {
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
         ctx.pruning_sample_from_pov = Some(reply.pruning_sample);
 
-        // SALT v2 hardfork: log once at the exact activation DAA score.
-        if header.daa_score == self.pow_salt_v2_activation.daa_score() {
-            info!(
-                "=== SALT v2 HARDFORK ACTIVATED at DAA {} — KeryxHash domain salt switched to v2, pre-v1.2.2 miners now rejected ===",
-                header.daa_score
-            );
-        }
-
-        // SALT v4 hardfork (chain relaunch on stock difficulty): log once at activation.
-        if header.daa_score == self.pow_salt_v4_activation.daa_score() {
-            info!(
-                "=== SALT v4 HARDFORK ACTIVATED at DAA {} — KeryxHash salt switched to v4, stock difficulty (no reset); chain relaunched off the abandoned SALT-v3 spiral, older binaries now rejected ===",
-                header.daa_score
-            );
-        }
-
-        // SALT v5 hardfork (shipped with opoi_v2): log once at activation.
-        if header.daa_score == self.pow_salt_v5_activation.daa_score() {
-            info!(
-                "=== SALT v5 HARDFORK ACTIVATED at DAA {} — KeryxHash salt switched to v5 alongside opoi_v2; pre-hardfork miners now rejected ===",
-                header.daa_score
-            );
-        }
-
-        // OPoI v2 hardfork: response commitment + embedded model_id (cross-block cap).
-        // Supersedes the Phase 3 same-block-only cap check below.
-        if self.opoi_v2_activation.is_active(header.daa_score) {
-            if header.daa_score == self.opoi_v2_activation.daa_score() {
-                info!(
-                    "=== OPoI V2 HARDFORK ACTIVATED at DAA {} — AiResponse commitment + cross-block model cap enforcement now live, 70B model swapped to Q4_K_M ===",
-                    header.daa_score
-                );
+        // Hardfork activation banner — one consolidated line per activation DAA, logged
+        // ONCE. The virtual-chain re-resolution at the boundary re-processes the same block
+        // many times; without this guard each pass re-emitted every banner (log spam).
+        {
+            use std::sync::atomic::Ordering;
+            static LAST_LOGGED_DAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+            // Short component names (no parentheticals); OPoI v2 names the fork headline.
+            let mut newly: Vec<&str> = Vec::new();
+            if header.daa_score == self.synthetic_liveness_activation.daa_score() { newly.push("synthetic-liveness"); }
+            if header.daa_score == self.tier_reward_activation.daa_score() { newly.push("tier-reward"); }
+            if header.daa_score == self.model_cap_enforcement_activation.daa_score() { newly.push("model-cap"); }
+            if header.daa_score == self.pow_salt_v5_activation.daa_score() { newly.push("SALT v5"); }
+            if header.daa_score == self.pow_salt_v4_activation.daa_score() { newly.push("SALT v4"); }
+            if header.daa_score == self.pow_salt_v2_activation.daa_score() { newly.push("SALT v2"); }
+            let opoi = header.daa_score == self.opoi_v2_activation.daa_score();
+            if (opoi || !newly.is_empty()) && LAST_LOGGED_DAA.swap(header.daa_score, Ordering::Relaxed) != header.daa_score {
+                match (opoi, newly.is_empty()) {
+                    (true, true) => info!("=== HARDFORK OPoI v2 ACTIVATED at DAA {} ===", header.daa_score),
+                    (true, false) => info!("=== HARDFORK OPoI v2 ACTIVATED at DAA {} — also: {} ===", header.daa_score, newly.join(" + ")),
+                    (false, _) => info!("=== HARDFORK ACTIVATED at DAA {} — {} ===", header.daa_score, newly.join(" + ")),
+                }
             }
+        }
+
+        // Enforcement (runs every block while active; unchanged).
+        if self.opoi_v2_activation.is_active(header.daa_score) {
             check_ai_response_v2(&txs)?;
         } else if self.model_cap_enforcement_activation.is_active(header.daa_score) {
-            // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
-            if header.daa_score == self.model_cap_enforcement_activation.daa_score() {
-                info!(
-                    "=== OPoI HARDFORK ACTIVATED at DAA {} — UTXO escrow + model cap enforcement now live ===",
-                    header.daa_score
-                );
-            }
             self.check_ai_response_model_caps(&txs)?;
-        }
-
-        // OPoI synthetic-liveness (Level-1): reject a chain block whose miner proves no
-        // fresh synthetic answer. Gated by `synthetic_liveness_activation` (no-op before).
-        if header.daa_score == self.synthetic_liveness_activation.daa_score() {
-            info!(
-                "=== OPoI SYNTHETIC-LIVENESS HARDFORK ACTIVATED at DAA {} — blocks now require a fresh synthetic inference answer (self-contained or /live: ancestor) ===",
-                header.daa_score
-            );
         }
         self.enforce_synthetic_liveness(&txs, header)?;
 
@@ -613,6 +590,15 @@ impl VirtualStateProcessor {
             return Ok(());
         }
         let epoch = header.daa_score / SYNTHETIC_EPOCH_BLOCKS;
+        // Defer enforcement until at least one FULL epoch has elapsed since opoi_v2. The
+        // first fully-v2 epoch runs UNENFORCED — the miner answers it freely and that answer
+        // gets annotated. Enforcement then begins the next epoch, where every block can
+        // reference that already-established answer via `/live:` from block one. This makes
+        // the hardfork transition seamless: no transient disqualifications, and no epoch
+        // straddling opoi_v2 (which could hold v1 answers) is ever enforced.
+        if epoch * SYNTHETIC_EPOCH_BLOCKS < self.opoi_v2_activation.daa_score().saturating_add(SYNTHETIC_EPOCH_BLOCKS) {
+            return Ok(());
+        }
         let Some(pubkey) = parse_coinbase_escrow_pubkey(&txs[0].payload) else {
             return Err(SyntheticLivenessNoEscrow(header.hash));
         };

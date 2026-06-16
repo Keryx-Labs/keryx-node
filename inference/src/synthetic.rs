@@ -18,7 +18,9 @@ use crate::ai_payload::AiRequestPayload;
 /// one synthetic task per epoch; `epoch = daa_score / SYNTHETIC_EPOCH_BLOCKS`.
 /// Shared by the node (recording/enforcement) and the miner (scheduling) so both
 /// agree on epoch boundaries. ~36k blocks ≈ 1 hour at 10 BPS.
-pub const SYNTHETIC_EPOCH_BLOCKS: u64 = 36_000;
+/// TESTNET: 200 (~20 s) so the first enforced epoch lands quickly after the gates.
+/// MUST match keryx-miner synthetic.rs. Revert to 36_000 before any mainnet build.
+pub const SYNTHETIC_EPOCH_BLOCKS: u64 = 200;
 
 /// Tokens the synthetic task asks for. Deliberately small — this proves
 /// liveness ("you are online and serving the model you declared"), not a real
