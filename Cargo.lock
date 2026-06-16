@@ -3422,6 +3422,7 @@ name = "keryx-rpc-service"
 version = "1.2.6"
 dependencies = [
  "async-trait",
+ "hex",
  "keryx-addresses",
  "keryx-consensus-core",
  "keryx-consensus-notify",
@@ -3429,6 +3430,7 @@ dependencies = [
  "keryx-core",
  "keryx-hashes",
  "keryx-index-core",
+ "keryx-inference",
  "keryx-math",
  "keryx-mining",
  "keryx-notify",

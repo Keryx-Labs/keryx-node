@@ -23,6 +23,7 @@ use keryx_consensus_notify::{
 };
 use keryx_consensusmanager::ConsensusManager;
 use keryx_core::time::unix_now;
+use keryx_inference::synthetic::{synthetic_model_for_epoch, SYNTHETIC_EPOCH_BLOCKS};
 use keryx_core::{
     core::Core,
     debug,
@@ -128,11 +129,15 @@ pub struct RpcCoreService {
 
 const RPC_CORE: &str = "rpc-core";
 
-/// Re-challenge interval: issue a new inference challenge every N DAA scores (~1 h at 10 BPS).
-/// Kept well above a cold model (re)load so a multi-GPU rig serving a large declared
-/// model spends its time mining, not reloading: one challenge per hour on a model
-/// picked at random from the miner's declared set.
-const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 36_000;
+/// Interval between capability challenges (~6 h at 10 BPS) once the first has fired.
+/// The capability challenge targets the SAME model the consensus synthetic-liveness uses
+/// for the current epoch (see `synthetic_model_for_epoch`), so when both land in the same
+/// hour the miner only needs one model loaded.
+const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 216_000;
+/// Delay before the FIRST capability challenge after a new connection (~1 h at 10 BPS).
+/// At startup the synthetic-liveness already runs and loads the miner's model, so we hold
+/// the first capability challenge back to keep boot to a single inference.
+const INFERENCE_CHALLENGE_FIRST_DELAY_DAA: u64 = 36_000;
 
 /// A per-connection inference challenge issued by the node to verify the miner can actually run
 /// inference on the model it announced in ai:cap.
@@ -477,16 +482,33 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             // empty inference_result; the old OR logic (`!passed || expired`) regenerated
             // a new nonce on every ping, so the response never matched. Now we only rotate
             // the nonce on expiry — pending challenges return a stable nonce until answered.
+            // Defer the first capability challenge by a full interval after a new
+            // connection: at startup the consensus synthetic-liveness already runs (and
+            // loads the miner's model), so we don't stack a capability challenge on top —
+            // that keeps startup to a single inference. Seed the interval timer now as
+            // "passed"; the first capability challenge then fires INTERVAL later.
+            if !states.contains_key(&conn_id) {
+                states.insert(conn_id, ChallengeState {
+                    model_id_hex: String::new(),
+                    nonce_hex: String::new(),
+                    // Backdate so the FIRST capability challenge fires FIRST_DELAY (~1h) after
+                    // connect, then every INTERVAL (~6h) after that.
+                    issued_at_daa: current_daa.saturating_sub(
+                        INFERENCE_CHALLENGE_INTERVAL_DAA.saturating_sub(INFERENCE_CHALLENGE_FIRST_DELAY_DAA),
+                    ),
+                    passed: true,
+                    fail_count: 0,
+                });
+            }
             let issue_new = match states.get(&conn_id) {
-                None => true,
+                None => false,
                 Some(state) => current_daa.saturating_sub(state.issued_at_daa) >= INFERENCE_CHALLENGE_INTERVAL_DAA,
             };
 
             if issue_new {
-                use rand::{Rng, RngCore};
-                // The most expensive declared model (by consensus min reward) is the one
-                // most worth faking — probe it first on any fresh state, so reconnecting
-                // never skips the hard proof.
+                use rand::RngCore;
+                // Fallback model (most expensive declared) when the synthetic-aligned model
+                // can't be derived (e.g. no parsable escrow in extra_data).
                 let most_expensive = || -> String {
                     declared_model_ids
                         .iter()
@@ -501,10 +523,28 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                         .expect("declared_model_ids is non-empty")
                         .clone()
                 };
+                // Align the capability challenge with the consensus synthetic-liveness model
+                // for this epoch, so when both fire in the same hour the miner only needs one
+                // model loaded. Derived from the escrow pubkey in extra_data + the declared set
+                // (same inputs the synthetic uses), so both sides pick the same model.
+                let aligned = extra_data_str
+                    .split('/')
+                    .find(|s| s.starts_with("escrow:"))
+                    .and_then(|s| s.get("escrow:".len().."escrow:".len() + 64))
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|v| <[u8; 32]>::try_from(v).ok())
+                    .and_then(|escrow| {
+                        let declared_bytes: Vec<[u8; 32]> = declared_model_ids
+                            .iter()
+                            .filter_map(|h| hex::decode(h).ok().and_then(|v| <[u8; 32]>::try_from(v).ok()))
+                            .collect();
+                        let epoch = current_daa / SYNTHETIC_EPOCH_BLOCKS;
+                        synthetic_model_for_epoch(epoch, &escrow, &declared_bytes).map(|m| model_id_to_hex(&m))
+                    });
                 // Layer-B capability gate: pick the model to challenge.
                 let (model_id_hex, fail_count) = match states.get(&conn_id) {
-                    // Sticky re-challenge: a model that failed (or expired unanswered) must
-                    // be re-proven before mining resumes — no random escape to an easier one.
+                    // Sticky re-challenge: an unproven model must be re-proven before mining
+                    // resumes — no escape to an easier one.
                     Some(prev)
                         if !prev.passed
                             && declared_model_ids.iter().any(|m| m.eq_ignore_ascii_case(&prev.model_id_hex)) =>
@@ -516,14 +556,8 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                         );
                         (prev.model_id_hex.clone(), count)
                     }
-                    // Previous challenge passed: rotate randomly across declared models.
-                    Some(prev) if prev.passed => {
-                        let idx = rand::thread_rng().gen_range(0..declared_model_ids.len());
-                        (declared_model_ids[idx].clone(), 0)
-                    }
-                    // New connection, or the unproven model vanished from ai:cap (caps
-                    // changed mid-connection): start from the most expensive model.
-                    _ => (most_expensive(), 0),
+                    // Otherwise challenge the synthetic-aligned model (fallback: most expensive).
+                    _ => (aligned.unwrap_or_else(most_expensive), 0),
                 };
                 let nonce_hex = format!("{:016x}", rand::thread_rng().next_u64());
                 let challenge = format!("{}:{}", model_id_hex, nonce_hex);

@@ -16,6 +16,7 @@ keryx-consensus-notify.workspace = true
 keryx-consensusmanager.workspace = true
 keryx-core.workspace = true
 keryx-hashes.workspace = true
+keryx-inference.workspace = true
 keryx-index-core.workspace = true
 keryx-math.workspace = true
 keryx-mining.workspace = true
@@ -31,6 +32,7 @@ keryx-utils-tower.workspace = true
 keryx-utxoindex.workspace = true
 
 async-trait.workspace = true
+hex.workspace = true
 log.workspace = true
 rand.workspace = true
 tokio.workspace = true

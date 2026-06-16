@@ -93,6 +93,18 @@ pub fn synthetic_seed(epoch: u64, escrow_pubkey: &[u8; 32]) -> [u8; 32] {
     out
 }
 
+/// The declared model the synthetic-liveness task targets for `epoch`, derived
+/// identically to the miner's own per-epoch pick. Lets the (non-consensus) capability
+/// challenge align on the same model, so when both fire in the same epoch a rig only
+/// needs a single model loaded. Returns `None` when `declared_models` is empty.
+pub fn synthetic_model_for_epoch(
+    epoch: u64,
+    escrow_pubkey: &[u8; 32],
+    declared_models: &[[u8; 32]],
+) -> Option<[u8; 32]> {
+    pick_model(&synthetic_seed(epoch, escrow_pubkey), declared_models)
+}
+
 pub fn derive_synthetic_request(
     seed: &[u8; 32],
     declared_models: &[[u8; 32]],
