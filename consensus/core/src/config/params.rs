@@ -826,18 +826,18 @@ pub const TESTNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::new(0),
 
-    // Testnet: activate ~5 min after genesis (3_000 blocks at 10 BPS) to observe the transition.
-    model_cap_enforcement_activation: ForkActivation::new(3_000),
+    // Testnet rollout (10 BPS): legacy gates active from genesis (salt pinned to v4,
+    // no mid-chain transition), new OPoI-v2-era gates flip together at DAA 1_000.
+    model_cap_enforcement_activation: ForkActivation::new(0),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // PoW SALT v2: testnet activation at DAA 6_000.
-    pow_salt_v2_activation: ForkActivation::new(6_000),
+    pow_salt_v2_activation: ForkActivation::new(0),
+    pow_salt_v4_activation: ForkActivation::new(0),
 
-    // PoW SALT v4: not needed on testnet (mainnet-only chain relaunch).
-    pow_salt_v4_activation: ForkActivation::never(),
-    opoi_v2_activation: ForkActivation::never(),
-    synthetic_liveness_activation: ForkActivation::never(),
-    tier_reward_activation: ForkActivation::never(),
+    // New OPoI-v2-era gates: all activate together at 1_000.
+    opoi_v2_activation: ForkActivation::new(1_000),
+    synthetic_liveness_activation: ForkActivation::new(1_000),
+    tier_reward_activation: ForkActivation::new(1_000),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
