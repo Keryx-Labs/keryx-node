@@ -60,7 +60,13 @@ impl TestBlockBuilder {
         )?;
         let pov_virtual_utxo_view = (&virtual_read.utxo_set).compose(accumulated_diff);
         self.validate_block_template_transactions(&txs, &pov_virtual_state, &pov_virtual_utxo_view)?;
+        let balance_bps_by_block = self.balance_bps_by_block(
+            &pov_virtual_state.ghostdag_data,
+            &pov_virtual_state.mergeset_non_daa,
+            pov_virtual_state.daa_score,
+            &pov_virtual_utxo_view,
+        );
         drop(virtual_read);
-        self.build_block_template_from_virtual_state(pov_virtual_state, miner_data, txs, vec![])
+        self.build_block_template_from_virtual_state(pov_virtual_state, miner_data, txs, vec![], balance_bps_by_block)
     }
 }

@@ -108,6 +108,33 @@ pub const TIER_REWARD_BPS: [u64; 6] = [
 /// Basis-points divisor for `TIER_REWARD_BPS`.
 pub const TIER_REWARD_BPS_DIVISOR: u64 = 10_000;
 
+/// Balance-reward brackets: a block's coinbase miner cut is additionally scaled
+/// (MULTIPLICATIVELY with the tier multiplier) by how much KRX the miner holds at
+/// its payout address, proven by `/bal:` outpoints embedded in the coinbase. Applied
+/// from `balance_reward_activation`; the un-earned delta is burned (deflationary).
+/// Pick the highest bracket whose `BALANCE_REWARD_THRESHOLDS_SOMPI` is met. Reuses
+/// `TIER_REWARD_BPS_DIVISOR`. Both factors floored ⇒ never inflates beyond schedule.
+pub const BALANCE_REWARD_BPS: [u64; 5] = [
+    8_000,  // 0  < 50k KRX         80%
+    8_700,  // 1  ≥ 50k KRX         87%
+    9_200,  // 2  ≥ 200k KRX        92%
+    9_700,  // 3  ≥ 500k KRX        97%
+    10_000, // 4  ≥ 1,000,000 KRX  100%
+];
+
+/// Minimum balance (in sompi) to earn each `BALANCE_REWARD_BPS` bracket. 1 KRX = 1e8 sompi.
+pub const BALANCE_REWARD_THRESHOLDS_SOMPI: [u64; 5] = [
+    0,
+    50_000 * 100_000_000,
+    200_000 * 100_000_000,
+    500_000 * 100_000_000,
+    1_000_000 * 100_000_000,
+];
+
+/// Max number of `/bal:` outpoints a coinbase may reference (bounds coinbase bloat
+/// and validation cost). References beyond this are ignored deterministically.
+pub const BALANCE_REWARD_MAX_OUTPOINTS: usize = 8;
+
 /// Canonical model ids ordered lightest → heaviest. A block's tier rank is the
 /// highest position among the model_ids it declares in its coinbase `ai:cap`
 /// field. The legacy IQ3 70B id is mapped to the same rank as the Q4_K_M id by
@@ -495,6 +522,15 @@ pub struct Params {
     /// The un-earned delta is never minted (deflationary). Before this gate the
     /// full schedule subsidy is paid, so historical blocks revalidate identically.
     pub tier_reward_activation: ForkActivation,
+
+    /// Balance-reward hardfork activation DAA score. From this score, each block's
+    /// coinbase miner cut is additionally scaled by the holdings bracket of the
+    /// miner (proven by `/bal:` outpoints paying to the coinbase payout SPK; see
+    /// `BALANCE_REWARD_BPS` / `BALANCE_REWARD_THRESHOLDS_SOMPI`), multiplicatively
+    /// with the tier multiplier. The un-earned delta is burned. Before this gate
+    /// the cut is unaffected, so historical blocks revalidate identically.
+    /// Gated to the SAME H as `opoi_v2_activation` (the intended last hardfork).
+    pub balance_reward_activation: ForkActivation,
 }
 
 impl Params {
@@ -683,6 +719,8 @@ impl Params {
             synthetic_liveness_activation: self.synthetic_liveness_activation,
 
             tier_reward_activation: self.tier_reward_activation,
+
+            balance_reward_activation: self.balance_reward_activation,
         }
     }
 }
@@ -790,6 +828,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // TODO(hardfork): set to a concrete DAA (~5-7 days ahead) just before the v1.3.0 release.
     synthetic_liveness_activation: ForkActivation::never(),
     tier_reward_activation: ForkActivation::never(),
+    balance_reward_activation: ForkActivation::never(),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -847,6 +886,7 @@ pub const TESTNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::new(1_000),
     synthetic_liveness_activation: ForkActivation::new(1_000),
     tier_reward_activation: ForkActivation::new(1_000),
+    balance_reward_activation: ForkActivation::new(1_000),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -896,6 +936,7 @@ pub const SIMNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::never(),
     synthetic_liveness_activation: ForkActivation::never(),
     tier_reward_activation: ForkActivation::never(),
+    balance_reward_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -943,4 +984,5 @@ pub const DEVNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::never(),
     synthetic_liveness_activation: ForkActivation::never(),
     tier_reward_activation: ForkActivation::never(),
+    balance_reward_activation: ForkActivation::never(),
 };

@@ -36,7 +36,7 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, TransactionOutpoint, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -48,6 +48,7 @@ use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKE
 use keryx_inference::synthetic::{derive_synthetic_request, synthetic_seed, SYNTHETIC_EPOCH_BLOCKS};
 use keryx_consensus_core::config::params::SYNTHETIC_LIVENESS_GRACE_EPOCHS;
 use keryx_consensus_core::config::params::{LLAMA_3_3_70B_MODEL_ID_LEGACY, TIER_MODEL_IDS, TIER_REWARD_BPS};
+use keryx_consensus_core::config::params::{BALANCE_REWARD_BPS, BALANCE_REWARD_MAX_OUTPOINTS, BALANCE_REWARD_THRESHOLDS_SOMPI};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
 use keryx_utils::refs::Refs;
@@ -227,14 +228,22 @@ impl VirtualStateProcessor {
 
         let txs = self.block_transactions_store.get(header.hash).unwrap();
 
-        // Verify coinbase transaction
-        self.verify_coinbase_transaction(
-            &txs[0],
-            header.daa_score,
-            &ctx.ghostdag_data,
-            &ctx.mergeset_rewards,
-            &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
-        )?;
+        // Verify coinbase transaction. Balance-reward sums each rewarded blue's `/bal:` outpoints
+        // against the block's FULL UTXO view (selected parent ∘ this block's mergeset diff) — the
+        // exact pairing the template builder used (the materialized virtual utxo_set), so builder
+        // and validator agree deterministically. Scoped so the borrow releases before ctx is
+        // mutated below.
+        {
+            let current_utxo_view = selected_parent_utxo_view.compose(&ctx.mergeset_diff);
+            self.verify_coinbase_transaction(
+                &txs[0],
+                header.daa_score,
+                &ctx.ghostdag_data,
+                &ctx.mergeset_rewards,
+                &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+                &current_utxo_view,
+            )?;
+        }
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -250,6 +259,7 @@ impl VirtualStateProcessor {
             let mut newly: Vec<&str> = Vec::new();
             if header.daa_score == self.synthetic_liveness_activation.daa_score() { newly.push("synthetic-liveness"); }
             if header.daa_score == self.tier_reward_activation.daa_score() { newly.push("tier-reward"); }
+            if header.daa_score == self.balance_reward_activation.daa_score() { newly.push("balance-reward"); }
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() { newly.push("model-cap"); }
             if header.daa_score == self.pow_salt_v5_activation.daa_score() { newly.push("SALT v5"); }
             if header.daa_score == self.pow_salt_v4_activation.daa_score() { newly.push("SALT v4"); }
@@ -308,17 +318,19 @@ impl VirtualStateProcessor {
         Ok(reply)
     }
 
-    fn verify_coinbase_transaction(
+    fn verify_coinbase_transaction<V: UtxoView>(
         &self,
         coinbase: &Transaction,
         daa_score: u64,
         ghostdag_data: &GhostdagData,
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
+        utxo_view: &V,
     ) -> BlockProcessResult<()> {
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
+        let balance_bps_by_block = self.balance_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score, utxo_view);
         let expected_coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -328,6 +340,7 @@ impl VirtualStateProcessor {
                 mergeset_rewards,
                 mergeset_non_daa,
                 &tier_bps_by_block,
+                &balance_bps_by_block,
             )
             .unwrap()
             .tx;
@@ -352,6 +365,42 @@ impl VirtualStateProcessor {
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let txs = self.block_transactions_store.get(*blue).unwrap();
             map.insert(*blue, tier_reward_bps(&txs[0].payload));
+        }
+        map
+    }
+
+    /// Balance-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue,
+    /// the holdings multiplier (bps) earned by the miner's KRX balance. The balance is the sum
+    /// of the blue coinbase's `/bal:` outpoints that (a) are unspent in `utxo_view` and (b) pay
+    /// to that coinbase's own payout SPK — so a miner can only count UTXOs at the very address
+    /// it is being rewarded to (referencing someone else's balance is pointless: the reward
+    /// would go to them). Both validator and template builder derive it from the same immutable
+    /// blue body + the same virtual-base UTXO view ⇒ deterministic. Empty before
+    /// `balance_reward_activation` (⇒ every cut paid in full, no penalty, no burn).
+    pub(super) fn balance_bps_by_block<V: UtxoView>(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        pov_daa_score: u64,
+        utxo_view: &V,
+    ) -> BlockHashMap<u64> {
+        let mut map = BlockHashMap::new();
+        if !self.balance_reward_activation.is_active(pov_daa_score) {
+            return map;
+        }
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            let coinbase = &self.block_transactions_store.get(*blue).unwrap()[0];
+            // Payout SPK the /bal: outpoints must pay to (binds the balance to the rewarded miner).
+            let payout_spk = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data.script_public_key;
+            let mut sum = 0u64;
+            for outpoint in parse_coinbase_bal_outpoints(&coinbase.payload) {
+                if let Some(entry) = utxo_view.get(&outpoint) {
+                    if entry.script_public_key == payout_spk {
+                        sum = sum.saturating_add(entry.amount);
+                    }
+                }
+            }
+            map.insert(*blue, balance_reward_bps(sum));
         }
         map
     }
@@ -672,6 +721,49 @@ fn tier_reward_bps(coinbase_payload: &[u8]) -> u64 {
         .max()
         .unwrap_or(0);
     TIER_REWARD_BPS[rank]
+}
+
+/// Holdings multiplier (basis points) for a balance in sompi: the highest
+/// `BALANCE_REWARD_BPS` bracket whose `BALANCE_REWARD_THRESHOLDS_SOMPI` is met.
+/// Thresholds are ascending; bracket 0 (floor) applies to a zero / no balance.
+fn balance_reward_bps(balance_sompi: u64) -> u64 {
+    let mut bps = BALANCE_REWARD_BPS[0];
+    for i in 0..BALANCE_REWARD_THRESHOLDS_SOMPI.len() {
+        if balance_sompi >= BALANCE_REWARD_THRESHOLDS_SOMPI[i] {
+            bps = BALANCE_REWARD_BPS[i];
+        }
+    }
+    bps
+}
+
+/// Parses `/bal:<txid_hex>:<index>,<txid_hex>:<index>,…` from a coinbase payload into
+/// outpoints (the miner's claimed balance UTXOs). The field runs until the next `/` or
+/// end of payload. Malformed entries are skipped; at most `BALANCE_REWARD_MAX_OUTPOINTS`
+/// are returned. Pure and deterministic over immutable block content.
+fn parse_coinbase_bal_outpoints(coinbase_payload: &[u8]) -> Vec<TransactionOutpoint> {
+    const MARKER: &[u8] = b"/bal:";
+    let mut out = Vec::new();
+    let Some(pos) = coinbase_payload.windows(MARKER.len()).position(|w| w == MARKER) else { return out };
+    let start = pos + MARKER.len();
+    let end =
+        coinbase_payload[start..].iter().position(|&b| b == b'/').map(|p| start + p).unwrap_or(coinbase_payload.len());
+    let Ok(field) = std::str::from_utf8(&coinbase_payload[start..end]) else { return out };
+    for entry in field.split(',') {
+        if out.len() >= BALANCE_REWARD_MAX_OUTPOINTS {
+            break;
+        }
+        let Some((tx_hex, idx_str)) = entry.split_once(':') else { continue };
+        if tx_hex.len() != 64 {
+            continue;
+        }
+        let mut tx_bytes = [0u8; 32];
+        if hex::decode_to_slice(tx_hex, &mut tx_bytes).is_err() {
+            continue;
+        }
+        let Ok(index) = idx_str.parse::<u32>() else { continue };
+        out.push(TransactionOutpoint::new(TransactionId::from_bytes(tx_bytes), index));
+    }
+    out
 }
 
 /// Expected `request_hash` (= `blake2b(payload)[..32]`) of the synthetic task for

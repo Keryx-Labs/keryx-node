@@ -236,6 +236,12 @@ impl CoinbaseManager {
         // a no-op before `tier_reward_activation`. Built by the caller from each merged
         // block's declared `ai:cap` tier (see `tier_bps_by_block`).
         tier_bps_by_block: &BlockHashMap<u64>,
+        // Balance-reward: blue block hash → holdings multiplier (bps) for its *miner* cut,
+        // applied MULTIPLICATIVELY with the tier multiplier. Empty / missing entry ⇒ full
+        // `TIER_REWARD_BPS_DIVISOR` (no penalty), so this is a no-op before
+        // `balance_reward_activation`. Built by the caller from each merged block's `/bal:`
+        // outpoints summed against the UTXO view (see `balance_bps_by_block`).
+        balance_bps_by_block: &BlockHashMap<u64>,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
         // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D
         // allocation, + 1 for the accumulated tier-reward burn
@@ -263,10 +269,14 @@ impl CoinbaseManager {
                 let escrow_cut = reward_data.subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
                 rd_total += rd_cut;
                 let miner_subsidy = reward_data.subsidy - rd_cut - escrow_cut;
-                // Tier-reward: scale only the miner cut by the block's declared tier; the
-                // shortfall is burned below. R&D and escrow keep their full-subsidy base.
+                // Tier-reward × Balance-reward: scale only the miner cut by the block's declared
+                // tier AND its holdings bracket (multiplicative); the shortfall is burned below.
+                // R&D and escrow keep their full-subsidy base. Sequential floored divisions keep
+                // the intermediate small (no overflow) and are deterministic for builder+validator.
                 let tier_bps = tier_bps_by_block.get(blue).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
-                let miner_paid = miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR;
+                let balance_bps = balance_bps_by_block.get(blue).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+                let miner_paid =
+                    miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * balance_bps / TIER_REWARD_BPS_DIVISOR;
                 tier_burn_total += miner_subsidy - miner_paid;
                 outputs.push(TransactionOutput::new(miner_paid, reward_data.script_public_key.clone()));
                 let escrow_spk = reward_data

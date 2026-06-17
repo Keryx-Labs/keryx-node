@@ -197,6 +197,10 @@ pub struct VirtualStateProcessor {
     // Tier-reward hardfork: scale each block's coinbase subsidy by the multiplier
     // of the highest model tier it declares in its `ai:cap` field (delta unminted)
     pub(super) tier_reward_activation: ForkActivation,
+
+    // Balance-reward hardfork: additionally scale the miner cut by the miner's KRX
+    // holdings bracket (proven by `/bal:` outpoints), multiplicatively with tier.
+    pub(super) balance_reward_activation: ForkActivation,
 }
 
 impl VirtualStateProcessor {
@@ -274,6 +278,7 @@ impl VirtualStateProcessor {
             opoi_v2_activation: params.opoi_v2_activation,
             synthetic_liveness_activation: params.synthetic_liveness_activation,
             tier_reward_activation: params.tier_reward_activation,
+            balance_reward_activation: params.balance_reward_activation,
         }
     }
 
@@ -1039,11 +1044,21 @@ impl VirtualStateProcessor {
             (TemplateBuildMode::Standard, true) | (TemplateBuildMode::Infallible, _) => {}
         }
 
+        // Balance-reward map: computed under the virtual read lock so it uses the exact
+        // materialized virtual UTXO view (= the block's full selected-parent ∘ mergeset view),
+        // which is precisely what the validator recomputes. Empty before balance_reward_activation.
+        let balance_bps_by_block = self.balance_bps_by_block(
+            &virtual_state.ghostdag_data,
+            &virtual_state.mergeset_non_daa,
+            virtual_state.daa_score,
+            virtual_utxo_view,
+        );
+
         // At this point we can safely drop the read lock
         drop(virtual_read);
 
         // Build the template
-        self.build_block_template_from_virtual_state(virtual_state, miner_data, txs, calculated_fees)
+        self.build_block_template_from_virtual_state(virtual_state, miner_data, txs, calculated_fees, balance_bps_by_block)
     }
 
     pub(crate) fn validate_block_template_transactions(
@@ -1068,6 +1083,9 @@ impl VirtualStateProcessor {
         miner_data: MinerData,
         mut txs: Vec<Transaction>,
         calculated_fees: Vec<u64>,
+        // Balance-reward map (blue → holdings bps), precomputed by the caller under the virtual
+        // read lock so it uses the same UTXO view the validator will. Empty ⇒ no balance penalty.
+        balance_bps_by_block: keryx_consensus_core::BlockHashMap<u64>,
     ) -> Result<BlockTemplate, RuleError> {
         // [`calc_block_parents`] can use deep blocks below the pruning point for this calculation, so we
         // need to hold the pruning lock.
@@ -1086,6 +1104,7 @@ impl VirtualStateProcessor {
                 &virtual_state.mergeset_rewards,
                 &virtual_state.mergeset_non_daa,
                 &tier_bps_by_block,
+                &balance_bps_by_block,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);
