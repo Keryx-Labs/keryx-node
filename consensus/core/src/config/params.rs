@@ -773,11 +773,13 @@ pub const TESTNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::new(0),
 
-    // Testnet: activate ~5 min after genesis (3_000 blocks at 10 BPS) to observe the transition.
-    model_cap_enforcement_activation: ForkActivation::new(3_000),
+    // Testnet: model capability + inference_reward enforcement ON from genesis, so the
+    // legacy lineup is enforced from block 0 and the v2 swap below is the only transition.
+    model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // OPoI v2: testnet activation (test value — tune before release).
+    // OPoI v2: testnet lineup swap (legacy → uncensored) at DAA 1000. Must match the
+    // miner's OPOI_V2_ACTIVATION_DAA. Test value — tune before release.
     opoi_v2_activation: ForkActivation::new(1_000),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
