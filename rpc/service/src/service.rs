@@ -128,8 +128,8 @@ pub struct RpcCoreService {
 
 const RPC_CORE: &str = "rpc-core";
 
-/// Re-challenge interval: issue a new inference challenge every N DAA scores (~6 min at 10 BPS).
-const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 3_600;
+/// Re-challenge interval: issue a new inference challenge every N DAA scores (~1 h at 10 BPS).
+const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 36_000;
 
 /// A per-connection inference challenge issued by the node to verify the miner can actually run
 /// inference on the model it announced in ai:cap.
@@ -458,7 +458,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             // the nonce on expiry — pending challenges return a stable nonce until answered.
             let issue_new = match states.get(&conn_id) {
                 None => true,
-                Some(state) => current_daa.saturating_sub(state.issued_at_daa) >= INFERENCE_CHALLENGE_INTERVAL_DAA,
+                // Rotate on expiry, OR immediately if the pending challenge's model is no longer
+                // declared by the miner — e.g. after the OPoI v2 lineup hot-swap, the miner stops
+                // serving the legacy model, so a stale challenge for it could never be answered.
+                Some(state) => current_daa.saturating_sub(state.issued_at_daa) >= INFERENCE_CHALLENGE_INTERVAL_DAA
+                    || !declared_model_ids.contains(&state.model_id_hex),
             };
 
             if issue_new {
