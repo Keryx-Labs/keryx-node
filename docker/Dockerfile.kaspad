@@ -24,14 +24,14 @@ ENV RUSTFLAGS="-C target-feature=-crt-static" \
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL="sparse"
 
 # Build dependencies - this is the caching Docker layer
-RUN cargo chef cook --release --recipe-path recipe.json -p kaspad --bin kaspad
+RUN cargo chef cook --release --recipe-path recipe.json -p keryxd --bin keryxd
 
 COPY . .
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=cargo-target,target=/app/target,sharing=locked \
-    cargo build --release --bin kaspad \
-    && cp /app/target/release/kaspad /app/kaspad   # <-- outside the mount, persists
+    cargo build --release --bin keryxd \
+    && cp /app/target/release/keryxd /app/keryxd   # <-- outside the mount, persists
 
 
 # ---------------------------------------- Runtime image ----------------------------------------
@@ -48,9 +48,9 @@ RUN apk --no-cache add \
   && mkdir -p /home/kaspa /app \
   && chown -R kaspa:kaspa /home/kaspa /app
 
-COPY --from=builder --chown=kaspa:kaspa /app/kaspad .
+COPY --from=builder --chown=kaspa:kaspa /app/keryxd .
 
 ENV HOME=/home/kaspa
 USER kaspa
 ENTRYPOINT [ "/sbin/tini", "--" ]
-CMD [ "/app/kaspad" ]
+CMD [ "/app/keryxd" ]
