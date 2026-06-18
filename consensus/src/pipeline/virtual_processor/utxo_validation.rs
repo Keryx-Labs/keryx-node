@@ -272,7 +272,20 @@ impl VirtualStateProcessor {
 
         // Enforce AiRequest inference_reward minimums and fee coverage after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
-            check_ai_request_inference_rewards(&txs, &validated_transactions, self.inference_reward_minimums)?;
+            // OPoI v2 hardfork: swap to the uncensored lineup at/after activation. DAA-gated so
+            // IBD re-validates historical (pre-v2) blocks against the legacy lineup unchanged.
+            let minimums = if self.opoi_v2_activation.is_active(header.daa_score) {
+                if header.daa_score == self.opoi_v2_activation.daa_score() {
+                    info!(
+                        "=== OPoI v2 HARDFORK ACTIVATED at DAA {} — uncensored model lineup now enforced ===",
+                        header.daa_score
+                    );
+                }
+                self.inference_reward_minimums_v2
+            } else {
+                self.inference_reward_minimums
+            };
+            check_ai_request_inference_rewards(&txs, &validated_transactions, minimums)?;
         }
 
         Ok(())

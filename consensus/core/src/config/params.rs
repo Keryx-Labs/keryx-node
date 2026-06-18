@@ -39,12 +39,57 @@ pub const LLAMA_3_3_70B_MODEL_ID: [u8; 32] = [
     0x1a, 0x46, 0x7d, 0xd3, 0x47, 0x56, 0x13, 0x44,
 ];
 
-/// Per-model minimum inference_reward in sompi.
+/// Per-model minimum inference_reward in sompi. Legacy (pre-OPoI-v2) lineup.
 pub const INFERENCE_REWARD_MINIMUMS: &[([u8; 32], u64)] = &[
     (TINYLLAMA_MODEL_ID,         50_000_000),   // 0.5 KRX
     (DEEPSEEK_R1_8B_MODEL_ID,   150_000_000),   // 1.5 KRX
     (DEEPSEEK_R1_32B_MODEL_ID,  250_000_000),   // 2.5 KRX
     (LLAMA_3_3_70B_MODEL_ID,   400_000_000),   // 4.0 KRX
+];
+
+// ── OPoI v2 lineup (uncensored / abliterated) ─────────────────────────────────
+// Active from `opoi_v2_activation`. Weights + tokenizers pinned on the Keryx IPFS
+// gateway. model_id = base58-decode(weight CID)[2..34] = sha2-256(model.gguf).
+
+/// Gemma-3-4B-it-abliterated — sha2-256(Qma1CbFzWTNhy2ReVjDG1GvM5q2Uy4VhqTbnS9c641jUQ6)
+pub const GEMMA_3_4B_MODEL_ID: [u8; 32] = [
+    0xad, 0x50, 0xad, 0x0b, 0xd4, 0x61, 0xd8, 0xab,
+    0x44, 0xef, 0xc0, 0x21, 0x49, 0x89, 0xeb, 0x33,
+    0x29, 0x16, 0x85, 0xef, 0x4a, 0xde, 0x22, 0xa0,
+    0xf4, 0xf2, 0x17, 0xd0, 0x32, 0x66, 0xd8, 0x37,
+];
+
+/// Dolphin-3.0-Llama-3.1-8B — sha2-256(QmYJtFpaDnVwAVSbzRo42fsb19nLpt8LHe8WVKoyxd4AkZ)
+pub const DOLPHIN_LLAMA3_8B_MODEL_ID: [u8; 32] = [
+    0x94, 0x21, 0x06, 0x6a, 0x64, 0x00, 0xc9, 0x8b,
+    0xa1, 0x37, 0x11, 0x4f, 0x7f, 0x4b, 0x7d, 0x4a,
+    0x2d, 0xdf, 0x13, 0xab, 0x16, 0x3a, 0x5d, 0xe3,
+    0x8c, 0x01, 0x84, 0x79, 0x3a, 0xf6, 0x31, 0x3a,
+];
+
+/// Qwen3-32B-abliterated — sha2-256(QmVBwp5n3muQJwYNLTHSu3EnzBWviQqfh58FvHvKRfLtam)
+pub const QWEN3_32B_MODEL_ID: [u8; 32] = [
+    0x65, 0xc6, 0xeb, 0x6f, 0xe1, 0x8b, 0x9e, 0xfd,
+    0x80, 0x60, 0xab, 0x9d, 0x2d, 0x03, 0xbb, 0x9b,
+    0x01, 0x05, 0x0a, 0x3b, 0x13, 0x78, 0xcb, 0xac,
+    0x00, 0x0c, 0x5c, 0xc0, 0xac, 0xdc, 0x0d, 0x2a,
+];
+
+/// Llama-3.3-70B-Instruct-abliterated — sha2-256(QmPdTayXcEsfUwMCoMKKcLSv7Dwpp2xVBWELwrG2M7Rhzu)
+pub const LLAMA_3_3_70B_ABLITERATED_MODEL_ID: [u8; 32] = [
+    0x13, 0x29, 0xfb, 0xe2, 0x1b, 0x3f, 0x36, 0xf6,
+    0xd0, 0x06, 0x89, 0xfc, 0xaa, 0x74, 0xf7, 0xa2,
+    0x22, 0xb8, 0xcc, 0x4c, 0x08, 0xc0, 0x19, 0x1f,
+    0xeb, 0x23, 0x97, 0x55, 0xa7, 0x23, 0x42, 0x1e,
+];
+
+/// Per-model minimum inference_reward in sompi. OPoI v2 lineup, enforced from
+/// `opoi_v2_activation` (replaces `INFERENCE_REWARD_MINIMUMS` at that DAA score).
+pub const INFERENCE_REWARD_MINIMUMS_V2: &[([u8; 32], u64)] = &[
+    (GEMMA_3_4B_MODEL_ID,                 50_000_000),   // 0.5 KRX  (--light)
+    (DOLPHIN_LLAMA3_8B_MODEL_ID,         150_000_000),   // 1.5 KRX  (default)
+    (QWEN3_32B_MODEL_ID,                 250_000_000),   // 2.5 KRX  (--high)
+    (LLAMA_3_3_70B_ABLITERATED_MODEL_ID, 400_000_000),   // 4.0 KRX  (--very-high)
 ];
 use crate::{
     BlockLevel, KType,
@@ -375,6 +420,16 @@ pub struct Params {
     /// Fulfilled inference_rewards are redirected from the fee burn to the responding miner.
     pub inference_reward_minimums: &'static [([u8; 32], u64)],
 
+    /// OPoI v2 hardfork activation DAA score. From this score the uncensored model
+    /// lineup (`inference_reward_minimums_v2`) replaces the legacy `inference_reward_minimums`.
+    /// DAA-gated so IBD re-validation keeps the legacy table for historical blocks
+    /// (swapping it unconditionally would diverge the UTXO set on pre-fork history).
+    pub opoi_v2_activation: ForkActivation,
+
+    /// OPoI v2 per-model minimum inference_reward (sompi). Used in place of
+    /// `inference_reward_minimums` for blocks at or after `opoi_v2_activation`.
+    pub inference_reward_minimums_v2: &'static [([u8; 32], u64)],
+
     /// PoW SALT v2 hardfork activation DAA score.
     /// After this score, `KERYX_MATRIX_SALT_V2` is used for matrix generation instead of v1.
     /// Any miner binary compiled against v1 will compute a different matrix and its blocks
@@ -564,6 +619,10 @@ impl Params {
                 .inference_reward_minimums
                 .unwrap_or(self.inference_reward_minimums),
 
+            opoi_v2_activation: self.opoi_v2_activation,
+
+            inference_reward_minimums_v2: self.inference_reward_minimums_v2,
+
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
@@ -658,6 +717,10 @@ pub const MAINNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::new(15_550_000),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
+    // OPoI v2: uncensored lineup swap. `never()` until the hardfork DAA score (H) is chosen.
+    opoi_v2_activation: ForkActivation::never(),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
+
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
     pow_salt_v2_activation: ForkActivation::new(17_275_000),
@@ -714,6 +777,10 @@ pub const TESTNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::new(3_000),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
+    // OPoI v2: testnet activation (test value — tune before release).
+    opoi_v2_activation: ForkActivation::new(1_000),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
+
     // PoW SALT v2: testnet activation at DAA 6_000.
     pow_salt_v2_activation: ForkActivation::new(6_000),
 
@@ -762,6 +829,8 @@ pub const SIMNET_PARAMS: Params = Params {
 
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+    opoi_v2_activation: ForkActivation::always(),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
 };
@@ -805,6 +874,8 @@ pub const DEVNET_PARAMS: Params = Params {
 
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+    opoi_v2_activation: ForkActivation::always(),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
 };
