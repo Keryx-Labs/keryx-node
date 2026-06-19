@@ -2,6 +2,7 @@ use crate::{
     BlueWorkType,
     coinbase::MinerData,
     header::Header,
+    pom::PomProof,
     tx::{Transaction, TransactionId},
 };
 use keryx_hashes::Hash;
@@ -36,23 +37,33 @@ impl MutableBlock {
 pub struct Block {
     pub header: Arc<Header>,
     pub transactions: Arc<Vec<Transaction>>,
+    /// Proof-of-Model possession witness. Post-PoW, outside `pre_pow_hash`, so it is an
+    /// additive `Option` (None pre-`pom_activation` and on legacy paths). Verified in
+    /// `post_pow_validation`. See `pom::PomProof` / POM_CONSENSUS_SPEC.md.
+    pub pom_proof: Option<Arc<PomProof>>,
 }
 
 impl Block {
     pub fn new(header: Header, txs: Vec<Transaction>) -> Self {
-        Self { header: Arc::new(header), transactions: Arc::new(txs) }
+        Self { header: Arc::new(header), transactions: Arc::new(txs), pom_proof: None }
     }
 
     pub fn from_arcs(header: Arc<Header>, transactions: Arc<Vec<Transaction>>) -> Self {
-        Self { header, transactions }
+        Self { header, transactions, pom_proof: None }
     }
 
     pub fn from_header_arc(header: Arc<Header>) -> Self {
-        Self { header, transactions: Arc::new(Vec::new()) }
+        Self { header, transactions: Arc::new(Vec::new()), pom_proof: None }
     }
 
     pub fn from_header(header: Header) -> Self {
-        Self { header: Arc::new(header), transactions: Arc::new(Vec::new()) }
+        Self { header: Arc::new(header), transactions: Arc::new(Vec::new()), pom_proof: None }
+    }
+
+    /// Attach a PoM possession proof (post-PoW witness). Builder-style.
+    pub fn with_pom_proof(mut self, proof: PomProof) -> Self {
+        self.pom_proof = Some(Arc::new(proof));
+        self
     }
 
     pub fn is_header_only(&self) -> bool {
@@ -82,6 +93,7 @@ impl MemSizeEstimator for Block {
             + self.header.estimate_mem_bytes()
             + size_of::<Vec<Transaction>>()
             + self.transactions.iter().map(Transaction::estimate_mem_bytes).sum::<usize>()
+            + self.pom_proof.as_ref().map_or(0, |p| p.approx_bytes())
     }
 }
 

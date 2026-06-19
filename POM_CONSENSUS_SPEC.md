@@ -231,8 +231,17 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
 
 1. ~~Lock `transition`/`mix` byte-exact (shared crate)~~ ✅ DONE — `pom-core` crate, 6 tests, KAT locked.
 2. ~~Measure `trace_root` commit cost (Q3)~~ ✅ DONE — off hot path, ≤0.2 ms/block (`pom-core/commit_cost`).
-3. `R_T` builder (offline tool: GGUF → 32 B chunks → Merkle root) + pin **all tiers** in params.
-4. `PomProof` struct + serde + Block plumbing (no enforcement yet).
+3. ~~`R_T` builder (offline: GGUF → 32 B chunks → Merkle root)~~ ✅ DONE — `pom-rt-builder`
+   (CPU candle + blake3 + pom-core). Canonical: name-sorted tensors, `floor(len/32)` 32 B
+   chunks of `QTensor::data()` bytes, leaf=blake3(chunk), tree=`pom_core::merkle_root`.
+   Validated: Gemma-3-4B (N=77,604,776, R_T=846caa40…), Dolphin-8B (N=153,528,426,
+   R_T=133f627b…), 0 dropped-tail bytes. Emits `*_POM_ROOT`/`*_POM_CHUNKS` to pin in params.
+   TODO: 32B/70B run when wiring (70B ~42 GiB needs streaming Merkle, all-leaves OOMs the box).
+4. ~~`PomProof` struct + serde + Block plumbing~~ ✅ DONE — `consensus/core/src/pom.rs`
+   (`PomProof`/`PomOpening`, serde+borsh). `Block.pom_proof: Option<Arc<PomProof>>` (additive,
+   None default, `with_pom_proof()` builder, MemSizeEstimator updated). `cargo check` green on
+   keryx-consensus + keryx-p2p-flows. NOTE: not yet on the P2P wire (protobuf unchanged, None on
+   round-trip) — transport lands with §5/§6.
 5. `post_pow_validation` verifier (multi-tier: select `R_T` by declared tier; `pom_activation` gated, testnet `always`).
 6. Miner: emit `PomProof` from the real walk (reuse kernel), tier = highest model it holds.
 7. End-to-end on a fresh testnet with ≥2 tiers (e.g. 8B + 32B) — difficulty global, untouched.
