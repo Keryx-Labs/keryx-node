@@ -4,10 +4,14 @@ use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
 use keryx_consensus_core::{
     block::Block,
+    config::params::{POM_OPENINGS, POM_TIERS, POM_WALK_STEPS},
+    hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
+    pom::{pom_block_seed, pom_pow_value, verify_pom_proof},
     tx::TransactionOutpoint,
 };
+use keryx_math::Uint256;
 
 impl BlockBodyProcessor {
     pub fn validate_body_in_isolation(self: &Arc<Self>, block: &Block) -> BlockProcessResult<Mass> {
@@ -20,6 +24,7 @@ impl BlockBodyProcessor {
         self.check_block_double_spends(block)?;
         self.check_no_chained_transactions(block)?;
         self.check_opoi_tag(block)?;
+        self.check_pom_proof(block)?;
         Ok(mass)
     }
 
@@ -127,6 +132,38 @@ impl BlockBodyProcessor {
         self.coinbase_manager
             .validate_opoi_tag(coinbase_payload)
             .map_err(RuleError::BadCoinbasePayload)
+    }
+
+    /// Proof-of-Model possession check (build order §5c). At/after `pom_activation` every
+    /// block must carry a valid `PomProof` proving the producer held the declared tier's
+    /// weight blob in VRAM while mining. 100% deterministic (no ε) — see `pom::verify_pom_proof`.
+    /// Genesis bypasses body validation entirely, so no exemption is needed here.
+    fn check_pom_proof(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let header = &block.header;
+        if !self.pom_activation.is_active(header.daa_score) {
+            return Ok(());
+        }
+        let proof = block.pom_proof.as_ref().ok_or(RuleError::PomProofMissing)?;
+        let tier = POM_TIERS.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
+
+        // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
+        let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
+        let seed = pom_block_seed(&pre_pow_hash, header.timestamp, header.nonce);
+        let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
+
+        verify_pom_proof(
+            &pre_pow_hash,
+            header.nonce,
+            seed,
+            proof,
+            tier.chunks,
+            POM_WALK_STEPS,
+            POM_OPENINGS,
+            &tier.root,
+            &target,
+            |s| pom_pow_value(s, &pre_pow_hash),
+        )
+        .map_err(RuleError::BadPomProof)
     }
 
     fn check_duplicate_transactions(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {

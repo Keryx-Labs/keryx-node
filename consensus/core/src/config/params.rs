@@ -882,7 +882,8 @@ pub const SIMNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     opoi_v2_activation: ForkActivation::always(),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
-    pom_activation: ForkActivation::always(),
+    // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
+    pom_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
 };
@@ -928,7 +929,8 @@ pub const DEVNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     opoi_v2_activation: ForkActivation::always(),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
-    pom_activation: ForkActivation::always(),
+    // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
+    pom_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
 };

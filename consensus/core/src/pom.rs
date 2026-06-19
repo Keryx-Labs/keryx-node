@@ -96,7 +96,7 @@ pub const POM_CHUNK_WORDS: usize = 4;
 /// Domain-separation salt folded into the walk seed (matches miner kernel / pom-core).
 pub const POM_SEED_SALT: u64 = 0x4B65727978500; // "KeryxP"
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PomVerifyError {
     WrongOpeningCount,
     PowValueMismatch,
@@ -127,6 +127,31 @@ fn mix64(mut x: u64) -> u64 {
 #[inline]
 pub fn pom_seed_state(pow_seed: u64) -> u64 {
     mix64(pow_seed ^ POM_SEED_SALT)
+}
+
+/// Canonical PoM block seed (initial walk state) from the PoW front-end. The miner and the
+/// node MUST compute this identically. The walk's memory-hardness is the actual work; this
+/// only binds the walk to `(pre_pow_hash, timestamp, nonce)`.
+pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"KRX-PoM-seed/v1");
+    hasher.update(pre_pow_hash);
+    hasher.update(&timestamp.to_le_bytes());
+    hasher.update(&nonce.to_le_bytes());
+    let d = hasher.finalize();
+    let seed = u64::from_le_bytes(d.as_bytes()[..8].try_into().unwrap());
+    pom_seed_state(seed)
+}
+
+/// Canonical PoM pow value (256-bit, little-endian) compared against the target. A cheap
+/// final fold of the walk's final state — the memory-hardness is already paid by the K
+/// data-dependent weight reads. Bound to the header via `pre_pow_hash`.
+pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"KRX-PoM-pow/v1");
+    hasher.update(&final_state.to_le_bytes());
+    hasher.update(pre_pow_hash);
+    *hasher.finalize().as_bytes()
 }
 
 #[inline]

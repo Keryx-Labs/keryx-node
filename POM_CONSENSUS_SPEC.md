@@ -253,10 +253,14 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
    the block's canonical seed — soundness gap found & fixed, `initial_trace_path` added to `PomProof`
    + pom-core). blake3 dep added; node round-trip + tamper test green. Verification belongs in
    **body validation** (the proof is body data), NOT header `post_pow_validation` — see below.
-   Remaining (c2, land WITH §6): call site in `body_processor/body_validation_in_isolation.rs`
-   (mirror `check_opoi_tag`) computing `pre_pow_hash`/`target`/`seed` + `POM_TIERS[tier]` lookup +
-   tier↔declared-model cross-check + gate `pom_activation`; the `seed`-fold (which 8 bytes of the
-   PowHash front-end) must match the miner; new `RuleError`; + P2P protobuf transport of the proof.
+   **(c2) pipeline hook ✅ DONE** — `body_validation_in_isolation::check_pom_proof` (gate
+   `pom_activation`, `POM_TIERS[tier]`, compute `pre_pow_hash`/`seed`/`target`, `verify_pom_proof`),
+   `BlockBodyProcessor.pom_activation` field, `RuleError::{PomProofMissing,PomUnknownTier,BadPomProof}`.
+   **Contract locked**: `pom::pom_block_seed` (seed = mix64(blake3("KRX-PoM-seed/v1"||pre_pow_hash||
+   time_le||nonce_le)[..8] ^ salt)) + `pom::pom_pow_value` (= blake3("KRX-PoM-pow/v1"||final_state_le||
+   pre_pow_hash), LE-compared to target). The MINER must reproduce these byte-exact. PoM now DORMANT
+   on all 4 nets (`never()`) until emission+transport land. Remaining: tier↔declared-model cross-check
+   (TODO in check); **P2P protobuf transport** of the proof; then §6 miner emission; §7 flip + testnet.
    into `post_pow_validation.rs` with `kHeavyHash` as `final_hash` + the node `PomProof` type
    (select `R_T` by declared tier); + P2P transport of the proof (protobuf).
 6. Miner: emit `PomProof` from the real walk (reuse kernel), tier = highest model it holds.

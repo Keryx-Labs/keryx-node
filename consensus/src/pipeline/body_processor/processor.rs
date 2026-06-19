@@ -27,7 +27,7 @@ use keryx_consensus_core::{
     KType,
     block::Block,
     blockstatus::BlockStatus::{self, StatusHeaderOnly, StatusInvalid},
-    config::{genesis::GenesisBlock, params::Params},
+    config::{genesis::GenesisBlock, params::{ForkActivation, Params}},
     mass::{Mass, MassCalculator, MassOps},
     tx::Transaction,
 };
@@ -59,6 +59,8 @@ pub struct BlockBodyProcessor {
     pub(super) genesis: GenesisBlock,
     pub(super) _ghostdag_k: KType,
     pub(super) skip_opoi: bool,
+    /// PoM possession activation — when active at a block's daa_score, its `pom_proof` is verified.
+    pub(super) pom_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -112,6 +114,7 @@ impl BlockBodyProcessor {
             genesis: params.genesis.clone(),
             _ghostdag_k: params.ghostdag_k(),
             skip_opoi: params.skip_proof_of_work,
+            pom_activation: params.pom_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
