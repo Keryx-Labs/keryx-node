@@ -783,8 +783,9 @@ pub const TESTNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::new(1_000),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoW SALT v2: testnet activation at DAA 6_000.
-    pow_salt_v2_activation: ForkActivation::new(6_000),
+    // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
+    // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).
+    pow_salt_v2_activation: ForkActivation::new(0),
 
     // PoW SALT v4: not needed on testnet (mainnet-only chain relaunch).
     pow_salt_v4_activation: ForkActivation::never(),
