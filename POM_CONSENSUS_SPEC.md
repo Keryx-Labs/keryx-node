@@ -248,7 +248,15 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
    `POM_TIERS` table (`PomTier{model_id,root,chunks}`; Gemma+Dolphin real, 32B/70B TODO-zero),
    `pom_activation: ForkActivation` (mainnet/testnet `never()`, sim/devnet `always()`, apply_overrides),
    `POM_WALK_STEPS=1024`/`POM_OPENINGS=32`; difficulty stays GLOBAL (no per-tier target).
-   Remaining: (c) wire `verify_proof`
+   **(c1) node verifier fn ✅ DONE** — `consensus/core/src/pom.rs::verify_pom_proof` (vendored
+   from pom-core, blake3, `kHeavyHash` as `final_hash` closure, **seed-bound**: `state[0]` must equal
+   the block's canonical seed — soundness gap found & fixed, `initial_trace_path` added to `PomProof`
+   + pom-core). blake3 dep added; node round-trip + tamper test green. Verification belongs in
+   **body validation** (the proof is body data), NOT header `post_pow_validation` — see below.
+   Remaining (c2, land WITH §6): call site in `body_processor/body_validation_in_isolation.rs`
+   (mirror `check_opoi_tag`) computing `pre_pow_hash`/`target`/`seed` + `POM_TIERS[tier]` lookup +
+   tier↔declared-model cross-check + gate `pom_activation`; the `seed`-fold (which 8 bytes of the
+   PowHash front-end) must match the miner; new `RuleError`; + P2P protobuf transport of the proof.
    into `post_pow_validation.rs` with `kHeavyHash` as `final_hash` + the node `PomProof` type
    (select `R_T` by declared tier); + P2P transport of the proof (protobuf).
 6. Miner: emit `PomProof` from the real walk (reuse kernel), tier = highest model it holds.

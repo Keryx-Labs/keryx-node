@@ -17,6 +17,7 @@ default = []
 [dependencies]
 arc-swap.workspace = true
 async-trait.workspace = true
+blake3 = "1"
 borsh.workspace = true
 bitflags.workspace = true
 cfg-if.workspace = true
