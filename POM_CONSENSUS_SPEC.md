@@ -213,7 +213,12 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
    199 GB/s = ~97 % of the dedicated-buffer microbench (full speed). Remaining = ENGINEERING,
    not risk: the blob is ~hundreds of disjoint tensors ⇒ a gather index (global offset →
    (tensor, local offset), coarse LUT = O(1)) + the canonical `R_T` layout; confirm its
-   per-read cost doesn't dent hashrate (the probe walked a single contiguous tensor).
+   per-read cost doesn't dent hashrate. CONFIRMED: gather walk over all 444 Gemma tensors
+   (binary search per read over the chunk-prefix array) = 204 GB/s = 113 % of the
+   single-tensor baseline — lookup fully hidden behind memory latency, no LUT needed.
+   Canonical layout (also defines `R_T`) = concat of each tensor's `floor(len/32)` 32 B
+   chunks in GGUF order (tail <32 B dropped, no chunk straddles two allocations).
+   No open feasibility risk left — remaining is pure consensus/miner implementation (§10 ≥3).
 5. **Per-tier difficulty — RESOLVED, dropped** (§5): global difficulty works, no
    GHOSTDAG interaction. Multi-tier ships from day 1 via per-tier `R_T` + reward bracket.
 6. **NVLink pooling** — quantify the penalty drop on a real 2-GPU NVLink rig if available.
