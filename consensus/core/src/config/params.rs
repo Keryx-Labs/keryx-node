@@ -91,6 +91,40 @@ pub const INFERENCE_REWARD_MINIMUMS_V2: &[([u8; 32], u64)] = &[
     (QWEN3_32B_MODEL_ID,                 250_000_000),   // 2.5 KRX  (--high)
     (LLAMA_3_3_70B_ABLITERATED_MODEL_ID, 400_000_000),   // 4.0 KRX  (--very-high)
 ];
+
+// --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
+
+/// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
+pub const POM_WALK_STEPS: u32 = 1024;
+/// Fiat-Shamir-opened steps revealed per `PomProof` (soundness `~f^t` vs proof size).
+pub const POM_OPENINGS: usize = 32;
+
+/// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
+/// produced offline by `pom-rt-builder` (canonical: name-sorted GGUF tensors). Tier index =
+/// slice position; `model_id` ties the tier to the declared model. Difficulty stays global
+/// (no per-tier target — measured ~1.5x hashrate spread over 10x model size).
+pub const POM_TIERS: &[crate::pom::PomTier] = &[
+    crate::pom::PomTier {
+        model_id: GEMMA_3_4B_MODEL_ID,
+        root: [
+            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2,
+            0x42, 0x45, 0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
+        ],
+        chunks: 77_604_776,
+    },
+    crate::pom::PomTier {
+        model_id: DOLPHIN_LLAMA3_8B_MODEL_ID,
+        root: [
+            0x13, 0x3f, 0x62, 0x7b, 0x88, 0x2e, 0xf8, 0x56, 0x78, 0x5a, 0x83, 0x98, 0x6a, 0x9b, 0x1a, 0xdf,
+            0xed, 0xff, 0xf0, 0x74, 0x4a, 0x1f, 0x94, 0x21, 0xec, 0x4d, 0xa6, 0xe9, 0x46, 0x68, 0x15, 0xde,
+        ],
+        chunks: 153_528_426,
+    },
+    // TODO(pom): run `pom-rt-builder` on the 32B/70B GGUFs and fill these. Zeroed and
+    // unreachable until those tiers are activated (70B also needs a streaming Merkle).
+    crate::pom::PomTier { model_id: QWEN3_32B_MODEL_ID, root: [0u8; 32], chunks: 0 },
+    crate::pom::PomTier { model_id: LLAMA_3_3_70B_ABLITERATED_MODEL_ID, root: [0u8; 32], chunks: 0 },
+];
 use crate::{
     BlockLevel, KType,
     constants::STORAGE_MASS_PARAMETER,
@@ -430,6 +464,11 @@ pub struct Params {
     /// `inference_reward_minimums` for blocks at or after `opoi_v2_activation`.
     pub inference_reward_minimums_v2: &'static [([u8; 32], u64)],
 
+    /// Proof-of-Model possession activation DAA score. At/after this score every block must
+    /// carry a valid `PomProof` (verified in `post_pow_validation` against `POM_TIERS`).
+    /// DAA-gated so IBD re-validation of pre-fork history keeps the legacy self-verifying PoW.
+    pub pom_activation: ForkActivation,
+
     /// PoW SALT v2 hardfork activation DAA score.
     /// After this score, `KERYX_MATRIX_SALT_V2` is used for matrix generation instead of v1.
     /// Any miner binary compiled against v1 will compute a different matrix and its blocks
@@ -623,6 +662,8 @@ impl Params {
 
             inference_reward_minimums_v2: self.inference_reward_minimums_v2,
 
+            pom_activation: self.pom_activation,
+
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
@@ -721,6 +762,9 @@ pub const MAINNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::never(),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
+    // PoM possession: `never()` until the hardfork DAA score (H) is chosen.
+    pom_activation: ForkActivation::never(),
+
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
     pow_salt_v2_activation: ForkActivation::new(17_275_000),
@@ -783,6 +827,10 @@ pub const TESTNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::new(1_000),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
+    // PoM possession: `never()` for now. TODO §7: set to `new(0)` for the fresh PoM testnet
+    // once the verifier (5c) + miner proof emission (§6) land.
+    pom_activation: ForkActivation::never(),
+
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
     // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).
     pow_salt_v2_activation: ForkActivation::new(0),
@@ -834,6 +882,7 @@ pub const SIMNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     opoi_v2_activation: ForkActivation::always(),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
+    pom_activation: ForkActivation::always(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
 };
@@ -879,6 +928,7 @@ pub const DEVNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
     opoi_v2_activation: ForkActivation::always(),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
+    pom_activation: ForkActivation::always(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
 };

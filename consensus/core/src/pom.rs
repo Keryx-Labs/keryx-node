@@ -13,6 +13,18 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+/// A PoM tier binding: the model whose possession this tier proves, plus its canonical
+/// 32 B-chunk Merkle root `R_T` and chunk count `N` (from the offline `pom-rt-builder`).
+/// Pinned per network in `config::params` (`POM_TIERS`); the tier index is the slice
+/// position. `model_id` links the tier to the miner's declared model (cross-checked in
+/// `post_pow_validation`), so a miner cannot claim a tier it does not hold.
+#[derive(Clone, Copy, Debug)]
+pub struct PomTier {
+    pub model_id: [u8; 32],
+    pub root: [u8; 32],
+    pub chunks: u64,
+}
+
 /// One Fiat-Shamir-opened step of the possession walk.
 ///
 /// Lets a weightless verifier re-check a single step `i`: that `state_before` is the

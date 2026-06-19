@@ -242,7 +242,15 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
    None default, `with_pom_proof()` builder, MemSizeEstimator updated). `cargo check` green on
    keryx-consensus + keryx-p2p-flows. NOTE: not yet on the P2P wire (protobuf unchanged, None on
    round-trip) — transport lands with §5/§6.
-5. `post_pow_validation` verifier (multi-tier: select `R_T` by declared tier; `pom_activation` gated, testnet `always`).
+5. `post_pow_validation` verifier. **(b) pure verify logic ✅ DONE** — `pom-core::proof`
+   (`merkle_proof`/`verify_merkle_proof`, `build_proof`, `verify_proof` + `PomError`), 14 tests
+   green (honest pass + 6 tamper rejections + merkle round-trip). **(a) params ✅ DONE** —
+   `POM_TIERS` table (`PomTier{model_id,root,chunks}`; Gemma+Dolphin real, 32B/70B TODO-zero),
+   `pom_activation: ForkActivation` (mainnet/testnet `never()`, sim/devnet `always()`, apply_overrides),
+   `POM_WALK_STEPS=1024`/`POM_OPENINGS=32`; difficulty stays GLOBAL (no per-tier target).
+   Remaining: (c) wire `verify_proof`
+   into `post_pow_validation.rs` with `kHeavyHash` as `final_hash` + the node `PomProof` type
+   (select `R_T` by declared tier); + P2P transport of the proof (protobuf).
 6. Miner: emit `PomProof` from the real walk (reuse kernel), tier = highest model it holds.
 7. End-to-end on a fresh testnet with ≥2 tiers (e.g. 8B + 32B) — difficulty global, untouched.
 ```
