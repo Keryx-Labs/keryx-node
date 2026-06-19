@@ -9,6 +9,9 @@ pub enum ConversionError {
     #[error("Optional field is None while expected to be Some")]
     NoneValue,
 
+    #[error("PoM proof borsh decode error")]
+    PomProofDecode,
+
     #[error("IP has illegal length {0}")]
     IllegalIPLength(usize),
 

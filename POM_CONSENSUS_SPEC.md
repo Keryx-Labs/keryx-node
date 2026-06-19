@@ -259,8 +259,10 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
    **Contract locked**: `pom::pom_block_seed` (seed = mix64(blake3("KRX-PoM-seed/v1"||pre_pow_hash||
    time_le||nonce_le)[..8] ^ salt)) + `pom::pom_pow_value` (= blake3("KRX-PoM-pow/v1"||final_state_le||
    pre_pow_hash), LE-compared to target). The MINER must reproduce these byte-exact. PoM now DORMANT
-   on all 4 nets (`never()`) until emission+transport land. Remaining: tier↔declared-model cross-check
-   (TODO in check); **P2P protobuf transport** of the proof; then §6 miner emission; §7 flip + testnet.
+   on all 4 nets (`never()`) until emission lands. **P2P transport ✅ DONE** — `BlockMessage.pom_proof`
+   (`optional bytes`, proto field 3) borsh-encoded in `convert/block.rs`; 2 round-trip tests green.
+   Remaining: tier↔declared-model cross-check (TODO in check); **RPC submit_block transport** (RpcBlock,
+   for miner→node submit); then §6 miner emission; §7 flip + testnet.
    into `post_pow_validation.rs` with `kHeavyHash` as `final_hash` + the node `PomProof` type
    (select `R_T` by declared tier); + P2P transport of the proof (protobuf).
 6. Miner: emit `PomProof` from the real walk (reuse kernel), tier = highest model it holds.
