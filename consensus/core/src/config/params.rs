@@ -95,7 +95,8 @@ pub const INFERENCE_REWARD_MINIMUMS_V2: &[([u8; 32], u64)] = &[
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
 
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
-pub const POM_WALK_STEPS: u32 = 1024;
+/// K=256 — chosen compromise: ~25 MH/s on a 3090 with solid possession strictness.
+pub const POM_WALK_STEPS: u32 = 256;
 /// Fiat-Shamir-opened steps revealed per `PomProof` (soundness `~f^t` vs proof size).
 pub const POM_OPENINGS: usize = 32;
 
@@ -827,9 +828,10 @@ pub const TESTNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::new(1_000),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoM possession: `never()` for now. TODO §7: set to `new(0)` for the fresh PoM testnet
-    // once the verifier (5c) + miner proof emission (§6) land.
-    pom_activation: ForkActivation::never(),
+    // PoM possession: activate together with OPoI v2 (DAA 1000) — one cutover for the V2
+    // lineup swap + the possession switch (pinned R_T are V2 models).
+    // ⚠️ TESTNET VALUE — DO NOT COMMIT (needs a fresh datadir). Mainnet stays `never()` until H.
+    pom_activation: ForkActivation::new(1_000),
 
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
     // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).

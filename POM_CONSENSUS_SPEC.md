@@ -270,6 +270,32 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
    `inference_challenge` — not touched.)
    into `post_pow_validation.rs` with `kHeavyHash` as `final_hash` + the node `PomProof` type
    (select `R_T` by declared tier); + P2P transport of the proof (protobuf).
-6. Miner: emit `PomProof` from the real walk (reuse kernel), tier = highest model it holds.
-7. End-to-end on a fresh testnet with ≥2 tiers (e.g. 8B + 32B) — difficulty global, untouched.
+6. Miner (keryx-miner@PoM): emit `PomProof`, tier = highest model it holds.
+   **(slice 1) prover module ✅ DONE** — `src/pom.rs` (byte-exact primitives + borsh `PomProof`/
+   `PomOpening` matching the node wire format + `build_proof` + `verify_proof` self-check; 2 tests
+   green incl. borsh round-trip). **(slice 2) weight index ✅ DONE** —
+   `pom::WeightIndex::build_from_gguf` (name-sorted tensors, floor(len/32) chunks, full Merkle tree
+   stored → O(log N) `merkle_path`; `build_proof` now takes a weight-path closure). **Cross-validated**:
+   miner R_T for Gemma == pinned `GEMMA_3_4B_POM_ROOT` + n_chunks 77,604,776, real proof self-verifies
+   (ignored test, 37s). RAM ~3x model (host copy + leaves + tree) — fine for small/mid tiers; big tiers
+   read from VRAM in slice 3. **(slice 3a-core) CPU mining ✅ DONE** —
+   `pom::walk_final` + `pom::mine_pom` (search nonces, on `pom_pow_value<=target` build the proof);
+   test mines a nonce + proof verifies against target. **(3a-wire seam) ✅ DONE** — miner
+   `proto/rpc.proto RpcBlock.pomProof` field 4 (plain `bytes`, wire-compatible with node's `optional`);
+   `State::generate_block_if_pom(nonce, index, tier)` (walk → `pom_pow_value<=target` → `build_proof` →
+   set nonce + attach borsh proof → return block; solo only, `PartialBlock`/pool TBD); `POM_WALK_STEPS`/
+   `POM_OPENINGS` consts mirror node. **(3a-loop) ✅ DONE (dormant)** — `State.daa_score`
+   stored; `pom::POM_ACTIVATION_DAA` (u64::MAX=never) + `pom::POM_INDEX` OnceLock + `set_index`/
+   `active_index`; CPU worker branches to `generate_block_if_pom` when `daa_score>=POM_ACTIVATION_DAA`
+   && index installed, else kHeavyHash; GPU worker guarded to not submit kHeavyHash blocks when PoM
+   active. All dormant (never + index None) → no behavior change. Remaining for LIVE: main.rs builds
+   `WeightIndex` at startup + `pom::set_index(idx, tier)`; flip `POM_ACTIVATION_DAA` == node `pom_activation`.
+   Then (3b) GPU kernel (gather walk + blake3-on-GPU) for competitive mining.
+7. **(bring-up) IN PROGRESS** — startup `WeightIndex` build wired (`main.rs`, gated; picks the
+   highest pinned-R_T tier the miner serves, builds after prefetch, `pom::set_index`). Gates FLIPPED
+   to testnet values (⚠️ NON-COMMIT, fresh datadir): node testnet `pom_activation=new(1000)`, miner
+   `POM_ACTIVATION_DAA=1000` — same DAA as OPoI v2, one cutover (V2 lineup swap + possession switch;
+   pinned R_T are V2 models). Mainnet stays `never()`/H. Run: fresh-datadir keryxd testnet + miner
+   `--light` (Gemma tier 0, pinned R_T); 0-999 mined kHeavyHash, hot-swap to PoM at 1000 → observe
+   block w/ proof accepted at DAA≥1000. Pending: actual run.
 ```

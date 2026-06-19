@@ -129,29 +129,43 @@ pub fn pom_seed_state(pow_seed: u64) -> u64 {
     mix64(pow_seed ^ POM_SEED_SALT)
 }
 
-/// Canonical PoM block seed (initial walk state) from the PoW front-end. The miner and the
-/// node MUST compute this identically. The walk's memory-hardness is the actual work; this
-/// only binds the walk to `(pre_pow_hash, timestamp, nonce)`.
-pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"KRX-PoM-seed/v1");
-    hasher.update(pre_pow_hash);
-    hasher.update(&timestamp.to_le_bytes());
-    hasher.update(&nonce.to_le_bytes());
-    let d = hasher.finalize();
-    let seed = u64::from_le_bytes(d.as_bytes()[..8].try_into().unwrap());
-    pom_seed_state(seed)
+#[inline]
+fn pph_words(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = [0u64; 4];
+    for (i, wi) in w.iter_mut().enumerate() {
+        *wi = u64::from_le_bytes(pre_pow_hash[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    w
 }
 
-/// Canonical PoM pow value (256-bit, little-endian) compared against the target. A cheap
-/// final fold of the walk's final state — the memory-hardness is already paid by the K
-/// data-dependent weight reads. Bound to the header via `pre_pow_hash`.
+/// Canonical PoM block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
+/// BYTE-IDENTICAL to the miner kernel `pom_mine.cu::pom_seed_fold` and `src/pom.rs`.
+pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    let p = pph_words(pre_pow_hash);
+    let mut s = mix64(nonce ^ 0x4B65727978531);
+    s = mix64(s ^ timestamp);
+    s = mix64(s ^ p[0]);
+    s = mix64(s ^ p[1]);
+    s = mix64(s ^ p[2]);
+    s = mix64(s ^ p[3]);
+    s
+}
+
+/// Canonical PoM pow value (256-bit, little-endian) compared against the target. mix64-fold of
+/// (final_state, pre_pow_hash) — the memory-hardness is already paid by the K data-dependent
+/// reads. BYTE-IDENTICAL to the miner kernel `pom_mine.cu::pom_pow_fold` and `src/pom.rs`.
 pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"KRX-PoM-pow/v1");
-    hasher.update(&final_state.to_le_bytes());
-    hasher.update(pre_pow_hash);
-    *hasher.finalize().as_bytes()
+    let p = pph_words(pre_pow_hash);
+    let o0 = mix64(final_state ^ p[0] ^ 0x9E3779B97F4A7C15);
+    let o1 = mix64(o0 ^ p[1] ^ 0xC2B2AE3D27D4EB4F);
+    let o2 = mix64(o1 ^ p[2] ^ 0x165667B19E3779F9);
+    let o3 = mix64(o2 ^ p[3] ^ 0xD6E8FEB86659FD93);
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&o0.to_le_bytes());
+    out[8..16].copy_from_slice(&o1.to_le_bytes());
+    out[16..24].copy_from_slice(&o2.to_le_bytes());
+    out[24..32].copy_from_slice(&o3.to_le_bytes());
+    out
 }
 
 #[inline]
