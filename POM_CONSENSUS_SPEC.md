@@ -181,8 +181,9 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
 
 | Concern | File / symbol |
 |---|---|
+| **Byte-exact reference (LOCKED)** | `pom-core/src/lib.rs` — `mix64`/`seed_state`/`offset`/`transition`/`walk`/`walk_with_trace`/`merkle_root`/`trace_root`/`challenges` (dep-free; to vendor into node+miner) |
 | Walk + final hash | `consensus/pow/src/lib.rs` `State::calculate_pow` (+ new PoM path) |
-| Memory-hard kernel (prototype) | `pom-microbench/cuda/kernel.cu` `pom_walk` |
+| Memory-hard kernel (prototype) | `pom-microbench/cuda/kernel.cu` `pom_walk` (mirrors `pom-core`) |
 | PoW check call site | `header_processor/pre_ghostdag_validation.rs:104` `state.check_pow` |
 | Post-PoW proof verify (new) | `header_processor/post_pow_validation.rs` |
 | Per-tier target / block level | `consensus/src/processes/difficulty.rs`, `keryx_pow::calc_level_from_pow` |
@@ -195,13 +196,24 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
 
 ## 9. Open questions (prototype before committing consensus)
 
-1. **`transition` / `mix` final form** — lock the byte-exact functions shared by
-   miner kernel + node verifier (the microbench uses XOR-accumulate + splitmix64).
+1. **`transition` / `mix` final form — LOCKED** in `pom-core` (standalone, dep-free):
+   `mix64` = splitmix64 finalizer; `transition(state, chunk) = mix64(state ^ w0^w1^w2^w3)`
+   over 4 LE u64 (32 B); `seed_state(s) = mix64(s ^ 0x4B65727978500)`. KAT anchor
+   (hash-independent): `walk(seed_state(0xdeadbeef), N=2^20, K=4000) = 0x500ec3878555c395`.
+   6 unit tests green. The CUDA kernel and node verifier must reproduce this.
 2. **`t` calibration** — soundness `f^t` vs proof size; target ~42 KiB / `t≈32`.
-3. **`trace_root` cost** — recording K states + Merkle tree at mining frequency;
-   does it dent honest hashrate? (microbench measured the *walk* only, not the commit.)
-4. **Kernel ↔ candle aliasing** — the PoW kernel must index the SAME VRAM buffer as the
-   quantized candle weights (zero duplicated VRAM). Feasibility unproven.
+3. **`trace_root` cost — RESOLVED, negligible**: the commit is built ONCE per winning
+   nonce (off the hot path), not per attempt ⇒ hashrate unaffected by construction.
+   Measured upper bound (stand-in hash, `pom-core` `commit_cost` bin): 0.20 ms/block at
+   K=1024 (0.2 % of a 100 ms block).
+4. **Kernel ↔ candle aliasing — RESOLVED, GO** (`pom-q4-probe`, 2026-06-19): a custom
+   CUDA kernel reads candle 0.9.2's quantized weights IN PLACE, launched in candle's own
+   context (re-exported cudarc + public `QTensor::device_ptr()`, **no candle patch**).
+   Proven: byte-exact XOR match vs `data()`; **zero** VRAM growth from the kernel; walk at
+   199 GB/s = ~97 % of the dedicated-buffer microbench (full speed). Remaining = ENGINEERING,
+   not risk: the blob is ~hundreds of disjoint tensors ⇒ a gather index (global offset →
+   (tensor, local offset), coarse LUT = O(1)) + the canonical `R_T` layout; confirm its
+   per-read cost doesn't dent hashrate (the probe walked a single contiguous tensor).
 5. **Per-tier difficulty — RESOLVED, dropped** (§5): global difficulty works, no
    GHOSTDAG interaction. Multi-tier ships from day 1 via per-tier `R_T` + reward bracket.
 6. **NVLink pooling** — quantify the penalty drop on a real 2-GPU NVLink rig if available.
@@ -212,8 +224,8 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
 
 ## 10. Suggested build order
 
-1. Lock `transition`/`mix`/`kHeavyHash` byte-exact (shared crate, miner + node).
-2. Microbench extension: add the `trace_root` commit to measure honest-hashrate cost (Q3).
+1. ~~Lock `transition`/`mix` byte-exact (shared crate)~~ ✅ DONE — `pom-core` crate, 6 tests, KAT locked.
+2. ~~Measure `trace_root` commit cost (Q3)~~ ✅ DONE — off hot path, ≤0.2 ms/block (`pom-core/commit_cost`).
 3. `R_T` builder (offline tool: GGUF → 32 B chunks → Merkle root) + pin **all tiers** in params.
 4. `PomProof` struct + serde + Block plumbing (no enforcement yet).
 5. `post_pow_validation` verifier (multi-tier: select `R_T` by declared tier; `pom_activation` gated, testnet `always`).
