@@ -12,6 +12,7 @@ from!(item: &keryx_rpc_core::RpcBlock, protowire::RpcBlock, {
         header: Some(protowire::RpcBlockHeader::from(&item.header)),
         transactions: item.transactions.iter().map(protowire::RpcTransaction::from).collect(),
         verbose_data: item.verbose_data.as_ref().map(|x| x.into()),
+        pom_proof: None,
     }
 });
 
@@ -20,6 +21,7 @@ from!(item: &keryx_rpc_core::RpcRawBlock, protowire::RpcBlock, {
         header: Some(protowire::RpcBlockHeader::from(&item.header)),
         transactions: item.transactions.iter().map(protowire::RpcTransaction::from).collect(),
         verbose_data: None,
+        pom_proof: item.pom_proof.clone(),
     }
 });
 
@@ -70,6 +72,7 @@ try_from!(item: &protowire::RpcBlock, keryx_rpc_core::RpcRawBlock, {
     Self {
     header: keryx_rpc_core::RpcRawHeader::try_from(item.header.as_ref().ok_or(RpcError::MissingRpcFieldError("RpcBlock".to_string(), "header".to_string()))?)?,
     transactions: item.transactions.iter().map(keryx_rpc_core::RpcTransaction::try_from).collect::<Result<Vec<_>, _>>()?,
+    pom_proof: item.pom_proof.clone(),
     }
 });
 

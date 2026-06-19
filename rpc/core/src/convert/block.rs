@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::{RpcBlock, RpcError, RpcOptionalBlock, RpcOptionalTransaction, RpcRawBlock, RpcResult, RpcTransaction};
 use keryx_consensus_core::block::{Block, MutableBlock};
+use keryx_consensus_core::pom::PomProof;
 
 // ----------------------------------------------------------------------------
 // consensus_core to rpc_core
@@ -22,7 +23,11 @@ impl From<&Block> for RpcBlock {
 
 impl From<&Block> for RpcRawBlock {
     fn from(item: &Block) -> Self {
-        Self { header: item.header.as_ref().into(), transactions: item.transactions.iter().map(RpcTransaction::from).collect() }
+        Self {
+            header: item.header.as_ref().into(),
+            transactions: item.transactions.iter().map(RpcTransaction::from).collect(),
+            pom_proof: item.pom_proof.as_ref().map(|p| borsh::to_vec(p.as_ref()).expect("PomProof borsh serialize")),
+        }
     }
 }
 
@@ -38,13 +43,21 @@ impl From<&MutableBlock> for RpcBlock {
 
 impl From<&MutableBlock> for RpcRawBlock {
     fn from(item: &MutableBlock) -> Self {
-        Self { header: item.header.as_ref().into(), transactions: item.transactions.iter().map(RpcTransaction::from).collect() }
+        Self {
+            header: item.header.as_ref().into(),
+            transactions: item.transactions.iter().map(RpcTransaction::from).collect(),
+            pom_proof: None,
+        }
     }
 }
 
 impl From<MutableBlock> for RpcRawBlock {
     fn from(item: MutableBlock) -> Self {
-        Self { header: item.header.into(), transactions: item.transactions.iter().map(RpcTransaction::from).collect() }
+        Self {
+            header: item.header.into(),
+            transactions: item.transactions.iter().map(RpcTransaction::from).collect(),
+            pom_proof: None,
+        }
     }
 }
 
@@ -63,6 +76,8 @@ impl TryFrom<RpcBlock> for Block {
                     .map(keryx_consensus_core::tx::Transaction::try_from)
                     .collect::<RpcResult<Vec<keryx_consensus_core::tx::Transaction>>>()?,
             ),
+            // RpcBlock (verbose) does not carry the PoM proof; submit uses RpcRawBlock.
+            pom_proof: None,
         })
     }
 }
@@ -70,6 +85,12 @@ impl TryFrom<RpcBlock> for Block {
 impl TryFrom<RpcRawBlock> for Block {
     type Error = RpcError;
     fn try_from(item: RpcRawBlock) -> RpcResult<Self> {
+        let pom_proof = match &item.pom_proof {
+            Some(bytes) => Some(Arc::new(
+                borsh::from_slice::<PomProof>(bytes).map_err(|e| RpcError::PomProofDecodeError(e.to_string()))?,
+            )),
+            None => None,
+        };
         Ok(Self {
             header: Arc::new(item.header.try_into()?),
             transactions: Arc::new(
@@ -78,6 +99,7 @@ impl TryFrom<RpcRawBlock> for Block {
                     .map(keryx_consensus_core::tx::Transaction::try_from)
                     .collect::<RpcResult<Vec<keryx_consensus_core::tx::Transaction>>>()?,
             ),
+            pom_proof,
         })
     }
 }
@@ -124,6 +146,8 @@ impl TryFrom<RpcOptionalBlock> for Block {
                     .map(keryx_consensus_core::tx::Transaction::try_from)
                     .collect::<RpcResult<Vec<keryx_consensus_core::tx::Transaction>>>()?,
             ),
+            // RpcOptionalBlock has no PoM proof field.
+            pom_proof: None,
         })
     }
 }

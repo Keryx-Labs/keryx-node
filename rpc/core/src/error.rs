@@ -42,6 +42,9 @@ pub enum RpcError {
     #[error("Missing required field {0}.{1}")]
     MissingRpcFieldError(String, String),
 
+    #[error("PoM possession proof decode error: {0}")]
+    PomProofDecodeError(String),
+
     #[error("Feature not supported")]
     UnsupportedFeature,
 

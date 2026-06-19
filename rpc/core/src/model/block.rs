@@ -10,6 +10,10 @@ use workflow_serializer::prelude::*;
 pub struct RpcRawBlock {
     pub header: RpcRawHeader,
     pub transactions: Vec<RpcTransaction>,
+    /// Proof-of-Model possession witness, borsh-encoded `PomProof` (opaque here; decoded
+    /// at the consensus boundary). Post-PoW, attached by the miner before submit_block.
+    #[serde(default)]
+    pub pom_proof: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,9 +48,10 @@ impl Deserializer for RpcBlock {
 
 impl Serializer for RpcRawBlock {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         serialize!(RpcRawHeader, &self.header, writer)?;
         serialize!(Vec<RpcTransaction>, &self.transactions, writer)?;
+        store!(Option<Vec<u8>>, &self.pom_proof, writer)?;
 
         Ok(())
     }
@@ -54,11 +59,12 @@ impl Serializer for RpcRawBlock {
 
 impl Deserializer for RpcRawBlock {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let header = deserialize!(RpcRawHeader, reader)?;
         let transactions = deserialize!(Vec<RpcTransaction>, reader)?;
+        let pom_proof = if version >= 2 { load!(Option<Vec<u8>>, reader)? } else { None };
 
-        Ok(Self { header, transactions })
+        Ok(Self { header, transactions, pom_proof })
     }
 }
 

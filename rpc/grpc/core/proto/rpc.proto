@@ -20,6 +20,9 @@ message RpcBlock {
   RpcBlockHeader header = 1;
   repeated RpcTransaction transactions = 2;
   RpcBlockVerboseData verboseData = 3;
+  // Proof-of-Model possession witness (borsh-encoded PomProof). Carried on submit_block;
+  // absent before pom_activation. See POM_CONSENSUS_SPEC.md.
+  optional bytes pomProof = 4;
 }
 
 message RpcBlockHeader {
