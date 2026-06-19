@@ -122,20 +122,32 @@ per opening ≈ 32 (state) + 32 (state') + 32 (chunk) + 28·32 (weight path) + 1
 
 ---
 
-## 5. Per-tier difficulty (highest-risk subsystem)
+## 5. Difficulty: GLOBAL, single target — NO per-tier difficulty
 
-Different tiers have different per-attempt cost (bigger blob ⇒ lower hashrate) and
-different aggregate hashrate. A single global target would starve high tiers.
+Multi-tier is the target (each miner declares + proves the highest model it holds),
+but per-tier difficulty is **not** needed. Measured (microbench, 2026-06-19, chunk
+32 B, K=1024, resident):
 
-⇒ **`target_T` retargeted per tier** (separate difficulty window per tier). The tier
-is declared in the header path that already carries the model id (coinbase `ai:cap` /
-model id, §6) and bound to the block. `calc_level_from_pow` /
-`consensus/src/processes/difficulty.rs` must select the window by tier.
+| blob (tier) | honest H/s |
+|---|---|
+| 2 GiB | 6.30M |
+| 8 GiB | 5.38M |
+| 20 GiB | 4.03M |
 
-⚠️ This interacts with GHOSTDAG blue-work accounting (parallel "lanes" of blocks by
-tier). **Staging recommendation:** v0 ships **one canonical tier** (single enforced
-model, single difficulty = today's machinery untouched), proving the possession
-mechanism end-to-end. Multi-tier difficulty is a separate, later milestone.
+Honest hashrate declines only **~1.5× over a 10× blob-size range** (sub-linear: the
+walk is latency-bound on `K` random 32 B reads, not bound by `N`). Therefore:
+
+- A **single global `target`** does not starve high tiers — a 70B miner does at most
+  ~1.5× fewer attempts than an 8B miner.
+- The **reward-by-tier gradient** (0.5 → 4.0 KRX, ×8) **dwarfs** that 1.5× penalty, so
+  the incentive is unambiguous: **declare the highest tier your GPU can hold** (and
+  prove it). Self-regulating "1 GPU = 1 tier".
+- You cannot declare a tier without proving possession (§4); holding the model needs
+  the VRAM (hardware barrier). Each GPU settles at its max tier naturally.
+
+⇒ **No parallel lanes, no per-tier retargeting, no GHOSTDAG interaction.** Difficulty
+machinery (`difficulty.rs`, `calc_level_from_pow`) is untouched. The tier is pure
+metadata + possession proof + reward bracket — it never enters difficulty.
 
 ---
 
@@ -190,8 +202,11 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
    does it dent honest hashrate? (microbench measured the *walk* only, not the commit.)
 4. **Kernel ↔ candle aliasing** — the PoW kernel must index the SAME VRAM buffer as the
    quantized candle weights (zero duplicated VRAM). Feasibility unproven.
-5. **Multi-tier difficulty vs GHOSTDAG** — the §5 risk. v0 = single tier.
+5. **Per-tier difficulty — RESOLVED, dropped** (§5): global difficulty works, no
+   GHOSTDAG interaction. Multi-tier ships from day 1 via per-tier `R_T` + reward bracket.
 6. **NVLink pooling** — quantify the penalty drop on a real 2-GPU NVLink rig if available.
+7. **Hashrate vs blob size** — measured ~1.5× over 10× size; re-confirm on the actual
+   tier blobs (8B/32B/70B GGUF) once `R_T` blobs exist.
 
 ---
 
@@ -199,9 +214,9 @@ must validate under the legacy self-verifying PoW; the proof requirement starts 
 
 1. Lock `transition`/`mix`/`kHeavyHash` byte-exact (shared crate, miner + node).
 2. Microbench extension: add the `trace_root` commit to measure honest-hashrate cost (Q3).
-3. `R_T` builder (offline tool: GGUF → 32 B chunks → Merkle root) + pin one tier in params.
+3. `R_T` builder (offline tool: GGUF → 32 B chunks → Merkle root) + pin **all tiers** in params.
 4. `PomProof` struct + serde + Block plumbing (no enforcement yet).
-5. `post_pow_validation` verifier (single tier, `pom_activation` gated, testnet `always`).
-6. Miner: emit `PomProof` from the real walk (reuse kernel).
-7. End-to-end on a fresh testnet (single tier) before touching multi-tier difficulty.
+5. `post_pow_validation` verifier (multi-tier: select `R_T` by declared tier; `pom_activation` gated, testnet `always`).
+6. Miner: emit `PomProof` from the real walk (reuse kernel), tier = highest model it holds.
+7. End-to-end on a fresh testnet with ≥2 tiers (e.g. 8B + 32B) — difficulty global, untouched.
 ```
