@@ -121,10 +121,24 @@ pub const POM_TIERS: &[crate::pom::PomTier] = &[
         ],
         chunks: 153_528_426,
     },
-    // TODO(pom): run `pom-rt-builder` on the 32B/70B GGUFs and fill these. Zeroed and
-    // unreachable until those tiers are activated (70B also needs a streaming Merkle).
-    crate::pom::PomTier { model_id: QWEN3_32B_MODEL_ID, root: [0u8; 32], chunks: 0 },
-    crate::pom::PomTier { model_id: LLAMA_3_3_70B_ABLITERATED_MODEL_ID, root: [0u8; 32], chunks: 0 },
+    // Qwen3-32B (Q4_K_M, 707 tensors, 18.40 GiB) — R_T from pom-rt-builder streaming Merkle.
+    crate::pom::PomTier {
+        model_id: QWEN3_32B_MODEL_ID,
+        root: [
+            0xe2, 0xaa, 0x66, 0x59, 0xaa, 0xb4, 0x38, 0x7e, 0xb5, 0xfd, 0x79, 0x40, 0x9c, 0x0a, 0x1a, 0x68,
+            0x86, 0x3a, 0x3d, 0xef, 0x3b, 0x66, 0x2c, 0xb4, 0x06, 0x16, 0x97, 0xf0, 0xea, 0x87, 0xfa, 0x58,
+        ],
+        chunks: 617_380_448,
+    },
+    // Llama-3.3-70B (Q4_K_M, 724 tensors, 39.59 GiB) — R_T from pom-rt-builder streaming Merkle.
+    crate::pom::PomTier {
+        model_id: LLAMA_3_3_70B_ABLITERATED_MODEL_ID,
+        root: [
+            0x53, 0x5f, 0xc2, 0xac, 0xb6, 0x09, 0x7b, 0x5d, 0xf8, 0x83, 0xec, 0x50, 0x66, 0x9a, 0x7f, 0x48,
+            0xdc, 0x9f, 0x3b, 0xd5, 0x98, 0x74, 0x28, 0x59, 0xb8, 0xbb, 0x4c, 0xac, 0x3b, 0x35, 0x26, 0xaa,
+        ],
+        chunks: 1_328_516_616,
+    },
 ];
 use crate::{
     BlockLevel, KType,
@@ -825,20 +839,21 @@ pub const TESTNET_PARAMS: Params = Params {
 
     // OPoI v2: testnet lineup swap (legacy → uncensored) at DAA 1000. Must match the
     // miner's OPOI_V2_ACTIVATION_DAA. Test value — tune before release.
-    opoi_v2_activation: ForkActivation::new(1_000),
+    opoi_v2_activation: ForkActivation::new(50_000),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoM possession: activate together with OPoI v2 (DAA 1000) — one cutover for the V2
-    // lineup swap + the possession switch (pinned R_T are V2 models).
+    // PoM possession: DAA 1000 to observe the kHeavyHash→PoM transition (incl. difficulty
+    // drift). Mainnet activation will need a difficulty reset at H.
     // ⚠️ TESTNET VALUE — DO NOT COMMIT (needs a fresh datadir). Mainnet stays `never()` until H.
-    pom_activation: ForkActivation::new(1_000),
+    pom_activation: ForkActivation::new(50_000),
 
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
     // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).
     pow_salt_v2_activation: ForkActivation::new(0),
 
-    // PoW SALT v4: not needed on testnet (mainnet-only chain relaunch).
-    pow_salt_v4_activation: ForkActivation::never(),
+    // PoW SALT v4: active from genesis on testnet to mirror the live mainnet PoW (salt v4)
+    // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
+    pow_salt_v4_activation: ForkActivation::new(0),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
