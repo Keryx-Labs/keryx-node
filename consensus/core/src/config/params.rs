@@ -839,13 +839,12 @@ pub const TESTNET_PARAMS: Params = Params {
 
     // OPoI v2: testnet lineup swap (legacy → uncensored) at DAA 1000. Must match the
     // miner's OPOI_V2_ACTIVATION_DAA. Test value — tune before release.
-    opoi_v2_activation: ForkActivation::new(50_000),
+    opoi_v2_activation: ForkActivation::new(5_000),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoM possession: DAA 1000 to observe the kHeavyHash→PoM transition (incl. difficulty
-    // drift). Mainnet activation will need a difficulty reset at H.
-    // ⚠️ TESTNET VALUE — DO NOT COMMIT (needs a fresh datadir). Mainnet stays `never()` until H.
-    pom_activation: ForkActivation::new(50_000),
+    // PoM possession: testnet DAA 5_000 to observe the kHeavyHash→PoM transition (incl.
+    // difficulty drift). Mainnet stays `never()` until H and will need a difficulty reset.
+    pom_activation: ForkActivation::new(5_000),
 
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
     // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).
