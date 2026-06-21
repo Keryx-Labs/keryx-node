@@ -503,6 +503,119 @@ mod tests {
         )
     }
 
+    // ── tier-reward ───────────────────────────────────────────────────────────
+
+    use keryx_consensus_core::blockhash::BlockHashes;
+    use keryx_consensus_core::config::params::TIER_REWARD_BPS;
+    use keryx_consensus_core::{HashKTypeMap, HashMapCustomHasher};
+    use keryx_hashes::Hash;
+
+    /// Builds a `GhostdagData` whose mergeset blues are exactly `blues` (no reds), enough to
+    /// drive `expected_coinbase_transaction`.
+    fn ghostdag_with_blues(blues: Vec<Hash>) -> GhostdagData {
+        let selected_parent = blues[0];
+        GhostdagData::new(
+            0,
+            Default::default(),
+            selected_parent,
+            BlockHashes::new(blues),
+            BlockHashes::new(vec![]),
+            HashKTypeMap::new(BlockHashMap::new()),
+        )
+    }
+
+    /// Two blue blocks with equal subsidy but different proven tiers: the floor tier (0, −30 %)
+    /// and the top tier (3, 0 %). Only the *miner cut* is scaled, the shortfall is burned, and
+    /// the total block reward, the escrow cuts and the R&D cut are untouched.
+    #[test]
+    fn tier_reward_scales_only_miner_cut() {
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let subsidy = 1_000_000_000u64;
+
+        let (h_a, h_b): (Hash, Hash) = (1.into(), 2.into());
+        let spk_a = ScriptPublicKey::from_vec(0, vec![0xaa]);
+        let spk_b = ScriptPublicKey::from_vec(0, vec![0xbb]);
+        let escrow_a = ScriptPublicKey::from_vec(0, vec![0xa1]);
+        let escrow_b = ScriptPublicKey::from_vec(0, vec![0xb1]);
+
+        let mut mergeset_rewards = BlockHashMap::new();
+        mergeset_rewards.insert(h_a, BlockRewardData::new_with_escrow(subsidy, 0, spk_a.clone(), Some(escrow_a.clone())));
+        mergeset_rewards.insert(h_b, BlockRewardData::new_with_escrow(subsidy, 0, spk_b.clone(), Some(escrow_b.clone())));
+
+        let ghostdag = ghostdag_with_blues(vec![h_a, h_b]);
+        let non_daa = BlockHashSet::new();
+        let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![0xcc]), vec![]);
+
+        // A = floor tier (−30 %), B = top tier (full).
+        let mut tier_bps = BlockHashMap::new();
+        tier_bps.insert(h_a, TIER_REWARD_BPS[0]);
+        tier_bps.insert(h_b, TIER_REWARD_BPS[3]);
+
+        let tx = cbm
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps)
+            .unwrap()
+            .tx;
+
+        let rd = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+        let escrow = subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
+        let full_miner = subsidy - rd - escrow;
+        let miner_a = full_miner * TIER_REWARD_BPS[0] / TIER_REWARD_BPS_DIVISOR; // −30 %
+        let miner_b = full_miner; // top tier, full
+
+        let value_of = |spk: &ScriptPublicKey| tx.outputs.iter().find(|o| &o.script_public_key == spk).map(|o| o.value);
+
+        // Miner cut scaled by tier.
+        assert_eq!(value_of(&spk_a), Some(miner_a), "floor-tier miner cut must be −30 %");
+        assert_eq!(value_of(&spk_b), Some(miner_b), "top-tier miner cut must be full");
+        assert!(miner_a < miner_b, "serving a heavier model must pay the miner strictly more");
+
+        // Escrow cuts untouched by the tier penalty.
+        assert_eq!(value_of(&escrow_a), Some(escrow), "escrow cut must keep its full base");
+        assert_eq!(value_of(&escrow_b), Some(escrow), "escrow cut must keep its full base");
+
+        // Total block reward unchanged — the delta is burned, not removed.
+        let total: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        assert_eq!(total, 2 * subsidy, "tier penalty must not change the total block reward");
+    }
+
+    /// Empty tier map (the pre-`pom_activation` state) is a no-op: the miner cut is paid in full,
+    /// the total is unchanged, and no extra burn output is appended.
+    #[test]
+    fn tier_reward_empty_map_is_noop() {
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let subsidy = 1_000_000_000u64;
+
+        let h_a: Hash = 1.into();
+        let spk_a = ScriptPublicKey::from_vec(0, vec![0xaa]);
+        let escrow_a = ScriptPublicKey::from_vec(0, vec![0xa1]);
+
+        let mut mergeset_rewards = BlockHashMap::new();
+        mergeset_rewards.insert(h_a, BlockRewardData::new_with_escrow(subsidy, 0, spk_a.clone(), Some(escrow_a.clone())));
+
+        let ghostdag = ghostdag_with_blues(vec![h_a]);
+        let non_daa = BlockHashSet::new();
+        let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![0xcc]), vec![]);
+
+        // No gate → empty map.
+        let tier_bps = BlockHashMap::new();
+
+        let tx = cbm
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps)
+            .unwrap()
+            .tx;
+
+        let rd = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+        let escrow = subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
+        let full_miner = subsidy - rd - escrow;
+
+        let value_of = |spk: &ScriptPublicKey| tx.outputs.iter().find(|o| &o.script_public_key == spk).map(|o| o.value);
+        assert_eq!(value_of(&spk_a), Some(full_miner), "no gate ⇒ full miner cut");
+        // 1 miner + 1 escrow + 1 R&D, and NO tier-burn output appended.
+        assert_eq!(tx.outputs.len(), 3, "no penalty ⇒ no extra burn output");
+        let total: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        assert_eq!(total, subsidy, "total reward equals the single block subsidy");
+    }
+
     #[test]
     fn emission_schedule_sanity_test() {
         let cbm = create_manager(&MAINNET_PARAMS);

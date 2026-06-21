@@ -140,6 +140,12 @@ impl BlockBodyProcessor {
     /// Genesis bypasses body validation entirely, so no exemption is needed here.
     fn check_pom_proof(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let header = &block.header;
+        // PoM *is* the proof-of-work under `pom_activation`; skipping PoW (simnet / tests) skips
+        // its verification too, exactly like the legacy kHeavyHash check. The block's declared
+        // `pom_proof.tier` is still persisted at commit, so tier-reward stays testable.
+        if self.skip_opoi {
+            return Ok(());
+        }
         if !self.pom_activation.is_active(header.daa_score) {
             return Ok(());
         }

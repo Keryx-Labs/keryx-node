@@ -367,3 +367,64 @@ async fn opoi_response_registered_on_chain() {
 // OPoI slashing removed (v1.2.3): the slash-behavior tests (fraud→slash, honest→no-slash,
 // unknown→no-slash, outside-window→no-slash) were dropped together with the slashing mechanism.
 // Escrows are now always spendable; there is no slash state to assert.
+
+// ── tier-reward E2E (full pipeline: commit → store → coinbase split) ──────────
+
+/// End-to-end: a merged block's miner cut in its merging block's coinbase is scaled by the
+/// merged block's cryptographically-proven PoM tier — persisted at body commit (`pom_tier_store`),
+/// read back by the virtual processor when it builds the coinbase. The floor tier (0, −30 %) pays
+/// its miner exactly 70 % of what the top tier (3, 0 %) pays, while the total block reward is
+/// identical (the shortfall is burned). `skip_proof_of_work` skips `check_pom_proof`, so the test
+/// can attach a chosen-tier proof without a real possession witness; only `tier` is read.
+#[tokio::test]
+async fn tier_reward_e2e_scales_merged_block_miner_cut() {
+    use keryx_consensus_core::config::params::{ForkActivation, TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR};
+    use keryx_consensus_core::pom::PomProof;
+
+    fn proof_with_tier(tier: u8) -> PomProof {
+        // Contents are irrelevant (check_pom_proof is skipped); only `tier` is persisted/read.
+        PomProof {
+            tier,
+            trace_root: [0; 32],
+            pow_value: [0; 32],
+            final_state: 0,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+        }
+    }
+
+    // (total coinbase payout of the block merging A, the part paid to the shared miner SPK).
+    async fn payout_for_tier(tier: u8) -> (u64, u64) {
+        let mut params = MAINNET_PARAMS;
+        params.pom_activation = ForkActivation::always();
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let mut ctx = TestContext::new(TestConsensus::new(&config));
+        let miner_spk = ctx.miner_data.script_public_key.clone();
+
+        // Block A over genesis, carrying a possession proof of `tier` → tier stored at commit.
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+        let a = ctx.build_block_template(0, ctx.simulated_time).block.to_immutable().with_pom_proof(proof_with_tier(tier));
+        ctx.validate_and_insert_block(a).await;
+
+        // Block B merges A: its coinbase rewards A, scaling A's miner cut by A's proven tier.
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+        let mut template_b = ctx.build_block_template(0, ctx.simulated_time);
+        let coinbase_b = template_b.block.transactions.remove(0);
+        let total: u64 = coinbase_b.outputs.iter().map(|o| o.value).sum();
+        let miner: u64 = coinbase_b.outputs.iter().filter(|o| o.script_public_key == miner_spk).map(|o| o.value).sum();
+        (total, miner)
+    }
+
+    let (total_top, miner_top) = payout_for_tier(3).await; // 0 %
+    let (total_floor, miner_floor) = payout_for_tier(0).await; // −30 %
+
+    assert!(miner_top > 0, "top-tier block must pay its miner");
+    assert_eq!(total_top, total_floor, "tier penalty must not change the total block reward");
+    assert_eq!(
+        miner_floor,
+        miner_top * TIER_REWARD_BPS[0] / TIER_REWARD_BPS_DIVISOR,
+        "floor-tier miner must get exactly 70 % of the top-tier cut"
+    );
+    assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
+}

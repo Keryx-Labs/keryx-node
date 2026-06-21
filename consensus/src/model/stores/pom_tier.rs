@@ -58,3 +58,44 @@ impl PomTierStoreReader for DbPomTierStore {
         self.access.has(hash)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_database::prelude::StoreResultExt;
+    use keryx_database::{create_temp_db, prelude::ConnBuilder};
+
+    #[test]
+    fn pom_tier_round_trip() {
+        let (_lifetime, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbPomTierStore::new(db.clone(), CachePolicy::Count(16));
+        let (a, b): (Hash, Hash) = (1.into(), 2.into());
+
+        // Write two tiers in a batch.
+        let mut batch = WriteBatch::default();
+        store.insert_batch(&mut batch, a, 3).unwrap();
+        store.insert_batch(&mut batch, b, 0).unwrap();
+        db.write(batch).unwrap();
+
+        // Read back.
+        assert_eq!(store.get(a).unwrap(), 3);
+        assert_eq!(store.get(b).unwrap(), 0);
+        assert!(store.has(a).unwrap());
+
+        // Missing key: get is KeyNotFound (None via optional), has is false.
+        let c: Hash = 9.into();
+        assert!(!store.has(c).unwrap());
+        assert_eq!(store.get(c).optional().unwrap(), None);
+
+        // Append-only: re-inserting the same hash errors.
+        let mut batch = WriteBatch::default();
+        assert!(store.insert_batch(&mut batch, a, 1).is_err());
+
+        // Delete is a no-op on a missing key (pre-fork blocks have no tier), and removes a present one.
+        let mut batch = WriteBatch::default();
+        store.delete_batch(&mut batch, c).unwrap(); // missing → Ok
+        store.delete_batch(&mut batch, a).unwrap();
+        db.write(batch).unwrap();
+        assert!(!store.has(a).unwrap());
+    }
+}
