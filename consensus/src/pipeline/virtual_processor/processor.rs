@@ -678,38 +678,44 @@ impl VirtualStateProcessor {
         // (and it can't be in the future by induction)
         loop {
             let candidate = heap.pop().expect("valid sink must exist").hash;
-            // Skip candidates that can never be the sink: header-only blocks (no body => no UTXO
-            // state) and blocks already disqualified from the chain. Crucially we do NOT walk into
-            // their parents — doing so would traverse an entire header-only / invalid branch (e.g. an
-            // abandoned higher-blue-work salt overhang left in the datadir after a relaunch) on every
-            // virtual resolve, an O(branch length) blow-up. The valid sink is always reachable through
-            // the body tips already present in the heap, so skipping these branches yields the
-            // identical sink and candidate set without the wasted walk.
             let candidate_status = self.statuses_store.read().get(candidate).unwrap();
-            if candidate_status.is_header_only() || candidate_status == StatusDisqualifiedFromChain {
+            // Header-only blocks have no body => no UTXO state, and an abandoned higher-blue-work
+            // overhang (e.g. a salt fork left in the datadir after a relaunch) can form a long
+            // header-only branch. Skip them WITHOUT walking their parents — doing so would traverse
+            // the whole overhang on every virtual resolve, an O(branch length) blow-up. The valid
+            // sink is reachable through the body tips already in the heap (or below disqualified
+            // bodies, handled next), so skipping header-only branches loses no valid sink.
+            if candidate_status.is_header_only() {
                 continue;
             }
-            if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
-                diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate);
-                if diff_point == candidate {
-                    // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual
+            // Disqualified blocks have a body but known-invalid UTXO state: they can never be the
+            // sink, so we skip the (known-failing) UTXO computation. But the valid sink may lie
+            // BELOW a disqualified block (e.g. a valid block built on top of one), so — unlike a
+            // header-only overhang — we MUST still walk its parents below. A disqualified branch is
+            // bounded (it has bodies and is part of the real DAG), so this is not the overhang case.
+            if candidate_status != StatusDisqualifiedFromChain {
+                if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
+                    diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate);
+                    if diff_point == candidate {
+                        // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual
 
-                    // All blocks with lower blue work than filtering_root are:
-                    // 1. not in its future (bcs blue work is monotonic),
-                    // 2. will be removed eventually by the bounded merge check.
-                    // Hence as an optimization we prefer removing such blocks in advance to allow valid tips to be considered.
-                    let filtering_root = self.depth_store.merge_depth_root(candidate).unwrap();
-                    let filtering_blue_work = self.ghostdag_store.get_blue_work(filtering_root).unwrap_or_default();
-                    return (
-                        candidate,
-                        heap.into_sorted_iter().take_while(|s| s.blue_work >= filtering_blue_work).map(|s| s.hash).collect(),
-                    );
-                } else {
-                    debug!("Block candidate {} has invalid UTXO state and is ignored from Virtual chain.", candidate)
+                        // All blocks with lower blue work than filtering_root are:
+                        // 1. not in its future (bcs blue work is monotonic),
+                        // 2. will be removed eventually by the bounded merge check.
+                        // Hence as an optimization we prefer removing such blocks in advance to allow valid tips to be considered.
+                        let filtering_root = self.depth_store.merge_depth_root(candidate).unwrap();
+                        let filtering_blue_work = self.ghostdag_store.get_blue_work(filtering_root).unwrap_or_default();
+                        return (
+                            candidate,
+                            heap.into_sorted_iter().take_while(|s| s.blue_work >= filtering_blue_work).map(|s| s.hash).collect(),
+                        );
+                    } else {
+                        debug!("Block candidate {} has invalid UTXO state and is ignored from Virtual chain.", candidate)
+                    }
+                } else if finality_point != pruning_point {
+                    // `finality_point == pruning_point` indicates we are at IBD start hence no warning required
+                    warn!("Finality Violation Detected. Block {} violates finality and is ignored from Virtual chain.", candidate);
                 }
-            } else if finality_point != pruning_point {
-                // `finality_point == pruning_point` indicates we are at IBD start hence no warning required
-                warn!("Finality Violation Detected. Block {} violates finality and is ignored from Virtual chain.", candidate);
             }
             // PRUNE SAFETY: see comment within [`resolve_virtual`]
             let prune_guard = self.pruning_lock.blocking_read();
