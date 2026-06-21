@@ -3,6 +3,7 @@ use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
     collateral::CHALLENGE_WINDOW_BLOCKS,
+    config::params::TIER_REWARD_BPS_DIVISOR,
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
@@ -230,10 +231,19 @@ impl CoinbaseManager {
         ghostdag_data: &GhostdagData,
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
+        // Tier-reward: blue block hash → multiplier (bps) for its *miner cut* only.
+        // Empty / missing entry ⇒ full `TIER_REWARD_BPS_DIVISOR` (no penalty), so this is a
+        // no-op before `pom_activation`. Built by the caller from each merged block's proven
+        // PoM tier (see `tier_bps_by_block`).
+        tier_bps_by_block: &BlockHashMap<u64>,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
-        // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D allocation
-        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() * 2 + 2);
+        // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D
+        // allocation, + 1 for the accumulated tier-reward burn
+        let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() * 2 + 3);
         let mut rd_total = 0u64;
+        // Sum of the per-blue miner-cut reductions, burned in a single output below. Keeps the
+        // total block reward equal to the schedule subsidy — only the miner's share is penalised.
+        let mut tier_burn_total = 0u64;
 
         // Add outputs for each mergeset blue block (∩ DAA window).
         // Transaction fees: 100% burned — no miner benefit, maximum supply destruction.
@@ -253,7 +263,12 @@ impl CoinbaseManager {
                 let escrow_cut = reward_data.subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
                 rd_total += rd_cut;
                 let miner_subsidy = reward_data.subsidy - rd_cut - escrow_cut;
-                outputs.push(TransactionOutput::new(miner_subsidy, reward_data.script_public_key.clone()));
+                // Tier-reward: scale only the miner cut by the block's proven tier; the shortfall
+                // is burned below. R&D and escrow keep their full-subsidy base, total unchanged.
+                let tier_bps = tier_bps_by_block.get(blue).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+                let miner_paid = miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR;
+                tier_burn_total += miner_subsidy - miner_paid;
+                outputs.push(TransactionOutput::new(miner_paid, reward_data.script_public_key.clone()));
                 let escrow_spk = reward_data
                     .escrow_script_public_key
                     .clone()
@@ -299,6 +314,12 @@ impl CoinbaseManager {
         // Single R&D allocation output — 2% of the total block reward, sent to the protocol treasury.
         if rd_total > 0 {
             outputs.push(TransactionOutput::new(rd_total, self.rd_allocation_script_public_key.clone()));
+        }
+
+        // Tier-reward: burn the accumulated miner-cut reductions in one output. Appended last so
+        // it never shifts `red_reward_output_index`. Zero before `pom_activation`.
+        if tier_burn_total > 0 {
+            outputs.push(TransactionOutput::new(tier_burn_total, self.burn_script_public_key.clone()));
         }
 
         // Build the current block's payload

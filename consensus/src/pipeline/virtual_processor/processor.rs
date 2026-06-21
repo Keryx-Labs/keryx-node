@@ -23,6 +23,7 @@ use crate::{
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
             past_pruning_points::DbPastPruningPointsStore,
+            pom_tier::DbPomTierStore,
             pruning::{DbPruningStore, PruningStoreReader},
             pruning_meta::PruningMetaStores,
             pruning_samples::DbPruningSamplesStore,
@@ -123,6 +124,8 @@ pub struct VirtualStateProcessor {
     pub(super) headers_store: Arc<DbHeadersStore>,
     pub(super) daa_excluded_store: Arc<DbDaaStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
+    /// Proven PoM tier per block, read to scale the tier-reward coinbase split.
+    pub(super) pom_tier_store: Arc<DbPomTierStore>,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
@@ -185,6 +188,10 @@ pub struct VirtualStateProcessor {
 
     // SALT v4 hardfork (chain relaunch on stock difficulty) activation score
     pub(super) pow_salt_v4_activation: ForkActivation,
+
+    // PoM possession activation: also gates the tier-reward coinbase split (a proven
+    // tier only exists under PoM). Empty tier-bps map before this score ⇒ no penalty.
+    pub(super) pom_activation: ForkActivation,
 }
 
 impl VirtualStateProcessor {
@@ -219,6 +226,7 @@ impl VirtualStateProcessor {
             ghostdag_store: storage.ghostdag_store.clone(),
             daa_excluded_store: storage.daa_excluded_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
+            pom_tier_store: storage.pom_tier_store.clone(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
@@ -260,6 +268,7 @@ impl VirtualStateProcessor {
 
             pow_salt_v2_activation: params.pow_salt_v2_activation,
             pow_salt_v4_activation: params.pow_salt_v4_activation,
+            pom_activation: params.pom_activation,
         }
     }
 
@@ -1072,6 +1081,8 @@ impl VirtualStateProcessor {
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let header_pruning_point =
             self.pruning_point_manager.expected_header_pruning_point(virtual_state.ghostdag_data.to_compact()).pruning_point;
+        let tier_bps_by_block =
+            self.tier_bps_by_block(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score);
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1080,6 +1091,7 @@ impl VirtualStateProcessor {
                 &virtual_state.ghostdag_data,
                 &virtual_state.mergeset_rewards,
                 &virtual_state.mergeset_non_daa,
+                &tier_bps_by_block,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);

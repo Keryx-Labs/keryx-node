@@ -58,6 +58,10 @@ pub enum DatabaseStorePrefixes {
     /// Slashed escrow outpoints: outpoint_bytes → slash_blue_score
     AiSlashed = 36,
 
+    // ---- PoM tier-reward ----
+    /// Proven PoM tier per block: block_hash → tier (u8)
+    PomTier = 37,
+
     // ---- Ghostdag Proof
     TempGhostdag = 40,
     TempGhostdagCompact = 41,
