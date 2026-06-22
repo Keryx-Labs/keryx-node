@@ -97,6 +97,12 @@ impl DbAddressAmountStore {
             self.access.write(BatchDbWriter::new(batch), key, amount)
         }
     }
+
+    /// Clears the whole index (this store's prefix only). Used at fast-sync import to drop any stale
+    /// aggregate before re-seeding from the imported pruning-point UTXO snapshot.
+    pub fn clear(&self, batch: &mut WriteBatch) -> Result<(), StoreError> {
+        self.access.delete_all(BatchDbWriter::new(batch))
+    }
 }
 
 impl AddressAmountStoreReader for DbAddressAmountStore {

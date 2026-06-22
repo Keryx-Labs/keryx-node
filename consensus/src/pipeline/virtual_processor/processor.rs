@@ -62,7 +62,7 @@ use keryx_consensus_core::{
     merkle::calc_hash_merkle_root,
     mining_rules::MiningRules,
     pruning::PruningPointsList,
-    tx::{MutableTransaction, Transaction},
+    tx::{MutableTransaction, ScriptPublicKey, Transaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -1256,6 +1256,27 @@ impl VirtualStateProcessor {
             for chunk in &pruning_meta_read.utxo_set.iterator().map(|iter_result| iter_result.unwrap()).chunks(1000) {
                 virtual_write.utxo_set.write_from_iterator_without_cache(chunk).unwrap();
             }
+
+            // Ratio-reward (Stage 2b): a from-genesis node builds the balance index from every UTXO
+            // diff since genesis; a fast-synced node skips that history, so seed the index directly
+            // from the imported pruning-point UTXO snapshot (grouped per payout SPK). The incremental
+            // lockstep maintenance in `commit_virtual_state` then carries it forward from here.
+            // The windowed-production index needs no seed (`W < pruning_depth` ⇒ its whole window lies
+            // above the pruning point and is rebuilt exactly by the IBD that follows); we only clear
+            // it so a re-import over a populated DB cannot leave stale aggregates.
+            let mut balances: HashMap<ScriptPublicKey, u64> = HashMap::new();
+            for item in virtual_write.utxo_set.iterator() {
+                let (_, entry) = item.unwrap();
+                let acc = balances.entry(entry.script_public_key.clone()).or_default();
+                *acc = acc.saturating_add(entry.amount);
+            }
+            let mut batch = WriteBatch::default();
+            self.address_balance_store.clear(&mut batch).unwrap();
+            self.windowed_production_store.clear(&mut batch).unwrap();
+            for (spk, amount) in balances {
+                self.address_balance_store.set_batch(&mut batch, &spk, amount).unwrap();
+            }
+            self.db.write(batch).unwrap();
         }
 
         let virtual_read = self.virtual_stores.upgradable_read();
