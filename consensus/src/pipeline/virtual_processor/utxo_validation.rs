@@ -24,10 +24,11 @@ use crate::{
         },
     },
 };
+use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::ratio_bps::RatioBpsStoreReader;
-use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR};
+use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
@@ -37,7 +38,7 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -389,6 +390,58 @@ impl VirtualStateProcessor {
         map
     }
 
+    /// Ratio-reward (Stage 2b) — resolves `block`'s holder-ratio bracket multiplier (bps), to be
+    /// persisted in `ratio_bps_store[block]` atomically with its UTXO commit. Returns `None` before
+    /// `ratio_reward_activation` (⇒ no entry ⇒ full miner cut, an exact no-op).
+    ///
+    /// Anchored at `block`'s **selected-parent view** (the locked design): the value is a function
+    /// of `block`'s intrinsic DAG position only, so it is reorg-stable and identical for every block
+    /// that later merges `block`. `sp_diff` is the UTXO diff `virtual → block's selected parent` (as
+    /// held by `calculate_utxo_state_relatively` *before* folding `block`'s own mergeset diff). The
+    /// balance index lags at the persistent virtual (advanced only in `commit_virtual_state`), so the
+    /// selected-parent balance is the indexed (virtual) balance corrected by `sp_diff` restricted to
+    /// the payout SPK.
+    ///
+    /// STAGE 2b-1: production is stubbed at the one-block-subsidy floor; the windowed-production
+    /// index (Stage 2b-2) replaces it. With the floor, the bracket is decided by `balance ÷ subsidy`
+    /// alone — enough to exercise the full plumbing end-to-end on testnet (mainnet stays `never()`).
+    pub(super) fn ratio_bps_for_block(&self, block: Hash, pov_daa_score: u64, sp_diff: &UtxoDiff) -> Option<u64> {
+        if !self.ratio_reward_activation.is_active(pov_daa_score) {
+            return None;
+        }
+        // Payout SPK = the miner cut of `block`'s own coinbase (intrinsic to its body).
+        let txs = self.block_transactions_store.get(block).unwrap();
+        let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+        let spk = coinbase_data.miner_data.script_public_key;
+        // balance at the selected-parent view = indexed virtual balance + sp_diff restricted to spk.
+        let indexed = self.address_balance_store.get(&spk).unwrap() as i128;
+        let balance = (indexed + balance_delta_for_spk(sp_diff, &spk)).max(0) as u64;
+        // STAGE 2b-1 stub (see doc above). `.max(1)` keeps the division-free bucket scan safe.
+        let production = self.coinbase_manager.calc_block_subsidy(pov_daa_score).max(1);
+        Some(ratio_reward_bps(balance, production))
+    }
+
+    /// Ratio-reward (Stage 2b) — advances the balance index by `diff`, keeping it in lockstep with
+    /// the virtual UTXO set (called from `commit_virtual_state` with the same `accumulated_diff`, in
+    /// the same batch). Folds the diff into one net delta per payout SPK, then read-modify-writes
+    /// each touched address once; a balance returning to 0 deletes its entry (via `set_batch`).
+    pub(super) fn apply_balance_diff(&self, batch: &mut rocksdb::WriteBatch, diff: &UtxoDiff) {
+        let mut deltas: std::collections::HashMap<ScriptPublicKey, i128> = std::collections::HashMap::new();
+        for entry in diff.add.values() {
+            *deltas.entry(entry.script_public_key.clone()).or_default() += entry.amount as i128;
+        }
+        for entry in diff.remove.values() {
+            *deltas.entry(entry.script_public_key.clone()).or_default() -= entry.amount as i128;
+        }
+        for (spk, delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            let new_balance = (self.address_balance_store.get(&spk).unwrap() as i128 + delta).max(0) as u64;
+            self.address_balance_store.set_batch(batch, &spk, new_balance).unwrap();
+        }
+    }
+
     fn check_ai_response_model_caps(&self, txs: &[Transaction]) -> BlockProcessResult<()> {
         check_ai_response_model_caps(txs)
     }
@@ -674,6 +727,16 @@ fn check_ai_request_inference_rewards(
 /// each AiResponse check its `request_hash` against that map.  If the AiRequest lives
 /// in an earlier block the response is skipped — cross-block enforcement is Phase 4.
 /// If the miner declared no caps at all (not yet upgraded), enforcement is also skipped.
+/// Ratio-reward (Stage 2b) — net amount (`added − removed`) attributable to `spk` within a UTXO
+/// diff. Used to translate the indexed virtual balance to a different chain view (a block's
+/// selected parent) in `ratio_bps_for_block`. `i128` carries the signed intermediate; the caller
+/// floors the corrected balance at 0.
+fn balance_delta_for_spk(diff: &UtxoDiff, spk: &ScriptPublicKey) -> i128 {
+    let added: i128 = diff.add.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();
+    let removed: i128 = diff.remove.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();
+    added - removed
+}
+
 fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     let declared_caps = parse_ai_caps(&txs[0].payload);
     if declared_caps.is_empty() {
