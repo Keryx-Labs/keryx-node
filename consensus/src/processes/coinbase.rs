@@ -526,6 +526,19 @@ mod tests {
         )
     }
 
+    #[test]
+    fn base_miner_cut_is_subsidy_minus_rd_and_escrow() {
+        let cbm = create_manager(&MAINNET_PARAMS);
+        // Across the emission phases (flat pre-emission, scheduled, tail), the base miner cut is the
+        // block subsidy minus the R&D and escrow allocations, BEFORE any tier/ratio scaling.
+        for daa in [0u64, 1, 1_000_000, 100_000_000, 10_000_000_000] {
+            let s = cbm.calc_block_subsidy(daa);
+            let expected = s - s * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR - s * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
+            assert_eq!(cbm.base_miner_cut(daa), expected, "daa={daa}");
+            assert!(cbm.base_miner_cut(daa) <= s, "base cut never exceeds the subsidy");
+        }
+    }
+
     // ── tier-reward ───────────────────────────────────────────────────────────
 
     use keryx_consensus_core::blockhash::BlockHashes;

@@ -202,6 +202,8 @@ pub struct VirtualStateProcessor {
     pub(super) pom_activation: ForkActivation,
     // Ratio-reward activation: empty ratio-bps map before this score ⇒ no penalty.
     pub(super) ratio_reward_activation: ForkActivation,
+    // Trailing selected-chain window length (blocks) for the ratio-reward production index.
+    pub(super) ratio_reward_window: u64,
 }
 
 impl VirtualStateProcessor {
@@ -282,6 +284,7 @@ impl VirtualStateProcessor {
             pow_salt_v4_activation: params.pow_salt_v4_activation,
             pom_activation: params.pom_activation,
             ratio_reward_activation: params.ratio_reward_activation,
+            ratio_reward_window: params.ratio_reward_window,
         }
     }
 

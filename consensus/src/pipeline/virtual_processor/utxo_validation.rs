@@ -28,7 +28,7 @@ use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
-use keryx_consensus_core::config::params::{RATIO_REWARD_WINDOW, TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
+use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -451,7 +451,7 @@ impl VirtualStateProcessor {
         sc: &impl SelectedChainStoreReader,
         deltas: &mut std::collections::HashMap<ScriptPublicKey, i128>,
     ) {
-        let w = RATIO_REWARD_WINDOW as i128;
+        let w = self.ratio_reward_window as i128;
         let from_tip = from_tip as i128;
         let to_tip = from_tip - chain_path.removed.len() as i128 + chain_path.added.len() as i128;
 
@@ -466,19 +466,14 @@ impl VirtualStateProcessor {
             }
         }
 
-        // Bottom slide: lowest in-window index is `tip − W + 1`; index 0 is the genesis/pruning anchor
-        // (never a production block), so skip indices < 1. Window blocks are retained (W < pruning depth).
-        let (from_low, to_low) = (from_tip - w, to_tip - w);
-        let (lo, hi, sign) = if to_low > from_low {
-            (from_low + 1, to_low, -1i128) // exit
-        } else if to_low < from_low {
-            (to_low + 1, from_low, 1i128) // re-enter
-        } else {
-            return;
-        };
-        for i in lo.max(1)..=hi {
-            if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
-                *deltas.entry(spk).or_default() += sign * cut as i128;
+        // Bottom slide: as the tip moves, the window's low boundary slides by the same amount — see
+        // `window_bottom_slide` for the exact index range + sign (the off-by-one-prone arithmetic,
+        // unit-tested in isolation). Window blocks are retained on disk (W < pruning depth).
+        if let Some((sign, lo, hi)) = window_bottom_slide(from_tip, to_tip, w) {
+            for i in lo..=hi {
+                if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
+                    *deltas.entry(spk).or_default() += sign * cut as i128;
+                }
             }
         }
     }
@@ -841,6 +836,28 @@ fn balance_delta_for_spk(diff: &UtxoDiff, spk: &ScriptPublicKey) -> i128 {
     added - removed
 }
 
+/// Ratio-reward (Stage 2b-2b) — pure index arithmetic of the windowed-production **bottom slide**.
+/// When the selected-chain tip moves from `from_tip` to `to_tip` (window length `w`), the window's
+/// low boundary slides by the same amount: chain blocks that leave the window must be subtracted
+/// (`sign = -1`), or — on a reorg that shortens the chain — those that re-enter must be re-added
+/// (`sign = +1`). Returns `Some((sign, lo, hi))` over the inclusive chain-index range `[lo, hi]`
+/// (with `lo >= 1`, since index 0 is the genesis/pruning anchor and is never a production block), or
+/// `None` when nothing crosses the boundary (no net tip move, or an early/short chain whose window
+/// has not yet reached index 1). Split out from `fold_production_window_delta` to be unit-tested in
+/// isolation — this is the off-by-one-prone core.
+fn window_bottom_slide(from_tip: i128, to_tip: i128, w: i128) -> Option<(i128, i128, i128)> {
+    let (from_low, to_low) = (from_tip - w, to_tip - w);
+    let (lo, hi, sign) = if to_low > from_low {
+        (from_low + 1, to_low, -1) // window grew at the top ⇒ blocks exit at the bottom
+    } else if to_low < from_low {
+        (to_low + 1, from_low, 1) // window shrank (reorg) ⇒ blocks re-enter at the bottom
+    } else {
+        return None;
+    };
+    let lo = lo.max(1);
+    (lo <= hi).then_some((sign, lo, hi))
+}
+
 fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     let declared_caps = parse_ai_caps(&txs[0].payload);
     if declared_caps.is_empty() {
@@ -1024,5 +1041,49 @@ mod tests {
             // Data was originally sorted, so we check if they remain sorted after filtering
             assert!(prev < curr, "expected {} < {} if original sort was preserved", prev, curr);
         });
+    }
+}
+
+#[cfg(test)]
+mod ratio_window_tests {
+    use super::window_bottom_slide;
+
+    #[test]
+    fn advance_by_one_exits_oldest() {
+        // tip 10 → 11, W=3: window {8,9,10} → {9,10,11}; index 8 exits (subtract).
+        assert_eq!(window_bottom_slide(10, 11, 3), Some((-1, 8, 8)));
+    }
+
+    #[test]
+    fn advance_by_three_exits_three() {
+        // tip 10 → 13, W=3: indices 8,9,10 all exit.
+        assert_eq!(window_bottom_slide(10, 13, 3), Some((-1, 8, 10)));
+    }
+
+    #[test]
+    fn reorg_reenters_oldest() {
+        // tip 11 → 10, W=3: index 8 re-enters the window (re-add).
+        assert_eq!(window_bottom_slide(11, 10, 3), Some((1, 8, 8)));
+    }
+
+    #[test]
+    fn no_tip_move_is_none() {
+        assert_eq!(window_bottom_slide(10, 10, 3), None);
+    }
+
+    #[test]
+    fn early_chain_skips_genesis_anchor() {
+        // Window not yet full (tip ≤ W): nothing has aged past index 0, so no bottom touch.
+        assert_eq!(window_bottom_slide(2, 3, 3), None);
+        // First real exit happens once the boundary reaches index 1.
+        assert_eq!(window_bottom_slide(3, 4, 3), Some((-1, 1, 1)));
+    }
+
+    #[test]
+    fn advance_then_reorg_cancels_exactly() {
+        // The forward exit and its reorg re-entry hit the SAME index with opposite signs ⇒ net zero,
+        // which is what makes the production index reorg-exact.
+        assert_eq!(window_bottom_slide(10, 11, 3), Some((-1, 8, 8)));
+        assert_eq!(window_bottom_slide(11, 10, 3), Some((1, 8, 8)));
     }
 }

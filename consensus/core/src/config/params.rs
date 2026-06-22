@@ -567,6 +567,12 @@ pub struct Params {
     /// computed by the node from the balance + windowed-production indexes). DAA-gated so IBD
     /// re-validation of pre-fork history is unaffected (empty map ⇒ full cut, no burn).
     pub ratio_reward_activation: ForkActivation,
+
+    /// Length (in blocks) of the trailing selected-chain window over which a payout address's
+    /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
+    /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
+    /// exercise the window slide. HARD CONSTRAINT: must stay `< pruning_depth`.
+    pub ratio_reward_window: u64,
 }
 
 impl Params {
@@ -755,6 +761,8 @@ impl Params {
             pow_salt_v4_activation: self.pow_salt_v4_activation,
 
             ratio_reward_activation: self.ratio_reward_activation,
+
+            ratio_reward_window: self.ratio_reward_window,
         }
     }
 }
@@ -865,6 +873,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // Ratio-reward: dormant on mainnet until the balance + production indexes land (Stage 2) and
     // an H is chosen. Stays never() so the placeholder map is empty and IBD is unaffected.
     ratio_reward_activation: ForkActivation::never(),
+    ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -934,6 +943,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
     // populates the bps store; the placeholder map is empty until then.
     ratio_reward_activation: ForkActivation::new(5_000),
+    ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -984,6 +994,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
+    ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -1032,4 +1043,5 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
+    ratio_reward_window: RATIO_REWARD_WINDOW,
 };
