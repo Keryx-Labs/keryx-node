@@ -27,10 +27,11 @@ use crate::{
 use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
-use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
+use crate::model::stores::selected_chain::SelectedChainStoreReader;
+use keryx_consensus_core::config::params::{RATIO_REWARD_WINDOW, TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
-    BlockHashMap, BlockHashSet, HashMapCustomHasher,
+    BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
     api::args::TransactionValidationArgs,
     coinbase::*,
@@ -398,10 +399,12 @@ impl VirtualStateProcessor {
         if !self.ratio_reward_activation.is_active(pov_daa_score) {
             return map;
         }
-        // STAGE 2b-2a: production stubbed at the one-block-subsidy floor (the windowed-production
-        // index is Stage 2b-2b). With the floor the bracket is decided by `balance ÷ subsidy` alone,
-        // which exercises the full inline path; `.max(1)` keeps the division-free bucket scan safe.
-        let production = self.coinbase_manager.calc_block_subsidy(pov_daa_score).max(1);
+        // Windowed-production correction (Stage 2b-2b): the production index lags at the committed
+        // virtual's selected chain; correct every payout SPK to THIS block's selected-parent window
+        // with one chain-path delta, shared by all blues (mirror of the balance `view_diffs`). Floor
+        // at one block's base miner cut so a newcomer with no recent production divides by one block.
+        let prod_correction = self.production_window_correction(ghostdag_data.selected_parent);
+        let prod_floor = self.coinbase_manager.base_miner_cut(pov_daa_score).max(1);
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             // Payout SPK = the blue's own miner cut, already resolved into the reward data.
             if let Some(reward) = mergeset_rewards.get(blue) {
@@ -409,10 +412,117 @@ impl VirtualStateProcessor {
                 let base = self.address_balance_store.get(spk).unwrap() as i128;
                 let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                 let balance = (base + delta).max(0) as u64;
+                let prod_base = self.windowed_production_store.get(spk).unwrap() as i128;
+                let prod_delta = prod_correction.get(spk).copied().unwrap_or(0);
+                let production = ((prod_base + prod_delta).max(0) as u64).max(prod_floor);
                 map.insert(*blue, ratio_reward_bps(balance, production));
             }
         }
         map
+    }
+
+    /// Reads selected-chain block `hash`'s production contribution: its producer payout SPK (the
+    /// `miner_data` SPK in its own coinbase) and the base (un-scaled) miner cut of one block subsidy
+    /// at its DAA score. `None` if that base cut is 0 (tail emission edge) ⇒ no contribution. This is
+    /// the per-block unit summed by the windowed-production index (one number per chain block,
+    /// attributed to its producer — deliberately not the per-output paid amount, see `base_miner_cut`).
+    fn block_production(&self, hash: Hash) -> Option<(ScriptPublicKey, u64)> {
+        let cut = self.coinbase_manager.base_miner_cut(self.headers_store.get_daa_score(hash).unwrap());
+        if cut == 0 {
+            return None;
+        }
+        let txs = self.block_transactions_store.get(hash).unwrap();
+        let spk = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap().miner_data.script_public_key;
+        Some((spk, cut))
+    }
+
+    /// Folds the per-SPK production delta of moving the windowed-production index along `chain_path`
+    /// (from a chain whose tip has index `from_tip`) into `deltas`. The window is the last
+    /// `RATIO_REWARD_WINDOW` selected-chain blocks (a block count, slid in O(1) via the chain index):
+    /// - **top**: `removed` blocks leave the window (subtract), `added` blocks join it (add);
+    /// - **bottom**: as the tip moves by `Δ = added − removed`, the low boundary slides by the same
+    ///   amount — blocks at indices `(from_tip−W, to_tip−W]` exit (subtract) when `Δ>0`, or re-enter
+    ///   (add) when `Δ<0`. Those deep blocks sit far below any reorg split, so reading them by index
+    ///   on `sc` (the pre-change chain) is reorg-stable and identical on every node.
+    fn fold_production_window_delta(
+        &self,
+        chain_path: &ChainPath,
+        from_tip: u64,
+        sc: &impl SelectedChainStoreReader,
+        deltas: &mut std::collections::HashMap<ScriptPublicKey, i128>,
+    ) {
+        let w = RATIO_REWARD_WINDOW as i128;
+        let from_tip = from_tip as i128;
+        let to_tip = from_tip - chain_path.removed.len() as i128 + chain_path.added.len() as i128;
+
+        for h in &chain_path.removed {
+            if let Some((spk, cut)) = self.block_production(*h) {
+                *deltas.entry(spk).or_default() -= cut as i128;
+            }
+        }
+        for h in &chain_path.added {
+            if let Some((spk, cut)) = self.block_production(*h) {
+                *deltas.entry(spk).or_default() += cut as i128;
+            }
+        }
+
+        // Bottom slide: lowest in-window index is `tip − W + 1`; index 0 is the genesis/pruning anchor
+        // (never a production block), so skip indices < 1. Window blocks are retained (W < pruning depth).
+        let (from_low, to_low) = (from_tip - w, to_tip - w);
+        let (lo, hi, sign) = if to_low > from_low {
+            (from_low + 1, to_low, -1i128) // exit
+        } else if to_low < from_low {
+            (to_low + 1, from_low, 1i128) // re-enter
+        } else {
+            return;
+        };
+        for i in lo.max(1)..=hi {
+            if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
+                *deltas.entry(spk).or_default() += sign * cut as i128;
+            }
+        }
+    }
+
+    /// Ratio-reward (Stage 2b-2b) — advances the windowed-production index along `chain_path`, kept in
+    /// lockstep with the selected chain (called from `commit_virtual_state` in the SAME batch as the
+    /// selected-chain `apply_changes`, BEFORE it runs, so `sc` still reflects the pre-change chain).
+    /// Ungated/passive: maintained from genesis so it is exact for from-genesis nodes; only read once
+    /// `ratio_reward_activation` fires. Folds one net delta per producer SPK, then writes each once
+    /// (a value returning to 0 deletes its entry via `set_batch`).
+    pub(super) fn advance_production_window(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        chain_path: &ChainPath,
+        sc: &impl SelectedChainStoreReader,
+    ) {
+        let from_tip = sc.get_tip().unwrap().0;
+        let mut deltas: std::collections::HashMap<ScriptPublicKey, i128> = std::collections::HashMap::new();
+        self.fold_production_window_delta(chain_path, from_tip, sc, &mut deltas);
+        for (spk, delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            let new_value = (self.windowed_production_store.get(&spk).unwrap() as i128 + delta).max(0) as u64;
+            self.windowed_production_store.set_batch(batch, &spk, new_value).unwrap();
+        }
+    }
+
+    /// Ratio-reward (Stage 2b-2b) — per-SPK production delta from the committed virtual's window to
+    /// block `m_sp`'s window (`m_sp` = the rewarding block's selected parent). The windowed-production
+    /// index is anchored at the committed virtual (its selected-chain tip); this corrects it to the
+    /// rewarding block's own view, exactly mirroring how the balance `view_diffs` correct the balance
+    /// index. Empty when `m_sp` is already the committed tip (the build path, where the rewarding
+    /// block is virtual itself). Deterministic: a function of `m_sp`'s intrinsic DAG position.
+    fn production_window_correction(&self, m_sp: Hash) -> std::collections::HashMap<ScriptPublicKey, i128> {
+        let mut deltas = std::collections::HashMap::new();
+        let sc = self.selected_chain_store.read();
+        let (committed_tip_index, committed_tip) = sc.get_tip().unwrap();
+        if m_sp == committed_tip {
+            return deltas;
+        }
+        let chain_path = self.dag_traversal_manager.calculate_chain_path(committed_tip, m_sp, None);
+        self.fold_production_window_delta(&chain_path, committed_tip_index, &*sc, &mut deltas);
+        deltas
     }
 
     /// Ratio-reward (Stage 2b) — advances the balance index by `diff`, keeping it in lockstep with

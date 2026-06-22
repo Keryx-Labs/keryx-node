@@ -141,6 +141,10 @@ pub struct VirtualStateProcessor {
     /// Ratio-reward balance index (Stage 2b): payout SPK → Σ unspent amount, kept in lockstep
     /// with the virtual UTXO set. Read to anchor `ratio_bps` at a block's selected-parent view.
     pub(super) address_balance_store: Arc<DbAddressAmountStore>,
+    /// Ratio-reward windowed-production index (Stage 2b): producer payout SPK → Σ `base_miner_cut`
+    /// over the last `RATIO_REWARD_WINDOW` selected-chain blocks, kept in lockstep with the selected
+    /// chain. Read to anchor the ratio denominator at a block's selected-parent view.
+    pub(super) windowed_production_store: Arc<DbAddressAmountStore>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -243,6 +247,7 @@ impl VirtualStateProcessor {
             utxo_multisets_store: storage.utxo_multisets_store.clone(),
             acceptance_data_store: storage.acceptance_data_store.clone(),
             address_balance_store: storage.address_balance_store.clone(),
+            windowed_production_store: storage.windowed_production_store.clone(),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_meta_stores: storage.pruning_meta_stores.clone(),
             lkg_virtual_state: storage.lkg_virtual_state.clone(),
@@ -620,6 +625,11 @@ impl VirtualStateProcessor {
         // `ratio_bps_by_block` reads it post-activation; maintaining it from genesis keeps it exact
         // for from-genesis nodes (fast-sync reconstruction from the pruning-point snapshot is 2b-3).
         self.apply_balance_diff(&mut batch, accumulated_diff);
+
+        // Ratio-reward (Stage 2b-2b): advance the windowed-production index along the SAME chain path,
+        // in the SAME batch, BEFORE `apply_changes` mutates the selected chain — so the index reads the
+        // pre-change chain (its current anchor) and stays in lockstep with it.
+        self.advance_production_window(&mut batch, chain_path, &*selected_chain_write);
 
         // Update virtual state
         virtual_write.state.set_batch(&mut batch, new_virtual_state).unwrap();

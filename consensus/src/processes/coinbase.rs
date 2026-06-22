@@ -484,6 +484,19 @@ impl CoinbaseManager {
         }
     }
 
+    /// Base (un-scaled) miner cut of a single block subsidy at `daa_score`: the block subsidy minus
+    /// the R&D and escrow allocations, BEFORE any tier/ratio-reward scaling. This is the exogenous
+    /// "mining output" of one selected-chain block, used by the ratio-reward windowed-production
+    /// index (see `ratio_bps_by_block`) — deliberately the base cut, not the paid (post-scaling)
+    /// amount, so production stays independent of the reward policy it feeds. Mirrors the per-blue
+    /// split in `expected_coinbase_transaction` (`miner_subsidy = subsidy − rd_cut − escrow_cut`).
+    pub fn base_miner_cut(&self, daa_score: u64) -> u64 {
+        let subsidy = self.calc_block_subsidy(daa_score);
+        let rd_cut = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+        let escrow_cut = subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
+        subsidy - rd_cut - escrow_cut
+    }
+
     /// Returns the number of elapsed calendar months since the emission phase started.
     ///
     /// Note: called only when `daa_score >= self.emission_start_daa_score`.
