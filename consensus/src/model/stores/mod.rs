@@ -1,4 +1,5 @@
 pub mod acceptance_data;
+pub mod address_amount;
 pub mod ai_slash;
 pub mod collateral;
 pub mod block_transactions;

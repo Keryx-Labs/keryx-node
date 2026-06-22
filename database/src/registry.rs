@@ -65,12 +65,18 @@ pub enum DatabaseStorePrefixes {
     // ---- Ratio-reward (holder-weighted miner cut) ----
     /// Computed holder ratio bracket per block: block_hash → ratio_bps (u64)
     RatioBps = 38,
+    /// Ratio-reward balance index: payout SPK → Σ unspent amount (consensus, lockstep with the UTXO set)
+    AddressBalance = 39,
 
     // ---- Ghostdag Proof
     TempGhostdag = 40,
     TempGhostdagCompact = 41,
     TempRelationsParents = 42,
     TempRelationsChildren = 43,
+
+    // ---- Ratio-reward (cont.) ----
+    /// Ratio-reward production index: payout SPK → Σ coinbase miner-cut over the trailing window W
+    WindowedProduction = 44,
 
     // ---- Retention Period Root ----
     RetentionPeriodRoot = 50,
