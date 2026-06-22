@@ -62,6 +62,10 @@ pub enum DatabaseStorePrefixes {
     /// Proven PoM tier per block: block_hash → tier (u8)
     PomTier = 37,
 
+    // ---- Ratio-reward (holder-weighted miner cut) ----
+    /// Computed holder ratio bracket per block: block_hash → ratio_bps (u64)
+    RatioBps = 38,
+
     // ---- Ghostdag Proof
     TempGhostdag = 40,
     TempGhostdagCompact = 41,

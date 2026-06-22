@@ -26,6 +26,7 @@ use crate::{
 };
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
+use crate::model::stores::ratio_bps::RatioBpsStoreReader;
 use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
@@ -317,6 +318,7 @@ impl VirtualStateProcessor {
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
+        let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
         let expected_coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -326,6 +328,7 @@ impl VirtualStateProcessor {
                 mergeset_rewards,
                 mergeset_non_daa,
                 &tier_bps_by_block,
+                &ratio_bps_by_block,
             )
             .unwrap()
             .tx;
@@ -352,6 +355,34 @@ impl VirtualStateProcessor {
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             if let Some(tier) = self.pom_tier_store.get(*blue).optional().unwrap() {
                 let bps = TIER_REWARD_BPS.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+                map.insert(*blue, bps);
+            }
+        }
+        map
+    }
+
+    /// Ratio-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue, the
+    /// holder-ratio bracket multiplier (bps) persisted in `ratio_bps_store` (computed from the
+    /// producer's `balance ÷ windowed_production`). Both the validator and the template builder
+    /// derive it identically from the same store, so the coinbase they produce agrees
+    /// deterministically. Returns an empty map before `ratio_reward_activation` (⇒ full miner cut,
+    /// no penalty, no burn). Compounds with `tier_bps_by_block` in the coinbase manager.
+    ///
+    /// STAGE 1: the balance + production indexes that fill `ratio_bps_store` are not implemented
+    /// yet (Stage 2), so the store is empty and this returns an empty map even past activation —
+    /// a deliberate no-op. The store read is wired so Stage 2 only has to start writing it.
+    pub(super) fn ratio_bps_by_block(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        pov_daa_score: u64,
+    ) -> BlockHashMap<u64> {
+        let mut map = BlockHashMap::new();
+        if !self.ratio_reward_activation.is_active(pov_daa_score) {
+            return map;
+        }
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            if let Some(bps) = self.ratio_bps_store.get(*blue).optional().unwrap() {
                 map.insert(*blue, bps);
             }
         }

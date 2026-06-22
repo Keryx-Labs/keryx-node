@@ -162,6 +162,49 @@ pub const TIER_REWARD_BPS: [u64; 4] = [7_000, 8_000, 9_000, 10_000];
 /// Basis-points divisor for `TIER_REWARD_BPS` (= the top-tier 100 % reference).
 pub const TIER_REWARD_BPS_DIVISOR: u64 = 10_000;
 
+/// Ratio-reward — holder-weighted multiplier (bps) applied to the *immediate miner cut*, indexed
+/// by the holder ratio `balance ÷ windowed_production` (see `ratio_reward_bps`). It clones the
+/// tier-reward machinery but swaps the proven model-tier input for a ratio bucket computed by the
+/// node from chain state (no miner input). The un-earned delta is burned, so the total reward, the
+/// R&D cut and the escrow cut are untouched. When the tier-reward is also active the two factors
+/// **compound** multiplicatively on the miner cut. Gated by `ratio_reward_activation`.
+///
+/// 6 brackets, brutal, floor 40 %: a miner holding < 1 window of its own production (a dumper)
+/// keeps 40 %; holding ~1 month of production keeps 100 %. See KERYX-KRX/ratio_reward_spec.md.
+pub const RATIO_REWARD_BPS: [u64; 6] = [4_000, 5_200, 6_400, 7_600, 8_800, 10_000];
+
+/// Basis-points divisor for `RATIO_REWARD_BPS` (= the top-bracket 100 % reference).
+pub const RATIO_REWARD_BPS_DIVISOR: u64 = 10_000;
+
+/// Bracket entry thresholds, expressed as integer multiples of windowed production. Bracket `i`
+/// is reached when `balance >= RATIO_REWARD_THRESHOLDS[i] * windowed_production`. Must be sorted
+/// ascending and start at 0 (bracket 0 always reachable). Reading: 0/1/3/7/15/30 windows held.
+pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
+
+/// Length (in blocks) of the trailing window over which a payout address's production (coinbase
+/// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
+/// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
+pub const RATIO_REWARD_WINDOW: u64 = 864_000;
+
+/// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
+/// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
+/// (a zero-history / freshly-rotated address would otherwise hit the top bracket for free).
+///
+/// Division-free: bracket `i` is reached iff `balance >= THRESHOLDS[i] * production`. Thresholds
+/// are ascending, so the first failing bracket ends the scan. `u128` math avoids overflow on the
+/// `threshold * production` product.
+pub fn ratio_reward_bps(balance: u64, production: u64) -> u64 {
+    let mut bps = RATIO_REWARD_BPS[0];
+    for i in 0..RATIO_REWARD_THRESHOLDS.len() {
+        if (balance as u128) >= (RATIO_REWARD_THRESHOLDS[i] as u128) * (production as u128) {
+            bps = RATIO_REWARD_BPS[i];
+        } else {
+            break;
+        }
+    }
+    bps
+}
+
 use crate::{
     BlockLevel, KType,
     constants::STORAGE_MASS_PARAMETER,
@@ -518,6 +561,12 @@ pub struct Params {
     /// This forks cleanly away from the abandoned SALT-v3 / diff-spiral chain while keeping
     /// stock difficulty (no genesis reset). Same forced-update mechanism as v2.
     pub pow_salt_v4_activation: ForkActivation,
+
+    /// Ratio-reward (holder-weighted miner-cut bonus) activation DAA score. At/after this score
+    /// the coinbase miner cut is scaled by the producer's holder ratio bracket (`RATIO_REWARD_BPS`,
+    /// computed by the node from the balance + windowed-production indexes). DAA-gated so IBD
+    /// re-validation of pre-fork history is unaffected (empty map ⇒ full cut, no burn).
+    pub ratio_reward_activation: ForkActivation,
 }
 
 impl Params {
@@ -704,6 +753,8 @@ impl Params {
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
+
+            ratio_reward_activation: self.ratio_reward_activation,
         }
     }
 }
@@ -810,6 +861,10 @@ pub const MAINNET_PARAMS: Params = Params {
     // forking cleanly away from the abandoned SALT-v3 / diff-1-spiral chain. Same DAA as the
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
+
+    // Ratio-reward: dormant on mainnet until the balance + production indexes land (Stage 2) and
+    // an H is chosen. Stays never() so the placeholder map is empty and IBD is unaffected.
+    ratio_reward_activation: ForkActivation::never(),
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -875,6 +930,10 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoW SALT v4: active from genesis on testnet to mirror the live mainnet PoW (salt v4)
     // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
     pow_salt_v4_activation: ForkActivation::new(0),
+
+    // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
+    // populates the bps store; the placeholder map is empty until then.
+    ratio_reward_activation: ForkActivation::new(5_000),
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -924,6 +983,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pom_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    ratio_reward_activation: ForkActivation::never(),
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -971,4 +1031,5 @@ pub const DEVNET_PARAMS: Params = Params {
     pom_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    ratio_reward_activation: ForkActivation::never(),
 };
