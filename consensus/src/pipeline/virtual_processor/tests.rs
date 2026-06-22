@@ -428,3 +428,45 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
     );
     assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
 }
+
+/// Ratio-reward (Stage 2b-2b) E2E: the windowed-production index accumulates one base miner cut per
+/// selected-chain block (attributed to that block's producer SPK) and slides — producers that age
+/// out of the last `ratio_reward_window` blocks have their entry dropped. Exercises the real store
+/// maintenance (top add + bottom slide through `commit_virtual_state`), not just the pure arithmetic.
+#[tokio::test]
+async fn windowed_production_accumulates_per_producer_and_slides() {
+    use crate::model::stores::address_amount::AddressAmountStoreReader;
+    use crate::model::stores::headers::HeaderStoreReader;
+
+    // Tiny window so a 6-block chain exercises the bottom slide. Index maintenance is ungated (runs
+    // from genesis), so no ratio activation is needed to populate the production index.
+    let mut params = MAINNET_PARAMS;
+    params.ratio_reward_window = 3;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    // Single-chain (width 1) of 6 blocks, each built by a distinct random producer SPK.
+    let mut producers: Vec<ScriptPublicKey> = Vec::new();
+    for _ in 0..6 {
+        let md = new_miner_data();
+        producers.push(md.script_public_key.clone());
+        ctx.miner_data = md;
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+
+    let vp = ctx.consensus.virtual_processor().clone();
+    let prod = |spk: &ScriptPublicKey| vp.windowed_production_store.get(spk).unwrap();
+
+    // Window = last 3 selected-chain blocks ⇒ producers[3..6] are in-window; producers[0..3] aged out.
+    let one_cut = prod(&producers[3]);
+    assert!(one_cut > 0, "an in-window producer must have non-zero production");
+    assert_eq!(prod(&producers[4]), one_cut, "each block contributes one equal base cut");
+    assert_eq!(prod(&producers[5]), one_cut);
+    for i in 0..3 {
+        assert_eq!(prod(&producers[i]), 0, "producer {i} aged out of the window ⇒ entry dropped");
+    }
+
+    // The in-window contribution is exactly one block's base miner cut.
+    let sink_daa = ctx.consensus.headers_store().get_daa_score(ctx.consensus.get_sink()).unwrap();
+    assert_eq!(one_cut, vp.coinbase_manager.base_miner_cut(sink_daa));
+}
