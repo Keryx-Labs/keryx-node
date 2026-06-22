@@ -27,7 +27,6 @@ use crate::{
 use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
-use crate::model::stores::ratio_bps::RatioBpsStoreReader;
 use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
@@ -208,6 +207,8 @@ impl VirtualStateProcessor {
         ctx: &mut UtxoProcessingContext,
         selected_parent_utxo_view: &V,
         header: &Header,
+        // Diff from the committed virtual to this block's selected parent (for ratio-reward balances).
+        sp_diff: &UtxoDiff,
     ) -> BlockProcessResult<()> {
         // Verify header UTXO commitment
         let expected_commitment = ctx.multiset_hash.finalize();
@@ -226,13 +227,16 @@ impl VirtualStateProcessor {
 
         let txs = self.block_transactions_store.get(header.hash).unwrap();
 
-        // Verify coinbase transaction
+        // Verify coinbase transaction. The two diffs (committed-virtual → selected parent, then
+        // selected parent → this block via its mergeset) let the ratio-reward bracket be evaluated at
+        // this block's own view from the virtual-anchored balance index.
         self.verify_coinbase_transaction(
             &txs[0],
             header.daa_score,
             &ctx.ghostdag_data,
             &ctx.mergeset_rewards,
             &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+            &[sp_diff, &ctx.mergeset_diff],
         )?;
 
         // Verify the header pruning point
@@ -315,11 +319,13 @@ impl VirtualStateProcessor {
         ghostdag_data: &GhostdagData,
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
+        // Diffs from the committed virtual to this block's own view, for ratio-reward balances.
+        view_diffs: &[&UtxoDiff],
     ) -> BlockProcessResult<()> {
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
-        let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
+        let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
         let expected_coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -363,62 +369,50 @@ impl VirtualStateProcessor {
     }
 
     /// Ratio-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue, the
-    /// holder-ratio bracket multiplier (bps) persisted in `ratio_bps_store` (computed from the
-    /// producer's `balance ÷ windowed_production`). Both the validator and the template builder
-    /// derive it identically from the same store, so the coinbase they produce agrees
-    /// deterministically. Returns an empty map before `ratio_reward_activation` (⇒ full miner cut,
-    /// no penalty, no burn). Compounds with `tier_bps_by_block` in the coinbase manager.
+    /// holder-ratio bracket multiplier (bps), computed **inline at this (rewarding) block's view**
+    /// from the consensus balance + production indexes — NOT read from any per-block store.
     ///
-    /// STAGE 1: the balance + production indexes that fill `ratio_bps_store` are not implemented
-    /// yet (Stage 2), so the store is empty and this returns an empty map even past activation —
-    /// a deliberate no-op. The store read is wired so Stage 2 only has to start writing it.
+    /// Why inline (Stage 2b option B): a per-block stored bracket would have to be written for every
+    /// blue, but blues are only UTXO-committed when they sit on the selected chain. A side-blue's
+    /// stored value would be missing — or, worse, non-deterministically present after a reorg
+    /// (whether a block was ever a transient chain candidate depends on each node's processing
+    /// order) — which diverges the expected coinbase across nodes → consensus split. Computing the
+    /// bracket inline from each rewarding block's own (intrinsic, reorg-stable) view removes the
+    /// store entirely and covers every blue identically on all nodes.
+    ///
+    /// `view_diffs` are the UTXO diffs from the node's committed virtual to THIS block's view (empty
+    /// on the build path, where the rewarding block is virtual itself). Per blue, the balance at
+    /// this view = the virtual-anchored balance index corrected by those diffs, restricted to the
+    /// blue's payout SPK (taken from `mergeset_rewards`, already derived for the coinbase). Returns
+    /// an empty map before `ratio_reward_activation` (⇒ full miner cut, no penalty). Compounds with
+    /// `tier_bps_by_block` in the coinbase manager.
     pub(super) fn ratio_bps_by_block(
         &self,
         ghostdag_data: &GhostdagData,
         mergeset_non_daa: &BlockHashSet,
+        mergeset_rewards: &BlockHashMap<BlockRewardData>,
         pov_daa_score: u64,
+        view_diffs: &[&UtxoDiff],
     ) -> BlockHashMap<u64> {
         let mut map = BlockHashMap::new();
         if !self.ratio_reward_activation.is_active(pov_daa_score) {
             return map;
         }
+        // STAGE 2b-2a: production stubbed at the one-block-subsidy floor (the windowed-production
+        // index is Stage 2b-2b). With the floor the bracket is decided by `balance ÷ subsidy` alone,
+        // which exercises the full inline path; `.max(1)` keeps the division-free bucket scan safe.
+        let production = self.coinbase_manager.calc_block_subsidy(pov_daa_score).max(1);
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
-            if let Some(bps) = self.ratio_bps_store.get(*blue).optional().unwrap() {
-                map.insert(*blue, bps);
+            // Payout SPK = the blue's own miner cut, already resolved into the reward data.
+            if let Some(reward) = mergeset_rewards.get(blue) {
+                let spk = &reward.script_public_key;
+                let base = self.address_balance_store.get(spk).unwrap() as i128;
+                let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
+                let balance = (base + delta).max(0) as u64;
+                map.insert(*blue, ratio_reward_bps(balance, production));
             }
         }
         map
-    }
-
-    /// Ratio-reward (Stage 2b) — resolves `block`'s holder-ratio bracket multiplier (bps), to be
-    /// persisted in `ratio_bps_store[block]` atomically with its UTXO commit. Returns `None` before
-    /// `ratio_reward_activation` (⇒ no entry ⇒ full miner cut, an exact no-op).
-    ///
-    /// Anchored at `block`'s **selected-parent view** (the locked design): the value is a function
-    /// of `block`'s intrinsic DAG position only, so it is reorg-stable and identical for every block
-    /// that later merges `block`. `sp_diff` is the UTXO diff `virtual → block's selected parent` (as
-    /// held by `calculate_utxo_state_relatively` *before* folding `block`'s own mergeset diff). The
-    /// balance index lags at the persistent virtual (advanced only in `commit_virtual_state`), so the
-    /// selected-parent balance is the indexed (virtual) balance corrected by `sp_diff` restricted to
-    /// the payout SPK.
-    ///
-    /// STAGE 2b-1: production is stubbed at the one-block-subsidy floor; the windowed-production
-    /// index (Stage 2b-2) replaces it. With the floor, the bracket is decided by `balance ÷ subsidy`
-    /// alone — enough to exercise the full plumbing end-to-end on testnet (mainnet stays `never()`).
-    pub(super) fn ratio_bps_for_block(&self, block: Hash, pov_daa_score: u64, sp_diff: &UtxoDiff) -> Option<u64> {
-        if !self.ratio_reward_activation.is_active(pov_daa_score) {
-            return None;
-        }
-        // Payout SPK = the miner cut of `block`'s own coinbase (intrinsic to its body).
-        let txs = self.block_transactions_store.get(block).unwrap();
-        let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
-        let spk = coinbase_data.miner_data.script_public_key;
-        // balance at the selected-parent view = indexed virtual balance + sp_diff restricted to spk.
-        let indexed = self.address_balance_store.get(&spk).unwrap() as i128;
-        let balance = (indexed + balance_delta_for_spk(sp_diff, &spk)).max(0) as u64;
-        // STAGE 2b-1 stub (see doc above). `.max(1)` keeps the division-free bucket scan safe.
-        let production = self.coinbase_manager.calc_block_subsidy(pov_daa_score).max(1);
-        Some(ratio_reward_bps(balance, production))
     }
 
     /// Ratio-reward (Stage 2b) — advances the balance index by `diff`, keeping it in lockstep with
@@ -728,9 +722,9 @@ fn check_ai_request_inference_rewards(
 /// in an earlier block the response is skipped — cross-block enforcement is Phase 4.
 /// If the miner declared no caps at all (not yet upgraded), enforcement is also skipped.
 /// Ratio-reward (Stage 2b) — net amount (`added − removed`) attributable to `spk` within a UTXO
-/// diff. Used to translate the indexed virtual balance to a different chain view (a block's
-/// selected parent) in `ratio_bps_for_block`. `i128` carries the signed intermediate; the caller
-/// floors the corrected balance at 0.
+/// diff. Used to translate the virtual-anchored balance index to a rewarding block's own view in
+/// `ratio_bps_by_block`. `i128` carries the signed intermediate; the caller floors the corrected
+/// balance at 0.
 fn balance_delta_for_spk(diff: &UtxoDiff, spk: &ScriptPublicKey) -> i128 {
     let added: i128 = diff.add.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();
     let removed: i128 = diff.remove.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();

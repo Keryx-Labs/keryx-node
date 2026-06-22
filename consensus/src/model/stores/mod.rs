@@ -12,7 +12,6 @@ pub mod headers;
 pub mod headers_selected_tip;
 pub mod past_pruning_points;
 pub mod pom_tier;
-pub mod ratio_bps;
 pub mod pruning;
 pub mod pruning_meta;
 pub mod pruning_samples;

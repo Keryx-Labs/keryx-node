@@ -63,8 +63,8 @@ pub enum DatabaseStorePrefixes {
     PomTier = 37,
 
     // ---- Ratio-reward (holder-weighted miner cut) ----
-    /// Computed holder ratio bracket per block: block_hash → ratio_bps (u64)
-    RatioBps = 38,
+    // 38 reserved (was RatioBps per-block store; removed — the bracket is now computed inline at the
+    // rewarding block's view, see ratio_bps_by_block, so nothing is persisted per block).
     /// Ratio-reward balance index: payout SPK → Σ unspent amount (consensus, lockstep with the UTXO set)
     AddressBalance = 39,
 

@@ -488,8 +488,6 @@ impl PruningProcessor {
                 self.block_transactions_store.delete_batch(&mut batch, current).unwrap();
                 // Proven PoM tier shares the block-body lifecycle (no-op for blocks that had no proof).
                 self.pom_tier_store.delete_batch(&mut batch, current).unwrap();
-                // Computed ratio-reward bracket shares the same lifecycle (no-op for pre-fork blocks).
-                self.ratio_bps_store.delete_batch(&mut batch, current).unwrap();
 
                 if let Some(&affiliated_proof_level) = keep_relations.get(&current) {
                     if statuses_write.get(current).optional().unwrap().is_some_and(|s| s.is_valid()) {
