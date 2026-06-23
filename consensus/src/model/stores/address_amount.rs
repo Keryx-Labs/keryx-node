@@ -103,6 +103,21 @@ impl DbAddressAmountStore {
     pub fn clear(&self, batch: &mut WriteBatch) -> Result<(), StoreError> {
         self.access.delete_all(BatchDbWriter::new(batch))
     }
+
+    /// Test helper: collects the whole index (this store's prefix only) into a map, reversing the
+    /// `ScriptPublicKeyBucket` key encoding back to the originating `ScriptPublicKey`. Used by the
+    /// ratio-reward reconstruction-equality test to assert that the incrementally maintained index
+    /// matches, key-for-key, a fresh seed grouped from the UTXO snapshot.
+    #[cfg(test)]
+    pub fn collect(&self) -> std::collections::HashMap<ScriptPublicKey, u64> {
+        self.access
+            .iterator()
+            .map(|res| {
+                let (key, amount) = res.unwrap();
+                (ScriptPublicKey::from(ScriptPublicKeyBucket(key.to_vec())), amount)
+            })
+            .collect()
+    }
 }
 
 impl AddressAmountStoreReader for DbAddressAmountStore {

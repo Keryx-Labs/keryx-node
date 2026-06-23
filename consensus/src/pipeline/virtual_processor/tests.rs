@@ -470,3 +470,58 @@ async fn windowed_production_accumulates_per_producer_and_slides() {
     let sink_daa = ctx.consensus.headers_store().get_daa_score(ctx.consensus.get_sink()).unwrap();
     assert_eq!(one_cut, vp.coinbase_manager.base_miner_cut(sink_daa));
 }
+
+/// Ratio-reward (Stage 2b) reconstruction-equality: the balance index maintained incrementally from
+/// genesis (lockstep with the virtual UTXO set in `commit_virtual_state`) must equal, key-for-key,
+/// the index a fast-synced node rebuilds at `import_pruning_point_utxo_set` by grouping the imported
+/// UTXO snapshot per payout SPK. If the two diverge, a fast-synced node would compute a different
+/// holder bracket than a from-genesis node for the same block → divergent expected coinbase → a
+/// consensus split. This pins the property that makes flipping `ratio_reward_activation` safe.
+#[tokio::test]
+async fn ratio_reward_balance_index_reconstruction_matches_incremental() {
+    use crate::model::stores::address_amount::AddressAmountStoreReader;
+    use keryx_consensus_core::tx::ScriptPublicKey;
+    use std::collections::HashMap;
+
+    // Index maintenance is ungated (runs from genesis), so no ratio activation is needed.
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    // A handful of width-1 blocks, each built by a distinct random producer SPK, so several payout
+    // addresses accrue coinbase (plus the escrow and R&D outputs of every block → multiple SPK kinds).
+    for _ in 0..8 {
+        ctx.miner_data = new_miner_data();
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+
+    let vp = ctx.consensus.virtual_processor().clone();
+
+    // Reconstruction seed: exact mirror of `import_pruning_point_utxo_set` — group the current
+    // virtual UTXO snapshot per SPK with `saturating_add`.
+    let mut reconstructed: HashMap<ScriptPublicKey, u64> = HashMap::new();
+    {
+        let virtual_read = vp.virtual_stores.read();
+        for item in virtual_read.utxo_set.iterator() {
+            let (_, entry) = item.unwrap();
+            let acc = reconstructed.entry(entry.script_public_key.clone()).or_default();
+            *acc = acc.saturating_add(entry.amount);
+        }
+    }
+    assert!(!reconstructed.is_empty(), "the chain must have produced spendable UTXOs to make this test meaningful");
+
+    // Forward direction (focused message): every UTXO-derived balance is present and equal in the
+    // incrementally maintained index.
+    for (spk, amount) in &reconstructed {
+        assert_eq!(
+            vp.address_balance_store.get(spk).unwrap(),
+            *amount,
+            "incremental balance index disagrees with the UTXO-set reconstruction for an address",
+        );
+    }
+
+    // Reverse direction: the incremental index holds no extra/stale entry absent from the
+    // reconstruction. Full key-set + value equality is exactly the byte-for-byte property a
+    // fast-synced node relies on.
+    let incremental = vp.address_balance_store.collect();
+    assert_eq!(incremental, reconstructed, "balance index and UTXO-set reconstruction must match exactly");
+}

@@ -943,7 +943,10 @@ pub const TESTNET_PARAMS: Params = Params {
     // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
     // populates the bps store; the placeholder map is empty until then.
     ratio_reward_activation: ForkActivation::new(5_000),
-    ratio_reward_window: RATIO_REWARD_WINDOW,
+    // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
+    // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
+    // rather than ~30 days. Still well under pruning_depth.
+    ratio_reward_window: 1_000,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
