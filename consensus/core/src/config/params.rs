@@ -148,16 +148,18 @@ pub const POM_TIERS: &[crate::pom::PomTier] = &[
 /// so the total block reward, the R&D cut and the escrow cut are untouched. The top tier is the
 /// 100 % reference. Gated by `pom_activation` (a proven tier only exists under PoM).
 ///
-/// 10-point steps (not 5) are deliberate: the PoM walk hashrate is near-flat across tiers
-/// (measured ~5 % drop over an 8× model-size range on a 3090), and under global difficulty the
-/// real incentive is `hashrate × (1 - penalty)`. A 5-point step is cancelled by that ~5 % dip,
-/// leaving an upgrade barely profitable; 10-point steps keep every tier-up worth ~+7-14 %.
-/// See the tier-reward bench study (KERYX-KRX/tier_reward_bench.md).
-///   0  Gemma-3-4B        --light       -30%
-///   1  Dolphin-Llama3-8B default       -20%
-///   2  Qwen3-32B         --high        -10%
+/// 6-point steps: a compromise between the bench-justified 10-point spread (the PoM walk hashrate is
+/// near-flat across tiers — ~5 % drop over an 8× model-size range on a 3090 — so a small step barely
+/// beats the dip; see KERYX-KRX/tier_reward_bench.md) and the need to soften the *multiplicative*
+/// compound now that tier-reward and holder-reward co-activate at the same mainnet H. The combined
+/// miner cut is `tier_bps × ratio_bps`, so a 10-point tier floor stacked on the 40 % holder floor
+/// dropped the worst case to 28 %; 6-point steps lift the tier floor to 82 % (worst case ≈ 33 %) while
+/// keeping each tier-up worth a meaningful ~+6-7 %.
+///   0  Gemma-3-4B        --light       -18%
+///   1  Dolphin-Llama3-8B default       -12%
+///   2  Qwen3-32B         --high         -6%
 ///   3  Llama-3.3-70B     --very-high     0%
-pub const TIER_REWARD_BPS: [u64; 4] = [7_000, 8_000, 9_000, 10_000];
+pub const TIER_REWARD_BPS: [u64; 4] = [8_200, 8_800, 9_400, 10_000];
 
 /// Basis-points divisor for `TIER_REWARD_BPS` (= the top-tier 100 % reference).
 pub const TIER_REWARD_BPS_DIVISOR: u64 = 10_000;

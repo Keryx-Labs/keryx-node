@@ -260,6 +260,30 @@ impl VirtualStateProcessor {
             );
         }
 
+        // Bundled hardfork (OPoI v2 + PoM + holder-reward share one mainnet activation DAA). Emit a
+        // single consolidated banner listing whichever of the three activate exactly at this block's
+        // DAA score. The gates are independent fields, so on a network that staggers them the banner
+        // still fires correctly at each distinct activation DAA; `never()` (= u64::MAX) never matches.
+        {
+            let mut lines: Vec<&str> = Vec::new();
+            if header.daa_score == self.pom_activation.daa_score() {
+                lines.push("  PoM           — Proof-of-Model mining live; kHeavyHash retired (1 GPU = 1 tier); non-PoM miners rejected");
+            }
+            if header.daa_score == self.opoi_v2_activation.daa_score() {
+                lines.push("  OPoI v2       — uncensored model lineup now enforced");
+            }
+            if header.daa_score == self.ratio_reward_activation.daa_score() {
+                lines.push("  Holder-reward — miner cut weighted by KRX holdings; the shortfall is burned");
+            }
+            if !lines.is_empty() {
+                info!("════════════════ KERYX HARDFORK · DAA {} ════════════════", header.daa_score);
+                for line in lines {
+                    info!("{line}");
+                }
+                info!("═══════════════════════════════════════════════════════════════");
+            }
+        }
+
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() {
@@ -284,13 +308,8 @@ impl VirtualStateProcessor {
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
             // OPoI v2 hardfork: swap to the uncensored lineup at/after activation. DAA-gated so
             // IBD re-validates historical (pre-v2) blocks against the legacy lineup unchanged.
+            // (Activation is announced by the consolidated KERYX HARDFORK banner above.)
             let minimums = if self.opoi_v2_activation.is_active(header.daa_score) {
-                if header.daa_score == self.opoi_v2_activation.daa_score() {
-                    info!(
-                        "=== OPoI v2 HARDFORK ACTIVATED at DAA {} — uncensored model lineup now enforced ===",
-                        header.daa_score
-                    );
-                }
                 self.inference_reward_minimums_v2
             } else {
                 self.inference_reward_minimums

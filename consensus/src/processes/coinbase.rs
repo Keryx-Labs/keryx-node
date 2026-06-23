@@ -560,7 +560,7 @@ mod tests {
         )
     }
 
-    /// Two blue blocks with equal subsidy but different proven tiers: the floor tier (0, −30 %)
+    /// Two blue blocks with equal subsidy but different proven tiers: the floor tier (0, −18 %)
     /// and the top tier (3, 0 %). Only the *miner cut* is scaled, the shortfall is burned, and
     /// the total block reward, the escrow cuts and the R&D cut are untouched.
     #[test]
@@ -582,7 +582,7 @@ mod tests {
         let non_daa = BlockHashSet::new();
         let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![0xcc]), vec![]);
 
-        // A = floor tier (−30 %), B = top tier (full).
+        // A = floor tier (−18 %), B = top tier (full).
         let mut tier_bps = BlockHashMap::new();
         tier_bps.insert(h_a, TIER_REWARD_BPS[0]);
         tier_bps.insert(h_b, TIER_REWARD_BPS[3]);
@@ -597,13 +597,13 @@ mod tests {
         let rd = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
         let escrow = subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
         let full_miner = subsidy - rd - escrow;
-        let miner_a = full_miner * TIER_REWARD_BPS[0] / TIER_REWARD_BPS_DIVISOR; // −30 %
+        let miner_a = full_miner * TIER_REWARD_BPS[0] / TIER_REWARD_BPS_DIVISOR; // −18 %
         let miner_b = full_miner; // top tier, full
 
         let value_of = |spk: &ScriptPublicKey| tx.outputs.iter().find(|o| &o.script_public_key == spk).map(|o| o.value);
 
         // Miner cut scaled by tier.
-        assert_eq!(value_of(&spk_a), Some(miner_a), "floor-tier miner cut must be −30 %");
+        assert_eq!(value_of(&spk_a), Some(miner_a), "floor-tier miner cut must be −18 %");
         assert_eq!(value_of(&spk_b), Some(miner_b), "top-tier miner cut must be full");
         assert!(miner_a < miner_b, "serving a heavier model must pay the miner strictly more");
 
@@ -656,7 +656,7 @@ mod tests {
     }
 
     /// Tier-reward and ratio-reward compound multiplicatively on the miner cut: a block at the
-    /// floor tier (−30 %) AND the floor ratio bracket (40 %) keeps 0.70 × 0.40 = 0.28 of its cut,
+    /// floor tier (−18 %) AND the floor ratio bracket (40 %) keeps 0.82 × 0.40 = 0.328 of its cut,
     /// the combined shortfall is burned, and the total block reward is unchanged.
     #[test]
     fn tier_and_ratio_reward_compound() {
@@ -675,7 +675,7 @@ mod tests {
         let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![0xcc]), vec![]);
 
         let mut tier_bps = BlockHashMap::new();
-        tier_bps.insert(h_a, TIER_REWARD_BPS[0]); // floor tier −30 %
+        tier_bps.insert(h_a, TIER_REWARD_BPS[0]); // floor tier −18 %
         let mut ratio_bps = BlockHashMap::new();
         ratio_bps.insert(h_a, RATIO_REWARD_BPS[0]); // floor bracket 40 %
 
