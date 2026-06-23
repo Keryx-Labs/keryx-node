@@ -854,12 +854,16 @@ pub const MAINNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::new(15_550_000),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // OPoI v2: uncensored lineup swap. `never()` until the hardfork DAA score (H) is chosen.
-    opoi_v2_activation: ForkActivation::never(),
+    // OPoI v2: uncensored lineup swap. Mainnet H = DAA 37_780_000 (2026-06-26 18:00 UTC), bundled
+    // with PoM + ratio-reward into a single hardfork. MUST equal the miner's OPOI_V2_ACTIVATION_DAA.
+    opoi_v2_activation: ForkActivation::new(37_780_000),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoM possession: `never()` until the hardfork DAA score (H) is chosen.
-    pom_activation: ForkActivation::never(),
+    // PoM possession: mainnet H = DAA 37_780_000 (2026-06-26 18:00 UTC). This is a mining-algorithm
+    // hardfork (kHeavyHash → Proof-of-Model) — every miner MUST run a PoM binary with the pinned
+    // GGUF models by H, and pom_activation MUST equal the miner's POM_ACTIVATION_DAA, or its blocks
+    // are rejected and it forks off the chain.
+    pom_activation: ForkActivation::new(37_780_000),
 
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
