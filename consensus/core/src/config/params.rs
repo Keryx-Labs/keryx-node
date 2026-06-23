@@ -870,9 +870,12 @@ pub const MAINNET_PARAMS: Params = Params {
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
 
-    // Ratio-reward: dormant on mainnet until the balance + production indexes land (Stage 2) and
-    // an H is chosen. Stays never() so the placeholder map is empty and IBD is unaffected.
-    ratio_reward_activation: ForkActivation::never(),
+    // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
+    // 2026-06-26 18:00 UTC at 10 BPS (measured: DAA 34_950_043 at 2026-06-23 11:24 UTC; +282_960 s
+    // × 10 = +2_829_600, rounded up ~36 s for a small margin so it lands at/after the announced time).
+    // Node-only gate (the miner has no ratio-reward logic). Before H the placeholder map is empty ⇒
+    // no-op, IBD/old blocks unaffected.
+    ratio_reward_activation: ForkActivation::new(37_780_000),
     ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
