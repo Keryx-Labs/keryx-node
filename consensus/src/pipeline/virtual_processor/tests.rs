@@ -372,8 +372,8 @@ async fn opoi_response_registered_on_chain() {
 
 /// End-to-end: a merged block's miner cut in its merging block's coinbase is scaled by the
 /// merged block's cryptographically-proven PoM tier — persisted at body commit (`pom_tier_store`),
-/// read back by the virtual processor when it builds the coinbase. The floor tier (0, −30 %) pays
-/// its miner exactly 70 % of what the top tier (3, 0 %) pays, while the total block reward is
+/// read back by the virtual processor when it builds the coinbase. The floor tier (0, −18 %) pays
+/// its miner exactly 82 % of what the top tier (3, 0 %) pays, while the total block reward is
 /// identical (the shortfall is burned). `skip_proof_of_work` skips `check_pom_proof`, so the test
 /// can attach a chosen-tier proof without a real possession witness; only `tier` is read.
 #[tokio::test]
@@ -417,14 +417,14 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
     }
 
     let (total_top, miner_top) = payout_for_tier(3).await; // 0 %
-    let (total_floor, miner_floor) = payout_for_tier(0).await; // −30 %
+    let (total_floor, miner_floor) = payout_for_tier(0).await; // −18 %
 
     assert!(miner_top > 0, "top-tier block must pay its miner");
     assert_eq!(total_top, total_floor, "tier penalty must not change the total block reward");
     assert_eq!(
         miner_floor,
         miner_top * TIER_REWARD_BPS[0] / TIER_REWARD_BPS_DIVISOR,
-        "floor-tier miner must get exactly 70 % of the top-tier cut"
+        "floor-tier miner must get exactly 82 % of the top-tier cut"
     );
     assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
 }
