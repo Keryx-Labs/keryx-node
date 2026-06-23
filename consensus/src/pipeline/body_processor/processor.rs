@@ -11,6 +11,7 @@ use crate::{
             block_transactions::DbBlockTransactionsStore,
             ghostdag::DbGhostdagStore,
             headers::DbHeadersStore,
+            pom_tier::DbPomTierStore,
             reachability::DbReachabilityStore,
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
             tips::{DbTipsStore, TipsStore},
@@ -27,7 +28,7 @@ use keryx_consensus_core::{
     KType,
     block::Block,
     blockstatus::BlockStatus::{self, StatusHeaderOnly, StatusInvalid},
-    config::{genesis::GenesisBlock, params::Params},
+    config::{genesis::GenesisBlock, params::{ForkActivation, Params}},
     mass::{Mass, MassCalculator, MassOps},
     tx::Transaction,
 };
@@ -59,12 +60,16 @@ pub struct BlockBodyProcessor {
     pub(super) genesis: GenesisBlock,
     pub(super) _ghostdag_k: KType,
     pub(super) skip_opoi: bool,
+    /// PoM possession activation — when active at a block's daa_score, its `pom_proof` is verified.
+    pub(super) pom_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
     pub(super) _ghostdag_store: Arc<DbGhostdagStore>,
     pub(super) _headers_store: Arc<DbHeadersStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
+    /// Proven PoM tier per block, persisted at commit for the tier-reward coinbase split.
+    pub(super) pom_tier_store: Arc<DbPomTierStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
 
     // Managers and services
@@ -112,11 +117,13 @@ impl BlockBodyProcessor {
             genesis: params.genesis.clone(),
             _ghostdag_k: params.ghostdag_k(),
             skip_opoi: params.skip_proof_of_work,
+            pom_activation: params.pom_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
             _headers_store: storage.headers_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
+            pom_tier_store: storage.pom_tier_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
 
             _reachability_service: services.reachability_service.clone(),
@@ -205,7 +212,11 @@ impl BlockBodyProcessor {
             }
         };
 
-        self.commit_body(block.hash(), block.header.direct_parents(), block.transactions.clone());
+        // Persist the proven PoM tier (verified in `check_pom_proof`) for the tier-reward
+        // coinbase split. The `pom_proof` is dropped once a block is reloaded from storage,
+        // so the tier must be captured here while it is still attached to the block.
+        let proven_tier = block.pom_proof.as_ref().map(|p| p.tier);
+        self.commit_body(block.hash(), block.header.direct_parents(), block.transactions.clone(), proven_tier);
 
         // Send a BlockAdded notification
         self.notification_root
@@ -227,11 +238,22 @@ impl BlockBodyProcessor {
         Ok(mass)
     }
 
-    fn commit_body(self: &Arc<BlockBodyProcessor>, hash: Hash, parents: &[Hash], transactions: Arc<Vec<Transaction>>) {
+    fn commit_body(
+        self: &Arc<BlockBodyProcessor>,
+        hash: Hash,
+        parents: &[Hash],
+        transactions: Arc<Vec<Transaction>>,
+        proven_tier: Option<u8>,
+    ) {
         let mut batch = WriteBatch::default();
 
         // This is an append only store so it requires no lock.
         self.block_transactions_store.insert_batch(&mut batch, hash, transactions).unwrap();
+
+        // Append-only: persist the proven PoM tier when the block carried a possession proof.
+        if let Some(tier) = proven_tier {
+            self.pom_tier_store.insert_batch(&mut batch, hash, tier).unwrap();
+        }
 
         let mut body_tips_write_guard = self.body_tips_store.write();
         body_tips_write_guard.add_tip_batch(&mut batch, hash, parents).unwrap();
@@ -254,6 +276,6 @@ impl BlockBodyProcessor {
         drop(body_tips_write_guard);
 
         // Write the genesis body
-        self.commit_body(self.genesis.hash, &[], Arc::new(self.genesis.build_genesis_transactions()))
+        self.commit_body(self.genesis.hash, &[], Arc::new(self.genesis.build_genesis_transactions()), None)
     }
 }

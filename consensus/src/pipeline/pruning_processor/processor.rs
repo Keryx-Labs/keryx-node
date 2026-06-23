@@ -486,6 +486,8 @@ impl PruningProcessor {
                 self.utxo_diffs_store.delete_batch(&mut batch, current).unwrap();
                 self.acceptance_data_store.delete_batch(&mut batch, current).unwrap();
                 self.block_transactions_store.delete_batch(&mut batch, current).unwrap();
+                // Proven PoM tier shares the block-body lifecycle (no-op for blocks that had no proof).
+                self.pom_tier_store.delete_batch(&mut batch, current).unwrap();
 
                 if let Some(&affiliated_proof_level) = keep_relations.get(&current) {
                     if statuses_write.get(current).optional().unwrap().is_some_and(|s| s.is_valid()) {

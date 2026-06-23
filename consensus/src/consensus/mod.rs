@@ -1190,6 +1190,7 @@ impl ConsensusApi for Consensus {
         Ok(Block {
             header: self.headers_store.get_header(hash).optional().unwrap().ok_or(ConsensusError::BlockNotFound(hash))?,
             transactions: self.block_transactions_store.get(hash).optional().unwrap().ok_or(ConsensusError::BlockNotFound(hash))?,
+            pom_proof: None,
         })
     }
 
@@ -1242,6 +1243,7 @@ impl ConsensusApi for Consensus {
             } else {
                 self.block_transactions_store.get(hash).optional().unwrap().unwrap_or_default()
             },
+            pom_proof: None,
         })
     }
 

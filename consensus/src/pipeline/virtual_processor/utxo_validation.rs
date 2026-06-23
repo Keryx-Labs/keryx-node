@@ -24,16 +24,21 @@ use crate::{
         },
     },
 };
+use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
+use crate::model::stores::pom_tier::PomTierStoreReader;
+use crate::model::stores::selected_chain::SelectedChainStoreReader;
+use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
+use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
-    BlockHashMap, BlockHashSet, HashMapCustomHasher,
+    BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
     api::args::TransactionValidationArgs,
     coinbase::*,
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -203,6 +208,8 @@ impl VirtualStateProcessor {
         ctx: &mut UtxoProcessingContext,
         selected_parent_utxo_view: &V,
         header: &Header,
+        // Diff from the committed virtual to this block's selected parent (for ratio-reward balances).
+        sp_diff: &UtxoDiff,
     ) -> BlockProcessResult<()> {
         // Verify header UTXO commitment
         let expected_commitment = ctx.multiset_hash.finalize();
@@ -221,13 +228,16 @@ impl VirtualStateProcessor {
 
         let txs = self.block_transactions_store.get(header.hash).unwrap();
 
-        // Verify coinbase transaction
+        // Verify coinbase transaction. The two diffs (committed-virtual → selected parent, then
+        // selected parent → this block via its mergeset) let the ratio-reward bracket be evaluated at
+        // this block's own view from the virtual-anchored balance index.
         self.verify_coinbase_transaction(
             &txs[0],
             header.daa_score,
             &ctx.ghostdag_data,
             &ctx.mergeset_rewards,
             &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+            &[sp_diff, &ctx.mergeset_diff],
         )?;
 
         // Verify the header pruning point
@@ -248,6 +258,30 @@ impl VirtualStateProcessor {
                 "=== SALT v4 HARDFORK ACTIVATED at DAA {} — KeryxHash salt switched to v4, stock difficulty (no reset); chain relaunched off the abandoned SALT-v3 spiral, older binaries now rejected ===",
                 header.daa_score
             );
+        }
+
+        // Bundled hardfork (OPoI v2 + PoM + holder-reward share one mainnet activation DAA). Emit a
+        // single consolidated banner listing whichever of the three activate exactly at this block's
+        // DAA score. The gates are independent fields, so on a network that staggers them the banner
+        // still fires correctly at each distinct activation DAA; `never()` (= u64::MAX) never matches.
+        {
+            let mut lines: Vec<&str> = Vec::new();
+            if header.daa_score == self.pom_activation.daa_score() {
+                lines.push("  PoM           — Proof-of-Model mining live; kHeavyHash retired (1 GPU = 1 tier); non-PoM miners rejected");
+            }
+            if header.daa_score == self.opoi_v2_activation.daa_score() {
+                lines.push("  OPoI v2       — uncensored model lineup now enforced");
+            }
+            if header.daa_score == self.ratio_reward_activation.daa_score() {
+                lines.push("  Holder-reward — miner cut weighted by KRX holdings; the shortfall is burned");
+            }
+            if !lines.is_empty() {
+                info!("════════════════ KERYX HARDFORK · DAA {} ════════════════", header.daa_score);
+                for line in lines {
+                    info!("{line}");
+                }
+                info!("═══════════════════════════════════════════════════════════════");
+            }
         }
 
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
@@ -272,7 +306,15 @@ impl VirtualStateProcessor {
 
         // Enforce AiRequest inference_reward minimums and fee coverage after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
-            check_ai_request_inference_rewards(&txs, &validated_transactions, self.inference_reward_minimums)?;
+            // OPoI v2 hardfork: swap to the uncensored lineup at/after activation. DAA-gated so
+            // IBD re-validates historical (pre-v2) blocks against the legacy lineup unchanged.
+            // (Activation is announced by the consolidated KERYX HARDFORK banner above.)
+            let minimums = if self.opoi_v2_activation.is_active(header.daa_score) {
+                self.inference_reward_minimums_v2
+            } else {
+                self.inference_reward_minimums
+            };
+            check_ai_request_inference_rewards(&txs, &validated_transactions, minimums)?;
         }
 
         Ok(())
@@ -297,15 +339,225 @@ impl VirtualStateProcessor {
         ghostdag_data: &GhostdagData,
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
+        // Diffs from the committed virtual to this block's own view, for ratio-reward balances.
+        view_diffs: &[&UtxoDiff],
     ) -> BlockProcessResult<()> {
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
+        let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
+        let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
         let expected_coinbase = self
             .coinbase_manager
-            .expected_coinbase_transaction(daa_score, miner_data, ghostdag_data, mergeset_rewards, mergeset_non_daa)
+            .expected_coinbase_transaction(
+                daa_score,
+                miner_data,
+                ghostdag_data,
+                mergeset_rewards,
+                mergeset_non_daa,
+                &tier_bps_by_block,
+                &ratio_bps_by_block,
+            )
             .unwrap()
             .tx;
         if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) { Err(BadCoinbaseTransaction) } else { Ok(()) }
+    }
+
+    /// Tier-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue, the
+    /// subsidy multiplier (bps) of its cryptographically-proven PoM tier (persisted at body commit
+    /// in `pom_tier_store`). Both the validator and the template builder derive it identically from
+    /// the same store, so the coinbase they produce agrees deterministically. Returns an empty map
+    /// before `pom_activation` (⇒ every miner cut paid in full, no penalty, no burn). A blue with no
+    /// stored tier (cannot happen for a valid post-fork block — `check_pom_proof` requires the proof)
+    /// is simply left out, falling back to the full cut on the coinbase side.
+    pub(super) fn tier_bps_by_block(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        pov_daa_score: u64,
+    ) -> BlockHashMap<u64> {
+        let mut map = BlockHashMap::new();
+        if !self.pom_activation.is_active(pov_daa_score) {
+            return map;
+        }
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            if let Some(tier) = self.pom_tier_store.get(*blue).optional().unwrap() {
+                let bps = TIER_REWARD_BPS.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+                map.insert(*blue, bps);
+            }
+        }
+        map
+    }
+
+    /// Ratio-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue, the
+    /// holder-ratio bracket multiplier (bps), computed **inline at this (rewarding) block's view**
+    /// from the consensus balance + production indexes — NOT read from any per-block store.
+    ///
+    /// Why inline (Stage 2b option B): a per-block stored bracket would have to be written for every
+    /// blue, but blues are only UTXO-committed when they sit on the selected chain. A side-blue's
+    /// stored value would be missing — or, worse, non-deterministically present after a reorg
+    /// (whether a block was ever a transient chain candidate depends on each node's processing
+    /// order) — which diverges the expected coinbase across nodes → consensus split. Computing the
+    /// bracket inline from each rewarding block's own (intrinsic, reorg-stable) view removes the
+    /// store entirely and covers every blue identically on all nodes.
+    ///
+    /// `view_diffs` are the UTXO diffs from the node's committed virtual to THIS block's view (empty
+    /// on the build path, where the rewarding block is virtual itself). Per blue, the balance at
+    /// this view = the virtual-anchored balance index corrected by those diffs, restricted to the
+    /// blue's payout SPK (taken from `mergeset_rewards`, already derived for the coinbase). Returns
+    /// an empty map before `ratio_reward_activation` (⇒ full miner cut, no penalty). Compounds with
+    /// `tier_bps_by_block` in the coinbase manager.
+    pub(super) fn ratio_bps_by_block(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        mergeset_rewards: &BlockHashMap<BlockRewardData>,
+        pov_daa_score: u64,
+        view_diffs: &[&UtxoDiff],
+    ) -> BlockHashMap<u64> {
+        let mut map = BlockHashMap::new();
+        if !self.ratio_reward_activation.is_active(pov_daa_score) {
+            return map;
+        }
+        // Windowed-production correction (Stage 2b-2b): the production index lags at the committed
+        // virtual's selected chain; correct every payout SPK to THIS block's selected-parent window
+        // with one chain-path delta, shared by all blues (mirror of the balance `view_diffs`). Floor
+        // at one block's base miner cut so a newcomer with no recent production divides by one block.
+        let prod_correction = self.production_window_correction(ghostdag_data.selected_parent);
+        let prod_floor = self.coinbase_manager.base_miner_cut(pov_daa_score).max(1);
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            // Payout SPK = the blue's own miner cut, already resolved into the reward data.
+            if let Some(reward) = mergeset_rewards.get(blue) {
+                let spk = &reward.script_public_key;
+                let base = self.address_balance_store.get(spk).unwrap() as i128;
+                let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
+                let balance = (base + delta).max(0) as u64;
+                let prod_base = self.windowed_production_store.get(spk).unwrap() as i128;
+                let prod_delta = prod_correction.get(spk).copied().unwrap_or(0);
+                let production = ((prod_base + prod_delta).max(0) as u64).max(prod_floor);
+                map.insert(*blue, ratio_reward_bps(balance, production));
+            }
+        }
+        map
+    }
+
+    /// Reads selected-chain block `hash`'s production contribution: its producer payout SPK (the
+    /// `miner_data` SPK in its own coinbase) and the base (un-scaled) miner cut of one block subsidy
+    /// at its DAA score. `None` if that base cut is 0 (tail emission edge) ⇒ no contribution. This is
+    /// the per-block unit summed by the windowed-production index (one number per chain block,
+    /// attributed to its producer — deliberately not the per-output paid amount, see `base_miner_cut`).
+    fn block_production(&self, hash: Hash) -> Option<(ScriptPublicKey, u64)> {
+        let cut = self.coinbase_manager.base_miner_cut(self.headers_store.get_daa_score(hash).unwrap());
+        if cut == 0 {
+            return None;
+        }
+        let txs = self.block_transactions_store.get(hash).unwrap();
+        let spk = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap().miner_data.script_public_key;
+        Some((spk, cut))
+    }
+
+    /// Folds the per-SPK production delta of moving the windowed-production index along `chain_path`
+    /// (from a chain whose tip has index `from_tip`) into `deltas`. The window is the last
+    /// `RATIO_REWARD_WINDOW` selected-chain blocks (a block count, slid in O(1) via the chain index):
+    /// - **top**: `removed` blocks leave the window (subtract), `added` blocks join it (add);
+    /// - **bottom**: as the tip moves by `Δ = added − removed`, the low boundary slides by the same
+    ///   amount — blocks at indices `(from_tip−W, to_tip−W]` exit (subtract) when `Δ>0`, or re-enter
+    ///   (add) when `Δ<0`. Those deep blocks sit far below any reorg split, so reading them by index
+    ///   on `sc` (the pre-change chain) is reorg-stable and identical on every node.
+    fn fold_production_window_delta(
+        &self,
+        chain_path: &ChainPath,
+        from_tip: u64,
+        sc: &impl SelectedChainStoreReader,
+        deltas: &mut std::collections::HashMap<ScriptPublicKey, i128>,
+    ) {
+        let w = self.ratio_reward_window as i128;
+        let from_tip = from_tip as i128;
+        let to_tip = from_tip - chain_path.removed.len() as i128 + chain_path.added.len() as i128;
+
+        for h in &chain_path.removed {
+            if let Some((spk, cut)) = self.block_production(*h) {
+                *deltas.entry(spk).or_default() -= cut as i128;
+            }
+        }
+        for h in &chain_path.added {
+            if let Some((spk, cut)) = self.block_production(*h) {
+                *deltas.entry(spk).or_default() += cut as i128;
+            }
+        }
+
+        // Bottom slide: as the tip moves, the window's low boundary slides by the same amount — see
+        // `window_bottom_slide` for the exact index range + sign (the off-by-one-prone arithmetic,
+        // unit-tested in isolation). Window blocks are retained on disk (W < pruning depth).
+        if let Some((sign, lo, hi)) = window_bottom_slide(from_tip, to_tip, w) {
+            for i in lo..=hi {
+                if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
+                    *deltas.entry(spk).or_default() += sign * cut as i128;
+                }
+            }
+        }
+    }
+
+    /// Ratio-reward (Stage 2b-2b) — advances the windowed-production index along `chain_path`, kept in
+    /// lockstep with the selected chain (called from `commit_virtual_state` in the SAME batch as the
+    /// selected-chain `apply_changes`, BEFORE it runs, so `sc` still reflects the pre-change chain).
+    /// Ungated/passive: maintained from genesis so it is exact for from-genesis nodes; only read once
+    /// `ratio_reward_activation` fires. Folds one net delta per producer SPK, then writes each once
+    /// (a value returning to 0 deletes its entry via `set_batch`).
+    pub(super) fn advance_production_window(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        chain_path: &ChainPath,
+        sc: &impl SelectedChainStoreReader,
+    ) {
+        let from_tip = sc.get_tip().unwrap().0;
+        let mut deltas: std::collections::HashMap<ScriptPublicKey, i128> = std::collections::HashMap::new();
+        self.fold_production_window_delta(chain_path, from_tip, sc, &mut deltas);
+        for (spk, delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            let new_value = (self.windowed_production_store.get(&spk).unwrap() as i128 + delta).max(0) as u64;
+            self.windowed_production_store.set_batch(batch, &spk, new_value).unwrap();
+        }
+    }
+
+    /// Ratio-reward (Stage 2b-2b) — per-SPK production delta from the committed virtual's window to
+    /// block `m_sp`'s window (`m_sp` = the rewarding block's selected parent). The windowed-production
+    /// index is anchored at the committed virtual (its selected-chain tip); this corrects it to the
+    /// rewarding block's own view, exactly mirroring how the balance `view_diffs` correct the balance
+    /// index. Empty when `m_sp` is already the committed tip (the build path, where the rewarding
+    /// block is virtual itself). Deterministic: a function of `m_sp`'s intrinsic DAG position.
+    fn production_window_correction(&self, m_sp: Hash) -> std::collections::HashMap<ScriptPublicKey, i128> {
+        let mut deltas = std::collections::HashMap::new();
+        let sc = self.selected_chain_store.read();
+        let (committed_tip_index, committed_tip) = sc.get_tip().unwrap();
+        if m_sp == committed_tip {
+            return deltas;
+        }
+        let chain_path = self.dag_traversal_manager.calculate_chain_path(committed_tip, m_sp, None);
+        self.fold_production_window_delta(&chain_path, committed_tip_index, &*sc, &mut deltas);
+        deltas
+    }
+
+    /// Ratio-reward (Stage 2b) — advances the balance index by `diff`, keeping it in lockstep with
+    /// the virtual UTXO set (called from `commit_virtual_state` with the same `accumulated_diff`, in
+    /// the same batch). Folds the diff into one net delta per payout SPK, then read-modify-writes
+    /// each touched address once; a balance returning to 0 deletes its entry (via `set_batch`).
+    pub(super) fn apply_balance_diff(&self, batch: &mut rocksdb::WriteBatch, diff: &UtxoDiff) {
+        let mut deltas: std::collections::HashMap<ScriptPublicKey, i128> = std::collections::HashMap::new();
+        for entry in diff.add.values() {
+            *deltas.entry(entry.script_public_key.clone()).or_default() += entry.amount as i128;
+        }
+        for entry in diff.remove.values() {
+            *deltas.entry(entry.script_public_key.clone()).or_default() -= entry.amount as i128;
+        }
+        for (spk, delta) in deltas {
+            if delta == 0 {
+                continue;
+            }
+            let new_balance = (self.address_balance_store.get(&spk).unwrap() as i128 + delta).max(0) as u64;
+            self.address_balance_store.set_batch(batch, &spk, new_balance).unwrap();
+        }
     }
 
     fn check_ai_response_model_caps(&self, txs: &[Transaction]) -> BlockProcessResult<()> {
@@ -593,6 +845,38 @@ fn check_ai_request_inference_rewards(
 /// each AiResponse check its `request_hash` against that map.  If the AiRequest lives
 /// in an earlier block the response is skipped — cross-block enforcement is Phase 4.
 /// If the miner declared no caps at all (not yet upgraded), enforcement is also skipped.
+/// Ratio-reward (Stage 2b) — net amount (`added − removed`) attributable to `spk` within a UTXO
+/// diff. Used to translate the virtual-anchored balance index to a rewarding block's own view in
+/// `ratio_bps_by_block`. `i128` carries the signed intermediate; the caller floors the corrected
+/// balance at 0.
+fn balance_delta_for_spk(diff: &UtxoDiff, spk: &ScriptPublicKey) -> i128 {
+    let added: i128 = diff.add.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();
+    let removed: i128 = diff.remove.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();
+    added - removed
+}
+
+/// Ratio-reward (Stage 2b-2b) — pure index arithmetic of the windowed-production **bottom slide**.
+/// When the selected-chain tip moves from `from_tip` to `to_tip` (window length `w`), the window's
+/// low boundary slides by the same amount: chain blocks that leave the window must be subtracted
+/// (`sign = -1`), or — on a reorg that shortens the chain — those that re-enter must be re-added
+/// (`sign = +1`). Returns `Some((sign, lo, hi))` over the inclusive chain-index range `[lo, hi]`
+/// (with `lo >= 1`, since index 0 is the genesis/pruning anchor and is never a production block), or
+/// `None` when nothing crosses the boundary (no net tip move, or an early/short chain whose window
+/// has not yet reached index 1). Split out from `fold_production_window_delta` to be unit-tested in
+/// isolation — this is the off-by-one-prone core.
+fn window_bottom_slide(from_tip: i128, to_tip: i128, w: i128) -> Option<(i128, i128, i128)> {
+    let (from_low, to_low) = (from_tip - w, to_tip - w);
+    let (lo, hi, sign) = if to_low > from_low {
+        (from_low + 1, to_low, -1) // window grew at the top ⇒ blocks exit at the bottom
+    } else if to_low < from_low {
+        (to_low + 1, from_low, 1) // window shrank (reorg) ⇒ blocks re-enter at the bottom
+    } else {
+        return None;
+    };
+    let lo = lo.max(1);
+    (lo <= hi).then_some((sign, lo, hi))
+}
+
 fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     let declared_caps = parse_ai_caps(&txs[0].payload);
     if declared_caps.is_empty() {
@@ -776,5 +1060,49 @@ mod tests {
             // Data was originally sorted, so we check if they remain sorted after filtering
             assert!(prev < curr, "expected {} < {} if original sort was preserved", prev, curr);
         });
+    }
+}
+
+#[cfg(test)]
+mod ratio_window_tests {
+    use super::window_bottom_slide;
+
+    #[test]
+    fn advance_by_one_exits_oldest() {
+        // tip 10 → 11, W=3: window {8,9,10} → {9,10,11}; index 8 exits (subtract).
+        assert_eq!(window_bottom_slide(10, 11, 3), Some((-1, 8, 8)));
+    }
+
+    #[test]
+    fn advance_by_three_exits_three() {
+        // tip 10 → 13, W=3: indices 8,9,10 all exit.
+        assert_eq!(window_bottom_slide(10, 13, 3), Some((-1, 8, 10)));
+    }
+
+    #[test]
+    fn reorg_reenters_oldest() {
+        // tip 11 → 10, W=3: index 8 re-enters the window (re-add).
+        assert_eq!(window_bottom_slide(11, 10, 3), Some((1, 8, 8)));
+    }
+
+    #[test]
+    fn no_tip_move_is_none() {
+        assert_eq!(window_bottom_slide(10, 10, 3), None);
+    }
+
+    #[test]
+    fn early_chain_skips_genesis_anchor() {
+        // Window not yet full (tip ≤ W): nothing has aged past index 0, so no bottom touch.
+        assert_eq!(window_bottom_slide(2, 3, 3), None);
+        // First real exit happens once the boundary reaches index 1.
+        assert_eq!(window_bottom_slide(3, 4, 3), Some((-1, 1, 1)));
+    }
+
+    #[test]
+    fn advance_then_reorg_cancels_exactly() {
+        // The forward exit and its reorg re-entry hit the SAME index with opposite signs ⇒ net zero,
+        // which is what makes the production index reorg-exact.
+        assert_eq!(window_bottom_slide(10, 11, 3), Some((-1, 8, 8)));
+        assert_eq!(window_bottom_slide(11, 10, 3), Some((1, 8, 8)));
     }
 }

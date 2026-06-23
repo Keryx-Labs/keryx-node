@@ -39,13 +39,174 @@ pub const LLAMA_3_3_70B_MODEL_ID: [u8; 32] = [
     0x1a, 0x46, 0x7d, 0xd3, 0x47, 0x56, 0x13, 0x44,
 ];
 
-/// Per-model minimum inference_reward in sompi.
+/// Per-model minimum inference_reward in sompi. Legacy (pre-OPoI-v2) lineup.
 pub const INFERENCE_REWARD_MINIMUMS: &[([u8; 32], u64)] = &[
     (TINYLLAMA_MODEL_ID,         50_000_000),   // 0.5 KRX
     (DEEPSEEK_R1_8B_MODEL_ID,   150_000_000),   // 1.5 KRX
     (DEEPSEEK_R1_32B_MODEL_ID,  250_000_000),   // 2.5 KRX
     (LLAMA_3_3_70B_MODEL_ID,   400_000_000),   // 4.0 KRX
 ];
+
+// ── OPoI v2 lineup (uncensored / abliterated) ─────────────────────────────────
+// Active from `opoi_v2_activation`. Weights + tokenizers pinned on the Keryx IPFS
+// gateway. model_id = base58-decode(weight CID)[2..34] = sha2-256(model.gguf).
+
+/// Gemma-3-4B-it-abliterated — sha2-256(Qma1CbFzWTNhy2ReVjDG1GvM5q2Uy4VhqTbnS9c641jUQ6)
+pub const GEMMA_3_4B_MODEL_ID: [u8; 32] = [
+    0xad, 0x50, 0xad, 0x0b, 0xd4, 0x61, 0xd8, 0xab,
+    0x44, 0xef, 0xc0, 0x21, 0x49, 0x89, 0xeb, 0x33,
+    0x29, 0x16, 0x85, 0xef, 0x4a, 0xde, 0x22, 0xa0,
+    0xf4, 0xf2, 0x17, 0xd0, 0x32, 0x66, 0xd8, 0x37,
+];
+
+/// Dolphin-3.0-Llama-3.1-8B — sha2-256(QmYJtFpaDnVwAVSbzRo42fsb19nLpt8LHe8WVKoyxd4AkZ)
+pub const DOLPHIN_LLAMA3_8B_MODEL_ID: [u8; 32] = [
+    0x94, 0x21, 0x06, 0x6a, 0x64, 0x00, 0xc9, 0x8b,
+    0xa1, 0x37, 0x11, 0x4f, 0x7f, 0x4b, 0x7d, 0x4a,
+    0x2d, 0xdf, 0x13, 0xab, 0x16, 0x3a, 0x5d, 0xe3,
+    0x8c, 0x01, 0x84, 0x79, 0x3a, 0xf6, 0x31, 0x3a,
+];
+
+/// Qwen3-32B-abliterated — sha2-256(QmVBwp5n3muQJwYNLTHSu3EnzBWviQqfh58FvHvKRfLtam)
+pub const QWEN3_32B_MODEL_ID: [u8; 32] = [
+    0x65, 0xc6, 0xeb, 0x6f, 0xe1, 0x8b, 0x9e, 0xfd,
+    0x80, 0x60, 0xab, 0x9d, 0x2d, 0x03, 0xbb, 0x9b,
+    0x01, 0x05, 0x0a, 0x3b, 0x13, 0x78, 0xcb, 0xac,
+    0x00, 0x0c, 0x5c, 0xc0, 0xac, 0xdc, 0x0d, 0x2a,
+];
+
+/// Llama-3.3-70B-Instruct-abliterated — sha2-256(QmPdTayXcEsfUwMCoMKKcLSv7Dwpp2xVBWELwrG2M7Rhzu)
+pub const LLAMA_3_3_70B_ABLITERATED_MODEL_ID: [u8; 32] = [
+    0x13, 0x29, 0xfb, 0xe2, 0x1b, 0x3f, 0x36, 0xf6,
+    0xd0, 0x06, 0x89, 0xfc, 0xaa, 0x74, 0xf7, 0xa2,
+    0x22, 0xb8, 0xcc, 0x4c, 0x08, 0xc0, 0x19, 0x1f,
+    0xeb, 0x23, 0x97, 0x55, 0xa7, 0x23, 0x42, 0x1e,
+];
+
+/// Per-model minimum inference_reward in sompi. OPoI v2 lineup, enforced from
+/// `opoi_v2_activation` (replaces `INFERENCE_REWARD_MINIMUMS` at that DAA score).
+pub const INFERENCE_REWARD_MINIMUMS_V2: &[([u8; 32], u64)] = &[
+    (GEMMA_3_4B_MODEL_ID,                 50_000_000),   // 0.5 KRX  (--light)
+    (DOLPHIN_LLAMA3_8B_MODEL_ID,         150_000_000),   // 1.5 KRX  (default)
+    (QWEN3_32B_MODEL_ID,                 250_000_000),   // 2.5 KRX  (--high)
+    (LLAMA_3_3_70B_ABLITERATED_MODEL_ID, 400_000_000),   // 4.0 KRX  (--very-high)
+];
+
+// --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
+
+/// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
+/// K=256 — chosen compromise: ~25 MH/s on a 3090 with solid possession strictness.
+pub const POM_WALK_STEPS: u32 = 256;
+/// Fiat-Shamir-opened steps revealed per `PomProof` (soundness `~f^t` vs proof size).
+pub const POM_OPENINGS: usize = 32;
+
+/// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
+/// produced offline by `pom-rt-builder` (canonical: name-sorted GGUF tensors). Tier index =
+/// slice position; `model_id` ties the tier to the declared model. Difficulty stays global
+/// (no per-tier target — measured ~1.5x hashrate spread over 10x model size).
+pub const POM_TIERS: &[crate::pom::PomTier] = &[
+    crate::pom::PomTier {
+        model_id: GEMMA_3_4B_MODEL_ID,
+        root: [
+            0x84, 0x6c, 0xaa, 0x40, 0x0c, 0xf0, 0x14, 0x13, 0x21, 0x18, 0x49, 0x5d, 0x22, 0xe4, 0xbf, 0xa2,
+            0x42, 0x45, 0x4e, 0xac, 0x0d, 0x83, 0x5c, 0x3f, 0x8e, 0x63, 0x47, 0xd0, 0x13, 0x9d, 0x1b, 0x7e,
+        ],
+        chunks: 77_604_776,
+    },
+    crate::pom::PomTier {
+        model_id: DOLPHIN_LLAMA3_8B_MODEL_ID,
+        root: [
+            0x13, 0x3f, 0x62, 0x7b, 0x88, 0x2e, 0xf8, 0x56, 0x78, 0x5a, 0x83, 0x98, 0x6a, 0x9b, 0x1a, 0xdf,
+            0xed, 0xff, 0xf0, 0x74, 0x4a, 0x1f, 0x94, 0x21, 0xec, 0x4d, 0xa6, 0xe9, 0x46, 0x68, 0x15, 0xde,
+        ],
+        chunks: 153_528_426,
+    },
+    // Qwen3-32B (Q4_K_M, 707 tensors, 18.40 GiB) — R_T from pom-rt-builder streaming Merkle.
+    crate::pom::PomTier {
+        model_id: QWEN3_32B_MODEL_ID,
+        root: [
+            0xe2, 0xaa, 0x66, 0x59, 0xaa, 0xb4, 0x38, 0x7e, 0xb5, 0xfd, 0x79, 0x40, 0x9c, 0x0a, 0x1a, 0x68,
+            0x86, 0x3a, 0x3d, 0xef, 0x3b, 0x66, 0x2c, 0xb4, 0x06, 0x16, 0x97, 0xf0, 0xea, 0x87, 0xfa, 0x58,
+        ],
+        chunks: 617_380_448,
+    },
+    // Llama-3.3-70B (Q4_K_M, 724 tensors, 39.59 GiB) — R_T from pom-rt-builder streaming Merkle.
+    crate::pom::PomTier {
+        model_id: LLAMA_3_3_70B_ABLITERATED_MODEL_ID,
+        root: [
+            0x53, 0x5f, 0xc2, 0xac, 0xb6, 0x09, 0x7b, 0x5d, 0xf8, 0x83, 0xec, 0x50, 0x66, 0x9a, 0x7f, 0x48,
+            0xdc, 0x9f, 0x3b, 0xd5, 0x98, 0x74, 0x28, 0x59, 0xb8, 0xbb, 0x4c, 0xac, 0x3b, 0x35, 0x26, 0xaa,
+        ],
+        chunks: 1_328_516_616,
+    },
+];
+
+/// Tier-reward — multiplier in basis points applied to the *immediate miner cut* (the 75 %
+/// paid at once, after the R&D and escrow cuts) of a block's subsidy, indexed by the block's
+/// cryptographically-proven PoM tier (`PomProof::tier`, the slice position in `POM_TIERS`).
+/// Heavier model ⇒ larger share kept. The un-earned delta is burned (see the coinbase manager),
+/// so the total block reward, the R&D cut and the escrow cut are untouched. The top tier is the
+/// 100 % reference. Gated by `pom_activation` (a proven tier only exists under PoM).
+///
+/// 6-point steps: a compromise between the bench-justified 10-point spread (the PoM walk hashrate is
+/// near-flat across tiers — ~5 % drop over an 8× model-size range on a 3090 — so a small step barely
+/// beats the dip; see KERYX-KRX/tier_reward_bench.md) and the need to soften the *multiplicative*
+/// compound now that tier-reward and holder-reward co-activate at the same mainnet H. The combined
+/// miner cut is `tier_bps × ratio_bps`, so a 10-point tier floor stacked on the 40 % holder floor
+/// dropped the worst case to 28 %; 6-point steps lift the tier floor to 82 % (worst case ≈ 33 %) while
+/// keeping each tier-up worth a meaningful ~+6-7 %.
+///   0  Gemma-3-4B        --light       -18%
+///   1  Dolphin-Llama3-8B default       -12%
+///   2  Qwen3-32B         --high         -6%
+///   3  Llama-3.3-70B     --very-high     0%
+pub const TIER_REWARD_BPS: [u64; 4] = [8_200, 8_800, 9_400, 10_000];
+
+/// Basis-points divisor for `TIER_REWARD_BPS` (= the top-tier 100 % reference).
+pub const TIER_REWARD_BPS_DIVISOR: u64 = 10_000;
+
+/// Ratio-reward — holder-weighted multiplier (bps) applied to the *immediate miner cut*, indexed
+/// by the holder ratio `balance ÷ windowed_production` (see `ratio_reward_bps`). It clones the
+/// tier-reward machinery but swaps the proven model-tier input for a ratio bucket computed by the
+/// node from chain state (no miner input). The un-earned delta is burned, so the total reward, the
+/// R&D cut and the escrow cut are untouched. When the tier-reward is also active the two factors
+/// **compound** multiplicatively on the miner cut. Gated by `ratio_reward_activation`.
+///
+/// 6 brackets, brutal, floor 40 %: a miner holding < 1 window of its own production (a dumper)
+/// keeps 40 %; holding ~1 month of production keeps 100 %. See KERYX-KRX/ratio_reward_spec.md.
+pub const RATIO_REWARD_BPS: [u64; 6] = [4_000, 5_200, 6_400, 7_600, 8_800, 10_000];
+
+/// Basis-points divisor for `RATIO_REWARD_BPS` (= the top-bracket 100 % reference).
+pub const RATIO_REWARD_BPS_DIVISOR: u64 = 10_000;
+
+/// Bracket entry thresholds, expressed as integer multiples of windowed production. Bracket `i`
+/// is reached when `balance >= RATIO_REWARD_THRESHOLDS[i] * windowed_production`. Must be sorted
+/// ascending and start at 0 (bracket 0 always reachable). Reading: 0/1/3/7/15/30 windows held.
+pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
+
+/// Length (in blocks) of the trailing window over which a payout address's production (coinbase
+/// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
+/// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
+pub const RATIO_REWARD_WINDOW: u64 = 864_000;
+
+/// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
+/// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
+/// (a zero-history / freshly-rotated address would otherwise hit the top bracket for free).
+///
+/// Division-free: bracket `i` is reached iff `balance >= THRESHOLDS[i] * production`. Thresholds
+/// are ascending, so the first failing bracket ends the scan. `u128` math avoids overflow on the
+/// `threshold * production` product.
+pub fn ratio_reward_bps(balance: u64, production: u64) -> u64 {
+    let mut bps = RATIO_REWARD_BPS[0];
+    for i in 0..RATIO_REWARD_THRESHOLDS.len() {
+        if (balance as u128) >= (RATIO_REWARD_THRESHOLDS[i] as u128) * (production as u128) {
+            bps = RATIO_REWARD_BPS[i];
+        } else {
+            break;
+        }
+    }
+    bps
+}
+
 use crate::{
     BlockLevel, KType,
     constants::STORAGE_MASS_PARAMETER,
@@ -375,6 +536,21 @@ pub struct Params {
     /// Fulfilled inference_rewards are redirected from the fee burn to the responding miner.
     pub inference_reward_minimums: &'static [([u8; 32], u64)],
 
+    /// OPoI v2 hardfork activation DAA score. From this score the uncensored model
+    /// lineup (`inference_reward_minimums_v2`) replaces the legacy `inference_reward_minimums`.
+    /// DAA-gated so IBD re-validation keeps the legacy table for historical blocks
+    /// (swapping it unconditionally would diverge the UTXO set on pre-fork history).
+    pub opoi_v2_activation: ForkActivation,
+
+    /// OPoI v2 per-model minimum inference_reward (sompi). Used in place of
+    /// `inference_reward_minimums` for blocks at or after `opoi_v2_activation`.
+    pub inference_reward_minimums_v2: &'static [([u8; 32], u64)],
+
+    /// Proof-of-Model possession activation DAA score. At/after this score every block must
+    /// carry a valid `PomProof` (verified in `post_pow_validation` against `POM_TIERS`).
+    /// DAA-gated so IBD re-validation of pre-fork history keeps the legacy self-verifying PoW.
+    pub pom_activation: ForkActivation,
+
     /// PoW SALT v2 hardfork activation DAA score.
     /// After this score, `KERYX_MATRIX_SALT_V2` is used for matrix generation instead of v1.
     /// Any miner binary compiled against v1 will compute a different matrix and its blocks
@@ -387,6 +563,18 @@ pub struct Params {
     /// This forks cleanly away from the abandoned SALT-v3 / diff-spiral chain while keeping
     /// stock difficulty (no genesis reset). Same forced-update mechanism as v2.
     pub pow_salt_v4_activation: ForkActivation,
+
+    /// Ratio-reward (holder-weighted miner-cut bonus) activation DAA score. At/after this score
+    /// the coinbase miner cut is scaled by the producer's holder ratio bracket (`RATIO_REWARD_BPS`,
+    /// computed by the node from the balance + windowed-production indexes). DAA-gated so IBD
+    /// re-validation of pre-fork history is unaffected (empty map ⇒ full cut, no burn).
+    pub ratio_reward_activation: ForkActivation,
+
+    /// Length (in blocks) of the trailing selected-chain window over which a payout address's
+    /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
+    /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
+    /// exercise the window slide. HARD CONSTRAINT: must stay `< pruning_depth`.
+    pub ratio_reward_window: u64,
 }
 
 impl Params {
@@ -564,9 +752,19 @@ impl Params {
                 .inference_reward_minimums
                 .unwrap_or(self.inference_reward_minimums),
 
+            opoi_v2_activation: self.opoi_v2_activation,
+
+            inference_reward_minimums_v2: self.inference_reward_minimums_v2,
+
+            pom_activation: self.pom_activation,
+
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
+
+            ratio_reward_activation: self.ratio_reward_activation,
+
+            ratio_reward_window: self.ratio_reward_window,
         }
     }
 }
@@ -658,6 +856,17 @@ pub const MAINNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::new(15_550_000),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
+    // OPoI v2: uncensored lineup swap. Mainnet H = DAA 37_780_000 (2026-06-26 18:00 UTC), bundled
+    // with PoM + ratio-reward into a single hardfork. MUST equal the miner's OPOI_V2_ACTIVATION_DAA.
+    opoi_v2_activation: ForkActivation::new(37_780_000),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
+
+    // PoM possession: mainnet H = DAA 37_780_000 (2026-06-26 18:00 UTC). This is a mining-algorithm
+    // hardfork (kHeavyHash → Proof-of-Model) — every miner MUST run a PoM binary with the pinned
+    // GGUF models by H, and pom_activation MUST equal the miner's POM_ACTIVATION_DAA, or its blocks
+    // are rejected and it forks off the chain.
+    pom_activation: ForkActivation::new(37_780_000),
+
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
     pow_salt_v2_activation: ForkActivation::new(17_275_000),
@@ -666,6 +875,14 @@ pub const MAINNET_PARAMS: Params = Params {
     // forking cleanly away from the abandoned SALT-v3 / diff-1-spiral chain. Same DAA as the
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
+
+    // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
+    // 2026-06-26 18:00 UTC at 10 BPS (measured: DAA 34_950_043 at 2026-06-23 11:24 UTC; +282_960 s
+    // × 10 = +2_829_600, rounded up ~36 s for a small margin so it lands at/after the announced time).
+    // Node-only gate (the miner has no ratio-reward logic). Before H the placeholder map is empty ⇒
+    // no-op, IBD/old blocks unaffected.
+    ratio_reward_activation: ForkActivation::new(37_780_000),
+    ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -710,15 +927,35 @@ pub const TESTNET_PARAMS: Params = Params {
 
     crescendo_activation: ForkActivation::new(0),
 
-    // Testnet: activate ~5 min after genesis (3_000 blocks at 10 BPS) to observe the transition.
-    model_cap_enforcement_activation: ForkActivation::new(3_000),
+    // Testnet: model capability + inference_reward enforcement ON from genesis, so the
+    // legacy lineup is enforced from block 0 and the v2 swap below is the only transition.
+    model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // PoW SALT v2: testnet activation at DAA 6_000.
-    pow_salt_v2_activation: ForkActivation::new(6_000),
+    // OPoI v2: testnet lineup swap (legacy → uncensored) at DAA 1000. Must match the
+    // miner's OPOI_V2_ACTIVATION_DAA. Test value — tune before release.
+    opoi_v2_activation: ForkActivation::new(5_000),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoW SALT v4: not needed on testnet (mainnet-only chain relaunch).
-    pow_salt_v4_activation: ForkActivation::never(),
+    // PoM possession: testnet DAA 5_000 to observe the kHeavyHash→PoM transition (incl.
+    // difficulty drift). Mainnet stays `never()` until H and will need a difficulty reset.
+    pom_activation: ForkActivation::new(5_000),
+
+    // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
+    // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).
+    pow_salt_v2_activation: ForkActivation::new(0),
+
+    // PoW SALT v4: active from genesis on testnet to mirror the live mainnet PoW (salt v4)
+    // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
+    pow_salt_v4_activation: ForkActivation::new(0),
+
+    // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
+    // populates the bps store; the placeholder map is empty until then.
+    ratio_reward_activation: ForkActivation::new(5_000),
+    // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
+    // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
+    // rather than ~30 days. Still well under pruning_depth.
+    ratio_reward_window: 1_000,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -762,8 +999,14 @@ pub const SIMNET_PARAMS: Params = Params {
 
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+    opoi_v2_activation: ForkActivation::always(),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
+    // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
+    pom_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    ratio_reward_activation: ForkActivation::never(),
+    ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -805,6 +1048,12 @@ pub const DEVNET_PARAMS: Params = Params {
 
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
+    opoi_v2_activation: ForkActivation::always(),
+    inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
+    // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
+    pom_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    ratio_reward_activation: ForkActivation::never(),
+    ratio_reward_window: RATIO_REWARD_WINDOW,
 };

@@ -58,11 +58,25 @@ pub enum DatabaseStorePrefixes {
     /// Slashed escrow outpoints: outpoint_bytes → slash_blue_score
     AiSlashed = 36,
 
+    // ---- PoM tier-reward ----
+    /// Proven PoM tier per block: block_hash → tier (u8)
+    PomTier = 37,
+
+    // ---- Ratio-reward (holder-weighted miner cut) ----
+    // 38 reserved (was RatioBps per-block store; removed — the bracket is now computed inline at the
+    // rewarding block's view, see ratio_bps_by_block, so nothing is persisted per block).
+    /// Ratio-reward balance index: payout SPK → Σ unspent amount (consensus, lockstep with the UTXO set)
+    AddressBalance = 39,
+
     // ---- Ghostdag Proof
     TempGhostdag = 40,
     TempGhostdagCompact = 41,
     TempRelationsParents = 42,
     TempRelationsChildren = 43,
+
+    // ---- Ratio-reward (cont.) ----
+    /// Ratio-reward production index: payout SPK → Σ coinbase miner-cut over the trailing window W
+    WindowedProduction = 44,
 
     // ---- Retention Period Root ----
     RetentionPeriodRoot = 50,

@@ -100,6 +100,13 @@ impl HeaderProcessor {
     }
 
     fn check_pow_and_calc_block_level(&self, header: &Header) -> BlockProcessResult<BlockLevel> {
+        // Proof-of-Model: the PoW is the possession walk (verified in body validation against
+        // the per-tier R_T), not kHeavyHash. The node has no weights, so it cannot recompute
+        // the pow value at header time — skip the kHeavyHash check here and assign the base
+        // block level. The real proof is enforced in `check_pom_proof`.
+        if self.pom_activation.is_active(header.daa_score) {
+            return Ok(0);
+        }
         let state = keryx_pow::State::new(header);
         let (passed, pow) = state.check_pow(header.nonce);
         if passed || self.skip_proof_of_work { Ok(calc_level_from_pow(pow, self.max_block_level)) } else { Err(RuleError::InvalidPoW) }

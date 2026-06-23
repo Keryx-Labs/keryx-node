@@ -31,6 +31,7 @@ pub mod merkle;
 pub mod mining_rules;
 pub mod muhash;
 pub mod network;
+pub mod pom;
 pub mod pruning;
 pub mod sign;
 pub mod subnets;

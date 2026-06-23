@@ -33,7 +33,7 @@ use keryx_consensus_core::{
     BlockHashSet, BlockLevel,
     blockhash::{BlockHashes, ORIGIN},
     blockstatus::BlockStatus::{self, StatusHeaderOnly, StatusInvalid},
-    config::genesis::GenesisBlock,
+    config::{genesis::GenesisBlock, params::ForkActivation},
     header::Header,
 };
 use keryx_consensusmanager::SessionLock;
@@ -107,6 +107,9 @@ pub struct HeaderProcessor {
     pub(super) max_block_parents: u8,
     pub(super) mergeset_size_limit: u64,
     pub(super) skip_proof_of_work: bool,
+    /// When active at a block's daa_score, the legacy kHeavyHash header check is skipped:
+    /// the PoW is the possession walk, verified in body validation (`check_pom_proof`).
+    pub(super) pom_activation: ForkActivation,
     pub(super) max_block_level: BlockLevel,
 
     // DB
@@ -193,6 +196,7 @@ impl HeaderProcessor {
             max_block_parents: params.max_block_parents(),
             mergeset_size_limit: params.mergeset_size_limit(),
             skip_proof_of_work: params.skip_proof_of_work,
+            pom_activation: params.pom_activation,
             max_block_level: params.max_block_level,
         }
     }

@@ -201,7 +201,7 @@ mod mockery {
 
     impl Mock for RpcRawBlock {
         fn mock() -> Self {
-            RpcRawBlock { header: mock(), transactions: mock() }
+            RpcRawBlock { header: mock(), transactions: mock(), pom_proof: None }
         }
     }
 

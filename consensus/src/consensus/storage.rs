@@ -3,6 +3,7 @@ use crate::{
     model::stores::{
         DB,
         acceptance_data::DbAcceptanceDataStore,
+        address_amount::DbAddressAmountStore,
         ai_slash::{DbAiResponseStore, DbAiSlashedStore},
         block_transactions::DbBlockTransactionsStore,
         block_window_cache::BlockWindowCacheStore,
@@ -12,6 +13,7 @@ use crate::{
         headers::{CompactHeaderData, DbHeadersStore},
         headers_selected_tip::DbHeadersSelectedTipStore,
         past_pruning_points::DbPastPruningPointsStore,
+        pom_tier::DbPomTierStore,
         pruning::DbPruningStore,
         pruning_meta::PruningMetaStores,
         pruning_samples::DbPruningSamplesStore,
@@ -57,12 +59,17 @@ pub struct ConsensusStorage {
     pub past_pruning_points_store: Arc<DbPastPruningPointsStore>,
     pub daa_excluded_store: Arc<DbDaaStore>,
     pub depth_store: Arc<DbDepthStore>,
+    pub pom_tier_store: Arc<DbPomTierStore>,
     pub pruning_samples_store: Arc<DbPruningSamplesStore>,
 
     // Utxo-related stores
     pub utxo_diffs_store: Arc<DbUtxoDiffsStore>,
     pub utxo_multisets_store: Arc<DbUtxoMultisetsStore>,
     pub acceptance_data_store: Arc<DbAcceptanceDataStore>,
+
+    // Ratio-reward indexes (Stage 2): mutable per-SPK aggregates kept in lockstep with the UTXO set
+    pub address_balance_store: Arc<DbAddressAmountStore>,
+    pub windowed_production_store: Arc<DbAddressAmountStore>,
 
     // OPoI slash stores (Phase 3 A4)
     pub ai_response_store: Arc<DbAiResponseStore>,
@@ -202,6 +209,7 @@ impl ConsensusStorage {
             ghostdag_compact_builder.downscale(0).build(),
         ));
         let daa_excluded_store = Arc::new(DbDaaStore::new(db.clone(), daa_excluded_builder.build()));
+        let pom_tier_store = Arc::new(DbPomTierStore::new(db.clone(), header_data_builder.build()));
         let headers_store = Arc::new(DbHeadersStore::new(db.clone(), headers_builder.build(), headers_compact_builder.build()));
         let depth_store = Arc::new(DbDepthStore::new(db.clone(), header_data_builder.build()));
         let selected_chain_store = Arc::new(RwLock::new(DbSelectedChainStore::new(db.clone(), header_data_builder.build())));
@@ -216,6 +224,13 @@ impl ConsensusStorage {
         let utxo_diffs_store = Arc::new(DbUtxoDiffsStore::new(db.clone(), utxo_diffs_builder.build()));
         let utxo_multisets_store = Arc::new(DbUtxoMultisetsStore::new(db.clone(), block_data_builder.build()));
         let acceptance_data_store = Arc::new(DbAcceptanceDataStore::new(db.clone(), acceptance_data_builder.build()));
+
+        // Ratio-reward indexes (Stage 2): balance keyspace is ~all addresses (utxo-set scale),
+        // windowed production is small (only recently-active miners) but shares the same shape.
+        let address_balance_store =
+            Arc::new(DbAddressAmountStore::new(db.clone(), utxo_set_builder.build(), DatabaseStorePrefixes::AddressBalance.into()));
+        let windowed_production_store =
+            Arc::new(DbAddressAmountStore::new(db.clone(), header_data_builder.build(), DatabaseStorePrefixes::WindowedProduction.into()));
 
         // OPoI slash stores
         let ai_response_store = Arc::new(DbAiResponseStore::new(db.clone(), header_data_builder.build()));
@@ -254,11 +269,14 @@ impl ConsensusStorage {
             virtual_stores,
             selected_chain_store,
             acceptance_data_store,
+            address_balance_store,
+            windowed_production_store,
             ai_response_store,
             ai_slashed_store,
             past_pruning_points_store,
             daa_excluded_store,
             depth_store,
+            pom_tier_store,
             pruning_samples_store,
             utxo_diffs_store,
             utxo_multisets_store,

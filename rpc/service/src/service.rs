@@ -128,8 +128,8 @@ pub struct RpcCoreService {
 
 const RPC_CORE: &str = "rpc-core";
 
-/// Re-challenge interval: issue a new inference challenge every N DAA scores (~6 min at 10 BPS).
-const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 3_600;
+/// Re-challenge interval: issue a new inference challenge every N DAA scores (~1 h at 10 BPS).
+const INFERENCE_CHALLENGE_INTERVAL_DAA: u64 = 36_000;
 
 /// A per-connection inference challenge issued by the node to verify the miner can actually run
 /// inference on the model it announced in ai:cap.
@@ -418,8 +418,12 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             .map(|s| s["ai:cap:".len()..].split(',').map(|id| id.trim().to_string()).filter(|id| id.len() == 64).collect())
             .unwrap_or_default();
 
+        // Under PoM the per-block possession proof is the capability gate, so the soft inference
+        // challenge is deactivated (it also picked a random declared model and suspended mining,
+        // which a PoM miner holding one resident tier cannot satisfy). Pre-PoM: legacy behaviour.
+        let pom_active = self.config.pom_activation.is_active(current_daa);
         // Only challenge miners who declare AI capabilities (i.e. gRPC solo miners).
-        let inference_challenge = if declared_model_ids.is_empty() {
+        let inference_challenge = if pom_active || declared_model_ids.is_empty() {
             String::new()
         } else if let Some(conn) = connection {
             let conn_id = conn.id();
@@ -458,7 +462,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             // the nonce on expiry — pending challenges return a stable nonce until answered.
             let issue_new = match states.get(&conn_id) {
                 None => true,
-                Some(state) => current_daa.saturating_sub(state.issued_at_daa) >= INFERENCE_CHALLENGE_INTERVAL_DAA,
+                // Rotate on expiry, OR immediately if the pending challenge's model is no longer
+                // declared by the miner — e.g. after the OPoI v2 lineup hot-swap, the miner stops
+                // serving the legacy model, so a stale challenge for it could never be answered.
+                Some(state) => current_daa.saturating_sub(state.issued_at_daa) >= INFERENCE_CHALLENGE_INTERVAL_DAA
+                    || !declared_model_ids.contains(&state.model_id_hex),
             };
 
             if issue_new {
@@ -489,11 +497,13 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             String::new()
         };
 
-        // While a challenge is pending (issued but not yet answered), suspend mining.
-        let challenge_pending = !inference_challenge.is_empty()
-            || connection.and_then(|c| {
-                self.inference_challenge_states.lock().ok()?.get(&c.id()).map(|s| !s.passed)
-            }).unwrap_or(false);
+        // While a challenge is pending (issued but not yet answered), suspend mining. Never under
+        // PoM — the possession proof is the gate, mining must not be suspended for a challenge.
+        let challenge_pending = !pom_active
+            && (!inference_challenge.is_empty()
+                || connection.and_then(|c| {
+                    self.inference_challenge_states.lock().ok()?.get(&c.id()).map(|s| !s.passed)
+                }).unwrap_or(false));
 
         let is_synced = if challenge_pending {
             false

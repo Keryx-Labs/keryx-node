@@ -1,4 +1,5 @@
 pub mod acceptance_data;
+pub mod address_amount;
 pub mod ai_slash;
 pub mod collateral;
 pub mod block_transactions;
@@ -10,6 +11,7 @@ pub mod ghostdag;
 pub mod headers;
 pub mod headers_selected_tip;
 pub mod past_pruning_points;
+pub mod pom_tier;
 pub mod pruning;
 pub mod pruning_meta;
 pub mod pruning_samples;

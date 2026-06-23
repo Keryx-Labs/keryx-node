@@ -93,7 +93,7 @@ mod tests {
     };
     use keryx_consensus_core::{
         api::ConsensusApi,
-        config::params::MAINNET_PARAMS,
+        config::params::{ForkActivation, MAINNET_PARAMS},
         merkle::calc_hash_merkle_root,
         subnets::SUBNETWORK_ID_NATIVE,
         tx::{Transaction, TransactionInput, TransactionOutpoint},
@@ -105,7 +105,13 @@ mod tests {
     async fn validate_body_in_context_test() {
         let config = ConfigBuilder::new(MAINNET_PARAMS)
             .skip_proof_of_work()
-            .edit_consensus_params(|p| p.deflationary_phase_daa_score = p.genesis.daa_score + 2)
+            .edit_consensus_params(|p| {
+                p.deflationary_phase_daa_score = p.genesis.daa_score + 2;
+                // The sink_search fix (walking a disqualified block's parents to reach a valid sink
+                // below it) is PoM-gated, so exercise the post-PoM path here. Otherwise the legacy
+                // pre-PoM skip stalls the virtual processor on this DAG (valid sink below block 3).
+                p.pom_activation = ForkActivation::always();
+            })
             .build();
         let consensus = TestConsensus::new(&config);
         let wait_handles = consensus.init();

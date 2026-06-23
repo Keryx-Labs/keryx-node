@@ -22,7 +22,9 @@ use crate::{
             depth::{DbDepthStore, DepthStoreReader},
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
+            address_amount::DbAddressAmountStore,
             past_pruning_points::DbPastPruningPointsStore,
+            pom_tier::DbPomTierStore,
             pruning::{DbPruningStore, PruningStoreReader},
             pruning_meta::PruningMetaStores,
             pruning_samples::DbPruningSamplesStore,
@@ -60,7 +62,7 @@ use keryx_consensus_core::{
     merkle::calc_hash_merkle_root,
     mining_rules::MiningRules,
     pruning::PruningPointsList,
-    tx::{MutableTransaction, Transaction},
+    tx::{MutableTransaction, ScriptPublicKey, Transaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -123,6 +125,8 @@ pub struct VirtualStateProcessor {
     pub(super) headers_store: Arc<DbHeadersStore>,
     pub(super) daa_excluded_store: Arc<DbDaaStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
+    /// Proven PoM tier per block, read to scale the tier-reward coinbase split.
+    pub(super) pom_tier_store: Arc<DbPomTierStore>,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
@@ -134,6 +138,13 @@ pub struct VirtualStateProcessor {
     pub(super) utxo_diffs_store: Arc<DbUtxoDiffsStore>,
     pub(super) utxo_multisets_store: Arc<DbUtxoMultisetsStore>,
     pub(super) acceptance_data_store: Arc<DbAcceptanceDataStore>,
+    /// Ratio-reward balance index (Stage 2b): payout SPK → Σ unspent amount, kept in lockstep
+    /// with the virtual UTXO set. Read to anchor `ratio_bps` at a block's selected-parent view.
+    pub(super) address_balance_store: Arc<DbAddressAmountStore>,
+    /// Ratio-reward windowed-production index (Stage 2b): producer payout SPK → Σ `base_miner_cut`
+    /// over the last `RATIO_REWARD_WINDOW` selected-chain blocks, kept in lockstep with the selected
+    /// chain. Read to anchor the ratio denominator at a block's selected-parent view.
+    pub(super) windowed_production_store: Arc<DbAddressAmountStore>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -176,11 +187,23 @@ pub struct VirtualStateProcessor {
     pub(super) model_cap_enforcement_activation: ForkActivation,
     pub(super) inference_reward_minimums: &'static [([u8; 32], u64)],
 
+    // OPoI v2 hardfork: uncensored lineup swap, DAA-gated
+    pub(super) opoi_v2_activation: ForkActivation,
+    pub(super) inference_reward_minimums_v2: &'static [([u8; 32], u64)],
+
     // SALT v2 hardfork: KeryxHash domain separation switch activation score
     pub(super) pow_salt_v2_activation: ForkActivation,
 
     // SALT v4 hardfork (chain relaunch on stock difficulty) activation score
     pub(super) pow_salt_v4_activation: ForkActivation,
+
+    // PoM possession activation: also gates the tier-reward coinbase split (a proven
+    // tier only exists under PoM). Empty tier-bps map before this score ⇒ no penalty.
+    pub(super) pom_activation: ForkActivation,
+    // Ratio-reward activation: empty ratio-bps map before this score ⇒ no penalty.
+    pub(super) ratio_reward_activation: ForkActivation,
+    // Trailing selected-chain window length (blocks) for the ratio-reward production index.
+    pub(super) ratio_reward_window: u64,
 }
 
 impl VirtualStateProcessor {
@@ -215,6 +238,7 @@ impl VirtualStateProcessor {
             ghostdag_store: storage.ghostdag_store.clone(),
             daa_excluded_store: storage.daa_excluded_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
+            pom_tier_store: storage.pom_tier_store.clone(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
@@ -224,6 +248,8 @@ impl VirtualStateProcessor {
             utxo_diffs_store: storage.utxo_diffs_store.clone(),
             utxo_multisets_store: storage.utxo_multisets_store.clone(),
             acceptance_data_store: storage.acceptance_data_store.clone(),
+            address_balance_store: storage.address_balance_store.clone(),
+            windowed_production_store: storage.windowed_production_store.clone(),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_meta_stores: storage.pruning_meta_stores.clone(),
             lkg_virtual_state: storage.lkg_virtual_state.clone(),
@@ -251,8 +277,14 @@ impl VirtualStateProcessor {
             model_cap_enforcement_activation: params.model_cap_enforcement_activation,
             inference_reward_minimums: params.inference_reward_minimums,
 
+            opoi_v2_activation: params.opoi_v2_activation,
+            inference_reward_minimums_v2: params.inference_reward_minimums_v2,
+
             pow_salt_v2_activation: params.pow_salt_v2_activation,
             pow_salt_v4_activation: params.pow_salt_v4_activation,
+            pom_activation: params.pom_activation,
+            ratio_reward_activation: params.ratio_reward_activation,
+            ratio_reward_window: params.ratio_reward_window,
         }
     }
 
@@ -459,7 +491,10 @@ impl VirtualStateProcessor {
                     let mut ctx = UtxoProcessingContext::new(mergeset_data.into(), selected_parent_multiset_hash);
 
                     self.calculate_utxo_state(&mut ctx, &selected_parent_utxo_view, pov_daa_score);
-                    let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &header);
+                    // `diff` is the diff from the committed virtual to `current`'s selected parent; pass
+                    // it so the ratio-reward bracket can be evaluated at `current`'s view (see
+                    // `ratio_bps_by_block`): balance index (at virtual) + this diff + current's mergeset diff.
+                    let res = self.verify_expected_utxo_state(&mut ctx, &selected_parent_utxo_view, &header, &*diff);
 
                     if let Err(rule_error) = res {
                         info!("Block {} is disqualified from virtual chain: {}", current, rule_error);
@@ -587,6 +622,18 @@ impl VirtualStateProcessor {
         // Apply the accumulated diff to the virtual UTXO set
         virtual_write.utxo_set.write_diff_batch(&mut batch, accumulated_diff).unwrap();
 
+        // Ratio-reward (Stage 2b): advance the balance index by the SAME diff, in the SAME batch,
+        // so it stays byte-for-byte in lockstep with the virtual UTXO set (a torn write would let
+        // the index drift). Ungated: it is a passive aggregate with no consensus effect until
+        // `ratio_bps_by_block` reads it post-activation; maintaining it from genesis keeps it exact
+        // for from-genesis nodes (fast-sync reconstruction from the pruning-point snapshot is 2b-3).
+        self.apply_balance_diff(&mut batch, accumulated_diff);
+
+        // Ratio-reward (Stage 2b-2b): advance the windowed-production index along the SAME chain path,
+        // in the SAME batch, BEFORE `apply_changes` mutates the selected chain — so the index reads the
+        // pre-change chain (its current anchor) and stays in lockstep with it.
+        self.advance_production_window(&mut batch, chain_path, &*selected_chain_write);
+
         // Update virtual state
         virtual_write.state.set_batch(&mut batch, new_virtual_state).unwrap();
 
@@ -662,18 +709,29 @@ impl VirtualStateProcessor {
         // (and it can't be in the future by induction)
         loop {
             let candidate = heap.pop().expect("valid sink must exist").hash;
-            // Skip candidates that can never be the sink: header-only blocks (no body => no UTXO
-            // state) and blocks already disqualified from the chain. Crucially we do NOT walk into
-            // their parents — doing so would traverse an entire header-only / invalid branch (e.g. an
-            // abandoned higher-blue-work salt overhang left in the datadir after a relaunch) on every
-            // virtual resolve, an O(branch length) blow-up. The valid sink is always reachable through
-            // the body tips already present in the heap, so skipping these branches yields the
-            // identical sink and candidate set without the wasted walk.
             let candidate_status = self.statuses_store.read().get(candidate).unwrap();
-            if candidate_status.is_header_only() || candidate_status == StatusDisqualifiedFromChain {
+            // Header-only blocks have no body => no UTXO state, and an abandoned higher-blue-work
+            // overhang (e.g. a salt fork left in the datadir after a relaunch) can form a long
+            // header-only branch. Skip them WITHOUT walking their parents — doing so would traverse
+            // the whole overhang on every virtual resolve, an O(branch length) blow-up.
+            if candidate_status.is_header_only() {
                 continue;
             }
-            if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
+            // Disqualified blocks have a body but known-invalid UTXO state: they can never be the
+            // sink. PoM-GATED behavior change (deliberately fork-gated, like every other consensus
+            // change since the storm — no modification to the live pre-PoM chain):
+            //   • pre-`pom_activation`: legacy — skip WITHOUT walking parents (the historically
+            //     deployed v1.2.6 behavior; preserves exact sink resolution for the current chain).
+            //   • from `pom_activation`: still skip the (known-failing) UTXO computation, but WALK
+            //     this block's parents, because the valid sink may lie BELOW a disqualified block
+            //     (a valid block built on top of one). A disqualified branch is bounded (real
+            //     bodies), so this is not the header-only overhang case. Fixes a sink-search stall.
+            if candidate_status == StatusDisqualifiedFromChain {
+                if !self.pom_activation.is_active(self.headers_store.get_daa_score(candidate).unwrap()) {
+                    continue;
+                }
+                // pom-active: fall through to the parent walk below (no UTXO computation).
+            } else if self.reachability_service.is_chain_ancestor_of(finality_point, candidate) {
                 diff_point = self.calculate_utxo_state_relatively(stores, diff, diff_point, candidate);
                 if diff_point == candidate {
                     // This indicates that candidate has valid UTXO state and that `diff` represents its diff from virtual
@@ -1065,6 +1123,17 @@ impl VirtualStateProcessor {
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let header_pruning_point =
             self.pruning_point_manager.expected_header_pruning_point(virtual_state.ghostdag_data.to_compact()).pruning_point;
+        let tier_bps_by_block =
+            self.tier_bps_by_block(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score);
+        // Build path: the rewarding block is virtual itself, so its view is the committed virtual the
+        // balance index already reflects ⇒ no view correction needed (`view_diffs = &[]`).
+        let ratio_bps_by_block = self.ratio_bps_by_block(
+            &virtual_state.ghostdag_data,
+            &virtual_state.mergeset_non_daa,
+            &virtual_state.mergeset_rewards,
+            virtual_state.daa_score,
+            &[],
+        );
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1073,6 +1142,8 @@ impl VirtualStateProcessor {
                 &virtual_state.ghostdag_data,
                 &virtual_state.mergeset_rewards,
                 &virtual_state.mergeset_non_daa,
+                &tier_bps_by_block,
+                &ratio_bps_by_block,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);
@@ -1188,6 +1259,27 @@ impl VirtualStateProcessor {
             for chunk in &pruning_meta_read.utxo_set.iterator().map(|iter_result| iter_result.unwrap()).chunks(1000) {
                 virtual_write.utxo_set.write_from_iterator_without_cache(chunk).unwrap();
             }
+
+            // Ratio-reward (Stage 2b): a from-genesis node builds the balance index from every UTXO
+            // diff since genesis; a fast-synced node skips that history, so seed the index directly
+            // from the imported pruning-point UTXO snapshot (grouped per payout SPK). The incremental
+            // lockstep maintenance in `commit_virtual_state` then carries it forward from here.
+            // The windowed-production index needs no seed (`W < pruning_depth` ⇒ its whole window lies
+            // above the pruning point and is rebuilt exactly by the IBD that follows); we only clear
+            // it so a re-import over a populated DB cannot leave stale aggregates.
+            let mut balances: HashMap<ScriptPublicKey, u64> = HashMap::new();
+            for item in virtual_write.utxo_set.iterator() {
+                let (_, entry) = item.unwrap();
+                let acc = balances.entry(entry.script_public_key.clone()).or_default();
+                *acc = acc.saturating_add(entry.amount);
+            }
+            let mut batch = WriteBatch::default();
+            self.address_balance_store.clear(&mut batch).unwrap();
+            self.windowed_production_store.clear(&mut batch).unwrap();
+            for (spk, amount) in balances {
+                self.address_balance_store.set_batch(&mut batch, &spk, amount).unwrap();
+            }
+            self.db.write(batch).unwrap();
         }
 
         let virtual_read = self.virtual_stores.upgradable_read();

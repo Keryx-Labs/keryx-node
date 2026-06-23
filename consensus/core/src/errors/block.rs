@@ -93,6 +93,15 @@ pub enum RuleError {
     #[error("bad coinbase payload: {0}")]
     BadCoinbasePayload(CoinbaseError),
 
+    #[error("PoM possession proof missing")]
+    PomProofMissing,
+
+    #[error("PoM possession proof references unknown tier {0}")]
+    PomUnknownTier(u8),
+
+    #[error("invalid PoM possession proof: {0:?}")]
+    BadPomProof(crate::pom::PomVerifyError),
+
     #[error("coinbase blue score of {0} is not the expected value of {1}")]
     BadCoinbasePayloadBlueScore(u64, u64),
 
