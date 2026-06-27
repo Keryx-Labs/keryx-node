@@ -63,6 +63,14 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Like [`validate_and_insert_block`], but for blocks received during IBD: the PoM possession
+    /// proof check is skipped (IBD does not carry proofs and legacy blocks have none persisted; the
+    /// synced chain is trusted by accumulated work). Defaults to full validation so any implementor
+    /// that does not override it stays safe.
+    fn validate_and_insert_block_ibd(&self, block: Block) -> BlockValidationFutures {
+        self.validate_and_insert_block(block)
+    }
+
     fn validate_and_insert_trusted_block(&self, tb: TrustedBlock) -> BlockValidationFutures {
         unimplemented!()
     }

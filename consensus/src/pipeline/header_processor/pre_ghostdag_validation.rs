@@ -15,6 +15,10 @@ impl HeaderProcessor {
     /// Validates the header in isolation including pow check against header declared bits.
     /// Returns the block level as computed from pow state or a rule error if such was encountered
     pub(super) fn validate_header_in_isolation(&self, header: &Header) -> BlockProcessResult<BlockLevel> {
+        // Sync ceiling (env KERYX_SYNC_CEILING_DAA) is enforced inside the IBD header download
+        // (`sync_headers`), not here: rejecting at header-isolation level errors the relay flow and
+        // disconnects the very peer we need to sync from. Relay blocks above the ceiling are left to
+        // normal orphan handling, which triggers a (ceiling-capped) IBD.
         self.check_header_version(header)?;
         self.check_block_timestamp_in_isolation(header)?;
         self.check_parents_limit(header)?;

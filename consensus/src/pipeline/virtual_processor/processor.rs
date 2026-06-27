@@ -1156,6 +1156,12 @@ impl VirtualStateProcessor {
         let utxo_commitment = virtual_state.multiset.clone().finalize();
         // Past median time is the exclusive lower bound for valid block time, so we increase by 1 to get the valid min
         let min_block_time = virtual_state.past_median_time + 1;
+        // Difficulty-reset hardfork: the persisted virtual `bits` is only refreshed when a new block
+        // is processed, but on a frozen chain none can be found at the inherited (too-high) difficulty.
+        // While the reset window is active we override the template to genesis so the first block is
+        // mineable; it validates under the same rule in `calculate_difficulty_bits`, and its insertion
+        // re-resolves the virtual normally. Outside the window this is a no-op (uses `virtual_state.bits`).
+        let template_bits = self.window_manager.reset_difficulty_bits(virtual_state.daa_score).unwrap_or(virtual_state.bits);
         let header = Header::new_finalized(
             version,
             parents_by_level,
@@ -1163,7 +1169,7 @@ impl VirtualStateProcessor {
             accepted_id_merkle_root,
             utxo_commitment,
             u64::max(min_block_time, unix_now()),
-            virtual_state.bits,
+            template_bits,
             0,
             virtual_state.daa_score,
             virtual_state.ghostdag_data.blue_work,

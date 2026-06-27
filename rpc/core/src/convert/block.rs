@@ -78,6 +78,7 @@ impl TryFrom<RpcBlock> for Block {
             ),
             // RpcBlock (verbose) does not carry the PoM proof; submit uses RpcRawBlock.
             pom_proof: None,
+            pom_tier: None,
         })
     }
 }
@@ -99,6 +100,7 @@ impl TryFrom<RpcRawBlock> for Block {
                     .map(keryx_consensus_core::tx::Transaction::try_from)
                     .collect::<RpcResult<Vec<keryx_consensus_core::tx::Transaction>>>()?,
             ),
+            pom_tier: pom_proof.as_ref().map(|p| p.tier),
             pom_proof,
         })
     }
@@ -148,6 +150,7 @@ impl TryFrom<RpcOptionalBlock> for Block {
             ),
             // RpcOptionalBlock has no PoM proof field.
             pom_proof: None,
+            pom_tier: None,
         })
     }
 }

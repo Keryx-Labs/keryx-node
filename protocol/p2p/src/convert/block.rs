@@ -15,12 +15,17 @@ impl From<(HeaderFormat, &Block)> for protowire::BlockMessage {
             transactions: block.transactions.iter().map(|tx| tx.into()).collect(),
             // borsh is infallible for in-memory PomProof (plain data).
             pom_proof: block.pom_proof.as_ref().map(|p| borsh::to_vec(p.as_ref()).expect("PomProof borsh serialize")),
+            // Carry the tier explicitly (falls back to the proof's tier) so it survives IBD even
+            // when the full proof is absent (legacy blocks).
+            pom_tier: block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier)).map(|t| t as u32),
         }
     }
 }
 impl From<&BlockBody> for protowire::BlockBodyMessage {
     fn from(block_body: &BlockBody) -> Self {
-        Self { transactions: block_body.iter().map(|tx| tx.into()).collect() }
+        // `pom_tier` is set by the IBD body serving flow (it has the block hash to look it up);
+        // this `BlockBody` (= just transactions) carries no tier.
+        Self { transactions: block_body.iter().map(|tx| tx.into()).collect(), pom_tier: None }
     }
 }
 
@@ -40,6 +45,7 @@ impl TryFrom<Versioned<protowire::BlockMessage>> for Block {
             let proof: PomProof = borsh::from_slice(&bytes).map_err(|_| ConversionError::PomProofDecode)?;
             blk = blk.with_pom_proof(proof);
         }
+        blk = blk.with_pom_tier(block.pom_tier.map(|t| t as u8));
         Ok(blk)
     }
 }

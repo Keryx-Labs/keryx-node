@@ -13,6 +13,7 @@ use crate::{
         headers::{CompactHeaderData, DbHeadersStore},
         headers_selected_tip::DbHeadersSelectedTipStore,
         past_pruning_points::DbPastPruningPointsStore,
+        pom_proof::DbPomProofStore,
         pom_tier::DbPomTierStore,
         pruning::DbPruningStore,
         pruning_meta::PruningMetaStores,
@@ -60,6 +61,7 @@ pub struct ConsensusStorage {
     pub daa_excluded_store: Arc<DbDaaStore>,
     pub depth_store: Arc<DbDepthStore>,
     pub pom_tier_store: Arc<DbPomTierStore>,
+    pub pom_proof_store: Arc<DbPomProofStore>,
     pub pruning_samples_store: Arc<DbPruningSamplesStore>,
 
     // Utxo-related stores
@@ -210,6 +212,7 @@ impl ConsensusStorage {
         ));
         let daa_excluded_store = Arc::new(DbDaaStore::new(db.clone(), daa_excluded_builder.build()));
         let pom_tier_store = Arc::new(DbPomTierStore::new(db.clone(), header_data_builder.build()));
+        let pom_proof_store = Arc::new(DbPomProofStore::new(db.clone(), header_data_builder.build()));
         let headers_store = Arc::new(DbHeadersStore::new(db.clone(), headers_builder.build(), headers_compact_builder.build()));
         let depth_store = Arc::new(DbDepthStore::new(db.clone(), header_data_builder.build()));
         let selected_chain_store = Arc::new(RwLock::new(DbSelectedChainStore::new(db.clone(), header_data_builder.build())));
@@ -277,6 +280,7 @@ impl ConsensusStorage {
             daa_excluded_store,
             depth_store,
             pom_tier_store,
+            pom_proof_store,
             pruning_samples_store,
             utxo_diffs_store,
             utxo_multisets_store,

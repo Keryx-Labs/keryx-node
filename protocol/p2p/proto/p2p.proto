@@ -64,10 +64,17 @@ message BlockMessage{
   // Proof-of-Model possession witness (borsh-encoded PomProof). Post-PoW, body-level,
   // absent before pom_activation. See POM_CONSENSUS_SPEC.md.
   optional bytes pom_proof = 3;
+  // Proven PoM tier, carried separately so it survives IBD even when the full proof is
+  // unavailable (legacy blocks have a stored tier but no proof). Consensus-critical: scales
+  // the coinbase tier-reward split. Absent before pom_activation.
+  optional uint32 pom_tier = 4;
 }
 
 message BlockBodyMessage{
   repeated TransactionMessage transactions = 1;
+  // Proven PoM tier (see BlockMessage.pom_tier) — needed so a syncing node can validate the
+  // coinbase tier-reward split for body-only IBD of post-pom blocks.
+  optional uint32 pom_tier = 2;
 }
 
 message BlockHeader{

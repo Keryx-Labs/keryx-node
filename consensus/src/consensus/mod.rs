@@ -21,6 +21,8 @@ use crate::{
             headers::{CompactHeaderData, HeaderStoreReader},
             headers_selected_tip::HeadersSelectedTipStoreReader,
             past_pruning_points::PastPruningPointsStoreReader,
+            pom_proof::PomProofStoreReader,
+            pom_tier::PomTierStoreReader,
             pruning::PruningStoreReader,
             relations::RelationsStoreReader,
             selected_chain::SelectedChainStore,
@@ -601,7 +603,16 @@ impl ConsensusApi for Consensus {
     }
 
     fn validate_and_insert_block(&self, block: Block) -> BlockValidationFutures {
-        let (block_task, virtual_state_task) = self.validate_and_insert_block_impl(BlockTask::Ordinary { block });
+        let (block_task, virtual_state_task) =
+            self.validate_and_insert_block_impl(BlockTask::Ordinary { block, skip_pom_proof: false });
+        BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }
+    }
+
+    fn validate_and_insert_block_ibd(&self, block: Block) -> BlockValidationFutures {
+        // IBD body sync: skip the PoM possession proof (not transmitted in IBD; legacy blocks have
+        // none persisted). The synced chain is trusted by accumulated work.
+        let (block_task, virtual_state_task) =
+            self.validate_and_insert_block_impl(BlockTask::Ordinary { block, skip_pom_proof: true });
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }
     }
 
@@ -1190,7 +1201,12 @@ impl ConsensusApi for Consensus {
         Ok(Block {
             header: self.headers_store.get_header(hash).optional().unwrap().ok_or(ConsensusError::BlockNotFound(hash))?,
             transactions: self.block_transactions_store.get(hash).optional().unwrap().ok_or(ConsensusError::BlockNotFound(hash))?,
-            pom_proof: None,
+            // Reattach the persisted PoM proof so the block can be re-served (relay/IBD) and pass
+            // peers' `check_pom_proof`. Pre-fork blocks have no entry ⇒ None.
+            pom_proof: self.pom_proof_store.get(hash).optional().unwrap().map(Arc::new),
+            // Reattach the proven tier so a syncing peer can validate the coinbase tier-reward split
+            // even for legacy blocks that have a tier but no persisted proof.
+            pom_tier: self.pom_tier_store.get(hash).optional().unwrap(),
         })
     }
 
@@ -1243,7 +1259,9 @@ impl ConsensusApi for Consensus {
             } else {
                 self.block_transactions_store.get(hash).optional().unwrap().unwrap_or_default()
             },
-            pom_proof: None,
+            // Reattach the persisted PoM proof for full blocks (header-only / pre-fork blocks have none).
+            pom_proof: if status.is_header_only() { None } else { self.pom_proof_store.get(hash).optional().unwrap().map(Arc::new) },
+            pom_tier: if status.is_header_only() { None } else { self.pom_tier_store.get(hash).optional().unwrap() },
         })
     }
 

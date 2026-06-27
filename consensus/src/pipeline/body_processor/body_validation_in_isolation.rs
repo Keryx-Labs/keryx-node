@@ -14,7 +14,7 @@ use keryx_consensus_core::{
 use keryx_math::Uint256;
 
 impl BlockBodyProcessor {
-    pub fn validate_body_in_isolation(self: &Arc<Self>, block: &Block) -> BlockProcessResult<Mass> {
+    pub fn validate_body_in_isolation(self: &Arc<Self>, block: &Block, skip_pom_proof: bool) -> BlockProcessResult<Mass> {
         Self::check_has_transactions(block)?;
         Self::check_hash_merkle_root(block)?;
         Self::check_only_one_coinbase(block)?;
@@ -24,7 +24,11 @@ impl BlockBodyProcessor {
         self.check_block_double_spends(block)?;
         self.check_no_chained_transactions(block)?;
         self.check_opoi_tag(block)?;
-        self.check_pom_proof(block)?;
+        // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
+        // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
+        if !skip_pom_proof {
+            self.check_pom_proof(block)?;
+        }
         Ok(mass)
     }
 
@@ -469,50 +473,50 @@ mod tests {
             txs,
         );
 
-        body_processor.validate_body_in_isolation(&example_block.clone().to_immutable()).unwrap();
+        body_processor.validate_body_in_isolation(&example_block.clone().to_immutable(), false).unwrap();
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;
         txs[1].version += 1;
-        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::BadMerkleRoot(_, _)));
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable(), false), Err(RuleError::BadMerkleRoot(_, _)));
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;
         txs[1].inputs[0].sig_op_count = 255;
         txs[1].inputs[1].sig_op_count = 255;
         block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
-        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::ExceedsComputeMassLimit(_, _)));
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable(), false), Err(RuleError::ExceedsComputeMassLimit(_, _)));
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;
         txs.push(txs[1].clone());
         block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
-        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::DuplicateTransactions(_)));
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable(), false), Err(RuleError::DuplicateTransactions(_)));
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;
         txs[1].subnetwork_id = SUBNETWORK_ID_COINBASE;
         block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
-        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::MultipleCoinbases(_)));
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable(), false), Err(RuleError::MultipleCoinbases(_)));
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;
         txs[2].inputs[0].previous_outpoint = txs[1].inputs[0].previous_outpoint;
         block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
-        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::DoubleSpendInSameBlock(_)));
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable(), false), Err(RuleError::DoubleSpendInSameBlock(_)));
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;
         txs[0].subnetwork_id = SUBNETWORK_ID_NATIVE;
         block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
-        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::FirstTxNotCoinbase));
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable(), false), Err(RuleError::FirstTxNotCoinbase));
 
         let mut block = example_block.clone();
         let txs = &mut block.transactions;
         txs[1].inputs = vec![];
         block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
         assert_match!(
-            body_processor.validate_body_in_isolation(&block.to_immutable()),
+            body_processor.validate_body_in_isolation(&block.to_immutable(), false),
             Err(RuleError::TxInIsolationValidationFailed(_, _))
         );
 
@@ -520,7 +524,7 @@ mod tests {
         let txs = &mut block.transactions;
         txs[3].inputs[0].previous_outpoint = TransactionOutpoint { transaction_id: txs[2].id(), index: 0 };
         block.header.hash_merkle_root = calc_hash_merkle_root(txs.iter());
-        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable()), Err(RuleError::ChainedTransaction(_)));
+        assert_match!(body_processor.validate_body_in_isolation(&block.to_immutable(), false), Err(RuleError::ChainedTransaction(_)));
 
         consensus.shutdown(wait_handles);
     }

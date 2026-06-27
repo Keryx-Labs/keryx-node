@@ -124,6 +124,9 @@ impl IbdFlow {
                 negotiation_output.syncer_pruning_point,
             )
             .await?;
+        // Body-sync target: normally the syncer's sink, but the highest header below the sync ceiling
+        // when one is set (the Sync path updates it from `sync_headers`).
+        let mut body_target = negotiation_output.syncer_virtual_selected_parent;
         match ibd_type {
             IbdType::Sync { highest_known_syncer_chain_hash, is_utxo_stable, is_pp_anticone_synced } => {
                 let pruning_point = session.async_pruning_point().await;
@@ -151,13 +154,14 @@ impl IbdFlow {
                     self.sync_new_utxo_set(&session, pruning_point).await?;
                 }
                 // Once utxo is valid, simply sync missing headers
-                self.sync_headers(
-                    &session,
-                    negotiation_output.syncer_virtual_selected_parent,
-                    highest_known_syncer_chain_hash,
-                    &relay_block,
-                )
-                .await?;
+                body_target = self
+                    .sync_headers(
+                        &session,
+                        negotiation_output.syncer_virtual_selected_parent,
+                        highest_known_syncer_chain_hash,
+                        &relay_block,
+                    )
+                    .await?;
             }
             IbdType::DownloadHeadersProof => {
                 drop(session); // Avoid holding the previous consensus throughout the staging IBD
@@ -202,12 +206,14 @@ impl IbdFlow {
             }
         }
 
-        // Sync missing bodies in the past of syncer sink (virtual selected parent)
-        self.sync_missing_block_bodies(&session, negotiation_output.syncer_virtual_selected_parent).await?;
+        // Sync missing bodies in the past of the (possibly ceiling-capped) sync target
+        self.sync_missing_block_bodies(&session, body_target).await?;
 
-        // Relay block might be in the antipast of syncer sink, thus
-        // check its past for missing bodies as well.
-        self.sync_missing_block_bodies(&session, relay_block.hash()).await?;
+        // Relay block might be in the antipast of syncer sink, thus check its past for missing bodies
+        // as well — but skip it under a sync ceiling (the relay block is the corrupted tip above it).
+        if self.sync_ceiling().is_none() {
+            self.sync_missing_block_bodies(&session, relay_block.hash()).await?;
+        }
 
         // Following IBD we revalidate orphans since many of them might have been processed during the IBD
         // or are now processable
@@ -534,13 +540,25 @@ impl IbdFlow {
         Ok(proof_pruning_point)
     }
 
+    /// Optional relaunch sync ceiling (env `KERYX_SYNC_CEILING_DAA`): when set, IBD ingests only
+    /// headers/blocks with `daa_score < ceiling` and stops there, so a pre-fork datadir can be synced
+    /// up to the last clean block without pulling the corrupted fork-era blocks. Unset = normal IBD.
+    fn sync_ceiling(&self) -> Option<u64> {
+        static SYNC_CEILING: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *SYNC_CEILING.get_or_init(|| std::env::var("KERYX_SYNC_CEILING_DAA").ok().and_then(|s| s.parse().ok()))
+    }
+
+    /// Downloads and validates headers from the shared point up to the syncer's sink. Returns the
+    /// effective body-sync target — normally the syncer's virtual selected parent, but the highest
+    /// header below the sync ceiling when one is set (see [`sync_ceiling`]).
     async fn sync_headers(
         &mut self,
         consensus: &ConsensusProxy,
         syncer_virtual_selected_parent: Hash,
         highest_known_syncer_chain_hash: Hash,
         relay_block: &Block,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<Hash, ProtocolError> {
+        let ceiling = self.sync_ceiling();
         let highest_shared_header_score = consensus.async_get_header(highest_known_syncer_chain_hash).await?.daa_score;
         let mut progress_reporter = ProgressReporter::new(highest_shared_header_score, relay_block.header.daa_score, "block headers");
 
@@ -555,36 +573,53 @@ impl IbdFlow {
             .await?;
         let mut chunk_stream = HeadersChunkStream::new(&self.router, &mut self.incoming_route, self.header_format);
 
-        if let Some(chunk) = chunk_stream.next().await? {
-            let (mut prev_daa_score, mut prev_timestamp) = {
+        // Pipelined: while the previous chunk is validating we receive the next one. When a ceiling is
+        // set, headers at/above it are dropped (not inserted), but the stream is still drained to its
+        // `DoneHeaders` terminator — the syncer doesn't know our ceiling and keeps streaming headers up
+        // to its own tip, and those messages must be consumed or the following body sync desyncs.
+        let mut ceiling_hit = false;
+        let mut prev: Option<(Vec<BlockValidationFuture>, u64, u64)> = None;
+        loop {
+            let chunk = match chunk_stream.next().await? {
+                Some(chunk) => chunk,
+                None => break,
+            };
+            let (current_daa_score, current_timestamp) = {
                 let last_header = chunk.last().expect("chunk is never empty");
                 (last_header.daa_score, last_header.timestamp)
             };
-            let mut prev_jobs: Vec<BlockValidationFuture> =
-                chunk.into_iter().map(|h| consensus.validate_and_insert_block(Block::from_header_arc(h)).virtual_state_task).collect();
-
-            while let Some(chunk) = chunk_stream.next().await? {
-                let (current_daa_score, current_timestamp) = {
-                    let last_header = chunk.last().expect("chunk is never empty");
-                    (last_header.daa_score, last_header.timestamp)
-                };
-                let current_jobs = chunk
-                    .into_iter()
-                    .map(|h| consensus.validate_and_insert_block(Block::from_header_arc(h)).virtual_state_task)
-                    .collect();
+            let current_jobs: Vec<BlockValidationFuture> = chunk
+                .into_iter()
+                .filter(|h| match ceiling {
+                    Some(c) if h.daa_score >= c => {
+                        ceiling_hit = true;
+                        false
+                    }
+                    _ => true,
+                })
+                .map(|h| consensus.validate_and_insert_block(Block::from_header_arc(h)).virtual_state_task)
+                .collect();
+            if let Some((prev_jobs, prev_daa_score, prev_timestamp)) = prev.take() {
                 let prev_chunk_len = prev_jobs.len();
-                // Join the previous chunk so that we always concurrently process a chunk and receive another
                 try_join_all(prev_jobs).await?;
-                // Log the progress
                 progress_reporter.report(prev_chunk_len, prev_daa_score, prev_timestamp);
-                prev_daa_score = current_daa_score;
-                prev_timestamp = current_timestamp;
-                prev_jobs = current_jobs;
             }
-
+            // Clamp the reported score below the ceiling (the last header may have been dropped).
+            let reported_daa = ceiling.map(|c| current_daa_score.min(c.saturating_sub(1))).unwrap_or(current_daa_score);
+            prev = Some((current_jobs, reported_daa, current_timestamp));
+        }
+        if let Some((prev_jobs, _, _)) = prev {
             let prev_chunk_len = prev_jobs.len();
             try_join_all(prev_jobs).await?;
             progress_reporter.report_completion(prev_chunk_len);
+        }
+
+        // Ceiling reached: stop at the highest accepted header (the syncer's sink is above the ceiling
+        // and is intentionally never received). Skip the syncer-sink and relay-past checks.
+        if ceiling_hit {
+            let tip = consensus.async_get_headers_selected_tip().await;
+            info!("sync ceiling reached during header download; stopping at headers selected tip {}", tip);
+            return Ok(tip);
         }
 
         if consensus.async_get_block_status(syncer_virtual_selected_parent).await.is_none() {
@@ -597,7 +632,7 @@ impl IbdFlow {
 
         self.sync_missing_relay_past_headers(consensus, syncer_virtual_selected_parent, relay_block.hash()).await?;
 
-        Ok(())
+        Ok(syncer_virtual_selected_parent)
     }
 
     async fn sync_new_utxo_set(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<(), ProtocolError> {
@@ -737,7 +772,9 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 if blk_body.is_empty() {
                     return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", hash)));
                 }
-                let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof: None };
+                // Trusted pruning-anticone blocks are pre-pom (pruning point precedes pom_activation),
+                // so there is no tier to carry.
+                let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof: None, pom_tier: None };
                 // TODO (relaxed): sending ghostdag data may be redundant, especially when the headers were already verified.
                 // Consider sending empty ghostdag data, simplifying a great deal. The result should be the same -
                 // a trusted task is sent, however the header is already verified, and hence only the block body will be verified.
@@ -877,7 +914,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             }
             current_daa_score = block.header.daa_score;
             current_timestamp = block.header.timestamp;
-            jobs.push(consensus.validate_and_insert_block(block).virtual_state_task);
+            jobs.push(consensus.validate_and_insert_block_ibd(block).virtual_state_task);
         }
         Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
     }
@@ -899,6 +936,9 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             .await?;
         for &expected_hash in chunk {
             let msg = dequeue_with_timeout!(self.incoming_route, Payload::BlockBody)?;
+            // Capture the proven tier before consuming `msg` — needed to validate the coinbase
+            // tier-reward split (IBD does not carry the full proof).
+            let pom_tier = msg.pom_tier.map(|t| t as u8);
             // TODO (relaxed): make header queries in a batch.
             let blk_header = consensus.async_get_header(expected_hash).await.map_err(|err| {
                 // Conceptually this indicates local inconsistency, since we received the expected hashes via a local
@@ -909,10 +949,10 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             if blk_body.is_empty() {
                 return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", expected_hash)));
             }
-            let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof: None };
+            let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof: None, pom_tier };
             current_daa_score = block.header.daa_score;
             current_timestamp = block.header.timestamp;
-            jobs.push(consensus.validate_and_insert_block(block).virtual_state_task);
+            jobs.push(consensus.validate_and_insert_block_ibd(block).virtual_state_task);
         }
         Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
     }

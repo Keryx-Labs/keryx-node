@@ -10,7 +10,7 @@ use crate::{
 use keryx_consensus_core::{
     BlockHashSet, BlueWorkType, HashMapCustomHasher,
     blockhash::{BlockHashExtensions, ORIGIN},
-    config::genesis::GenesisBlock,
+    config::{genesis::GenesisBlock, params::ForkActivation},
     errors::{block::RuleError, difficulty::DifficultyResult},
 };
 use keryx_hashes::Hash;
@@ -105,6 +105,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
         difficulty_sample_rate: u64,
         past_median_time_window_size: usize,
         past_median_time_sample_rate: u64,
+        difficulty_reset_activation: ForkActivation,
     ) -> Self {
         let difficulty_manager = SampledDifficultyManager::new(
             headers_store.clone(),
@@ -116,6 +117,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
             min_difficulty_window_size,
             difficulty_sample_rate,
             target_time_per_block,
+            difficulty_reset_activation,
         );
         let past_median_time_manager = SampledPastMedianTimeManager::new(headers_store.clone(), genesis.timestamp);
         Self {
@@ -133,6 +135,13 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
             difficulty_manager,
             past_median_time_manager,
         }
+    }
+
+    /// `Some(genesis_bits)` while the difficulty-reset hardfork window is active for `daa_score`.
+    /// See [`SampledDifficultyManager::reset_bits`] — used to override a stale virtual `bits` at
+    /// template build time so a frozen chain can be relaunched.
+    pub fn reset_difficulty_bits(&self, daa_score: u64) -> Option<u32> {
+        self.difficulty_manager.reset_bits(daa_score)
     }
 
     fn build_block_window(
@@ -345,7 +354,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
     }
 
     fn calculate_difficulty_bits(&self, ghostdag_data: &GhostdagData, daa_window: &DaaWindow) -> u32 {
-        self.difficulty_manager.calculate_difficulty_bits(&daa_window.window, ghostdag_data)
+        self.difficulty_manager.calculate_difficulty_bits(&daa_window.window, ghostdag_data, daa_window.daa_score)
     }
 
     fn calc_past_median_time(&self, ghostdag_data: &GhostdagData) -> Result<(u64, Arc<BlockWindowHeap>), RuleError> {

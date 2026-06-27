@@ -570,6 +570,14 @@ pub struct Params {
     /// re-validation of pre-fork history is unaffected (empty map ⇒ full cut, no burn).
     pub ratio_reward_activation: ForkActivation,
 
+    /// Difficulty-reset hardfork activation DAA score (chain relaunch). At/after this score the
+    /// difficulty window discards every sample that precedes the reset, so the chain resumes at
+    /// `genesis.bits` and the DAA re-converges to the post-fork (PoM-only) hashrate within one
+    /// window. Needed when a hardfork sheds most of the pre-fork hashrate (e.g. non-PoM pools cut
+    /// off at `pom_activation`), leaving stock difficulty far too high and the chain frozen.
+    /// Forward-only: blocks below this score keep their original bits (no re-org). `never()` to disable.
+    pub difficulty_reset_activation: ForkActivation,
+
     /// Length (in blocks) of the trailing selected-chain window over which a payout address's
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
@@ -763,6 +771,7 @@ impl Params {
             pow_salt_v4_activation: self.pow_salt_v4_activation,
 
             ratio_reward_activation: self.ratio_reward_activation,
+            difficulty_reset_activation: self.difficulty_reset_activation,
 
             ratio_reward_window: self.ratio_reward_window,
         }
@@ -882,6 +891,18 @@ pub const MAINNET_PARAMS: Params = Params {
     // Node-only gate (the miner has no ratio-reward logic). Before H the placeholder map is empty ⇒
     // no-op, IBD/old blocks unaffected.
     ratio_reward_activation: ForkActivation::new(37_780_000),
+    // Difficulty reset (chain relaunch). H = DAA 37_780_000 shed almost all pre-fork hashrate
+    // (non-PoM pools cut off), leaving stock difficulty calibrated to ~456 GH/s while only the
+    // PoM hashrate (~tens of MH/s) remained valid → chain froze at the fork.
+    // Gated AT the fork DAA (= ratio-reward activation, the clean/corrupt boundary): the relaunch
+    // base is a pre-fork datadir synced to the last block with daa < H (the fork-era blocks at
+    // daa >= H are auto-rejected by the deterministic coinbase/difficulty), so re-mining starts
+    // with virtual_daa_score >= H and the reset fires on the very first re-mined block. The reset
+    // filters the difficulty window down to samples with daa_score >= this score — only the top
+    // boundary layer (well under MIN_DIFFICULTY_WINDOW_SIZE=150) — so the calc falls back to
+    // genesis.bits. The chain relaunches at the launch target and the DAA re-converges upward to
+    // the real PoM hashrate within one window. MUST match across all honest nodes.
+    difficulty_reset_activation: ForkActivation::new(37_780_000),
     ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
@@ -952,6 +973,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
     // populates the bps store; the placeholder map is empty until then.
     ratio_reward_activation: ForkActivation::new(5_000),
+    // Testnet has no frozen-chain history to relaunch from; difficulty reset stays disabled.
+    difficulty_reset_activation: ForkActivation::never(),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
     // rather than ~30 days. Still well under pruning_depth.
@@ -1006,6 +1029,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
+    difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 
@@ -1055,5 +1079,6 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
+    difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
 };

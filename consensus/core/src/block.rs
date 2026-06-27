@@ -41,28 +41,40 @@ pub struct Block {
     /// additive `Option` (None pre-`pom_activation` and on legacy paths). Verified in
     /// `post_pow_validation`. See `pom::PomProof` / POM_CONSENSUS_SPEC.md.
     pub pom_proof: Option<Arc<PomProof>>,
+    /// Proven PoM tier, carried separately from `pom_proof` so it survives IBD: legacy blocks
+    /// (mined before proofs were persisted) have a stored tier but no proof, and IBD does not verify
+    /// the proof anyway. The tier is consensus-critical (it scales the coinbase tier-reward split),
+    /// so it must propagate to a syncing node even when the full proof is unavailable. `None`
+    /// pre-`pom_activation` / when not provided; when a proof is present its `tier` is authoritative.
+    pub pom_tier: Option<u8>,
 }
 
 impl Block {
     pub fn new(header: Header, txs: Vec<Transaction>) -> Self {
-        Self { header: Arc::new(header), transactions: Arc::new(txs), pom_proof: None }
+        Self { header: Arc::new(header), transactions: Arc::new(txs), pom_proof: None, pom_tier: None }
     }
 
     pub fn from_arcs(header: Arc<Header>, transactions: Arc<Vec<Transaction>>) -> Self {
-        Self { header, transactions, pom_proof: None }
+        Self { header, transactions, pom_proof: None, pom_tier: None }
     }
 
     pub fn from_header_arc(header: Arc<Header>) -> Self {
-        Self { header, transactions: Arc::new(Vec::new()), pom_proof: None }
+        Self { header, transactions: Arc::new(Vec::new()), pom_proof: None, pom_tier: None }
     }
 
     pub fn from_header(header: Header) -> Self {
-        Self { header: Arc::new(header), transactions: Arc::new(Vec::new()), pom_proof: None }
+        Self { header: Arc::new(header), transactions: Arc::new(Vec::new()), pom_proof: None, pom_tier: None }
     }
 
     /// Attach a PoM possession proof (post-PoW witness). Builder-style.
     pub fn with_pom_proof(mut self, proof: PomProof) -> Self {
         self.pom_proof = Some(Arc::new(proof));
+        self
+    }
+
+    /// Attach the proven PoM tier without the full proof (IBD path). Builder-style.
+    pub fn with_pom_tier(mut self, tier: Option<u8>) -> Self {
+        self.pom_tier = tier;
         self
     }
 

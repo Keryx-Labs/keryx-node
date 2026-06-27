@@ -41,8 +41,12 @@ impl VirtualStateProcessingMessage {
 }
 
 pub enum BlockTask {
-    /// Ordinary block processing task, requiring full validation. The block might be header-only
-    Ordinary { block: Block },
+    /// Ordinary block processing task, requiring full validation. The block might be header-only.
+    /// `skip_pom_proof` is set only by the IBD body-download path: IBD does not carry the PoM
+    /// possession proof (and legacy blocks have none persisted), so the possession check is skipped
+    /// for synced history — the chain is trusted by accumulated work, like pruned history. Relay,
+    /// submit and orphan resolution leave it `false`, keeping the real-time anti-fraud check intact.
+    Ordinary { block: Block, skip_pom_proof: bool },
 
     /// Trusted block processing task, only requiring partial validation.
     /// Trusted blocks arrive as part of the pruning proof; the block might be header-only.
@@ -52,7 +56,7 @@ pub enum BlockTask {
 impl BlockTask {
     pub fn block(&self) -> &Block {
         match self {
-            BlockTask::Ordinary { block } => block,
+            BlockTask::Ordinary { block, .. } => block,
             BlockTask::Trusted { block } => block,
         }
     }
@@ -63,6 +67,11 @@ impl BlockTask {
 
     pub fn is_trusted(&self) -> bool {
         matches!(self, BlockTask::Trusted { .. })
+    }
+
+    /// Whether the PoM possession proof check should be skipped for this block (IBD body sync only).
+    pub fn skip_pom_proof(&self) -> bool {
+        matches!(self, BlockTask::Ordinary { skip_pom_proof: true, .. })
     }
 
     pub fn requires_virtual_processing(&self) -> bool {

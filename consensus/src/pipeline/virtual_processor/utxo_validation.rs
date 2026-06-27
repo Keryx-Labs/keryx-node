@@ -359,7 +359,20 @@ impl VirtualStateProcessor {
             )
             .unwrap()
             .tx;
-        if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) { Err(BadCoinbaseTransaction) } else { Ok(()) }
+        if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) {
+            // TEMP DIAGNOSTIC: pinpoint why the coinbase differs (tier vs ratio vs amounts).
+            warn!(
+                "COINBASE MISMATCH daa={} tier_bps={:?} ratio_bps={:?} actual_outs={:?} expected_outs={:?}",
+                daa_score,
+                tier_bps_by_block,
+                ratio_bps_by_block,
+                coinbase.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
+                expected_coinbase.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
+            );
+            Err(BadCoinbaseTransaction)
+        } else {
+            Ok(())
+        }
     }
 
     /// Tier-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue, the
@@ -437,6 +450,41 @@ impl VirtualStateProcessor {
                 map.insert(*blue, ratio_reward_bps(balance, production));
             }
         }
+
+        // Optional self-check (env KERYX_RATIO_SELFCHECK=1): verify the maintained windowed-production
+        // index (store + correction) equals the DIRECT window recompute for each rewarded blue. Catches
+        // any residual non-determinism live. O(W) per call — enable only briefly to validate a relaunch.
+        if std::env::var("KERYX_RATIO_SELFCHECK").is_ok() {
+            let sc = self.selected_chain_store.read();
+            if let Ok(sp_idx) = sc.get_by_hash(ghostdag_data.selected_parent) {
+                let w = self.ratio_reward_window;
+                let lo = sp_idx.saturating_sub(w - 1).max(1);
+                let mut direct: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
+                for i in lo..=sp_idx {
+                    if let Ok(h) = sc.get_by_index(i) {
+                        if let Some((spk, cut)) = self.block_production(h) {
+                            *direct.entry(spk).or_default() += cut;
+                        }
+                    }
+                }
+                for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+                    if let Some(reward) = mergeset_rewards.get(blue) {
+                        let spk = &reward.script_public_key;
+                        let used = ((self.windowed_production_store.get(spk).unwrap() as i128
+                            + prod_correction.get(spk).copied().unwrap_or(0))
+                        .max(0) as u64)
+                            .max(prod_floor);
+                        let truth = direct.get(spk).copied().unwrap_or(0).max(prod_floor);
+                        if used != truth {
+                            warn!(
+                                "RATIO-SELFCHECK MISMATCH daa={} blue={} used_prod={} direct_prod={} drift={}",
+                                pov_daa_score, blue, used, truth, used as i128 - truth as i128
+                            );
+                        }
+                    }
+                }
+            }
+        }
         map
     }
 
@@ -472,8 +520,44 @@ impl VirtualStateProcessor {
     ) {
         let w = self.ratio_reward_window as i128;
         let from_tip = from_tip as i128;
-        let to_tip = from_tip - chain_path.removed.len() as i128 + chain_path.added.len() as i128;
+        let removed_len = chain_path.removed.len() as i128;
+        let added_len = chain_path.added.len() as i128;
+        let common = from_tip - removed_len; // common-ancestor index (shared chain below the reorg)
+        let to_tip = common + added_len;
 
+        // Disjoint-window case: when the reorg/jump exceeds the window (`added` or `removed` > W — e.g.
+        // a reorg across the difficulty-reset genesis-diff burst), the incremental top+bottom-slide
+        // below is unsafe: it would (a) subtract/add `removed`/`added` blocks that lie BELOW the window
+        // — over-counting, which the saturating store then silently loses — and (b) read bottom-slide
+        // indices past the reorg split, which aren't on the pre-change `sc`. Recompute both windows
+        // directly instead (subtract the whole old window, add the whole new window). O(W), only on
+        // such large jumps; the per-block path keeps the O(1) incremental branch below.
+        if added_len > w || removed_len > w {
+            // Old window [from_tip-W+1, from_tip] — entirely on `sc` (the pre-change chain).
+            for i in (from_tip - w + 1).max(1)..=from_tip {
+                if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
+                    *deltas.entry(spk).or_default() -= cut as i128;
+                }
+            }
+            // New window [to_tip-W+1, to_tip]: indices ≤ common come from `sc` (shared low chain),
+            // indices > common come from `added` (added[k] is at index common+1+k, ascending).
+            let new_lo = (to_tip - w + 1).max(1);
+            for i in new_lo..=common {
+                if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
+                    *deltas.entry(spk).or_default() += cut as i128;
+                }
+            }
+            let first_added_k = (new_lo - (common + 1)).max(0) as usize;
+            for h in chain_path.added.iter().skip(first_added_k) {
+                if let Some((spk, cut)) = self.block_production(*h) {
+                    *deltas.entry(spk).or_default() += cut as i128;
+                }
+            }
+            return;
+        }
+
+        // Overlap case (`added` and `removed` ≤ W): every removed/added block falls inside its window,
+        // so the top is a straight subtract/add, and the bottom shifts by only `Δ = added − removed`.
         for h in &chain_path.removed {
             if let Some((spk, cut)) = self.block_production(*h) {
                 *deltas.entry(spk).or_default() -= cut as i128;

@@ -5,7 +5,7 @@ use crate::model::stores::{
 };
 use keryx_consensus_core::{
     BlockHashSet, BlueWorkType, MAX_WORK_LEVEL,
-    config::params::MAX_DIFFICULTY_TARGET_AS_F64,
+    config::params::{ForkActivation, MAX_DIFFICULTY_TARGET_AS_F64},
     errors::difficulty::{DifficultyError, DifficultyResult},
 };
 use keryx_core::{info, log::CRESCENDO_KEYWORD};
@@ -154,9 +154,11 @@ pub struct SampledDifficultyManager<T: HeaderStoreReader, U: GhostdagStoreReader
     min_difficulty_window_size: usize,
     difficulty_sample_rate: u64,
     target_time_per_block: u64,
+    difficulty_reset_activation: ForkActivation,
 }
 
 impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         headers_store: Arc<T>,
         ghostdag_store: Arc<U>,
@@ -167,6 +169,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         min_difficulty_window_size: usize,
         difficulty_sample_rate: u64,
         target_time_per_block: u64,
+        difficulty_reset_activation: ForkActivation,
     ) -> Self {
         Self::check_min_difficulty_window_size(difficulty_window_size, min_difficulty_window_size);
         Self {
@@ -179,7 +182,18 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
             min_difficulty_window_size,
             difficulty_sample_rate,
             target_time_per_block,
+            difficulty_reset_activation,
         }
+    }
+
+    /// Returns `Some(genesis_bits)` while the difficulty-reset hardfork window is active for
+    /// `daa_score`, else `None`. Used to override a stale *persisted* virtual `bits` at block-template
+    /// build time. The virtual only recomputes its difficulty when a new block is processed, but on a
+    /// frozen chain no block can be found at the inherited (too-high) difficulty — a deadlock. Forcing
+    /// the template to genesis lets the first block be mined; it validates against the same reset rule
+    /// in `calculate_difficulty_bits`, and its insertion re-resolves the virtual normally afterwards.
+    pub fn reset_bits(&self, daa_score: u64) -> Option<u32> {
+        self.difficulty_reset_activation.is_within_range_from_activation(daa_score, self.difficulty_full_window_size()).then_some(self.genesis_bits)
     }
 
     #[inline]
@@ -213,7 +227,21 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         (self.internal_calc_daa_score(ghostdag_data, &mergeset_non_daa), mergeset_non_daa)
     }
 
-    pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData) -> u32 {
+    pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData, daa_score: u64) -> u32 {
+        // Difficulty-reset hardfork: for the first full window after `difficulty_reset_activation`,
+        // force `genesis_bits` outright, ignoring the inherited window. The pre-fork window is
+        // calibrated to the old (mostly non-PoM) hashrate; once the fork sheds it the chain freezes,
+        // and the frozen tip shares its daa_score with the new blocks — so daa-based filtering can't
+        // separate old high-difficulty samples from new ones. Forcing genesis across the whole
+        // transition window relaunches the chain at the launch target unconditionally; the normal
+        // sampled calc resumes once daa passes the window and it is full of post-reset blocks, at
+        // which point the DAA re-converges to the real PoM hashrate. Forward-only: blocks below the
+        // activation score are never in range here. Checked before the window fetch so the genesis
+        // burst doesn't pay 661 store reads per block.
+        if self.difficulty_reset_activation.is_within_range_from_activation(daa_score, self.difficulty_full_window_size()) {
+            return self.genesis_bits;
+        }
+
         let mut difficulty_blocks = self.get_difficulty_blocks(window);
 
         // Until there are enough blocks for a valid calculation the difficulty should remain constant.

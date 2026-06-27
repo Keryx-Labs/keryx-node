@@ -11,6 +11,7 @@
 //! tensors) is produced by the offline `pom-rt-builder`. See `POM_CONSENSUS_SPEC.md`.
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
 
 /// A PoM tier binding: the model whose possession this tier proves, plus its canonical
@@ -82,6 +83,12 @@ impl PomProof {
             .map(|o| 32 + 8 + path_bytes(&o.weight_path) + path_bytes(&o.trace_path_before) + path_bytes(&o.trace_path_after))
             .sum();
         1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings
+    }
+}
+
+impl MemSizeEstimator for PomProof {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>() + self.approx_bytes()
     }
 }
 

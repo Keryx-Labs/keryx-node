@@ -11,6 +11,7 @@ use crate::{
             block_transactions::DbBlockTransactionsStore,
             ghostdag::DbGhostdagStore,
             headers::DbHeadersStore,
+            pom_proof::DbPomProofStore,
             pom_tier::DbPomTierStore,
             reachability::DbReachabilityStore,
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
@@ -30,6 +31,7 @@ use keryx_consensus_core::{
     blockstatus::BlockStatus::{self, StatusHeaderOnly, StatusInvalid},
     config::{genesis::GenesisBlock, params::{ForkActivation, Params}},
     mass::{Mass, MassCalculator, MassOps},
+    pom::PomProof,
     tx::Transaction,
 };
 use keryx_consensus_notify::{
@@ -70,6 +72,9 @@ pub struct BlockBodyProcessor {
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, persisted at commit for the tier-reward coinbase split.
     pub(super) pom_tier_store: Arc<DbPomTierStore>,
+    /// Full PoM possession proof per block, persisted at commit so the block can be re-served
+    /// (relay/IBD) with its proof attached. See `DbPomProofStore`.
+    pub(super) pom_proof_store: Arc<DbPomProofStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
 
     // Managers and services
@@ -124,6 +129,7 @@ impl BlockBodyProcessor {
             _headers_store: storage.headers_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
+            pom_proof_store: storage.pom_proof_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
 
             _reachability_service: services.reachability_service.clone(),
@@ -163,7 +169,7 @@ impl BlockBodyProcessor {
 
     fn queue_block(self: &Arc<BlockBodyProcessor>, task_id: TaskId) {
         if let Some(task) = self.task_manager.try_begin(task_id) {
-            let res = self.process_body(task.block(), task.is_trusted());
+            let res = self.process_body(task.block(), task.is_trusted(), task.skip_pom_proof());
 
             let dependent_tasks = self.task_manager.end(task, |task, block_result_transmitter, virtual_state_result_transmitter| {
                 let _ = block_result_transmitter.send(res.clone());
@@ -182,7 +188,7 @@ impl BlockBodyProcessor {
         }
     }
 
-    fn process_body(self: &Arc<BlockBodyProcessor>, block: &Block, is_trusted: bool) -> BlockProcessResult<BlockStatus> {
+    fn process_body(self: &Arc<BlockBodyProcessor>, block: &Block, is_trusted: bool, skip_pom_proof: bool) -> BlockProcessResult<BlockStatus> {
         let _prune_guard = self.pruning_lock.blocking_read();
         let status = self.statuses_store.read().get(block.hash()).unwrap();
         match status {
@@ -192,7 +198,7 @@ impl BlockBodyProcessor {
             _ => panic!("unexpected block status {status:?}"),
         }
 
-        let mass = match self.validate_body(block, is_trusted) {
+        let mass = match self.validate_body(block, is_trusted, skip_pom_proof) {
             Ok(mass) => mass,
             Err(e) => {
                 // We mark invalid blocks with status StatusInvalid except in the
@@ -212,11 +218,13 @@ impl BlockBodyProcessor {
             }
         };
 
-        // Persist the proven PoM tier (verified in `check_pom_proof`) for the tier-reward
-        // coinbase split. The `pom_proof` is dropped once a block is reloaded from storage,
-        // so the tier must be captured here while it is still attached to the block.
-        let proven_tier = block.pom_proof.as_ref().map(|p| p.tier);
-        self.commit_body(block.hash(), block.header.direct_parents(), block.transactions.clone(), proven_tier);
+        // Persist the PoM possession proof (verified in `check_pom_proof`): the full proof so the
+        // block can be re-served to peers (relay/IBD) with its proof attached, plus the tier alone
+        // for the tier-reward coinbase split read by the virtual processor. The in-memory
+        // `block.pom_proof` is dropped once a block is reloaded from storage, so both must be
+        // captured here while it is still attached to the block.
+        let pom_proof = block.pom_proof.clone();
+        self.commit_body(block.hash(), block.header.direct_parents(), block.transactions.clone(), pom_proof, block.pom_tier);
 
         // Send a BlockAdded notification
         self.notification_root
@@ -230,8 +238,8 @@ impl BlockBodyProcessor {
         Ok(BlockStatus::StatusUTXOPendingVerification)
     }
 
-    fn validate_body(self: &Arc<BlockBodyProcessor>, block: &Block, is_trusted: bool) -> BlockProcessResult<Mass> {
-        let mass = self.validate_body_in_isolation(block)?;
+    fn validate_body(self: &Arc<BlockBodyProcessor>, block: &Block, is_trusted: bool, skip_pom_proof: bool) -> BlockProcessResult<Mass> {
+        let mass = self.validate_body_in_isolation(block, skip_pom_proof)?;
         if !is_trusted {
             self.validate_body_in_context(block)?;
         }
@@ -243,15 +251,22 @@ impl BlockBodyProcessor {
         hash: Hash,
         parents: &[Hash],
         transactions: Arc<Vec<Transaction>>,
-        proven_tier: Option<u8>,
+        pom_proof: Option<Arc<PomProof>>,
+        pom_tier: Option<u8>,
     ) {
         let mut batch = WriteBatch::default();
 
         // This is an append only store so it requires no lock.
         self.block_transactions_store.insert_batch(&mut batch, hash, transactions).unwrap();
 
-        // Append-only: persist the proven PoM tier when the block carried a possession proof.
-        if let Some(tier) = proven_tier {
+        // Append-only: persist the possession proof (full proof for re-serving + tier alone for the
+        // tier-reward split) when the block carried one. On the IBD path the full proof is absent but
+        // the tier travels separately (`block.pom_tier`) — persist it so the coinbase tier-reward
+        // split is reconstructible. `proof.tier` is authoritative when a proof is present.
+        if let Some(proof) = &pom_proof {
+            self.pom_proof_store.insert_batch(&mut batch, hash, proof).unwrap();
+            self.pom_tier_store.insert_batch(&mut batch, hash, proof.tier).unwrap();
+        } else if let Some(tier) = pom_tier {
             self.pom_tier_store.insert_batch(&mut batch, hash, tier).unwrap();
         }
 
@@ -276,6 +291,6 @@ impl BlockBodyProcessor {
         drop(body_tips_write_guard);
 
         // Write the genesis body
-        self.commit_body(self.genesis.hash, &[], Arc::new(self.genesis.build_genesis_transactions()), None)
+        self.commit_body(self.genesis.hash, &[], Arc::new(self.genesis.build_genesis_transactions()), None, None)
     }
 }
