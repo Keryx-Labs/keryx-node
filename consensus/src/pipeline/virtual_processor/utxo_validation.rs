@@ -231,14 +231,21 @@ impl VirtualStateProcessor {
         // Verify coinbase transaction. The two diffs (committed-virtual → selected parent, then
         // selected parent → this block via its mergeset) let the ratio-reward bracket be evaluated at
         // this block's own view from the virtual-anchored balance index.
-        self.verify_coinbase_transaction(
-            &txs[0],
-            header.daa_score,
-            &ctx.ghostdag_data,
-            &ctx.mergeset_rewards,
-            &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
-            &[sp_diff, &ctx.mergeset_diff],
-        )?;
+        //
+        // Skipped under the `KERYX_TRUST_COINBASE` operator opt-in (see `trust_coinbase`): the
+        // `utxo_commitment` verified above already pins this block's resulting UTXO set to the
+        // canonical chain, so the block's coinbase outputs are trusted without re-deriving the ratio
+        // bracket — which a clean node cannot reproduce for the post-fork canonical chain.
+        if !self.trust_coinbase {
+            self.verify_coinbase_transaction(
+                &txs[0],
+                header.daa_score,
+                &ctx.ghostdag_data,
+                &ctx.mergeset_rewards,
+                &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+                &[sp_diff, &ctx.mergeset_diff],
+            )?;
+        }
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -493,7 +500,7 @@ impl VirtualStateProcessor {
     /// at its DAA score. `None` if that base cut is 0 (tail emission edge) ⇒ no contribution. This is
     /// the per-block unit summed by the windowed-production index (one number per chain block,
     /// attributed to its producer — deliberately not the per-output paid amount, see `base_miner_cut`).
-    fn block_production(&self, hash: Hash) -> Option<(ScriptPublicKey, u64)> {
+    pub(super) fn block_production(&self, hash: Hash) -> Option<(ScriptPublicKey, u64)> {
         let cut = self.coinbase_manager.base_miner_cut(self.headers_store.get_daa_score(hash).unwrap());
         if cut == 0 {
             return None;

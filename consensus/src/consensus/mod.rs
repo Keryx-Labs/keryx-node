@@ -279,6 +279,7 @@ impl Consensus {
             notification_root.clone(),
             counters.clone(),
             mining_rules,
+            config.is_archival,
         ));
 
         let pruning_processor = Arc::new(PruningProcessor::new(
@@ -322,6 +323,13 @@ impl Consensus {
 
         // Run database upgrades if any
         this.run_database_upgrades();
+
+        // One-shot recovery (env KERYX_REBUILD_PRODUCTION=1): rebuild the windowed-production index in
+        // place from the on-disk selected chain (full window, no pruning-point clamp). Repairs an
+        // archival store left without its from-genesis accumulation by the import clear. Run once.
+        if std::env::var("KERYX_REBUILD_PRODUCTION").is_ok() {
+            this.virtual_processor.rebuild_windowed_production_index();
+        }
 
         this
     }

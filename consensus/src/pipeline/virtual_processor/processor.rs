@@ -30,7 +30,7 @@ use crate::{
             pruning_samples::DbPruningSamplesStore,
             reachability::DbReachabilityStore,
             relations::{DbRelationsStore, RelationsStoreReader},
-            selected_chain::{DbSelectedChainStore, SelectedChainStore},
+            selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
             tips::{DbTipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
@@ -204,6 +204,14 @@ pub struct VirtualStateProcessor {
     pub(super) ratio_reward_activation: ForkActivation,
     // Trailing selected-chain window length (blocks) for the ratio-reward production index.
     pub(super) ratio_reward_window: u64,
+
+    // Skip ratio/tier coinbase verification while following the chain. Auto-enabled for ARCHIVAL
+    // nodes (`KERYX_TRUST_COINBASE=1` also forces it on): an archival node retains blocks below the
+    // pruning point, so its windowed-production fold subtracts leaving blocks that pruned nodes (the
+    // canonical majority) never see → it computes a different ratio and would disqualify the whole
+    // chain. The header `utxo_commitment` (checked first, always) already pins the resulting UTXO set
+    // to the canonical chain, so trusting the block's coinbase outputs is safe.
+    pub(super) trust_coinbase: bool,
 }
 
 impl VirtualStateProcessor {
@@ -221,7 +229,20 @@ impl VirtualStateProcessor {
         notification_root: Arc<ConsensusNotificationRoot>,
         counters: Arc<ProcessingCounters>,
         mining_rules: Arc<MiningRules>,
+        is_archival: bool,
     ) -> Self {
+        // Archival nodes retain blocks below the pruning point, so their windowed-production fold
+        // subtracts leaving blocks that pruned nodes (the canonical majority) never see — diverging
+        // the ratio/tier coinbase. They therefore MUST trust it (the header utxo_commitment still
+        // pins the resulting UTXO set). Auto-enabled by `--archival`; `KERYX_TRUST_COINBASE=1` also
+        // forces it on. See field doc.
+        let trust_coinbase = is_archival || std::env::var("KERYX_TRUST_COINBASE").is_ok();
+        if trust_coinbase {
+            warn!(
+                "Ratio/tier coinbase verification DISABLED ({}) — following the chain on UTXO-commitment trust only.",
+                if is_archival { "archival node" } else { "KERYX_TRUST_COINBASE set" }
+            );
+        }
         Self {
             receiver,
             pruning_sender,
@@ -285,6 +306,7 @@ impl VirtualStateProcessor {
             pom_activation: params.pom_activation,
             ratio_reward_activation: params.ratio_reward_activation,
             ratio_reward_window: params.ratio_reward_window,
+            trust_coinbase,
         }
     }
 
@@ -646,6 +668,48 @@ impl VirtualStateProcessor {
         // Calling the drops explicitly after the batch is written in order to avoid possible errors.
         drop(virtual_write);
         drop(selected_chain_write);
+    }
+
+    /// One-shot recovery (env `KERYX_REBUILD_PRODUCTION=1`): rebuild the windowed-production index in
+    /// place from the on-disk selected chain — the sum of `block_production` over the FULL last
+    /// `ratio_reward_window` chain blocks ending at the tip, down to genesis (`.max(1)`), with NO
+    /// pruning-point clamp. Repairs an ARCHIVAL store that the import `clear` left without its
+    /// from-genesis accumulation (⇒ undercounted production ⇒ ratio_bps too high ⇒ divergent
+    /// coinbase). Requires every window block on disk — archival only. Run once, then restart without
+    /// the flag; incremental lockstep maintenance carries it forward.
+    pub(crate) fn rebuild_windowed_production_index(&self) {
+        let sc = self.selected_chain_store.read();
+        let tip_idx = match sc.get_tip() {
+            Ok((idx, _)) => idx,
+            Err(_) => {
+                warn!("KERYX_REBUILD_PRODUCTION: no selected-chain tip; skipping rebuild");
+                return;
+            }
+        };
+        let w = self.ratio_reward_window;
+        let lo = tip_idx.saturating_sub(w.saturating_sub(1)).max(1);
+        info!(
+            "KERYX_REBUILD_PRODUCTION: rebuilding windowed-production over selected-chain [{}, {}] ({} blocks)...",
+            lo,
+            tip_idx,
+            tip_idx.saturating_sub(lo) + 1
+        );
+        let mut sums: HashMap<ScriptPublicKey, u64> = HashMap::new();
+        for i in lo..=tip_idx {
+            if let Ok(h) = sc.get_by_index(i) {
+                if let Some((spk, cut)) = self.block_production(h) {
+                    *sums.entry(spk).or_default() += cut;
+                }
+            }
+        }
+        let entries = sums.len();
+        let mut batch = WriteBatch::default();
+        self.windowed_production_store.clear(&mut batch).unwrap();
+        for (spk, v) in sums {
+            self.windowed_production_store.set_batch(&mut batch, &spk, v).unwrap();
+        }
+        self.db.write(batch).unwrap();
+        info!("KERYX_REBUILD_PRODUCTION: done — {} producer SPKs written. Restart WITHOUT the flag.", entries);
     }
 
     /// Caches the DAA and Median time windows of the sink block (if needed). Following, virtual's window calculations will
