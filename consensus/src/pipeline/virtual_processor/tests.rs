@@ -471,6 +471,67 @@ async fn windowed_production_accumulates_per_producer_and_slides() {
     assert_eq!(one_cut, vp.coinbase_manager.base_miner_cut(sink_daa));
 }
 
+/// Fastsync production-window trust (Option A): `trust_coinbase()` must relax ratio-reward coinbase
+/// verification for exactly the `ratio_reward_window` selected-chain blocks following a pruning-point
+/// UTXO import (the only window during which a fast-synced node's freshly-cleared
+/// `windowed_production_store` cannot yet match a from-genesis node's), then self-expire. A node that
+/// has never imported a snapshot must never see this relaxation.
+///
+/// The import is simulated at genesis (mirrors the `set_initial_utxo_set` / integration-test pattern
+/// for `import_pruning_point_utxo_set`: an empty multiset trivially matches genesis's own UTXO
+/// commitment). `import_pruning_point_utxo_set` recomputes virtual with the imported pruning point as
+/// its sole parent, so this must happen *before* any blocks are built on top of genesis — doing it
+/// after would silently discard that chain progress from virtual's perspective. Real fast sync never
+/// hits that ordering hazard because the imported pruning point is always itself the current chain
+/// tip; constructing a *non-genesis* pruning point with a correctly matching multiset needs the full
+/// integration-test machinery (see `ratio_reward_balance_index_reconstruction_matches_incremental` /
+/// `testing/integration/src/consensus_integration_tests.rs`), which is out of scope for this
+/// unit-level test of `trust_coinbase()`'s windowing arithmetic.
+#[tokio::test]
+async fn fastsync_catchup_window_trusts_then_expires() {
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use keryx_consensus_core::api::ConsensusApi;
+    use keryx_muhash::MuHash;
+
+    // Tiny window (mirrors `windowed_production_accumulates_per_producer_and_slides`) so the test
+    // exercises the full catch-up-then-expiry cycle in a handful of blocks instead of needing the
+    // real mainnet/testnet `ratio_reward_window` (864_000 / 1_000).
+    let mut params = MAINNET_PARAMS;
+    params.ratio_reward_window = 3;
+    let window = params.ratio_reward_window;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let vp = ctx.consensus.virtual_processor().clone();
+
+    // Never imported a snapshot ⇒ no catch-up gap to begin with, regardless of chain progress.
+    assert_eq!(vp.production_index_seed_store.read().get_optional(), None, "fresh node must have no seed recorded");
+    assert!(!vp.trust_coinbase(), "a from-genesis node must never get the fastsync relaxation");
+
+    // Simulate a pruning-point UTXO import (fast sync) at genesis, before any blocks are built (see
+    // doc comment above for why ordering matters here). The seeded index it records is the *current*
+    // selected-chain tip at the moment of the call — genesis, i.e. index 0.
+    let genesis_hash = ctx.consensus.params().genesis.hash;
+    ctx.consensus.import_pruning_point_utxo_set(genesis_hash, MuHash::new()).unwrap();
+
+    let seeded_at = vp.production_index_seed_store.read().get_optional().expect("import must record a seed");
+    assert_eq!(seeded_at, 0, "import happened at genesis ⇒ seeded index must be 0");
+    assert!(vp.trust_coinbase(), "must be trusted immediately after import (0 blocks into the catch-up window)");
+
+    // Still inside the window: ratio_reward_window - 1 more blocks keeps us under the threshold.
+    for i in 0..(window - 1) {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+        let tip_idx = vp.selected_chain_store.read().get_tip().unwrap().0;
+        assert_eq!(tip_idx, i + 1, "single-chain row must advance the selected-chain tip by exactly one block");
+        assert!(vp.trust_coinbase(), "must stay trusted while still inside the post-import catch-up window");
+    }
+
+    // One more block crosses the window boundary ⇒ the relaxation must self-expire.
+    ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    let tip_idx = vp.selected_chain_store.read().get_tip().unwrap().0;
+    assert!(tip_idx - seeded_at >= window, "test setup sanity: must have crossed the window");
+    assert!(!vp.trust_coinbase(), "must self-expire once a full ratio_reward_window of blocks has passed since import");
+}
+
 /// Ratio-reward (Stage 2b) reconstruction-equality: the balance index maintained incrementally from
 /// genesis (lockstep with the virtual UTXO set in `commit_virtual_state`) must equal, key-for-key,
 /// the index a fast-synced node rebuilds at `import_pruning_point_utxo_set` by grouping the imported

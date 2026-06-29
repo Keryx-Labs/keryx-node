@@ -232,11 +232,12 @@ impl VirtualStateProcessor {
         // selected parent → this block via its mergeset) let the ratio-reward bracket be evaluated at
         // this block's own view from the virtual-anchored balance index.
         //
-        // Skipped under the `KERYX_TRUST_COINBASE` operator opt-in (see `trust_coinbase`): the
-        // `utxo_commitment` verified above already pins this block's resulting UTXO set to the
+        // Skipped while `trust_coinbase()` holds (archival node, `KERYX_TRUST_COINBASE` operator
+        // opt-in, or still inside our own fast-sync production-index catch-up window — see its doc):
+        // the `utxo_commitment` verified above already pins this block's resulting UTXO set to the
         // canonical chain, so the block's coinbase outputs are trusted without re-deriving the ratio
-        // bracket — which a clean node cannot reproduce for the post-fork canonical chain.
-        if !self.trust_coinbase {
+        // bracket — which such a node cannot yet reproduce for the post-fork canonical chain.
+        if !self.trust_coinbase() {
             self.verify_coinbase_transaction(
                 &txs[0],
                 header.daa_score,

@@ -15,6 +15,7 @@ use crate::{
         past_pruning_points::DbPastPruningPointsStore,
         pom_proof::DbPomProofStore,
         pom_tier::DbPomTierStore,
+        production_seed::DbProductionIndexSeedStore,
         pruning::DbPruningStore,
         pruning_meta::PruningMetaStores,
         pruning_samples::DbPruningSamplesStore,
@@ -48,6 +49,9 @@ pub struct ConsensusStorage {
     pub reachability_relations_store: Arc<RwLock<DbRelationsStore>>,
     pub pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
+    /// Fast-sync catch-up: selected-chain index at which `windowed_production_store` was last
+    /// reset by a pruning-point UTXO import. See `production_seed` module doc.
+    pub production_index_seed_store: Arc<RwLock<DbProductionIndexSeedStore>>,
     pub body_tips_store: Arc<RwLock<DbTipsStore>>,
     pub pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
     pub virtual_stores: Arc<RwLock<VirtualStores>>,
@@ -241,6 +245,7 @@ impl ConsensusStorage {
 
         // Tips
         let headers_selected_tip_store = Arc::new(RwLock::new(DbHeadersSelectedTipStore::new(db.clone())));
+        let production_index_seed_store = Arc::new(RwLock::new(DbProductionIndexSeedStore::new(db.clone())));
         let body_tips_store = Arc::new(RwLock::new(DbTipsStore::new(db.clone())));
 
         // Block windows
@@ -271,6 +276,7 @@ impl ConsensusStorage {
             pruning_meta_stores,
             virtual_stores,
             selected_chain_store,
+            production_index_seed_store,
             acceptance_data_store,
             address_balance_store,
             windowed_production_store,
