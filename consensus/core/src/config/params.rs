@@ -83,6 +83,28 @@ pub const LLAMA_3_3_70B_ABLITERATED_MODEL_ID: [u8; 32] = [
     0xeb, 0x23, 0x97, 0x55, 0xa7, 0x23, 0x42, 0x1e,
 ];
 
+// --- H2 lineup refresh (gated by `very_light_activation`). MUST mirror the miner's `models.rs`. ---
+
+/// Qwen3-1.7B-abliterated Q4_K_M (mlabonne base, locally quantized). New `--very-light` tier 0
+/// post-H2. CIDv0[2..34] of model.gguf — must match the miner's `QWEN3_1_7B.model_id`.
+pub const QWEN3_1_7B_MODEL_ID: [u8; 32] = [
+    0x4f, 0x21, 0xdd, 0xeb, 0x7d, 0x62, 0xbd, 0x22,
+    0x65, 0xbc, 0x54, 0x23, 0x0d, 0x53, 0x6c, 0xa3,
+    0xf1, 0x74, 0x99, 0x27, 0x78, 0x0f, 0x52, 0x8c,
+    0x3c, 0x41, 0xfa, 0x29, 0x11, 0xdf, 0x4d, 0x72,
+];
+
+/// Llama-3.3-70B-Instruct-abliterated Q2_K_L (bartowski). Replaces the 48 GB Q4 as the post-H2
+/// top tier so a 32 GB 5090 can serve it. CIDv0[2..34] of model.gguf — must match the miner's
+/// `LLAMA_3_3_70B_Q2.model_id`. Verified: a fresh bartowski download re-hashes to exactly this CID
+/// (`QmVjsK1LBMjk24tawUrGyWUEXHQwkcPgeetC5JpNZL7p1J`), so the model_id and R_T below are canonical.
+pub const LLAMA_3_3_70B_Q2_MODEL_ID: [u8; 32] = [
+    0x6d, 0xf4, 0x6a, 0x78, 0xcb, 0xe4, 0xdc, 0x57,
+    0x9f, 0x04, 0xdb, 0xd8, 0x01, 0xf1, 0xa5, 0x20,
+    0xb9, 0xea, 0xe2, 0x8c, 0xe7, 0xb5, 0x0c, 0x8d,
+    0xa7, 0x87, 0x4b, 0xfa, 0x3f, 0xb5, 0x10, 0x8d,
+];
+
 /// Per-model minimum inference_reward in sompi. OPoI v2 lineup, enforced from
 /// `opoi_v2_activation` (replaces `INFERENCE_REWARD_MINIMUMS` at that DAA score).
 pub const INFERENCE_REWARD_MINIMUMS_V2: &[([u8; 32], u64)] = &[
@@ -153,6 +175,47 @@ pub const POM_TIERS: &[crate::pom::PomTier] = &[
     },
 ];
 
+/// Post-H2 (5-tier) possession anchors, gated by `very_light_activation`. Inserts `--very-light`
+/// Qwen3-1.7B at tier 0 (the existing tiers shift up by one) and replaces the top tier's 70B Q4
+/// with the 32 GB-servable Q2_K_L. MUST mirror the miner's `pom_tier_index` post-H2 ordering:
+/// Qwen3-1.7B=0, Gemma=1, Dolphin=2, Qwen3-32B=3, Llama-70B-Q2=4.
+pub const POM_TIERS_H2: &[crate::pom::PomTier] = &[
+    // Qwen3-1.7B (Q4_K_M, 310 tensors, 1.026 GiB) — R_T from pom-rt-builder streaming Merkle.
+    crate::pom::PomTier {
+        model_id: QWEN3_1_7B_MODEL_ID,
+        root: [
+            0xd0, 0x9a, 0x0b, 0x1c, 0x26, 0x25, 0x69, 0xc2, 0x39, 0xfa, 0xcc, 0xf6, 0x41, 0xf8, 0xe4, 0x35,
+            0x4a, 0x15, 0x77, 0x50, 0x1b, 0xa8, 0x42, 0xbc, 0x64, 0x9a, 0x87, 0x6d, 0xe1, 0xaf, 0x9a, 0x5d,
+        ],
+        chunks: 34_420_544,
+    },
+    POM_TIERS[0], // Gemma-3-4B
+    POM_TIERS[1], // Dolphin-Llama3-8B
+    POM_TIERS[2], // Qwen3-32B
+    // Llama-3.3-70B-Q2_K_L (724 tensors, 25.512 GiB) — R_T from pom-rt-builder streaming Merkle.
+    // GGUF re-downloaded from bartowski; CID verified == the recorded model_id before computing R_T.
+    crate::pom::PomTier {
+        model_id: LLAMA_3_3_70B_Q2_MODEL_ID,
+        root: [
+            0xb9, 0x6c, 0xfc, 0xb5, 0x38, 0xae, 0xb0, 0x66, 0xa1, 0x8c, 0xea, 0xa1, 0x1c, 0x8b, 0x1a, 0x04,
+            0x4f, 0x91, 0x32, 0x40, 0x8e, 0x87, 0x04, 0x8e, 0xb7, 0x41, 0xfe, 0x73, 0xed, 0x1b, 0xf6, 0x18,
+        ],
+        chunks: 856_040_456,
+    },
+];
+
+/// Possession anchors for a block at `daa_score`: the 5-tier H2 set once `very_light_activation`
+/// is live, the legacy 4-tier set before. The choice MUST be made per block from that block's own
+/// DAA (never frozen) — an archival/IBD node recomputing a pre-H2 block under the 5-tier scheme
+/// would validate against the wrong anchors and reject the chain.
+pub fn pom_tiers(very_light_active: bool) -> &'static [crate::pom::PomTier] {
+    if very_light_active {
+        POM_TIERS_H2
+    } else {
+        POM_TIERS
+    }
+}
+
 /// Tier-reward — multiplier in basis points applied to the *immediate miner cut* (the 75 %
 /// paid at once, after the R&D and escrow cuts) of a block's subsidy, indexed by the block's
 /// cryptographically-proven PoM tier (`PomProof::tier`, the slice position in `POM_TIERS`).
@@ -172,6 +235,28 @@ pub const POM_TIERS: &[crate::pom::PomTier] = &[
 ///   2  Qwen3-32B         --high         -6%
 ///   3  Llama-3.3-70B     --very-high     0%
 pub const TIER_REWARD_BPS: [u64; 4] = [8_200, 8_800, 9_400, 10_000];
+
+/// Post-H2 (5-tier) tier-reward schedule, gated by `very_light_activation`. 8-point steps with the
+/// 70B-Q2 as the 100 % top, so `--very-light` (Qwen3-1.7B) bottoms out at −32 %: smallest model ⇒
+/// weakest possession ⇒ lowest reward, deliberately steep to discourage low-effort farming of the
+/// entry tier. Wider than the legacy 4-tier 6-point spread — the H2 curve re-spaces all five tiers.
+///   0  Qwen3-1.7B        --very-light  -32%
+///   1  Gemma-3-4B        --light       -24%
+///   2  Dolphin-Llama3-8B default       -16%
+///   3  Qwen3-32B         --high         -8%
+///   4  Llama-3.3-70B-Q2  --very-high     0%
+pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
+
+/// Tier-reward schedule for a block at `daa_score`: 5-tier H2 once `very_light_activation` is live,
+/// legacy 4-tier before. Chosen per block from that block's own DAA (never frozen) — same gating
+/// discipline as `pom_tiers`, so archival/IBD recomputation of pre-H2 blocks stays canonical.
+pub fn tier_reward_bps(very_light_active: bool) -> &'static [u64] {
+    if very_light_active {
+        &TIER_REWARD_BPS_H2
+    } else {
+        &TIER_REWARD_BPS
+    }
+}
 
 /// Basis-points divisor for `TIER_REWARD_BPS` (= the top-tier 100 % reference).
 pub const TIER_REWARD_BPS_DIVISOR: u64 = 10_000;
@@ -562,6 +647,10 @@ pub struct Params {
     /// carry a valid `PomProof` (verified in `post_pow_validation` against `POM_TIERS`).
     /// DAA-gated so IBD re-validation of pre-fork history keeps the legacy self-verifying PoW.
     pub pom_activation: ForkActivation,
+    /// H2 lineup refresh (very-light Qwen3-1.7B + 70B-Q2) gate. Selects the 5-tier `POM_TIERS_H2` /
+    /// `TIER_REWARD_BPS_H2` over the legacy 4-tier sets. MUST equal the miner's
+    /// `VERY_LIGHT_ACTIVATION_DAA` for the running network. Dormant until the H2 DAA is chosen.
+    pub very_light_activation: ForkActivation,
 
     /// PoW SALT v2 hardfork activation DAA score.
     /// After this score, `KERYX_MATRIX_SALT_V2` is used for matrix generation instead of v1.
@@ -778,6 +867,8 @@ impl Params {
 
             pom_activation: self.pom_activation,
 
+            very_light_activation: self.very_light_activation,
+
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
@@ -887,6 +978,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // GGUF models by H, and pom_activation MUST equal the miner's POM_ACTIVATION_DAA, or its blocks
     // are rejected and it forks off the chain.
     pom_activation: ForkActivation::new(37_780_000),
+    very_light_activation: ForkActivation::never(), // H2 DAA TBD — set on miner + node together before activation
 
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
@@ -973,6 +1065,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoM possession: testnet DAA 5_000 to observe the kHeavyHash→PoM transition (incl.
     // difficulty drift). Mainnet stays `never()` until H and will need a difficulty reset.
     pom_activation: ForkActivation::new(5_000),
+    very_light_activation: ForkActivation::never(), // testnet H2 DAA TBD — set with the miner to exercise the 5-tier lineup
 
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
     // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).
@@ -1038,6 +1131,7 @@ pub const SIMNET_PARAMS: Params = Params {
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
+    very_light_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
@@ -1088,6 +1182,7 @@ pub const DEVNET_PARAMS: Params = Params {
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
+    very_light_activation: ForkActivation::never(),
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),

@@ -202,6 +202,8 @@ pub struct VirtualStateProcessor {
     // PoM possession activation: also gates the tier-reward coinbase split (a proven
     // tier only exists under PoM). Empty tier-bps map before this score ⇒ no penalty.
     pub(super) pom_activation: ForkActivation,
+    // H2 lineup gate — selects the 5-tier `tier_reward_bps` schedule when active at a block's daa.
+    pub(super) very_light_activation: ForkActivation,
     // Ratio-reward activation: empty ratio-bps map before this score ⇒ no penalty.
     pub(super) ratio_reward_activation: ForkActivation,
     // Trailing selected-chain window length (blocks) for the ratio-reward production index.
@@ -321,6 +323,7 @@ impl VirtualStateProcessor {
             pow_salt_v2_activation: params.pow_salt_v2_activation,
             pow_salt_v4_activation: params.pow_salt_v4_activation,
             pom_activation: params.pom_activation,
+            very_light_activation: params.very_light_activation,
             ratio_reward_activation: params.ratio_reward_activation,
             ratio_reward_window: params.ratio_reward_window,
             is_archival,

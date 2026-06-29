@@ -28,7 +28,7 @@ use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
-use keryx_consensus_core::config::params::{TIER_REWARD_BPS, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps};
+use keryx_consensus_core::config::params::{TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -400,9 +400,12 @@ impl VirtualStateProcessor {
         if !self.pom_activation.is_active(pov_daa_score) {
             return map;
         }
+        // Reward schedule gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
+        // keyed on this block's own daa_score to match `pom_tiers` and stay canonical under IBD.
+        let schedule = tier_reward_bps(self.very_light_activation.is_active(pov_daa_score));
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             if let Some(tier) = self.pom_tier_store.get(*blue).optional().unwrap() {
-                let bps = TIER_REWARD_BPS.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+                let bps = schedule.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
                 map.insert(*blue, bps);
             }
         }

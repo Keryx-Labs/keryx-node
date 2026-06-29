@@ -4,7 +4,7 @@ use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
 use keryx_consensus_core::{
     block::Block,
-    config::params::{POM_OPENINGS, POM_TIERS, POM_WALK_STEPS},
+    config::params::{POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
@@ -154,7 +154,10 @@ impl BlockBodyProcessor {
             return Ok(());
         }
         let proof = block.pom_proof.as_ref().ok_or(RuleError::PomProofMissing)?;
-        let tier = POM_TIERS.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
+        // Tier set is gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
+        // chosen from this block's own daa_score so archival/IBD recomputation stays canonical.
+        let tiers = pom_tiers(self.very_light_activation.is_active(header.daa_score));
+        let tier = tiers.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
 
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
         let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
