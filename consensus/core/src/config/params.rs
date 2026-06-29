@@ -100,6 +100,18 @@ pub const POM_WALK_STEPS: u32 = 256;
 /// Fiat-Shamir-opened steps revealed per `PomProof` (soundness `~f^t` vs proof size).
 pub const POM_OPENINGS: usize = 32;
 
+/// Selected-chain depth, in chain blocks, behind which a block's persisted `PomProof` may be
+/// garbage-collected. Each proof is ~48 KB; persisting one per block over the full body window
+/// (`pruning_depth`, days of blocks) is what doubled pruned datadirs after the PoM hardfork. A
+/// proof is only ever needed to (re-)serve a *recent* block to peers via relay; far older blocks
+/// are only ever requested through IBD, which does not verify the proof (`skip_pom_proof`). So
+/// keeping proofs for the last `POM_PROOF_RETENTION_DEPTH` chain blocks (~83 min at 10 BPS) is far
+/// more than the relay horizon (a few hundred blocks) and lets the rest be reclaimed. Deleting a
+/// proof can never corrupt consensus state: the proof is not part of the UTXO set / state, and the
+/// header `utxo_commitment` already pins the state. NOTE: the actual GC pass is gated OFF by
+/// default behind the `KERYX_POM_PROOF_GC` env flag (see the pruning processor).
+pub const POM_PROOF_RETENTION_DEPTH: u64 = 50_000;
+
 /// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
 /// produced offline by `pom-rt-builder` (canonical: name-sorted GGUF tensors). Tier index =
 /// slice position; `model_id` ties the tier to the declared model. Difficulty stays global

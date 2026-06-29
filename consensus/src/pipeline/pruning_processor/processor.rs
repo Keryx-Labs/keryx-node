@@ -11,6 +11,7 @@ use crate::{
             ghostdag::{CompactGhostdagData, GhostdagStoreReader},
             headers::HeaderStoreReader,
             past_pruning_points::PastPruningPointsStoreReader,
+            pom_proof::PomProofStoreReader,
             pruning::PruningStoreReader,
             pruning_samples::PruningSamplesStoreReader,
             reachability::{DbReachabilityStore, ReachabilityStoreReader, StagingReachabilityStore},
@@ -30,7 +31,7 @@ use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, BlockLevel,
     blockhash::ORIGIN,
     blockstatus::BlockStatus::StatusHeaderOnly,
-    config::Config,
+    config::{Config, params::POM_PROOF_RETENTION_DEPTH},
     muhash::MuHashExtensions,
     pruning::{PruningPointProof, PruningPointTrustedData},
     trusted::ExternalGhostdagData,
@@ -48,7 +49,7 @@ use std::{
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -83,6 +84,11 @@ pub struct PruningProcessor {
 
     // Signals
     is_consensus_exiting: Arc<AtomicBool>,
+
+    // Highest selected-chain index whose mergeset PoM proofs have already been garbage-collected
+    // (see `gc_pom_proofs_if_enabled`). In-memory only — on restart the sweep simply re-walks from
+    // the pruning point, issuing harmless no-op deletes for proofs that are already gone.
+    pom_gc_cursor: AtomicU64,
 }
 
 impl Deref for PruningProcessor {
@@ -114,6 +120,7 @@ impl PruningProcessor {
             pruning_lock,
             config,
             is_consensus_exiting,
+            pom_gc_cursor: AtomicU64::new(0),
         }
     }
 
@@ -136,7 +143,81 @@ impl PruningProcessor {
                 recovered = true;
             }
             self.advance_pruning_point_if_possible(sink_ghostdag_data);
+            self.gc_pom_proofs_if_enabled();
         }
+    }
+
+    /// Garbage-collect PoM possession proofs older than `POM_PROOF_RETENTION_DEPTH` chain blocks.
+    ///
+    /// Gated OFF by default behind the `KERYX_POM_PROOF_GC` env flag. When enabled this is a
+    /// self-contained cache reclaim: it deletes only from the `pom_proof` store and touches no
+    /// consensus state (UTXO, statuses, rewards, relations). The worst case if it ever over-deletes
+    /// is a recent block being served "naked" — which IBD tolerates (it skips proof verification,
+    /// `skip_pom_proof`) and the serving guard-rail flags loudly; it can never cause a UTXO /
+    /// consensus divergence, since the header `utxo_commitment` is what pins state, not the proof.
+    ///
+    /// Walk strategy (bounded, never a full-store scan): every block belongs to the mergeset of
+    /// exactly one selected-chain block, so iterating chain blocks and deleting each one's mergeset
+    /// proofs (blues + reds + the chain block itself) covers the whole DAG without overlap. An
+    /// in-memory cursor advances from the pruning point up to `tip - retention`, processing at most
+    /// `GC_BATCH` chain blocks per pruning message so a large backlog drains gradually without ever
+    /// blocking consensus.
+    fn gc_pom_proofs_if_enabled(&self) {
+        const GC_BATCH: u64 = 2_000;
+        if std::env::var("KERYX_POM_PROOF_GC").is_err() {
+            return;
+        }
+
+        let Ok((tip_index, _)) = self.selected_chain_store.read().get_tip() else {
+            return;
+        };
+        let target = tip_index.saturating_sub(POM_PROOF_RETENTION_DEPTH);
+        if target == 0 {
+            return;
+        }
+
+        // Lower bound: nothing below the pruning point exists anymore, so never walk past it.
+        let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
+        let floor = self.selected_chain_store.read().get_by_hash(pruning_point).optional().unwrap().unwrap_or(0);
+        let from = self.pom_gc_cursor.load(Ordering::Relaxed).max(floor);
+        if from >= target {
+            return; // caught up — nothing newly exited the retention window
+        }
+        let to = target.min(from + GC_BATCH);
+
+        // Resolve chain index -> hash under a single brief read lock; do the heavy work lock-free.
+        let chain_hashes: Vec<Hash> = {
+            let sc = self.selected_chain_store.read();
+            ((from + 1)..=to).filter_map(|i| sc.get_by_index(i).optional().unwrap()).collect()
+        };
+
+        let mut batch = WriteBatch::default();
+        let mut deleted = 0u64;
+        for chain_hash in chain_hashes {
+            // Cheap skip for pre-fork chain blocks (no proof) and their pre-fork mergesets.
+            if !self.pom_proof_store.has(chain_hash).unwrap_or(false) {
+                continue;
+            }
+            let Some(gd) = self.ghostdag_store.get_data(chain_hash).optional().unwrap() else {
+                continue;
+            };
+            for hash in std::iter::once(chain_hash)
+                .chain(gd.mergeset_blues.iter().copied())
+                .chain(gd.mergeset_reds.iter().copied())
+            {
+                self.pom_proof_store.delete_batch(&mut batch, hash).unwrap();
+                deleted += 1;
+            }
+        }
+        self.db.write(batch).unwrap();
+        self.pom_gc_cursor.store(to, Ordering::Relaxed);
+        debug!(
+            "PoM proof GC: swept chain indices {}..={} ({} block proofs deleted; retention depth {})",
+            from + 1,
+            to,
+            deleted,
+            POM_PROOF_RETENTION_DEPTH
+        );
     }
 
     fn recover_pruning_workflows_if_needed(&self) -> bool {
