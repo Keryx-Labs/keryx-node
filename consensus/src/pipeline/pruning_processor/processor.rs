@@ -143,13 +143,13 @@ impl PruningProcessor {
                 recovered = true;
             }
             self.advance_pruning_point_if_possible(sink_ghostdag_data);
-            self.gc_pom_proofs_if_enabled();
+            self.gc_old_pom_proofs();
         }
     }
 
     /// Garbage-collect PoM possession proofs older than `POM_PROOF_RETENTION_DEPTH` chain blocks.
     ///
-    /// Gated OFF by default behind the `KERYX_POM_PROOF_GC` env flag. When enabled this is a
+    /// Runs unconditionally on every pruning message — no flag, transparent on every node. It is a
     /// self-contained cache reclaim: it deletes only from the `pom_proof` store and touches no
     /// consensus state (UTXO, statuses, rewards, relations). The worst case if it ever over-deletes
     /// is a recent block being served "naked" — which IBD tolerates (it skips proof verification,
@@ -162,11 +162,8 @@ impl PruningProcessor {
     /// in-memory cursor advances from the pruning point up to `tip - retention`, processing at most
     /// `GC_BATCH` chain blocks per pruning message so a large backlog drains gradually without ever
     /// blocking consensus.
-    fn gc_pom_proofs_if_enabled(&self) {
+    fn gc_old_pom_proofs(&self) {
         const GC_BATCH: u64 = 2_000;
-        if std::env::var("KERYX_POM_PROOF_GC").is_err() {
-            return;
-        }
 
         let Ok((tip_index, _)) = self.selected_chain_store.read().get_tip() else {
             return;

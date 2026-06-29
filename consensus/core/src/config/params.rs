@@ -108,8 +108,8 @@ pub const POM_OPENINGS: usize = 32;
 /// keeping proofs for the last `POM_PROOF_RETENTION_DEPTH` chain blocks (~83 min at 10 BPS) is far
 /// more than the relay horizon (a few hundred blocks) and lets the rest be reclaimed. Deleting a
 /// proof can never corrupt consensus state: the proof is not part of the UTXO set / state, and the
-/// header `utxo_commitment` already pins the state. NOTE: the actual GC pass is gated OFF by
-/// default behind the `KERYX_POM_PROOF_GC` env flag (see the pruning processor).
+/// header `utxo_commitment` already pins the state. The GC pass runs unconditionally on every node
+/// (see the pruning processor) — no flag, transparent — so pruned datadirs stay bounded by design.
 pub const POM_PROOF_RETENTION_DEPTH: u64 = 50_000;
 
 /// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
