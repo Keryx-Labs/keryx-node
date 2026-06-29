@@ -23,7 +23,7 @@ use keryx_core::{
     kaspad_env::{name, version},
     task::tick::TickService,
 };
-use keryx_core::{time::unix_now, warn};
+use keryx_core::{error, time::unix_now, warn};
 use keryx_hashes::Hash;
 use keryx_mining::mempool::tx::{Orphan, Priority};
 use keryx_mining::{manager::MiningManagerProxy, mempool::tx::RbfPolicy};
@@ -298,6 +298,25 @@ impl Deref for FlowContext {
 }
 
 impl FlowContext {
+    /// PoM guard-rail. A block at/after `pom_activation` MUST carry its possession proof. Serving
+    /// it "naked" (proof `None`) is what wedged the network on 2026-06-29: the receiving peer
+    /// persists the naked block, later relays it, the relay is rejected ("PoM possession proof
+    /// missing"), and the rejection cascades into a network-wide freeze. We do NOT refuse to serve
+    /// (that would stall a legitimately-syncing peer), but we turn the previously-silent condition
+    /// into a loud error so an operator catches it immediately instead of debugging a frozen chain.
+    /// Returns `true` when the block is naked. Called from every block/body serving path.
+    pub fn warn_if_serving_naked_pom_block(&self, block: &Block) -> bool {
+        let naked = self.config.pom_activation.is_active(block.header.daa_score) && block.pom_proof.is_none();
+        if naked {
+            error!(
+                "PoM guard-rail: about to serve block {} (daa {}) WITHOUT its possession proof. Proof-enforcing peers will reject it — this is how a propagation hole becomes a network wedge. The proof was not persisted for this block (pre-fix or pruned); it should be re-synced from a proof-carrying node.",
+                block.hash(),
+                block.header.daa_score
+            );
+        }
+        naked
+    }
+
     pub fn new(
         consensus_manager: Arc<ConsensusManager>,
         address_manager: Arc<Mutex<AddressManager>>,

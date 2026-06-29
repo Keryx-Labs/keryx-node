@@ -39,6 +39,7 @@ impl HandleIbdBlockRequests {
 
             for hash in hashes {
                 let block = session.async_get_block(hash).await?;
+                self.ctx.warn_if_serving_naked_pom_block(&block);
                 self.router.enqueue(make_response!(Payload::IbdBlock, (self.header_format, &block).into(), request_id)).await?;
             }
         }

@@ -99,6 +99,32 @@ mod tests {
     }
 
     #[test]
+    fn pom_proof_survives_body_message_roundtrip() {
+        // Mirrors the IBD body-sync path that wedged the network on 2026-06-29: the serving flow
+        // (`v8::request_block_bodies`) borsh-encodes the proof into `BlockBodyMessage.pom_proof` and
+        // the tier into `pom_tier`; the receiving flow (`ibd::flow`) borsh-decodes them back. The
+        // `From<&BlockBody>` conversion itself drops both (it only has transactions), so this guards
+        // the manual encode/decode the flows perform — the exact step that was missing before.
+        let proof = dummy_proof();
+
+        // Serve side (request_block_bodies): start from the transaction-only conversion, then attach.
+        let mut body: protowire::BlockBodyMessage = (&BlockBody::new()).into();
+        assert!(body.pom_proof.is_none() && body.pom_tier.is_none());
+        body.pom_tier = Some(proof.tier as u32);
+        body.pom_proof = Some(borsh::to_vec(&proof).expect("PomProof borsh serialize"));
+
+        // Receive side (ibd::flow): decode tier + proof back out.
+        assert_eq!(body.pom_tier.map(|t| t as u8), Some(1));
+        let decoded: PomProof = borsh::from_slice(body.pom_proof.as_deref().unwrap()).expect("proof preserved over the body wire");
+        assert_eq!(decoded.tier, proof.tier);
+        assert_eq!(decoded.trace_root, proof.trace_root);
+        assert_eq!(decoded.final_state, proof.final_state);
+        assert_eq!(decoded.openings.len(), 1);
+        assert_eq!(decoded.openings[0].state_before, 42);
+        assert_eq!(decoded.openings[0].weight_path.len(), 2);
+    }
+
+    #[test]
     fn no_proof_roundtrips_as_none() {
         let block = Block::from_precomputed_hash(Hash::from_bytes([2u8; 32]), vec![]);
         let msg: protowire::BlockMessage = (HeaderFormat::Legacy, &block).into();
