@@ -186,7 +186,16 @@ impl ProofContext {
             let mut selected_tip =
                 proof[level as usize].first().map(|header| header.hash).ok_or(PruningImportError::PruningProofNotEnoughHeaders)?;
             for (i, header) in proof[level as usize].iter().enumerate() {
+                // `header_level` keeps the real PoW-derived level so it stays consistent with the
+                // builder's per-level placement. But post-PoM kHeavyHash is not the PoW (PoM
+                // possession is, verified in body validation) — post-pom headers carry no valid
+                // kHeavyHash, so the pass/fail PoW check must be bypassed for them, else the proof
+                // rejects every post-pom block with ProofOfWorkFailed and no from-scratch node can
+                // sync across pom_activation. Pre-pom history is still fully PoW-validated; post-pom
+                // blocks are trusted (PoM security model — same as the normal-validation skip in
+                // `pre_ghostdag_validation::check_pow_and_calc_block_level`).
                 let (header_level, pow_passes) = calc_block_level_check_pow(header, ppm.max_block_level);
+                let pow_passes = pow_passes || ppm.pom_activation.is_active(header.daa_score);
                 if header_level < level {
                     return Err(PruningImportError::PruningProofWrongBlockLevel(header.hash, header_level, level));
                 }

@@ -17,6 +17,7 @@ use rocksdb::WriteBatch;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, BlockLevel, HashMapCustomHasher, KType,
     blockhash::{self, BlockHashExtensions},
+    config::params::ForkActivation,
     errors::{
         consensus::{ConsensusError, ConsensusResult},
         pruning::{PruningImportError, PruningImportResult},
@@ -117,6 +118,9 @@ pub struct PruningProofManager {
     anticone_finalization_depth: u64,
     ghostdag_k: KType,
     skip_proof_of_work: bool,
+    // Post-PoM blocks carry no valid kHeavyHash PoW (PoM possession replaces it), so the proof's
+    // per-level PoW check must skip them — mirror `pre_ghostdag_validation::check_pow_and_calc_block_level`.
+    pom_activation: ForkActivation,
 
     is_consensus_exiting: Arc<AtomicBool>,
 }
@@ -137,6 +141,7 @@ impl PruningProofManager {
         anticone_finalization_depth: u64,
         ghostdag_k: KType,
         skip_proof_of_work: bool,
+        pom_activation: ForkActivation,
         is_consensus_exiting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -171,6 +176,7 @@ impl PruningProofManager {
             anticone_finalization_depth,
             ghostdag_k,
             skip_proof_of_work,
+            pom_activation,
 
             is_consensus_exiting,
         }
