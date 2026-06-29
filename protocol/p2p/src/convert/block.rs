@@ -23,9 +23,9 @@ impl From<(HeaderFormat, &Block)> for protowire::BlockMessage {
 }
 impl From<&BlockBody> for protowire::BlockBodyMessage {
     fn from(block_body: &BlockBody) -> Self {
-        // `pom_tier` is set by the IBD body serving flow (it has the block hash to look it up);
-        // this `BlockBody` (= just transactions) carries no tier.
-        Self { transactions: block_body.iter().map(|tx| tx.into()).collect(), pom_tier: None }
+        // `pom_tier`/`pom_proof` are set by the IBD body serving flow (it has the block hash to
+        // look them up); this `BlockBody` (= just transactions) carries neither.
+        Self { transactions: block_body.iter().map(|tx| tx.into()).collect(), pom_tier: None, pom_proof: None }
     }
 }
 

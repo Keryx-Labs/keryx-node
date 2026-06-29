@@ -29,6 +29,7 @@ keryx-mining.workspace = true
 keryx-notify.workspace = true
 
 async-trait.workspace = true
+borsh.workspace = true
 futures = { workspace = true, features = ["alloc"] }
 indexmap.workspace = true
 itertools.workspace = true

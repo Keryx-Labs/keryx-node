@@ -75,6 +75,10 @@ message BlockBodyMessage{
   // Proven PoM tier (see BlockMessage.pom_tier) — needed so a syncing node can validate the
   // coinbase tier-reward split for body-only IBD of post-pom blocks.
   optional uint32 pom_tier = 2;
+  // Borsh-encoded PomProof, carried so IBD'd blocks get their possession proof persisted and
+  // can later be relayed to proof-enforcing peers (otherwise they are served "naked" and
+  // rejected with "PoM possession proof missing"). Absent before pom_activation.
+  optional bytes pom_proof = 3;
 }
 
 message BlockHeader{

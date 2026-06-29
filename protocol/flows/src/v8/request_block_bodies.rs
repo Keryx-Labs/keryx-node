@@ -35,12 +35,15 @@ impl HandleBlockBodyRequests {
             let session = self.ctx.consensus().unguarded_session();
 
             for hash in hashes {
-                // Fetch the full block (not just the body) so the proven PoM tier travels with the
-                // body: a syncing peer needs it to validate the coinbase tier-reward split for
-                // post-pom blocks, since IBD does not carry the full proof.
+                // Fetch the full block (not just the body) so the proven PoM tier AND the
+                // possession proof travel with the body: a syncing peer needs the tier to validate
+                // the coinbase tier-reward split, and the proof so the block it persists can later
+                // be relayed to proof-enforcing peers (otherwise it is served "naked" and rejected
+                // with "PoM possession proof missing").
                 let block = session.async_get_block(hash).await?;
                 let mut body_msg: keryx_p2p_lib::pb::BlockBodyMessage = block.transactions.as_ref().into();
                 body_msg.pom_tier = block.pom_tier.map(|t| t as u32);
+                body_msg.pom_proof = block.pom_proof.as_ref().map(|p| borsh::to_vec(p.as_ref()).expect("PomProof borsh serialize"));
                 self.router.enqueue(make_response!(Payload::BlockBody, body_msg, request_id)).await?;
             }
         }

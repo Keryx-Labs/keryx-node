@@ -10,6 +10,7 @@ use keryx_consensus_core::{
     api::BlockValidationFuture,
     block::Block,
     header::Header,
+    pom::PomProof,
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
     trusted::TrustedBlock,
     tx::Transaction,
@@ -936,9 +937,18 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             .await?;
         for &expected_hash in chunk {
             let msg = dequeue_with_timeout!(self.incoming_route, Payload::BlockBody)?;
-            // Capture the proven tier before consuming `msg` — needed to validate the coinbase
-            // tier-reward split (IBD does not carry the full proof).
+            // Capture the proven tier and possession proof before consuming `msg`. The tier is
+            // needed to validate the coinbase tier-reward split; the proof must be persisted so this
+            // block can later be relayed to proof-enforcing peers (otherwise it is served "naked"
+            // and rejected with "PoM possession proof missing").
             let pom_tier = msg.pom_tier.map(|t| t as u8);
+            let pom_proof = msg
+                .pom_proof
+                .as_deref()
+                .map(borsh::from_slice::<PomProof>)
+                .transpose()
+                .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for block {}", expected_hash)))?
+                .map(Arc::new);
             // TODO (relaxed): make header queries in a batch.
             let blk_header = consensus.async_get_header(expected_hash).await.map_err(|err| {
                 // Conceptually this indicates local inconsistency, since we received the expected hashes via a local
@@ -949,7 +959,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             if blk_body.is_empty() {
                 return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", expected_hash)));
             }
-            let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof: None, pom_tier };
+            let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof, pom_tier };
             current_daa_score = block.header.daa_score;
             current_timestamp = block.header.timestamp;
             jobs.push(consensus.validate_and_insert_block_ibd(block).virtual_state_task);
