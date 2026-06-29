@@ -306,6 +306,22 @@ impl IbdFlow {
             return Err(ProtocolError::Other("peer is in a finality conflict with the local pruning point"));
         }
 
+        // Option B (KERYX_TRUST_SYNC_FROM_TIP): no shared chain block was found because our tip is
+        // below the trusted peer's pruning point. The standard fallback below is headers-proof IBD,
+        // which is broken across the PoM/diff-reset hardfork. Instead, trust the `--connect`'d
+        // archival peer and catch up forward from our own sink (it serves the blocks below its
+        // pruning point). See `trust_sync_from_tip` — gated by env, unsafe for public P2P.
+        if self.trust_sync_from_tip() {
+            let local_sink = consensus.async_get_sink().await;
+            let is_utxo_stable = consensus.async_is_pruning_utxoset_stable().await;
+            let is_pp_anticone_synced = consensus.async_is_pruning_point_anticone_fully_synced().await;
+            warn!(
+                "KERYX_TRUST_SYNC_FROM_TIP: no shared chain block with {} (our tip is below its pruning point) — trusting peer, catching up forward from local sink {}",
+                self.router, local_sink
+            );
+            return Ok(IbdType::Sync { highest_known_syncer_chain_hash: local_sink, is_utxo_stable, is_pp_anticone_synced });
+        }
+
         let hst_header = consensus.async_get_header(consensus.async_get_headers_selected_tip().await).await.unwrap();
         let pruning_depth = self.ctx.config.pruning_depth();
         if relay_header.blue_score >= hst_header.blue_score + pruning_depth && relay_header.blue_work > hst_header.blue_work {
@@ -547,6 +563,19 @@ impl IbdFlow {
     fn sync_ceiling(&self) -> Option<u64> {
         static SYNC_CEILING: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
         *SYNC_CEILING.get_or_init(|| std::env::var("KERYX_SYNC_CEILING_DAA").ok().and_then(|s| s.parse().ok()))
+    }
+
+    /// Option B (env `KERYX_TRUST_SYNC_FROM_TIP=1`): when syncing from a trusted, `--connect`'d
+    /// archival source whose pruning point is ABOVE our tip, the standard negotiation finds no
+    /// shared chain block (it only searches the peer's chain down to its pruning point) and falls
+    /// back to headers-proof IBD — which is broken across the PoM/difficulty-reset hardfork
+    /// (post-PoM blocks have no kHeavyHash PoW, and the reset collapses post-reset blue work). With
+    /// this set we instead trust the peer and catch up forward from our own sink (the archival has
+    /// the blocks below its pruning point and serves them). UNSAFE for public P2P — it skips
+    /// proof-based chain selection — use only against a known-good `--connect` peer.
+    fn trust_sync_from_tip(&self) -> bool {
+        static TRUST_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TRUST_SYNC.get_or_init(|| matches!(std::env::var("KERYX_TRUST_SYNC_FROM_TIP").as_deref(), Ok("1")))
     }
 
     /// Downloads and validates headers from the shared point up to the syncer's sink. Returns the
