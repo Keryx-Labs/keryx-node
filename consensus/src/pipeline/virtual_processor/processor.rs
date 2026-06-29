@@ -225,6 +225,9 @@ pub struct VirtualStateProcessor {
     // In every case the header `utxo_commitment` (checked first, always) already pins the resulting
     // UTXO set to the canonical chain, so trusting the block's coinbase outputs is safe.
     pub(super) is_archival: bool,
+    // `KERYX_TRUST_COINBASE` operator override, read once at construction (it never changes at
+    // runtime) so the per-block `trust_coinbase()` hot path avoids a fresh env lookup per coinbase.
+    pub(super) trust_coinbase_env: bool,
 }
 
 impl VirtualStateProcessor {
@@ -249,7 +252,8 @@ impl VirtualStateProcessor {
         // the ratio/tier coinbase. They therefore MUST trust it (the header utxo_commitment still
         // pins the resulting UTXO set). Auto-enabled by `--archival`; `KERYX_TRUST_COINBASE=1` also
         // forces it on. See field doc.
-        if is_archival || std::env::var("KERYX_TRUST_COINBASE").is_ok() {
+        let trust_coinbase_env = std::env::var("KERYX_TRUST_COINBASE").is_ok();
+        if is_archival || trust_coinbase_env {
             warn!(
                 "Ratio/tier coinbase verification DISABLED ({}) — following the chain on UTXO-commitment trust only.",
                 if is_archival { "archival node" } else { "KERYX_TRUST_COINBASE set" }
@@ -320,6 +324,7 @@ impl VirtualStateProcessor {
             ratio_reward_activation: params.ratio_reward_activation,
             ratio_reward_window: params.ratio_reward_window,
             is_archival,
+            trust_coinbase_env,
         }
     }
 
@@ -328,7 +333,7 @@ impl VirtualStateProcessor {
     /// every call (cheap: one cached env lookup + at most one store read) rather than fixed at
     /// construction, so the fast-sync catch-up relaxation auto-expires once the window refills.
     pub(super) fn trust_coinbase(&self) -> bool {
-        self.is_archival || std::env::var("KERYX_TRUST_COINBASE").is_ok() || self.in_production_catchup_window()
+        self.is_archival || self.trust_coinbase_env || self.in_production_catchup_window()
     }
 
     /// True while we're still inside our own post-import catch-up window: fewer than
