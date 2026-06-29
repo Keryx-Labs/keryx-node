@@ -78,6 +78,10 @@ pub enum DatabaseStorePrefixes {
     /// Ratio-reward production index: payout SPK → Σ coinbase miner-cut over the trailing window W
     WindowedProduction = 44,
 
+    /// Fast-sync catch-up: virtual selected-chain index at which `WindowedProduction` was last reset
+    /// by a pruning-point UTXO import (see `import_pruning_point_utxo_set`). Single value, no key.
+    ProductionIndexSeededAt = 45,
+
     // ---- Retention Period Root ----
     RetentionPeriodRoot = 50,
 

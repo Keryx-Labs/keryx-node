@@ -25,6 +25,7 @@ use crate::{
             address_amount::DbAddressAmountStore,
             past_pruning_points::DbPastPruningPointsStore,
             pom_tier::DbPomTierStore,
+            production_seed::{DbProductionIndexSeedStore, ProductionIndexSeedStore},
             pruning::{DbPruningStore, PruningStoreReader},
             pruning_meta::PruningMetaStores,
             pruning_samples::DbPruningSamplesStore,
@@ -132,6 +133,7 @@ pub struct VirtualStateProcessor {
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
     pub(super) depth_store: Arc<DbDepthStore>,
     pub(super) selected_chain_store: Arc<RwLock<DbSelectedChainStore>>,
+    pub(super) production_index_seed_store: Arc<RwLock<DbProductionIndexSeedStore>>,
     pub(super) pruning_samples_store: Arc<DbPruningSamplesStore>,
 
     // Utxo-related stores
@@ -205,13 +207,24 @@ pub struct VirtualStateProcessor {
     // Trailing selected-chain window length (blocks) for the ratio-reward production index.
     pub(super) ratio_reward_window: u64,
 
-    // Skip ratio/tier coinbase verification while following the chain. Auto-enabled for ARCHIVAL
-    // nodes (`KERYX_TRUST_COINBASE=1` also forces it on): an archival node retains blocks below the
-    // pruning point, so its windowed-production fold subtracts leaving blocks that pruned nodes (the
-    // canonical majority) never see → it computes a different ratio and would disqualify the whole
-    // chain. The header `utxo_commitment` (checked first, always) already pins the resulting UTXO set
-    // to the canonical chain, so trusting the block's coinbase outputs is safe.
-    pub(super) trust_coinbase: bool,
+    // Skip ratio/tier coinbase verification while following the chain. Three independent reasons,
+    // ORed together and re-checked live (see `trust_coinbase()`) rather than fixed at construction:
+    //  - `is_archival`: an archival node retains blocks below the pruning point, so its
+    //    windowed-production fold subtracts leaving blocks that pruned nodes (the canonical
+    //    majority) never see → it computes a different ratio and would disqualify the whole chain.
+    //    Permanent for the node's lifetime.
+    //  - `KERYX_TRUST_COINBASE` env: manual operator override, also permanent.
+    //  - fast-sync catch-up window: `import_pruning_point_utxo_set` clears (does not seed) the
+    //    windowed-production index, on the assumption the whole `ratio_reward_window` lies above
+    //    the pruning point. That assumption breaks once the chain has advanced past `pruning_depth`
+    //    beyond the ratio-reward activation height — every fresh fast sync then starts its index at
+    //    zero while activation is already live, and needs a full window of catch-up before its
+    //    computed ratio matches long-running nodes. This case self-expires: once
+    //    `current_tip_index - seeded_at_index >= ratio_reward_window`, the index has organically
+    //    refilled and verification re-enables itself with no operator action.
+    // In every case the header `utxo_commitment` (checked first, always) already pins the resulting
+    // UTXO set to the canonical chain, so trusting the block's coinbase outputs is safe.
+    pub(super) is_archival: bool,
 }
 
 impl VirtualStateProcessor {
@@ -236,8 +249,7 @@ impl VirtualStateProcessor {
         // the ratio/tier coinbase. They therefore MUST trust it (the header utxo_commitment still
         // pins the resulting UTXO set). Auto-enabled by `--archival`; `KERYX_TRUST_COINBASE=1` also
         // forces it on. See field doc.
-        let trust_coinbase = is_archival || std::env::var("KERYX_TRUST_COINBASE").is_ok();
-        if trust_coinbase {
+        if is_archival || std::env::var("KERYX_TRUST_COINBASE").is_ok() {
             warn!(
                 "Ratio/tier coinbase verification DISABLED ({}) — following the chain on UTXO-commitment trust only.",
                 if is_archival { "archival node" } else { "KERYX_TRUST_COINBASE set" }
@@ -265,6 +277,7 @@ impl VirtualStateProcessor {
             body_tips_store: storage.body_tips_store.clone(),
             depth_store: storage.depth_store.clone(),
             selected_chain_store: storage.selected_chain_store.clone(),
+            production_index_seed_store: storage.production_index_seed_store.clone(),
             pruning_samples_store: storage.pruning_samples_store.clone(),
             utxo_diffs_store: storage.utxo_diffs_store.clone(),
             utxo_multisets_store: storage.utxo_multisets_store.clone(),
@@ -306,8 +319,32 @@ impl VirtualStateProcessor {
             pom_activation: params.pom_activation,
             ratio_reward_activation: params.ratio_reward_activation,
             ratio_reward_window: params.ratio_reward_window,
-            trust_coinbase,
+            is_archival,
         }
+    }
+
+    /// Whether ratio/tier coinbase verification should be skipped for the chain we're currently
+    /// following. See the field doc on `is_archival` for the three ORed conditions. Re-evaluated on
+    /// every call (cheap: one cached env lookup + at most one store read) rather than fixed at
+    /// construction, so the fast-sync catch-up relaxation auto-expires once the window refills.
+    pub(super) fn trust_coinbase(&self) -> bool {
+        self.is_archival || std::env::var("KERYX_TRUST_COINBASE").is_ok() || self.in_production_catchup_window()
+    }
+
+    /// True while we're still inside our own post-import catch-up window: fewer than
+    /// `ratio_reward_window` selected-chain blocks have been committed since the last
+    /// pruning-point UTXO import seeded (cleared) `windowed_production_store`. `false` if the node
+    /// has never imported a snapshot (built from genesis — no gap to begin with).
+    fn in_production_catchup_window(&self) -> bool {
+        let seeded_at = match self.production_index_seed_store.read().get_optional() {
+            Some(idx) => idx,
+            None => return false,
+        };
+        let tip_idx = match self.selected_chain_store.read().get_tip() {
+            Ok((idx, _)) => idx,
+            Err(_) => return false,
+        };
+        tip_idx.saturating_sub(seeded_at) < self.ratio_reward_window
     }
 
     pub fn worker(self: &Arc<Self>) {
@@ -1334,22 +1371,44 @@ impl VirtualStateProcessor {
             // diff since genesis; a fast-synced node skips that history, so seed the index directly
             // from the imported pruning-point UTXO snapshot (grouped per payout SPK). The incremental
             // lockstep maintenance in `commit_virtual_state` then carries it forward from here.
-            // The windowed-production index needs no seed (`W < pruning_depth` ⇒ its whole window lies
-            // above the pruning point and is rebuilt exactly by the IBD that follows); we only clear
-            // it so a re-import over a populated DB cannot leave stale aggregates.
+            //
+            // The windowed-production index is NOT seeded from the snapshot (there is nothing to seed
+            // it with — the snapshot is a UTXO set, not a production history) — we only clear it so a
+            // re-import over a populated DB cannot leave stale aggregates. This was historically assumed
+            // safe because `W < pruning_depth` ⇒ the whole window lies above the pruning point and gets
+            // rebuilt exactly by the IBD that follows, completing before the window matters. That holds
+            // only while the pruning point is still before the ratio-reward activation height; once the
+            // chain has advanced past `pruning_depth` beyond it, every fresh fast sync now lands its
+            // import after activation, and needs a full window of catch-up before its computed ratio
+            // matches long-running nodes. We record the pre-import chain position here so
+            // `trust_coinbase()` can detect and bound exactly that catch-up period (self-expiring once
+            // the window organically refills) instead of disqualifying every block it sees in the
+            // meantime. See `production_seed` module doc and `is_archival` field doc for the full
+            // rationale.
             let mut balances: HashMap<ScriptPublicKey, u64> = HashMap::new();
             for item in virtual_write.utxo_set.iterator() {
                 let (_, entry) = item.unwrap();
                 let acc = balances.entry(entry.script_public_key.clone()).or_default();
                 *acc = acc.saturating_add(entry.amount);
             }
+            let production_seed_index = match self.selected_chain_store.read().get_tip() {
+                Ok((idx, _)) => idx,
+                Err(_) => 0,
+            };
             let mut batch = WriteBatch::default();
             self.address_balance_store.clear(&mut batch).unwrap();
             self.windowed_production_store.clear(&mut batch).unwrap();
+            self.production_index_seed_store.write().set_batch(&mut batch, production_seed_index).unwrap();
             for (spk, amount) in balances {
                 self.address_balance_store.set_batch(&mut batch, &spk, amount).unwrap();
             }
             self.db.write(batch).unwrap();
+            info!(
+                "Ratio-reward windowed-production index reset at import (selected-chain index {}); \
+                 ratio/tier coinbase verification will be auto-trusted for the next ~{} blocks of \
+                 catch-up (see KERYX_TRUST_COINBASE / is_archival for the other ways this can happen).",
+                production_seed_index, self.ratio_reward_window
+            );
         }
 
         let virtual_read = self.virtual_stores.upgradable_read();
