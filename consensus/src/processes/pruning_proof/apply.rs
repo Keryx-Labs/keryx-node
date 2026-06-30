@@ -167,8 +167,17 @@ impl PruningProofManager {
         let mut up_heap = BinaryHeap::with_capacity(capacity_estimate);
         for header in proof.iter().flatten().cloned() {
             if let Vacant(e) = dag.entry(header.hash) {
-                // pow passing has already been checked during validation
-                let block_level = calc_block_level(&header, self.max_block_level);
+                // pow passing has already been checked during validation. Use the PoM-aware
+                // level (not the raw kHeavyHash-derived one) because this writes into the SAME
+                // shared `headers_store` that real-time header processing populates, and
+                // `pre_ghostdag_validation::check_pow_and_calc_block_level` forces level 0 for
+                // every post-PoM header there. Without this, a pruning-point-proof import (the
+                // bulk of headers a syncing node ingests) could persist a different, raw-PoW
+                // level for the same post-PoM header than the level real-time validation would
+                // have assigned it, which `parents_builder`/`post_pow_validation` assume can't
+                // happen (see `pom_aware_block_level`'s doc comment for the same reasoning behind
+                // the sibling fix in `import_pruning_points`).
+                let block_level = super::pom_aware_block_level(&header, self.max_block_level, self.pom_activation);
                 self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
 
                 let mut parents = BlockHashSet::with_capacity(header.direct_parents().len() * 2);
