@@ -27,6 +27,7 @@ use crate::{
         utxo_diffs::DbUtxoDiffsStore,
         utxo_multisets::DbUtxoMultisetsStore,
         virtual_state::{LkgVirtualState, VirtualStores},
+        windowed_production_prefix::DbWindowedProductionPrefixStore,
     },
     processes::{ghostdag::ordering::SortableBlock, reachability::inquirer as reachability, relations},
 };
@@ -49,8 +50,8 @@ pub struct ConsensusStorage {
     pub reachability_relations_store: Arc<RwLock<DbRelationsStore>>,
     pub pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
-    /// Fast-sync catch-up: selected-chain index at which `windowed_production_store` was last
-    /// reset by a pruning-point UTXO import. See `production_seed` module doc.
+    /// Fast-sync catch-up: selected-chain index at which the windowed-production prefix index was
+    /// last reset by a pruning-point UTXO import. See `production_seed` module doc.
     pub production_index_seed_store: Arc<RwLock<DbProductionIndexSeedStore>>,
     pub body_tips_store: Arc<RwLock<DbTipsStore>>,
     pub pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
@@ -75,7 +76,10 @@ pub struct ConsensusStorage {
 
     // Ratio-reward indexes (Stage 2): mutable per-SPK aggregates kept in lockstep with the UTXO set
     pub address_balance_store: Arc<DbAddressAmountStore>,
-    pub windowed_production_store: Arc<DbAddressAmountStore>,
+    /// Gold-standard ratio-reward production index: per-SPK prefix sum over the selected chain. A
+    /// pure function of the chain (no path-dependent running sum), so all nodes compute identical
+    /// windowed values. Maintained in lockstep with the selected chain; read by `ratio_bps_by_block`.
+    pub windowed_production_prefix_store: Arc<DbWindowedProductionPrefixStore>,
 
     // OPoI slash stores (Phase 3 A4)
     pub ai_response_store: Arc<DbAiResponseStore>,
@@ -236,8 +240,7 @@ impl ConsensusStorage {
         // windowed production is small (only recently-active miners) but shares the same shape.
         let address_balance_store =
             Arc::new(DbAddressAmountStore::new(db.clone(), utxo_set_builder.build(), DatabaseStorePrefixes::AddressBalance.into()));
-        let windowed_production_store =
-            Arc::new(DbAddressAmountStore::new(db.clone(), header_data_builder.build(), DatabaseStorePrefixes::WindowedProduction.into()));
+        let windowed_production_prefix_store = Arc::new(DbWindowedProductionPrefixStore::new(db.clone()));
 
         // OPoI slash stores
         let ai_response_store = Arc::new(DbAiResponseStore::new(db.clone(), header_data_builder.build()));
@@ -279,7 +282,7 @@ impl ConsensusStorage {
             production_index_seed_store,
             acceptance_data_store,
             address_balance_store,
-            windowed_production_store,
+            windowed_production_prefix_store,
             ai_response_store,
             ai_slashed_store,
             past_pruning_points_store,

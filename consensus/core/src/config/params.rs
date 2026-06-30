@@ -671,6 +671,17 @@ pub struct Params {
     /// re-validation of pre-fork history is unaffected (empty map ⇒ full cut, no burn).
     pub ratio_reward_activation: ForkActivation,
 
+    /// Ratio/tier coinbase VERIFICATION boundary. Coinbase ratio/tier outputs are re-derived and
+    /// checked only at/after this score; below it they are trusted (the `utxo_commitment` still pins
+    /// the UTXO set). Rationale: the pre-relaunch chain's coinbases were built by the old regime with a
+    /// path-dependent windowed-production value that NO clean recomputation (legacy rebuild or
+    /// prefix-sum) reproduces — so that history is intrinsically non-revalidatable and must be trusted,
+    /// while the cleanly re-mined chain at/after the relaunch frontier is fully verified by the
+    /// deterministic prefix-sum. Mainnet = the relaunch frontier; other networks = 0 (verify all, no
+    /// corrupted history). Distinct from `trust_coinbase()` (node-local: archival/env/catch-up) — this
+    /// is a consensus rule, identical on every node, and also covers the IBD/staging path.
+    pub ratio_verification_activation: ForkActivation,
+
     /// Difficulty-reset hardfork activation DAA score (chain relaunch). At/after this score the
     /// difficulty window discards every sample that precedes the reset, so the chain resumes at
     /// `genesis.bits` and the DAA re-converges to the post-fork (PoM-only) hashrate within one
@@ -874,6 +885,7 @@ impl Params {
             pow_salt_v4_activation: self.pow_salt_v4_activation,
 
             ratio_reward_activation: self.ratio_reward_activation,
+            ratio_verification_activation: self.ratio_verification_activation,
             difficulty_reset_activation: self.difficulty_reset_activation,
 
             ratio_reward_window: self.ratio_reward_window,
@@ -995,6 +1007,13 @@ pub const MAINNET_PARAMS: Params = Params {
     // Node-only gate (the miner has no ratio-reward logic). Before H the placeholder map is empty ⇒
     // no-op, IBD/old blocks unaffected.
     ratio_reward_activation: ForkActivation::new(37_780_000),
+    // Coinbase ratio/tier enforcement boundary. Confirmed cross-node determinism (archival vs pruned
+    // compute identical balance + prefix-sum production ⇒ identical coinbase) in observe-only mode, so
+    // enforcement is re-enabled at/after this DAA. Set ABOVE the post-relaunch transition blocks (which
+    // were mined with a stale balance index before the fix) so they stay trusted; only the cleanly
+    // computed blocks above it are enforced. Below this score the coinbase is trusted (utxo_commitment
+    // pins state) — covers both the non-revalidatable pre-relaunch history and the transition blocks.
+    ratio_verification_activation: ForkActivation::new(38_980_000),
     // Difficulty reset (chain relaunch). H = DAA 37_780_000 shed almost all pre-fork hashrate
     // (non-PoM pools cut off), leaving stock difficulty calibrated to ~456 GH/s while only the
     // PoM hashrate (~tens of MH/s) remained valid → chain froze at the fork.
@@ -1078,6 +1097,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
     // populates the bps store; the placeholder map is empty until then.
     ratio_reward_activation: ForkActivation::new(5_000),
+    ratio_verification_activation: ForkActivation::new(0), // no corrupted history on testnet — verify all
     // Testnet has no frozen-chain history to relaunch from; difficulty reset stays disabled.
     difficulty_reset_activation: ForkActivation::never(),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
@@ -1135,6 +1155,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
+    ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
 };
@@ -1186,6 +1207,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
+    ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
 };

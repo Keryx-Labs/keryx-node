@@ -23,6 +23,7 @@ use crate::{
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
             address_amount::DbAddressAmountStore,
+            windowed_production_prefix::DbWindowedProductionPrefixStore,
             past_pruning_points::DbPastPruningPointsStore,
             pom_tier::DbPomTierStore,
             production_seed::{DbProductionIndexSeedStore, ProductionIndexSeedStore},
@@ -143,10 +144,11 @@ pub struct VirtualStateProcessor {
     /// Ratio-reward balance index (Stage 2b): payout SPK → Σ unspent amount, kept in lockstep
     /// with the virtual UTXO set. Read to anchor `ratio_bps` at a block's selected-parent view.
     pub(super) address_balance_store: Arc<DbAddressAmountStore>,
-    /// Ratio-reward windowed-production index (Stage 2b): producer payout SPK → Σ `base_miner_cut`
-    /// over the last `RATIO_REWARD_WINDOW` selected-chain blocks, kept in lockstep with the selected
-    /// chain. Read to anchor the ratio denominator at a block's selected-parent view.
-    pub(super) windowed_production_store: Arc<DbAddressAmountStore>,
+    /// Gold-standard prefix-sum production index (pure function of the chain): producer payout SPK → Σ
+    /// `base_miner_cut` cumulated over the selected chain, kept in lockstep with it. The ratio
+    /// denominator (windowed production at a block's selected-parent view) is the difference of two
+    /// cumulatives; read by `ratio_bps_by_block`.
+    pub(super) windowed_production_prefix_store: Arc<DbWindowedProductionPrefixStore>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -206,6 +208,9 @@ pub struct VirtualStateProcessor {
     pub(super) very_light_activation: ForkActivation,
     // Ratio-reward activation: empty ratio-bps map before this score ⇒ no penalty.
     pub(super) ratio_reward_activation: ForkActivation,
+    // Coinbase ratio/tier VERIFICATION boundary: trust coinbases below this score (non-revalidatable
+    // pre-relaunch history), verify with the prefix-sum at/above. Consensus rule (see params doc).
+    pub(super) ratio_verification_activation: ForkActivation,
     // Trailing selected-chain window length (blocks) for the ratio-reward production index.
     pub(super) ratio_reward_window: u64,
 
@@ -256,7 +261,7 @@ impl VirtualStateProcessor {
         // forces it on. See field doc.
         let trust_coinbase_env = std::env::var("KERYX_TRUST_COINBASE").is_ok();
         if is_archival || trust_coinbase_env {
-            warn!(
+            debug!(
                 "Ratio/tier coinbase verification DISABLED ({}) — following the chain on UTXO-commitment trust only.",
                 if is_archival { "archival node" } else { "KERYX_TRUST_COINBASE set" }
             );
@@ -289,7 +294,7 @@ impl VirtualStateProcessor {
             utxo_multisets_store: storage.utxo_multisets_store.clone(),
             acceptance_data_store: storage.acceptance_data_store.clone(),
             address_balance_store: storage.address_balance_store.clone(),
-            windowed_production_store: storage.windowed_production_store.clone(),
+            windowed_production_prefix_store: storage.windowed_production_prefix_store.clone(),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_meta_stores: storage.pruning_meta_stores.clone(),
             lkg_virtual_state: storage.lkg_virtual_state.clone(),
@@ -325,6 +330,7 @@ impl VirtualStateProcessor {
             pom_activation: params.pom_activation,
             very_light_activation: params.very_light_activation,
             ratio_reward_activation: params.ratio_reward_activation,
+            ratio_verification_activation: params.ratio_verification_activation,
             ratio_reward_window: params.ratio_reward_window,
             is_archival,
             trust_coinbase_env,
@@ -341,7 +347,7 @@ impl VirtualStateProcessor {
 
     /// True while we're still inside our own post-import catch-up window: fewer than
     /// `ratio_reward_window` selected-chain blocks have been committed since the last
-    /// pruning-point UTXO import seeded (cleared) `windowed_production_store`. `false` if the node
+    /// pruning-point UTXO import cleared the windowed-production prefix index. `false` if the node
     /// has never imported a snapshot (built from genesis — no gap to begin with).
     fn in_production_catchup_window(&self) -> bool {
         let seeded_at = match self.production_index_seed_store.read().get_optional() {
@@ -696,10 +702,11 @@ impl VirtualStateProcessor {
         // for from-genesis nodes (fast-sync reconstruction from the pruning-point snapshot is 2b-3).
         self.apply_balance_diff(&mut batch, accumulated_diff);
 
-        // Ratio-reward (Stage 2b-2b): advance the windowed-production index along the SAME chain path,
-        // in the SAME batch, BEFORE `apply_changes` mutates the selected chain — so the index reads the
-        // pre-change chain (its current anchor) and stays in lockstep with it.
-        self.advance_production_window(&mut batch, chain_path, &*selected_chain_write);
+        // Ratio-reward (Stage 2b-2b): advance the prefix-sum production index along the SAME chain
+        // path, in the SAME batch, BEFORE `apply_changes` mutates the selected chain — so the index
+        // reads the pre-change chain (its current anchor) and stays in lockstep with it. Pure function
+        // of the chain (no path dependence) — see `advance_production_prefix`; read by `ratio_bps_by_block`.
+        self.advance_production_prefix(&mut batch, chain_path, &*selected_chain_write);
 
         // Update virtual state
         virtual_write.state.set_batch(&mut batch, new_virtual_state).unwrap();
@@ -715,66 +722,78 @@ impl VirtualStateProcessor {
         drop(selected_chain_write);
     }
 
-    /// Deterministic clean-baseline rebuild of the windowed-production index, run automatically at
-    /// every node start (see `rebuild_windowed_production_index_on_start` and `Consensus::new`). The
-    /// index is an incremental cache; its value MUST equal the canonical direct sum of
-    /// `block_production` over the last `ratio_reward_window` selected-chain blocks ending at the tip
-    /// (down to genesis, `.max(1)`). Recomputing it directly from the on-disk chain wipes any drift
-    /// inherited from a buggy-version reorg history — the root cause of the post-hardfork ratio-reward
-    /// coinbase divergence — and makes every node hold the identical canonical value. Safe for pruned
-    /// nodes too: `ratio_reward_window` (864k) < `pruning_depth` (1.08M), so every window block is
-    /// always on disk. `KERYX_REBUILD_PRODUCTION=1` forces it even mid catch-up.
-    pub(crate) fn rebuild_windowed_production_index(&self) {
+    /// Rebuild the ratio-reward BALANCE index (`address_balance_store`) directly from the current
+    /// virtual UTXO set — the authoritative source — at startup. The balance index is the ratio
+    /// numerator (`Σ unspent amount` per payout SPK). A from-genesis node maintains it incrementally
+    /// and a fast-synced node seeds it from the pruning-point UTXO snapshot at import; but a datadir
+    /// restored from a snapshot built by an older binary (or before this index existed) carries a
+    /// STALE balance index that no longer matches its own UTXO set — making the ratio numerator differ
+    /// across nodes (the cause of the post-relaunch balance divergence: e.g. 81 G vs 242 T for the same
+    /// SPK). Recomputing it from the UTXO set makes every node's numerator the canonical `Σ UTXO`, so
+    /// the same SPK yields the same balance everywhere. Run on every start; incremental lockstep
+    /// maintenance (`apply_balance_diff`) carries it forward exactly from this canonical baseline.
+    pub(crate) fn rebuild_address_balance_index(&self) {
+        let virtual_read = self.virtual_stores.read();
+        let mut balances: HashMap<ScriptPublicKey, u64> = HashMap::new();
+        for item in virtual_read.utxo_set.iterator() {
+            let (_, entry) = item.unwrap();
+            let acc = balances.entry(entry.script_public_key.clone()).or_default();
+            *acc = acc.saturating_add(entry.amount);
+        }
+        let n = balances.len();
+        info!("address-balance rebuild: recomputing the ratio-reward balance index from the UTXO set ({} addresses)...", n);
+        let mut batch = WriteBatch::default();
+        self.address_balance_store.clear(&mut batch).unwrap();
+        for (spk, amount) in balances {
+            self.address_balance_store.set_batch(&mut batch, &spk, amount).unwrap();
+        }
+        self.db.write(batch).unwrap();
+        info!("address-balance rebuild: done — {} addresses written (canonical Σ UTXO).", n);
+    }
+
+    /// One-time from-chain build of the gold-standard prefix-sum production index (run at startup when
+    /// the store is empty — a datadir predating it, or a fresh prefix). Walks the selected chain over a
+    /// generous range above any practical reorg depth, accumulating each producer SPK's cumulative
+    /// (baseline 0 at the range start) and writing one entry per production index. Indices below the
+    /// pruning point on a pruned node are simply unavailable and skipped: `windowed` is a *difference*,
+    /// so the absolute baseline is immaterial, and `W < pruning_depth` keeps every queried index inside
+    /// the built range. Pure function of the chain ⇒ every node derives identical windowed values.
+    pub(crate) fn rebuild_windowed_production_prefix_index(&self) {
         let sc = self.selected_chain_store.read();
         let tip_idx = match sc.get_tip() {
             Ok((idx, _)) => idx,
             Err(_) => {
-                warn!("windowed-production rebuild: no selected-chain tip; skipping");
+                warn!("windowed-production prefix build: no selected-chain tip; skipping");
                 return;
             }
         };
-        let w = self.ratio_reward_window;
-        let lo = tip_idx.saturating_sub(w.saturating_sub(1)).max(1);
-        info!(
-            "windowed-production rebuild: recomputing canonical index over selected-chain [{}, {}] ({} blocks)...",
-            lo,
-            tip_idx,
-            tip_idx.saturating_sub(lo) + 1
-        );
-        let mut sums: HashMap<ScriptPublicKey, u64> = HashMap::new();
+        let lo = tip_idx.saturating_sub(2 * self.ratio_reward_window).max(1);
+        info!("windowed-production prefix build: deriving canonical index over selected-chain [{}, {}]...", lo, tip_idx);
+        let mut batch = WriteBatch::default();
+        self.windowed_production_prefix_store.clear(&mut batch);
+        let mut cum: HashMap<ScriptPublicKey, u64> = HashMap::new();
+        let mut written = 0u64;
         for i in lo..=tip_idx {
-            if let Ok(h) = sc.get_by_index(i) {
-                if let Some((spk, cut)) = self.block_production(h) {
-                    *sums.entry(spk).or_default() += cut;
-                }
+            if let Ok(h) = sc.get_by_index(i)
+                && let Some((spk, cut)) = self.block_production(h)
+            {
+                let c = cum.entry(spk.clone()).or_insert(0);
+                *c += cut;
+                self.windowed_production_prefix_store.put_cumulative(&mut batch, &spk, i, *c);
+                written += 1;
             }
         }
-        let entries = sums.len();
-        let mut batch = WriteBatch::default();
-        self.windowed_production_store.clear(&mut batch).unwrap();
-        for (spk, v) in sums {
-            self.windowed_production_store.set_batch(&mut batch, &spk, v).unwrap();
-        }
         self.db.write(batch).unwrap();
-        info!("windowed-production rebuild: done — {} producer SPKs written (canonical baseline).", entries);
+        info!("windowed-production prefix build: done — {} entries written (canonical baseline).", written);
     }
 
-    /// Automatic clean-baseline rebuild invoked once on every node start. Unconditionally rebuilds the
-    /// canonical windowed-production index (see `rebuild_windowed_production_index`) so a node never
-    /// relies on a possibly-drifted incremental history — this is the determinism guarantee for the
-    /// ratio-reward coinbase. Skipped ONLY while still inside the fast-sync catch-up window: there the
-    /// pre-import portion of the window is not yet on disk (pruned below the freshly imported point),
-    /// so a rebuild would undercount; `trust_coinbase()` covers that bounded period and a later
-    /// restart rebuilds once the window has organically refilled past the import point.
-    pub(crate) fn rebuild_windowed_production_index_on_start(&self) {
-        if self.in_production_catchup_window() {
-            info!(
-                "windowed-production rebuild skipped: still inside fast-sync catch-up window \
-                 (index refills forward; coinbase is trusted meanwhile)."
-            );
-            return;
+    /// Startup hook: build the prefix-sum index from the chain only when it is empty (a datadir
+    /// predating this store, or a fresh prefix). Once populated it stays current via lockstep
+    /// maintenance, so this is a no-op on subsequent boots.
+    pub(crate) fn rebuild_windowed_production_prefix_index_on_start(&self) {
+        if self.windowed_production_prefix_store.is_empty() {
+            self.rebuild_windowed_production_prefix_index();
         }
-        self.rebuild_windowed_production_index();
     }
 
     /// Caches the DAA and Median time windows of the sink block (if needed). Following, virtual's window calculations will
@@ -1400,15 +1419,15 @@ impl VirtualStateProcessor {
             // from the imported pruning-point UTXO snapshot (grouped per payout SPK). The incremental
             // lockstep maintenance in `commit_virtual_state` then carries it forward from here.
             //
-            // The windowed-production index is NOT seeded from the snapshot (there is nothing to seed
-            // it with — the snapshot is a UTXO set, not a production history) — we only clear it so a
-            // re-import over a populated DB cannot leave stale aggregates. This was historically assumed
-            // safe because `W < pruning_depth` ⇒ the whole window lies above the pruning point and gets
-            // rebuilt exactly by the IBD that follows, completing before the window matters. That holds
-            // only while the pruning point is still before the ratio-reward activation height; once the
-            // chain has advanced past `pruning_depth` beyond it, every fresh fast sync now lands its
-            // import after activation, and needs a full window of catch-up before its computed ratio
-            // matches long-running nodes. We record the pre-import chain position here so
+            // The windowed-production prefix index is NOT seeded from the snapshot (there is nothing to
+            // seed it with — the snapshot is a UTXO set, not a production history) — we only clear it so
+            // a re-import over a populated DB cannot leave stale aggregates. This was historically
+            // assumed safe because `W < pruning_depth` ⇒ the whole window lies above the pruning point
+            // and gets rebuilt exactly by the IBD that follows, completing before the window matters.
+            // That holds only while the pruning point is still before the ratio-reward activation
+            // height; once the chain has advanced past `pruning_depth` beyond it, every fresh fast sync
+            // now lands its import after activation, and needs a full window of catch-up before its
+            // computed ratio matches long-running nodes. We record the pre-import chain position here so
             // `trust_coinbase()` can detect and bound exactly that catch-up period (self-expiring once
             // the window organically refills) instead of disqualifying every block it sees in the
             // meantime. See `production_seed` module doc and `is_archival` field doc for the full
@@ -1425,7 +1444,10 @@ impl VirtualStateProcessor {
             };
             let mut batch = WriteBatch::default();
             self.address_balance_store.clear(&mut batch).unwrap();
-            self.windowed_production_store.clear(&mut batch).unwrap();
+            // Reset the prefix-sum production index: forward lockstep maintenance rebuilds it from the
+            // import point (baseline immaterial — `windowed` is a difference), and the fast-sync
+            // catch-up window trusts the coinbase until it has refilled past the import point.
+            self.windowed_production_prefix_store.clear(&mut batch);
             self.production_index_seed_store.write().set_batch(&mut batch, production_seed_index).unwrap();
             for (spk, amount) in balances {
                 self.address_balance_store.set_batch(&mut batch, &spk, amount).unwrap();

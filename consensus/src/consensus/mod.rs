@@ -324,16 +324,28 @@ impl Consensus {
         // Run database upgrades if any
         this.run_database_upgrades();
 
-        // Deterministic clean baseline for the ratio-reward windowed-production index: recompute it
-        // directly from the on-disk selected-chain window on every start, so every node holds the
-        // canonical direct sum instead of a possibly-drifted incremental history (the root cause of the
-        // post-hardfork coinbase non-determinism). Skipped automatically while mid fast-sync catch-up.
-        // `KERYX_REBUILD_PRODUCTION=1` forces an unconditional rebuild (even during catch-up).
-        if std::env::var("KERYX_REBUILD_PRODUCTION").is_ok() {
-            this.virtual_processor.rebuild_windowed_production_index();
-        } else {
-            this.virtual_processor.rebuild_windowed_production_index_on_start();
-        }
+        // Invariant the prefix-sum production index depends on for determinism: the ratio-reward
+        // window never reaches below the pruning point, so every in-window block AND the `cum(b−W)`
+        // floor baseline are always on disk for every node (archival or pruned). If a future param
+        // change ever violated this, the index would silently undercount past the floor → divergent
+        // coinbase. Fail loudly at startup instead. (864k < 1.08M on mainnet today.)
+        assert!(
+            this.config.params.ratio_reward_window < this.config.pruning_depth(),
+            "ratio_reward_window ({}) must be strictly less than pruning_depth ({}) — the windowed-production \
+             prefix index requires the whole window to stay above the pruning floor",
+            this.config.params.ratio_reward_window,
+            this.config.pruning_depth()
+        );
+
+        // Gold-standard prefix-sum production index: one-time from-chain build when the store is empty
+        // (a datadir predating it, or a fresh prefix). Once populated it is kept current by lockstep
+        // maintenance, so this is a no-op on subsequent boots. Pure function of the chain.
+        this.virtual_processor.rebuild_windowed_production_prefix_index_on_start();
+
+        // Ratio-reward balance index (the ratio numerator): recompute from the current UTXO set so a
+        // snapshot-restored datadir's stale balance index can't make the numerator differ across nodes.
+        // Authoritative (Σ UTXO); incremental maintenance carries it forward from here. See its doc.
+        this.virtual_processor.rebuild_address_balance_index();
 
         this
     }

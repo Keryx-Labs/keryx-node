@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 /// Fast-sync catch-up tracking for the ratio-reward windowed-production index.
 ///
-/// `import_pruning_point_utxo_set` clears `windowed_production_store` on every pruning-point UTXO
-/// import (fast sync) instead of seeding it, on the assumption that the whole `ratio_reward_window`
+/// `import_pruning_point_utxo_set` clears the windowed-production prefix index on every pruning-point
+/// UTXO import (fast sync) instead of seeding it, on the assumption that the whole `ratio_reward_window`
 /// lies above the pruning point and gets rebuilt exactly by the body-IBD that follows. That holds
 /// only while the pruning point itself is still before the ratio-reward activation height; once the
 /// chain has advanced past `pruning_depth` beyond that height, every fresh fast sync starts its
@@ -42,8 +42,8 @@ impl DbProductionIndexSeedStore {
         Self::new(db)
     }
 
-    /// `None` if the node has never imported a pruning-point UTXO snapshot (built from genesis, so
-    /// `windowed_production_store` was never cleared/reset and has no catch-up gap), or pre-dates
+    /// `None` if the node has never imported a pruning-point UTXO snapshot (built from genesis, so the
+    /// windowed-production prefix index was never cleared/reset and has no catch-up gap), or pre-dates
     /// this store.
     pub fn get_optional(&self) -> Option<u64> {
         self.access.read().optional().unwrap()

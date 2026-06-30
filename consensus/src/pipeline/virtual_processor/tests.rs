@@ -429,53 +429,73 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
     assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
 }
 
-/// Ratio-reward (Stage 2b-2b) E2E: the windowed-production index accumulates one base miner cut per
-/// selected-chain block (attributed to that block's producer SPK) and slides — producers that age
-/// out of the last `ratio_reward_window` blocks have their entry dropped. Exercises the real store
-/// maintenance (top add + bottom slide through `commit_virtual_state`), not just the pure arithmetic.
+/// Gold-standard prefix-sum production index E2E: maintained in lockstep through the real
+/// `commit_virtual_state` path, its windowed value at the sink (Case A of
+/// `windowed_production_for_block`) accumulates one base miner cut per in-window selected-chain block
+/// attributed to that block's producer, drops producers that age out of the last `ratio_reward_window`
+/// blocks, and chains cumulatively for a producer that appears more than once inside the window.
 #[tokio::test]
-async fn windowed_production_accumulates_per_producer_and_slides() {
-    use crate::model::stores::address_amount::AddressAmountStoreReader;
+async fn windowed_production_prefix_accumulates_per_producer_and_slides() {
     use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 
-    // Tiny window so a 6-block chain exercises the bottom slide. Index maintenance is ungated (runs
-    // from genesis), so no ratio activation is needed to populate the production index.
+    // Tiny window so a short chain exercises both the slide (aged-out producers drop to zero) and
+    // cumulative chaining. Index maintenance is ungated (runs from genesis), so no ratio activation
+    // is needed to populate the production index.
     let mut params = MAINNET_PARAMS;
     params.ratio_reward_window = 3;
+    let w = params.ratio_reward_window;
     let config = ConfigBuilder::new(params).skip_proof_of_work().build();
     let mut ctx = TestContext::new(TestConsensus::new(&config));
 
-    // Single-chain (width 1) of 6 blocks, each built by a distinct random producer SPK.
+    // 7-block single chain (chain indices 1..=7). The same producer mines blocks 6 and 7 (0-indexed
+    // i=5,6 ⇒ chain indices 6,7), both inside the last-3 window ⇒ its windowed production must be two
+    // base cuts (cumulative chaining within one SPK).
+    let repeat = new_miner_data();
     let mut producers: Vec<ScriptPublicKey> = Vec::new();
-    for _ in 0..6 {
-        let md = new_miner_data();
+    for i in 0..7 {
+        let md = if i == 5 || i == 6 { repeat.clone() } else { new_miner_data() };
         producers.push(md.script_public_key.clone());
         ctx.miner_data = md;
         ctx.build_block_template_row(0..1).validate_and_insert_row().await;
     }
 
     let vp = ctx.consensus.virtual_processor().clone();
-    let prod = |spk: &ScriptPublicKey| vp.windowed_production_store.get(spk).unwrap();
+    let sink = ctx.consensus.get_sink();
+    let tip_idx = vp.selected_chain_store.read().get_tip().unwrap().0;
+    let one_cut = {
+        let sink_daa = ctx.consensus.headers_store().get_daa_score(sink).unwrap();
+        vp.coinbase_manager.base_miner_cut(sink_daa)
+    };
+    assert!(one_cut > 0, "an in-window producer must have a non-zero base cut");
 
-    // Window = last 3 selected-chain blocks ⇒ producers[3..6] are in-window; producers[0..3] aged out.
-    let one_cut = prod(&producers[3]);
-    assert!(one_cut > 0, "an in-window producer must have non-zero production");
-    assert_eq!(prod(&producers[4]), one_cut, "each block contributes one equal base cut");
-    assert_eq!(prod(&producers[5]), one_cut);
-    for i in 0..3 {
-        assert_eq!(prod(&producers[i]), 0, "producer {i} aged out of the window ⇒ entry dropped");
+    // Windowed production at the sink, asserting the Case-A block query and the direct prefix query agree.
+    let windowed = |spk: &ScriptPublicKey| {
+        let via_block = vp.windowed_production_for_block(spk, sink, w);
+        let direct = vp.windowed_production_prefix_store.windowed(spk, tip_idx, w).unwrap();
+        assert_eq!(via_block, direct, "Case-A block query must match the direct windowed query");
+        via_block
+    };
+
+    // Window = last 3 selected-chain blocks (chain indices 5,6,7 ⇒ producers i=4,5,6). Producers i=0..3
+    // aged out ⇒ dropped to zero; i=4 contributes one cut; the repeat (i=5,6) chains to two cuts.
+    for i in 0..4 {
+        assert_eq!(windowed(&producers[i]), 0, "producer {i} aged out of the window ⇒ entry dropped");
     }
-
-    // The in-window contribution is exactly one block's base miner cut.
-    let sink_daa = ctx.consensus.headers_store().get_daa_score(ctx.consensus.get_sink()).unwrap();
-    assert_eq!(one_cut, vp.coinbase_manager.base_miner_cut(sink_daa));
+    assert_eq!(windowed(&producers[4]), one_cut, "a single in-window block contributes exactly one base cut");
+    assert_eq!(
+        windowed(&repeat.script_public_key),
+        2 * one_cut,
+        "a producer of two in-window blocks must show two base cuts (cumulative chaining)"
+    );
 }
 
 /// Fastsync production-window trust (Option A): `trust_coinbase()` must relax ratio-reward coinbase
 /// verification for exactly the `ratio_reward_window` selected-chain blocks following a pruning-point
-/// UTXO import (the only window during which a fast-synced node's freshly-cleared
-/// `windowed_production_store` cannot yet match a from-genesis node's), then self-expire. A node that
-/// has never imported a snapshot must never see this relaxation.
+/// UTXO import (the only window during which a fast-synced node's freshly-cleared windowed-production
+/// prefix index cannot yet match a from-genesis node's), then self-expire. A node that has never
+/// imported a snapshot must never see this relaxation.
 ///
 /// The import is simulated at genesis (mirrors the `set_initial_utxo_set` / integration-test pattern
 /// for `import_pruning_point_utxo_set`: an empty multiset trivially matches genesis's own UTXO
@@ -493,7 +513,7 @@ async fn fastsync_catchup_window_trusts_then_expires() {
     use keryx_consensus_core::api::ConsensusApi;
     use keryx_muhash::MuHash;
 
-    // Tiny window (mirrors `windowed_production_accumulates_per_producer_and_slides`) so the test
+    // Tiny window (mirrors `windowed_production_prefix_accumulates_per_producer_and_slides`) so the test
     // exercises the full catch-up-then-expiry cycle in a handful of blocks instead of needing the
     // real mainnet/testnet `ratio_reward_window` (864_000 / 1_000).
     let mut params = MAINNET_PARAMS;

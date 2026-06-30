@@ -26,6 +26,7 @@ pub mod utxo_diffs;
 pub mod utxo_multisets;
 pub mod utxo_set;
 pub mod virtual_state;
+pub mod windowed_production_prefix;
 
 pub use keryx_database;
 pub use keryx_database::prelude::DB;

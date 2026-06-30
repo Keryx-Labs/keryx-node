@@ -28,6 +28,7 @@ use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
+use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::config::params::{TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
@@ -44,7 +45,7 @@ use keryx_consensus_core::{
         utxo_view::{UtxoView, UtxoViewComposition},
     },
 };
-use keryx_core::{error, info, trace, warn};
+use keryx_core::{debug, info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_muhash::MuHash;
@@ -237,16 +238,24 @@ impl VirtualStateProcessor {
         // the `utxo_commitment` verified above already pins this block's resulting UTXO set to the
         // canonical chain, so the block's coinbase outputs are trusted without re-deriving the ratio
         // bracket — which such a node cannot yet reproduce for the post-fork canonical chain.
-        if !self.trust_coinbase() {
-            self.verify_coinbase_transaction(
-                &txs[0],
-                header.daa_score,
-                &ctx.ghostdag_data,
-                &ctx.mergeset_rewards,
-                &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
-                &[sp_diff, &ctx.mergeset_diff],
-            )?;
-        }
+        // Coinbase ratio/tier verification. We ALWAYS compute the expected coinbase and log any
+        // mismatch (so the producer's and every validator's computation can be compared across nodes);
+        // we only REJECT when `enforce` holds. Enforcement requires the relaunch-frontier gate
+        // (`ratio_verification_activation`, so non-revalidatable pre-relaunch history is trusted — its
+        // `utxo_commitment`, checked above, pins the state) AND the node not being in a trust window
+        // (archival / `KERYX_TRUST_COINBASE` / fast-sync catch-up). With the gate set to `never()`,
+        // enforcement is OFF (observe-only) network-wide — the relaunch runs while we confirm the
+        // prefix-sum makes all nodes agree, then enforcement is switched on by setting the gate DAA.
+        let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase();
+        self.verify_coinbase_transaction(
+            &txs[0],
+            header.daa_score,
+            &ctx.ghostdag_data,
+            &ctx.mergeset_rewards,
+            &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+            &[sp_diff, &ctx.mergeset_diff],
+            enforce,
+        )?;
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -349,6 +358,10 @@ impl VirtualStateProcessor {
         mergeset_non_daa: &BlockHashSet,
         // Diffs from the committed virtual to this block's own view, for ratio-reward balances.
         view_diffs: &[&UtxoDiff],
+        // When false (observe-only): compute the expected coinbase and LOG any mismatch, but do NOT
+        // reject the block. Lets the network run while we confirm the producer and validators compute
+        // the identical coinbase (logs comparable across nodes) before enforcement is switched on.
+        enforce: bool,
     ) -> BlockProcessResult<()> {
         // Extract only miner data from the provided coinbase
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
@@ -368,16 +381,25 @@ impl VirtualStateProcessor {
             .unwrap()
             .tx;
         if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) {
-            // TEMP DIAGNOSTIC: pinpoint why the coinbase differs (tier vs ratio vs amounts).
-            warn!(
-                "COINBASE MISMATCH daa={} tier_bps={:?} ratio_bps={:?} actual_outs={:?} expected_outs={:?}",
+            // Diagnostic: pinpoint why the coinbase differs (tier vs ratio vs amounts). Logged at WARN
+            // only when it causes a real rejection (`enforce`); in observe-only it would fire for every
+            // trusted transition/history block, so it stays at DEBUG to avoid spamming normal logs.
+            let detail = format!(
+                "COINBASE MISMATCH enforce={} daa={} tier_bps={:?} ratio_bps={:?} actual_outs={:?} expected_outs={:?}",
+                enforce,
                 daa_score,
                 tier_bps_by_block,
                 ratio_bps_by_block,
                 coinbase.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
                 expected_coinbase.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
             );
-            Err(BadCoinbaseTransaction)
+            if enforce {
+                warn!("{}", detail);
+                return Err(BadCoinbaseTransaction);
+            }
+            // Observe-only: block is accepted; keep the comparison at debug level.
+            debug!("{}", detail);
+            Ok(())
         } else {
             Ok(())
         }
@@ -442,12 +464,14 @@ impl VirtualStateProcessor {
         if !self.ratio_reward_activation.is_active(pov_daa_score) {
             return map;
         }
-        // Windowed-production correction (Stage 2b-2b): the production index lags at the committed
-        // virtual's selected chain; correct every payout SPK to THIS block's selected-parent window
-        // with one chain-path delta, shared by all blues (mirror of the balance `view_diffs`). Floor
-        // at one block's base miner cut so a newcomer with no recent production divides by one block.
-        let prod_correction = self.production_window_correction(ghostdag_data.selected_parent);
+        // Windowed production is read from the gold-standard prefix-sum index, evaluated at THIS
+        // block's selected-parent window (Case A/B inside `windowed_production_for_block`). It is a pure
+        // function of the chain — no path-dependent running sum, no slide arithmetic, no saturating
+        // clamp — so every node computes the identical denominator. Floor at one block's base miner cut
+        // so a newcomer with no recent production divides by one block. The balance numerator keeps its
+        // own committed-index + `view_diffs` correction (that index is exact and not the divergence source).
         let prod_floor = self.coinbase_manager.base_miner_cut(pov_daa_score).max(1);
+        let w = self.ratio_reward_window;
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             // Payout SPK = the blue's own miner cut, already resolved into the reward data.
             if let Some(reward) = mergeset_rewards.get(blue) {
@@ -455,20 +479,56 @@ impl VirtualStateProcessor {
                 let base = self.address_balance_store.get(spk).unwrap() as i128;
                 let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                 let balance = (base + delta).max(0) as u64;
-                let prod_base = self.windowed_production_store.get(spk).unwrap() as i128;
-                let prod_delta = prod_correction.get(spk).copied().unwrap_or(0);
-                let production = ((prod_base + prod_delta).max(0) as u64).max(prod_floor);
+                let production = self.windowed_production_for_block(spk, ghostdag_data.selected_parent, w).max(prod_floor);
                 map.insert(*blue, ratio_reward_bps(balance, production));
             }
         }
 
-        // Optional self-check (env KERYX_RATIO_SELFCHECK=1): verify the maintained windowed-production
-        // index (store + correction) equals the DIRECT window recompute for each rewarded blue. Catches
-        // any residual non-determinism live. O(W) per call — enable only briefly to validate a relaunch.
-        if std::env::var("KERYX_RATIO_SELFCHECK").is_ok() {
+        // Targeted diagnostic (env KERYX_RATIO_DEBUG=1): dump the exact ratio inputs per rewarded blue
+        // — selected-parent chain index, balance (numerator), windowed production from the prefix index
+        // (O(log), cheap), the floor, and the resulting bracket. Run on the producer (build) and the
+        // validator (verify) and diff the two lines to localize a cross-node disagreement: differing
+        // `sp_idx` ⇒ chain/index mismatch; differing `balance` ⇒ numerator; differing `prod_prefix` with
+        // same `sp_idx` ⇒ window/prefix mismatch. NOTE: deliberately NO O(W) direct-sum recompute here —
+        // it runs on the build path per template and an 864k-block scan stalls template production (~40s),
+        // starving the miner. The prefix value is the cross-node comparison we need.
+        if std::env::var("KERYX_RATIO_DEBUG").is_ok() {
             let sc = self.selected_chain_store.read();
             if let Ok(sp_idx) = sc.get_by_hash(ghostdag_data.selected_parent) {
-                let w = self.ratio_reward_window;
+                for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+                    if let Some(reward) = mergeset_rewards.get(blue) {
+                        let spk = &reward.script_public_key;
+                        let base = self.address_balance_store.get(spk).unwrap() as i128;
+                        let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
+                        let balance = (base + delta).max(0) as u64;
+                        let prefix = self.windowed_production_for_block(spk, ghostdag_data.selected_parent, w);
+                        debug!(
+                            "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={}",
+                            pov_daa_score, blue, sp_idx, balance, prefix, prod_floor,
+                            map.get(blue).copied().unwrap_or(0)
+                        );
+                    }
+                }
+            }
+        }
+
+        // Optional self-check (env KERYX_RATIO_SELFCHECK=1): verify BOTH the legacy maintained index
+        // (store + correction) AND the new gold-standard prefix-sum index equal the DIRECT window
+        // recompute for each rewarded blue. This is the equivalence oracle that proves the prefix index
+        // before it becomes the consensus value. O(W) per call — enable only briefly (e.g. a relaunch).
+        if std::env::var("KERYX_RATIO_SELFCHECK").is_ok() {
+            let w = self.ratio_reward_window;
+            // Prefix-index value per rewarded blue, computed FIRST so each `windowed_production_for_block`
+            // takes and releases the selected-chain read lock before we hold it below (no nested re-lock).
+            let mut prefix_vals: std::collections::HashMap<Hash, u64> = std::collections::HashMap::new();
+            for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+                if let Some(reward) = mergeset_rewards.get(blue) {
+                    let v = self.windowed_production_for_block(&reward.script_public_key, ghostdag_data.selected_parent, w);
+                    prefix_vals.insert(*blue, v.max(prod_floor));
+                }
+            }
+            let sc = self.selected_chain_store.read();
+            if let Ok(sp_idx) = sc.get_by_hash(ghostdag_data.selected_parent) {
                 let lo = sp_idx.saturating_sub(w - 1).max(1);
                 let mut direct: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
                 for i in lo..=sp_idx {
@@ -481,15 +541,12 @@ impl VirtualStateProcessor {
                 for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
                     if let Some(reward) = mergeset_rewards.get(blue) {
                         let spk = &reward.script_public_key;
-                        let used = ((self.windowed_production_store.get(spk).unwrap() as i128
-                            + prod_correction.get(spk).copied().unwrap_or(0))
-                        .max(0) as u64)
-                            .max(prod_floor);
                         let truth = direct.get(spk).copied().unwrap_or(0).max(prod_floor);
-                        if used != truth {
+                        let prefix = prefix_vals.get(blue).copied().unwrap_or(prod_floor);
+                        if prefix != truth {
                             warn!(
-                                "RATIO-SELFCHECK MISMATCH daa={} blue={} used_prod={} direct_prod={} drift={}",
-                                pov_daa_score, blue, used, truth, used as i128 - truth as i128
+                                "RATIO-SELFCHECK MISMATCH (prefix) daa={} blue={} prefix_prod={} direct_prod={} drift={}",
+                                pov_daa_score, blue, prefix, truth, prefix as i128 - truth as i128
                             );
                         }
                     }
@@ -514,139 +571,103 @@ impl VirtualStateProcessor {
         Some((spk, cut))
     }
 
-    /// Folds the per-SPK production delta of moving the windowed-production index along `chain_path`
-    /// (from a chain whose tip has index `from_tip`) into `deltas`. The window is the last
-    /// `RATIO_REWARD_WINDOW` selected-chain blocks (a block count, slid in O(1) via the chain index):
-    /// - **top**: `removed` blocks leave the window (subtract), `added` blocks join it (add);
-    /// - **bottom**: as the tip moves by `Δ = added − removed`, the low boundary slides by the same
-    ///   amount — blocks at indices `(from_tip−W, to_tip−W]` exit (subtract) when `Δ>0`, or re-enter
-    ///   (add) when `Δ<0`. Those deep blocks sit far below any reorg split, so reading them by index
-    ///   on `sc` (the pre-change chain) is reorg-stable and identical on every node.
-    fn fold_production_window_delta(
-        &self,
-        chain_path: &ChainPath,
-        from_tip: u64,
-        sc: &impl SelectedChainStoreReader,
-        deltas: &mut std::collections::HashMap<ScriptPublicKey, i128>,
-    ) {
-        let w = self.ratio_reward_window as i128;
-        let from_tip = from_tip as i128;
-        let removed_len = chain_path.removed.len() as i128;
-        let added_len = chain_path.added.len() as i128;
-        let common = from_tip - removed_len; // common-ancestor index (shared chain below the reorg)
-        let to_tip = common + added_len;
-
-        // Disjoint-window case: when the reorg/jump exceeds the window (`added` or `removed` > W — e.g.
-        // a reorg across the difficulty-reset genesis-diff burst), the incremental top+bottom-slide
-        // below is unsafe: it would (a) subtract/add `removed`/`added` blocks that lie BELOW the window
-        // — over-counting, which the saturating store then silently loses — and (b) read bottom-slide
-        // indices past the reorg split, which aren't on the pre-change `sc`. Recompute both windows
-        // directly instead (subtract the whole old window, add the whole new window). O(W), only on
-        // such large jumps; the per-block path keeps the O(1) incremental branch below.
-        if added_len > w || removed_len > w {
-            // Old window [from_tip-W+1, from_tip] — entirely on `sc` (the pre-change chain).
-            for i in (from_tip - w + 1).max(1)..=from_tip {
-                if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
-                    *deltas.entry(spk).or_default() -= cut as i128;
-                }
-            }
-            // New window [to_tip-W+1, to_tip]: indices ≤ common come from `sc` (shared low chain),
-            // indices > common come from `added` (added[k] is at index common+1+k, ascending).
-            let new_lo = (to_tip - w + 1).max(1);
-            for i in new_lo..=common {
-                if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
-                    *deltas.entry(spk).or_default() += cut as i128;
-                }
-            }
-            let first_added_k = (new_lo - (common + 1)).max(0) as usize;
-            for h in chain_path.added.iter().skip(first_added_k) {
-                if let Some((spk, cut)) = self.block_production(*h) {
-                    *deltas.entry(spk).or_default() += cut as i128;
-                }
-            }
-            return;
-        }
-
-        // Overlap case (`added` and `removed` ≤ W): every removed/added block falls inside its window,
-        // so the top is a straight subtract/add, and the bottom shifts by only `Δ = added − removed`.
-        for h in &chain_path.removed {
-            if let Some((spk, cut)) = self.block_production(*h) {
-                *deltas.entry(spk).or_default() -= cut as i128;
-            }
-        }
-        for h in &chain_path.added {
-            if let Some((spk, cut)) = self.block_production(*h) {
-                *deltas.entry(spk).or_default() += cut as i128;
-            }
-        }
-
-        // Bottom slide: as the tip moves, the window's low boundary slides by the same amount — see
-        // `window_bottom_slide` for the exact index range + sign (the off-by-one-prone arithmetic,
-        // unit-tested in isolation). Window blocks are retained on disk (W < pruning depth).
-        if let Some((sign, lo, hi)) = window_bottom_slide(from_tip, to_tip, w) {
-            for i in lo..=hi {
-                if let Some((spk, cut)) = self.block_production(sc.get_by_index(i as u64).unwrap()) {
-                    *deltas.entry(spk).or_default() += sign * cut as i128;
-                }
-            }
-        }
-    }
-
-    /// Ratio-reward (Stage 2b-2b) — advances the windowed-production index along `chain_path`, kept in
+    /// Gold-standard prefix-sum maintenance — advances the production index along `chain_path`, kept in
     /// lockstep with the selected chain (called from `commit_virtual_state` in the SAME batch as the
     /// selected-chain `apply_changes`, BEFORE it runs, so `sc` still reflects the pre-change chain).
     /// Ungated/passive: maintained from genesis so it is exact for from-genesis nodes; only read once
-    /// `ratio_reward_activation` fires. Folds one net delta per producer SPK, then writes each once
-    /// (a value returning to 0 deletes its entry via `set_batch`).
-    pub(super) fn advance_production_window(
+    /// `ratio_reward_activation` fires. Translates the selected-chain `chain_path` into the
+    /// `(common, removals, additions)` the prefix store extends with. EXACT and path-independent: the store
+    /// seeds each addition from `cumulative_at(spk, common)` — a reverse seek that naturally ignores
+    /// the about-to-be-removed entries (they sit at index > `common`) — and re-derives cumulatives, so
+    /// there is no slide arithmetic and no saturating clamp that could silently drift.
+    ///
+    /// Index assignment mirrors the selected-chain store: `common = from_tip − |removed|`; a removed
+    /// block `removed[j]` sat at index `from_tip − j` (removed is tip→split order); an added block
+    /// `added[k]` lands at `common + 1 + k` (added is split→tip order). Producers with a zero base cut
+    /// (`block_production == None`, tail-emission edge) contribute no entry — identical to the legacy
+    /// fold skipping them, and correct since a zero cut never changes a cumulative.
+    pub(super) fn advance_production_prefix(
         &self,
         batch: &mut rocksdb::WriteBatch,
         chain_path: &ChainPath,
         sc: &impl SelectedChainStoreReader,
     ) {
         let from_tip = sc.get_tip().unwrap().0;
-        let mut deltas: std::collections::HashMap<ScriptPublicKey, i128> = std::collections::HashMap::new();
-        self.fold_production_window_delta(chain_path, from_tip, sc, &mut deltas);
-        for (spk, delta) in deltas {
-            if delta == 0 {
-                continue;
-            }
-            let raw = self.windowed_production_store.get(&spk).unwrap() as i128 + delta;
-            if raw < 0 {
-                // A correctly-maintained windowed sum (a sum of non-negative per-block base miner
-                // cuts) can NEVER go negative. A negative intermediate means the incremental index
-                // has drifted from the canonical direct window sum. Surface it loudly instead of
-                // silently clamping: the old `.max(0)` masked exactly this and let the drift compound
-                // into a divergent coinbase (the post-hardfork freeze). A clean canonical baseline is
-                // rebuilt on the next node restart (`rebuild_windowed_production_index_on_start`).
-                error!(
-                    "windowed-production drift detected: per-SPK sum went negative (raw={}, delta={}); \
-                     index is no longer canonical and will be rebuilt on next restart",
-                    raw, delta
-                );
-            }
-            let new_value = raw.max(0) as u64;
-            self.windowed_production_store.set_batch(batch, &spk, new_value).unwrap();
-        }
+        let common = from_tip - chain_path.removed.len() as u64;
+        let removals: Vec<(ScriptPublicKey, u64)> = chain_path
+            .removed
+            .iter()
+            .enumerate()
+            .filter_map(|(j, h)| self.block_production(*h).map(|(spk, _)| (spk, from_tip - j as u64)))
+            .collect();
+        let additions: Vec<(ScriptPublicKey, u64, u64)> = chain_path
+            .added
+            .iter()
+            .enumerate()
+            .filter_map(|(k, h)| self.block_production(*h).map(|(spk, cut)| (spk, common + 1 + k as u64, cut)))
+            .collect();
+        self.windowed_production_prefix_store.extend(batch, common, &removals, &additions).unwrap();
     }
 
-    /// Ratio-reward (Stage 2b-2b) — per-SPK production delta from the committed virtual's window to
-    /// block `m_sp`'s window (`m_sp` = the rewarding block's selected parent). The windowed-production
-    /// index is anchored at the committed virtual (its selected-chain tip); this corrects it to the
-    /// rewarding block's own view, exactly mirroring how the balance `view_diffs` correct the balance
-    /// index. Empty when `m_sp` is already the committed tip (the build path, where the rewarding
-    /// block is virtual itself). Deterministic: a function of `m_sp`'s intrinsic DAG position.
-    fn production_window_correction(&self, m_sp: Hash) -> std::collections::HashMap<ScriptPublicKey, i128> {
-        let mut deltas = std::collections::HashMap::new();
+    /// Windowed production for `spk` as seen by the block whose selected parent is `m_sp`, read from
+    /// the gold-standard prefix-sum index, with the window FLOORED at `m_sp`'s committed pruning point
+    /// (option C). The window is `(max(idx(m_sp) − W, idx(pruning_point)), idx(m_sp)]` — the last `W`
+    /// chain-blocks, but never reaching below the pruning point.
+    ///
+    /// Why the floor: a pruned node only retains the selected chain back to the pruning point, and
+    /// across the pre-relaunch (high-DAG-width) history that is FEWER than `W` chain-blocks — so it
+    /// physically cannot reproduce an un-clamped `W`-window (it computes a truncated, larger ratio than
+    /// an archival node). Clamping BOTH archival and pruned nodes to the same consensus pruning point
+    /// makes them sum production over the identical block set `(pruning_point, m_sp]`, hence identical
+    /// values. The pruning point is read from `m_sp`'s HEADER (a consensus value every validator
+    /// shares), not the node's local pruning state (which lags during sync). Absolute chain indices may
+    /// differ across nodes (archival from genesis vs pruned re-based), but the cumulative DIFFERENCE
+    /// over the same block range is offset-independent, so the result agrees.
+    ///
+    /// **Case A** — `m_sp` on the committed chain: `cum(idx) − cum(floor)`.
+    /// **Case B** — `m_sp` off-chain (mid-reorg): committed-prefix part `(floor, common]` + the
+    /// side-chain `added` blocks above the floor, summed directly.
+    pub(super) fn windowed_production_for_block(&self, spk: &ScriptPublicKey, m_sp: Hash, w: u64) -> u64 {
         let sc = self.selected_chain_store.read();
-        let (committed_tip_index, committed_tip) = sc.get_tip().unwrap();
-        if m_sp == committed_tip {
-            return deltas;
+        // Window floor: chain index of m_sp's committed pruning point (consensus). 0 if not on the
+        // selected chain (no clamp) — should not happen for a valid block's pruning point.
+        let pruning_idx =
+            sc.get_by_hash(self.headers_store.get_header(m_sp).unwrap().pruning_point).unwrap_or(0);
+        if let Ok(m_idx) = sc.get_by_hash(m_sp) {
+            // Case A: m_sp is a committed chain block.
+            let bottom = m_idx.saturating_sub(w).max(pruning_idx);
+            let hi = self.windowed_production_prefix_store.cumulative_at(spk, m_idx).unwrap();
+            let lo_cum = self.windowed_production_prefix_store.cumulative_at(spk, bottom).unwrap();
+            return hi.saturating_sub(lo_cum);
         }
+        // Case B: m_sp is on a side chain. Reconstruct its window = committed-prefix part + side delta.
+        let (committed_tip_index, committed_tip) = sc.get_tip().unwrap();
         let chain_path = self.dag_traversal_manager.calculate_chain_path(committed_tip, m_sp, None);
-        self.fold_production_window_delta(&chain_path, committed_tip_index, &*sc, &mut deltas);
-        deltas
+        let common = committed_tip_index - chain_path.removed.len() as u64;
+        let m = common + chain_path.added.len() as u64; // m_sp's index along its OWN selected chain
+        let lo = m.saturating_sub(w).max(pruning_idx); // window bottom, floored at the pruning point
+        // Shared part: committed-chain indices (lo, common] (empty when the whole window is side-chain).
+        let shared = if lo < common {
+            let hi = self.windowed_production_prefix_store.cumulative_at(spk, common).unwrap();
+            let bottom = self.windowed_production_prefix_store.cumulative_at(spk, lo).unwrap();
+            hi.saturating_sub(bottom)
+        } else {
+            0
+        };
+        // Side part: added[k] sits at index common+1+k; include those inside the window (index > lo).
+        let mut side = 0u64;
+        for (k, h) in chain_path.added.iter().enumerate() {
+            let idx = common + 1 + k as u64;
+            if idx > lo
+                && let Some((s, cut)) = self.block_production(*h)
+                && &s == spk
+            {
+                side += cut;
+            }
+        }
+        shared + side
     }
+
 
     /// Ratio-reward (Stage 2b) — advances the balance index by `diff`, keeping it in lockstep with
     /// the virtual UTXO set (called from `commit_virtual_state` with the same `accumulated_diff`, in
@@ -964,28 +985,6 @@ fn balance_delta_for_spk(diff: &UtxoDiff, spk: &ScriptPublicKey) -> i128 {
     added - removed
 }
 
-/// Ratio-reward (Stage 2b-2b) — pure index arithmetic of the windowed-production **bottom slide**.
-/// When the selected-chain tip moves from `from_tip` to `to_tip` (window length `w`), the window's
-/// low boundary slides by the same amount: chain blocks that leave the window must be subtracted
-/// (`sign = -1`), or — on a reorg that shortens the chain — those that re-enter must be re-added
-/// (`sign = +1`). Returns `Some((sign, lo, hi))` over the inclusive chain-index range `[lo, hi]`
-/// (with `lo >= 1`, since index 0 is the genesis/pruning anchor and is never a production block), or
-/// `None` when nothing crosses the boundary (no net tip move, or an early/short chain whose window
-/// has not yet reached index 1). Split out from `fold_production_window_delta` to be unit-tested in
-/// isolation — this is the off-by-one-prone core.
-fn window_bottom_slide(from_tip: i128, to_tip: i128, w: i128) -> Option<(i128, i128, i128)> {
-    let (from_low, to_low) = (from_tip - w, to_tip - w);
-    let (lo, hi, sign) = if to_low > from_low {
-        (from_low + 1, to_low, -1) // window grew at the top ⇒ blocks exit at the bottom
-    } else if to_low < from_low {
-        (to_low + 1, from_low, 1) // window shrank (reorg) ⇒ blocks re-enter at the bottom
-    } else {
-        return None;
-    };
-    let lo = lo.max(1);
-    (lo <= hi).then_some((sign, lo, hi))
-}
-
 fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     let declared_caps = parse_ai_caps(&txs[0].payload);
     if declared_caps.is_empty() {
@@ -1172,46 +1171,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod ratio_window_tests {
-    use super::window_bottom_slide;
-
-    #[test]
-    fn advance_by_one_exits_oldest() {
-        // tip 10 → 11, W=3: window {8,9,10} → {9,10,11}; index 8 exits (subtract).
-        assert_eq!(window_bottom_slide(10, 11, 3), Some((-1, 8, 8)));
-    }
-
-    #[test]
-    fn advance_by_three_exits_three() {
-        // tip 10 → 13, W=3: indices 8,9,10 all exit.
-        assert_eq!(window_bottom_slide(10, 13, 3), Some((-1, 8, 10)));
-    }
-
-    #[test]
-    fn reorg_reenters_oldest() {
-        // tip 11 → 10, W=3: index 8 re-enters the window (re-add).
-        assert_eq!(window_bottom_slide(11, 10, 3), Some((1, 8, 8)));
-    }
-
-    #[test]
-    fn no_tip_move_is_none() {
-        assert_eq!(window_bottom_slide(10, 10, 3), None);
-    }
-
-    #[test]
-    fn early_chain_skips_genesis_anchor() {
-        // Window not yet full (tip ≤ W): nothing has aged past index 0, so no bottom touch.
-        assert_eq!(window_bottom_slide(2, 3, 3), None);
-        // First real exit happens once the boundary reaches index 1.
-        assert_eq!(window_bottom_slide(3, 4, 3), Some((-1, 1, 1)));
-    }
-
-    #[test]
-    fn advance_then_reorg_cancels_exactly() {
-        // The forward exit and its reorg re-entry hit the SAME index with opposite signs ⇒ net zero,
-        // which is what makes the production index reorg-exact.
-        assert_eq!(window_bottom_slide(10, 11, 3), Some((-1, 8, 8)));
-        assert_eq!(window_bottom_slide(11, 10, 3), Some((1, 8, 8)));
-    }
-}

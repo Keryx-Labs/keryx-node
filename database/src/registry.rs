@@ -75,12 +75,24 @@ pub enum DatabaseStorePrefixes {
     TempRelationsChildren = 43,
 
     // ---- Ratio-reward (cont.) ----
-    /// Ratio-reward production index: payout SPK → Σ coinbase miner-cut over the trailing window W
-    WindowedProduction = 44,
+    // 44 retired: the legacy `WindowedProduction` running-sum index, superseded by the path-independent
+    // prefix-sum index below (`WindowedProductionPrefix`). Do not reuse this discriminant.
 
-    /// Fast-sync catch-up: virtual selected-chain index at which `WindowedProduction` was last reset
-    /// by a pruning-point UTXO import (see `import_pruning_point_utxo_set`). Single value, no key.
+    /// Fast-sync catch-up: virtual selected-chain index at which the windowed-production index was last
+    /// reset by a pruning-point UTXO import (see `import_pruning_point_utxo_set`). Single value, no key.
     ProductionIndexSeededAt = 45,
+
+    /// Ratio-reward production PREFIX-SUM index (gold-standard, replaces the path-dependent
+    /// `WindowedProduction` running sum): key `SPK || be(chain_index)` → cumulative production for that
+    /// SPK over selected-chain [genesis, chain_index]. The windowed value is the pure-function
+    /// difference `cum(b) − cum(b−W)`, so every node on the same chain computes the identical number
+    /// regardless of its update history. See `windowed_production_prefix`.
+    WindowedProductionPrefix = 46,
+
+    /// Floor baseline for `WindowedProductionPrefix`: key `SPK` → cumulative production up to the
+    /// current pruning floor, for SPKs whose per-block entries below the floor have been collapsed
+    /// (so `cum(b−W)` stays exact after pruning). See `windowed_production_prefix::advance_floor`.
+    WindowedProductionFloor = 47,
 
     // ---- Retention Period Root ----
     RetentionPeriodRoot = 50,
