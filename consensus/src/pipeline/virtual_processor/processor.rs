@@ -715,26 +715,28 @@ impl VirtualStateProcessor {
         drop(selected_chain_write);
     }
 
-    /// One-shot recovery (env `KERYX_REBUILD_PRODUCTION=1`): rebuild the windowed-production index in
-    /// place from the on-disk selected chain — the sum of `block_production` over the FULL last
-    /// `ratio_reward_window` chain blocks ending at the tip, down to genesis (`.max(1)`), with NO
-    /// pruning-point clamp. Repairs an ARCHIVAL store that the import `clear` left without its
-    /// from-genesis accumulation (⇒ undercounted production ⇒ ratio_bps too high ⇒ divergent
-    /// coinbase). Requires every window block on disk — archival only. Run once, then restart without
-    /// the flag; incremental lockstep maintenance carries it forward.
+    /// Deterministic clean-baseline rebuild of the windowed-production index, run automatically at
+    /// every node start (see `rebuild_windowed_production_index_on_start` and `Consensus::new`). The
+    /// index is an incremental cache; its value MUST equal the canonical direct sum of
+    /// `block_production` over the last `ratio_reward_window` selected-chain blocks ending at the tip
+    /// (down to genesis, `.max(1)`). Recomputing it directly from the on-disk chain wipes any drift
+    /// inherited from a buggy-version reorg history — the root cause of the post-hardfork ratio-reward
+    /// coinbase divergence — and makes every node hold the identical canonical value. Safe for pruned
+    /// nodes too: `ratio_reward_window` (864k) < `pruning_depth` (1.08M), so every window block is
+    /// always on disk. `KERYX_REBUILD_PRODUCTION=1` forces it even mid catch-up.
     pub(crate) fn rebuild_windowed_production_index(&self) {
         let sc = self.selected_chain_store.read();
         let tip_idx = match sc.get_tip() {
             Ok((idx, _)) => idx,
             Err(_) => {
-                warn!("KERYX_REBUILD_PRODUCTION: no selected-chain tip; skipping rebuild");
+                warn!("windowed-production rebuild: no selected-chain tip; skipping");
                 return;
             }
         };
         let w = self.ratio_reward_window;
         let lo = tip_idx.saturating_sub(w.saturating_sub(1)).max(1);
         info!(
-            "KERYX_REBUILD_PRODUCTION: rebuilding windowed-production over selected-chain [{}, {}] ({} blocks)...",
+            "windowed-production rebuild: recomputing canonical index over selected-chain [{}, {}] ({} blocks)...",
             lo,
             tip_idx,
             tip_idx.saturating_sub(lo) + 1
@@ -754,7 +756,25 @@ impl VirtualStateProcessor {
             self.windowed_production_store.set_batch(&mut batch, &spk, v).unwrap();
         }
         self.db.write(batch).unwrap();
-        info!("KERYX_REBUILD_PRODUCTION: done — {} producer SPKs written. Restart WITHOUT the flag.", entries);
+        info!("windowed-production rebuild: done — {} producer SPKs written (canonical baseline).", entries);
+    }
+
+    /// Automatic clean-baseline rebuild invoked once on every node start. Unconditionally rebuilds the
+    /// canonical windowed-production index (see `rebuild_windowed_production_index`) so a node never
+    /// relies on a possibly-drifted incremental history — this is the determinism guarantee for the
+    /// ratio-reward coinbase. Skipped ONLY while still inside the fast-sync catch-up window: there the
+    /// pre-import portion of the window is not yet on disk (pruned below the freshly imported point),
+    /// so a rebuild would undercount; `trust_coinbase()` covers that bounded period and a later
+    /// restart rebuilds once the window has organically refilled past the import point.
+    pub(crate) fn rebuild_windowed_production_index_on_start(&self) {
+        if self.in_production_catchup_window() {
+            info!(
+                "windowed-production rebuild skipped: still inside fast-sync catch-up window \
+                 (index refills forward; coinbase is trusted meanwhile)."
+            );
+            return;
+        }
+        self.rebuild_windowed_production_index();
     }
 
     /// Caches the DAA and Median time windows of the sink block (if needed). Following, virtual's window calculations will

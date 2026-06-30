@@ -324,11 +324,15 @@ impl Consensus {
         // Run database upgrades if any
         this.run_database_upgrades();
 
-        // One-shot recovery (env KERYX_REBUILD_PRODUCTION=1): rebuild the windowed-production index in
-        // place from the on-disk selected chain (full window, no pruning-point clamp). Repairs an
-        // archival store left without its from-genesis accumulation by the import clear. Run once.
+        // Deterministic clean baseline for the ratio-reward windowed-production index: recompute it
+        // directly from the on-disk selected-chain window on every start, so every node holds the
+        // canonical direct sum instead of a possibly-drifted incremental history (the root cause of the
+        // post-hardfork coinbase non-determinism). Skipped automatically while mid fast-sync catch-up.
+        // `KERYX_REBUILD_PRODUCTION=1` forces an unconditional rebuild (even during catch-up).
         if std::env::var("KERYX_REBUILD_PRODUCTION").is_ok() {
             this.virtual_processor.rebuild_windowed_production_index();
+        } else {
+            this.virtual_processor.rebuild_windowed_production_index_on_start();
         }
 
         this

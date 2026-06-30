@@ -978,7 +978,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // GGUF models by H, and pom_activation MUST equal the miner's POM_ACTIVATION_DAA, or its blocks
     // are rejected and it forks off the chain.
     pom_activation: ForkActivation::new(37_780_000),
-    very_light_activation: ForkActivation::never(), // H2 DAA TBD — set on miner + node together before activation
+    very_light_activation: ForkActivation::new(38_951_445), // H2 = frozen frontier; mirrors miner VERY_LIGHT_ACTIVATION_DAA
 
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
@@ -1006,7 +1006,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // boundary layer (well under MIN_DIFFICULTY_WINDOW_SIZE=150) — so the calc falls back to
     // genesis.bits. The chain relaunches at the launch target and the DAA re-converges upward to
     // the real PoM hashrate within one window. MUST match across all honest nodes.
-    difficulty_reset_activation: ForkActivation::new(37_780_000),
+    difficulty_reset_activation: ForkActivation::new(38_951_445),
     ratio_reward_window: RATIO_REWARD_WINDOW,
 };
 

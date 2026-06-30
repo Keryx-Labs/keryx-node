@@ -44,7 +44,7 @@ use keryx_consensus_core::{
         utxo_view::{UtxoView, UtxoViewComposition},
     },
 };
-use keryx_core::{info, trace, warn};
+use keryx_core::{error, info, trace, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_muhash::MuHash;
@@ -611,7 +611,21 @@ impl VirtualStateProcessor {
             if delta == 0 {
                 continue;
             }
-            let new_value = (self.windowed_production_store.get(&spk).unwrap() as i128 + delta).max(0) as u64;
+            let raw = self.windowed_production_store.get(&spk).unwrap() as i128 + delta;
+            if raw < 0 {
+                // A correctly-maintained windowed sum (a sum of non-negative per-block base miner
+                // cuts) can NEVER go negative. A negative intermediate means the incremental index
+                // has drifted from the canonical direct window sum. Surface it loudly instead of
+                // silently clamping: the old `.max(0)` masked exactly this and let the drift compound
+                // into a divergent coinbase (the post-hardfork freeze). A clean canonical baseline is
+                // rebuilt on the next node restart (`rebuild_windowed_production_index_on_start`).
+                error!(
+                    "windowed-production drift detected: per-SPK sum went negative (raw={}, delta={}); \
+                     index is no longer canonical and will be rebuilt on next restart",
+                    raw, delta
+                );
+            }
+            let new_value = raw.max(0) as u64;
             self.windowed_production_store.set_batch(batch, &spk, new_value).unwrap();
         }
     }
