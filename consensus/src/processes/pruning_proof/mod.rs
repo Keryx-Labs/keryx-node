@@ -207,7 +207,7 @@ impl PruningProofManager {
                 continue;
             }
 
-            let block_level = calc_block_level(header, self.max_block_level);
+            let block_level = pom_aware_block_level(header, self.max_block_level, self.pom_activation);
             self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
         }
 
@@ -411,3 +411,63 @@ where
 }
 
 impl<T: GhostdagStoreReader> GhostdagReaderExt for T {}
+
+/// Computes the block level to persist for a pruning-point-proof header, mirroring
+/// `pre_ghostdag_validation::check_pow_and_calc_block_level`'s real-time behavior: post-PoM
+/// headers carry no valid kHeavyHash PoW (PoM possession replaces it), so their level is forced
+/// to 0 rather than derived from `calc_block_level`'s (meaningless, post-fork) leading-zero count.
+///
+/// This matters because `import_pruning_points` persists the result into the SAME shared
+/// `headers_store` that real-time header processing populates. Before this helper existed, this
+/// call site used the raw `calc_block_level(header, max_block_level)` with no PoM awareness,
+/// which could disagree with the level the real-time path would have assigned to the same header
+/// had it arrived through normal sync. Readers of `headers_store` (e.g. `parents_builder` and
+/// `post_pow_validation::check_indirect_parents`) assume a single consistent level per block
+/// regardless of which path stored it, so the two computations must agree.
+fn pom_aware_block_level(header: &Header, max_block_level: BlockLevel, pom_activation: ForkActivation) -> BlockLevel {
+    if pom_activation.is_active(header.daa_score) { 0 } else { calc_block_level(header, max_block_level) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_with_daa_score(daa_score: u64) -> Header {
+        // A single non-empty parent level avoids `calc_block_level`'s genesis shortcut
+        // (`parents_by_level.is_empty()` => `max_block_level`), so the result is driven purely by
+        // the (deterministic, nonce/timestamp-independent-of-pass/fail) PoW-derived level.
+        let mut header = Header::from_precomputed_hash(Hash::from_bytes([1u8; 32]), vec![Hash::from_bytes([2u8; 32])]);
+        header.daa_score = daa_score;
+        header
+    }
+
+    #[test]
+    fn pom_aware_block_level_forces_zero_once_active() {
+        let header = header_with_daa_score(1_000);
+        let raw = calc_block_level(&header, 225);
+
+        // Before activation: behaves exactly like the raw, non-PoM-aware calculation.
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::never()), raw);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_001)), raw);
+
+        // At and after activation: forced to 0 regardless of what the raw PoW-derived level is.
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_000)), 0);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::always()), 0);
+    }
+
+    #[test]
+    fn pom_aware_block_level_matches_real_time_validation_boundary() {
+        // The activation boundary is inclusive (`is_active` is `>=`), exactly like
+        // `pre_ghostdag_validation::check_pow_and_calc_block_level`'s `pom_activation.is_active(..)`
+        // check. Headers one DAA score before activation must NOT be zeroed; headers at the
+        // activation DAA score must be.
+        let activation = ForkActivation::new(37_780_000);
+
+        let before = header_with_daa_score(37_779_999);
+        let raw_before = calc_block_level(&before, 225);
+        assert_eq!(pom_aware_block_level(&before, 225, activation), raw_before);
+
+        let at = header_with_daa_score(37_780_000);
+        assert_eq!(pom_aware_block_level(&at, 225, activation), 0);
+    }
+}
