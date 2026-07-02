@@ -792,6 +792,14 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
 
             for &hash in chunk.iter() {
                 let msg = dequeue_with_timeout!(self.incoming_route, Payload::BlockBody)?;
+                let pom_tier = msg.pom_tier.map(|tier| tier as u8);
+                let pom_proof = msg
+                    .pom_proof
+                    .as_deref()
+                    .map(borsh::from_slice::<PomProof>)
+                    .transpose()
+                    .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for trusted block {}", hash)))?
+                    .map(Arc::new);
                 let blk_body: BlockBody = msg.try_into()?;
                 // TODO (relaxed): make header queries in a batch.
                 let blk_header = consensus.async_get_header(hash).await.map_err(|err| {
@@ -802,9 +810,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 if blk_body.is_empty() {
                     return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", hash)));
                 }
-                // Trusted pruning-anticone blocks are pre-pom (pruning point precedes pom_activation),
-                // so there is no tier to carry.
-                let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof: None, pom_tier: None };
+                let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof, pom_tier };
                 // TODO (relaxed): sending ghostdag data may be redundant, especially when the headers were already verified.
                 // Consider sending empty ghostdag data, simplifying a great deal. The result should be the same -
                 // a trusted task is sent, however the header is already verified, and hence only the block body will be verified.

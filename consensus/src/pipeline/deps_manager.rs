@@ -69,9 +69,16 @@ impl BlockTask {
         matches!(self, BlockTask::Trusted { .. })
     }
 
-    /// Whether the PoM possession proof check should be skipped for this block (IBD body sync only).
+    /// Whether the PoM possession proof check should be skipped for this block.
+    ///
+    /// Trusted blocks belong to a pruning proof whose accumulated work was already
+    /// validated. Their historical PoM proofs may also have been garbage-collected,
+    /// so requiring an individual possession proof here would make fresh IBD fail.
     pub fn skip_pom_proof(&self) -> bool {
-        matches!(self, BlockTask::Ordinary { skip_pom_proof: true, .. })
+        match self {
+            BlockTask::Ordinary { skip_pom_proof, .. } => *skip_pom_proof,
+            BlockTask::Trusted { .. } => true,
+        }
     }
 
     pub fn requires_virtual_processing(&self) -> bool {
@@ -158,6 +165,22 @@ impl TaskQueue {
             TaskQueue::Single(_) => false,
             TaskQueue::Many(q) => q.is_empty(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_block() -> Block {
+        Block::from_precomputed_hash(Hash::from_bytes([1; 32]), vec![])
+    }
+
+    #[test]
+    fn pom_proof_skip_policy_distinguishes_live_and_ibd_tasks() {
+        assert!(!BlockTask::Ordinary { block: test_block(), skip_pom_proof: false }.skip_pom_proof());
+        assert!(BlockTask::Ordinary { block: test_block(), skip_pom_proof: true }.skip_pom_proof());
+        assert!(BlockTask::Trusted { block: test_block() }.skip_pom_proof());
     }
 }
 
