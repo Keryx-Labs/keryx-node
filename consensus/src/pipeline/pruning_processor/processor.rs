@@ -144,7 +144,45 @@ impl PruningProcessor {
             }
             self.advance_pruning_point_if_possible(sink_ghostdag_data);
             self.gc_old_pom_proofs();
+            self.gc_collapse_ratio_prefix();
         }
+    }
+
+    /// Collapse ratio-reward prefix-index entries the consensus can no longer read into the per-SPK
+    /// floor, so the index stays bounded instead of growing with the whole chain — the same
+    /// unbounded-growth-on-pruned-nodes problem the PoM proof GC solves (pruning removes block
+    /// bodies, not this separate index, yet every full node writes one entry per chain block).
+    ///
+    /// Runs unconditionally on every pruning message. Self-contained storage reclaim that touches no
+    /// consensus state: `windowed_production_for_block` clamps every window bottom to
+    /// `max(m_idx − W, pruning_idx)`, whose minimum (a block just above the pruning point) is
+    /// `pruning_idx − W`, so entries strictly below that are never read again. It changes no value the
+    /// consensus reads (`RATIO_REWARD_WINDOW < pruning_depth` keeps the floor above the pruned
+    /// region), needs no cross-node coordination, and can never cause a UTXO / consensus divergence.
+    fn gc_collapse_ratio_prefix(&self) {
+        const COLLAPSE_BUDGET: u64 = 50_000;
+        let w = self.config.params.ratio_reward_window;
+        let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
+        let Some(pruning_idx) = self.selected_chain_store.read().get_by_hash(pruning_point).optional().unwrap() else {
+            return; // pruning point not yet indexed on the selected chain
+        };
+        let floor_index = pruning_idx.saturating_sub(w);
+        if floor_index == 0 {
+            return; // the whole chain is still within one ratio window of the pruning point
+        }
+        let mut batch = WriteBatch::default();
+        let deleted = match self.windowed_production_prefix_store.collapse_below(&mut batch, floor_index, COLLAPSE_BUDGET) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!("ratio prefix collapse skipped: {e}");
+                return;
+            }
+        };
+        if deleted == 0 {
+            return; // caught up — nothing newly fell below the floor
+        }
+        self.db.write(batch).unwrap();
+        debug!("Ratio prefix collapse: folded {deleted} entries below chain index {floor_index} into per-SPK floors");
     }
 
     /// Garbage-collect PoM possession proofs older than `POM_PROOF_RETENTION_DEPTH` chain blocks.

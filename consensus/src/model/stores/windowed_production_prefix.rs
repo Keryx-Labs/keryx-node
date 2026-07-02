@@ -180,6 +180,55 @@ impl DbWindowedProductionPrefixStore {
         Ok(())
     }
 
+    /// Fold every retained per-block entry with chain index `< floor_index` into its SPK's floor
+    /// baseline (deleting the entry), so the index stays bounded to ~the pruning window instead of
+    /// growing with the whole chain. Processes at most `entry_budget` entries per call, so a large
+    /// first-run backlog drains gradually over successive pruning messages. Returns the count deleted.
+    ///
+    /// SAFE for consensus. `windowed_production_for_block` clamps every window bottom to
+    /// `max(m_idx − W, pruning_idx)`, whose minimum — a block just above the pruning point — is
+    /// `pruning_idx − W`; the caller passes `floor_index = pruning_idx − ratio_reward_window`, so no
+    /// consensus read ever touches a collapsed index. Query-preserving at *every* intermediate commit
+    /// too: entries are visited in ascending index order and the lowest are deleted first, so a per-SPK
+    /// floor is never set above a still-retained entry — a reverse seek always returns the correct
+    /// highest-retained cumulative (see `collapse_below_preserves_queries`). Because it changes no value
+    /// the consensus reads, it needs no cross-node coordination (a collapsed and a freshly-built node
+    /// return identical `windowed()`), and can never cause a UTXO / consensus divergence.
+    pub fn collapse_below(&self, batch: &mut WriteBatch, floor_index: u64, entry_budget: u64) -> Result<u64, StoreError> {
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_range(rocksdb::PrefixRange([self.entries_prefix].as_slice()));
+        let it = self.db.iterator_opt(IteratorMode::Start, opts);
+
+        // Per-SPK max cumulative among this call's collapsed entries (bucket bytes → cumulative).
+        let mut folded: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut deleted = 0u64;
+        for item in it {
+            if deleted >= entry_budget {
+                break;
+            }
+            let (key, value) = item?;
+            // Key layout: entries_prefix(1) || spk_bucket(N) || be(index)(8).
+            let index = u64::from_be_bytes(key[key.len() - 8..].try_into().expect("index is 8 bytes"));
+            if index >= floor_index {
+                continue; // at/above the floor: the consensus may still read it — keep.
+            }
+            let bucket = key[1..key.len() - 8].to_vec();
+            batch.delete(key.as_ref());
+            let e = folded.entry(bucket).or_insert(0);
+            *e = (*e).max(decode_u64(value.to_vec()));
+            deleted += 1;
+        }
+        // Merge each collapsed max into the SPK's committed floor (monotonic, order-independent).
+        for (bucket, cumulative) in folded {
+            let mut fk = Vec::with_capacity(1 + bucket.len());
+            fk.push(self.floor_prefix);
+            fk.extend_from_slice(&bucket);
+            let existing = self.db.get(&fk)?.map(decode_u64).unwrap_or(0);
+            batch.put(fk, existing.max(cumulative).to_le_bytes());
+        }
+        Ok(deleted)
+    }
+
     /// True if the index holds no entries at all (fresh prefix, or a datadir created before this
     /// store existed) — the trigger for the one-time from-chain build/migration at startup.
     pub fn is_empty(&self) -> bool {
@@ -372,6 +421,50 @@ mod tests {
         for (sb, b, want) in before {
             let got = store.windowed(&spk(sb), b, w).unwrap();
             assert_eq!(got, want, "post-collapse spk {sb} at b {b} (floor {floor})");
+        }
+    }
+
+    /// `collapse_below` (the wired GC path) must preserve every at/above-floor query — and do so
+    /// after EACH budgeted partial pass, not just at the end (the ascending delete-lowest-first
+    /// invariant is what makes an intermediate commit safe).
+    #[test]
+    fn collapse_below_preserves_queries() {
+        let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbWindowedProductionPrefixStore::new(db.clone());
+        let w = 6u64;
+        let chain: Vec<(ScriptPublicKey, u64)> = vec![
+            (spk(1), 10), (spk(1), 20), (spk(2), 5), (spk(2), 5), (spk(1), 30),
+            (spk(2), 7), (spk(2), 7), (spk(2), 7), (spk(2), 7), (spk(2), 7),
+            (spk(2), 7), (spk(2), 7), (spk(2), 7), (spk(2), 7), (spk(2), 7),
+        ];
+        for (k, (s, c)) in chain.iter().enumerate() {
+            let index = k as u64 + 1;
+            let mut batch = WriteBatch::default();
+            store.extend(&mut batch, index - 1, &[], &[(s.clone(), index, *c)]).unwrap();
+            db.write(batch).unwrap();
+        }
+        let tip = chain.len() as u64;
+        // Collapse indices < 6; valid queries need `b − w ≥ 5`, i.e. `b ≥ 6 + w` (the production
+        // invariant `floor_index = pruning_idx − W`, `min_b = pruning_idx`).
+        let floor_index = 6u64;
+        let min_b = floor_index + w;
+
+        let before: Vec<(u8, u64, u64)> = (1..=2u8)
+            .flat_map(|sb| (min_b..=tip).map(move |b| (sb, b)))
+            .map(|(sb, b)| (sb, b, store.windowed(&spk(sb), b, w).unwrap()))
+            .collect();
+
+        // Tiny budget forces multiple partial passes (incl. mid-bucket cuts).
+        loop {
+            let mut batch = WriteBatch::default();
+            let n = store.collapse_below(&mut batch, floor_index, 2).unwrap();
+            db.write(batch).unwrap();
+            for (sb, b, want) in &before {
+                assert_eq!(store.windowed(&spk(*sb), *b, w).unwrap(), *want, "post partial-collapse spk {sb} b {b}");
+            }
+            if n == 0 {
+                break;
+            }
         }
     }
 
