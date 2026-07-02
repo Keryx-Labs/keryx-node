@@ -195,6 +195,10 @@ pub struct VirtualStateProcessor {
     pub(super) opoi_v2_activation: ForkActivation,
     pub(super) inference_reward_minimums_v2: &'static [([u8; 32], u64)],
 
+    // H2 inference_reward minimums (5-tier: adds Qwen3-1.7B + 70B-Q2), DAA-gated at a future score
+    pub(super) inference_min_h2_activation: ForkActivation,
+    pub(super) inference_reward_minimums_v2_h2: &'static [([u8; 32], u64)],
+
     // SALT v2 hardfork: KeryxHash domain separation switch activation score
     pub(super) pow_salt_v2_activation: ForkActivation,
 
@@ -324,6 +328,9 @@ impl VirtualStateProcessor {
 
             opoi_v2_activation: params.opoi_v2_activation,
             inference_reward_minimums_v2: params.inference_reward_minimums_v2,
+
+            inference_min_h2_activation: params.inference_min_h2_activation,
+            inference_reward_minimums_v2_h2: params.inference_reward_minimums_v2_h2,
 
             pow_salt_v2_activation: params.pow_salt_v2_activation,
             pow_salt_v4_activation: params.pow_salt_v4_activation,

@@ -326,7 +326,10 @@ impl VirtualStateProcessor {
             // OPoI v2 hardfork: swap to the uncensored lineup at/after activation. DAA-gated so
             // IBD re-validates historical (pre-v2) blocks against the legacy lineup unchanged.
             // (Activation is announced by the consolidated KERYX HARDFORK banner above.)
-            let minimums = if self.opoi_v2_activation.is_active(header.daa_score) {
+            let minimums = if self.inference_min_h2_activation.is_active(header.daa_score) {
+                // H2 (5-tier) floors: adds Qwen3-1.7B + 70B-Q2, absent from the v2 table.
+                self.inference_reward_minimums_v2_h2
+            } else if self.opoi_v2_activation.is_active(header.daa_score) {
                 self.inference_reward_minimums_v2
             } else {
                 self.inference_reward_minimums

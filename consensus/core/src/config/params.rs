@@ -114,6 +114,22 @@ pub const INFERENCE_REWARD_MINIMUMS_V2: &[([u8; 32], u64)] = &[
     (LLAMA_3_3_70B_ABLITERATED_MODEL_ID, 400_000_000),   // 4.0 KRX  (--very-high)
 ];
 
+/// Per-model minimum inference_reward in sompi. H2 (5-tier) lineup, enforced from
+/// `inference_min_h2_activation` (replaces `INFERENCE_REWARD_MINIMUMS_V2` at that DAA score).
+/// The v2 table above was never extended when the H2 lineup shipped, so two served models had no
+/// enforced floor: `--very-light` Qwen3-1.7B (absent) and the top tier 70B-Q2 (the v2 table still
+/// lists the retired 70B-Q4 model_id). This table adds both, mirroring the dApp's advertised floors.
+/// Gated at a FUTURE DAA — never at `very_light_activation` (already past): applying a stricter
+/// minimum to a historical block would reject it on IBD re-validation and diverge the UTXO set.
+/// Node-only enforcement (the miner does not check minimums), so no miner lockstep is required.
+pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
+    (QWEN3_1_7B_MODEL_ID,          30_000_000),   // 0.3 KRX  (--very-light)
+    (GEMMA_3_4B_MODEL_ID,          50_000_000),   // 0.5 KRX  (--light)
+    (DOLPHIN_LLAMA3_8B_MODEL_ID,  150_000_000),   // 1.5 KRX  (default)
+    (QWEN3_32B_MODEL_ID,          250_000_000),   // 2.5 KRX  (--high)
+    (LLAMA_3_3_70B_Q2_MODEL_ID,   400_000_000),   // 4.0 KRX  (--very-high, Q2_K_L)
+];
+
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
 
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
@@ -652,6 +668,17 @@ pub struct Params {
     /// `VERY_LIGHT_ACTIVATION_DAA` for the running network. Dormant until the H2 DAA is chosen.
     pub very_light_activation: ForkActivation,
 
+    /// H2 per-model minimum inference_reward gate. From this score `inference_reward_minimums_v2_h2`
+    /// (5-tier, incl. Qwen3-1.7B + 70B-Q2) replaces `inference_reward_minimums_v2`. MUST be a FUTURE
+    /// DAA — never `very_light_activation` (already past) — so IBD re-validation of historical blocks
+    /// keeps the v2 table; a stricter minimum applied retroactively would reject a past AiRequest and
+    /// diverge the UTXO set. Node-only enforcement (no miner involvement).
+    pub inference_min_h2_activation: ForkActivation,
+
+    /// H2 (5-tier) per-model minimum inference_reward (sompi). Used in place of
+    /// `inference_reward_minimums_v2` for blocks at or after `inference_min_h2_activation`.
+    pub inference_reward_minimums_v2_h2: &'static [([u8; 32], u64)],
+
     /// PoW SALT v2 hardfork activation DAA score.
     /// After this score, `KERYX_MATRIX_SALT_V2` is used for matrix generation instead of v1.
     /// Any miner binary compiled against v1 will compute a different matrix and its blocks
@@ -880,6 +907,9 @@ impl Params {
 
             very_light_activation: self.very_light_activation,
 
+            inference_min_h2_activation: self.inference_min_h2_activation,
+            inference_reward_minimums_v2_h2: self.inference_reward_minimums_v2_h2,
+
             pow_salt_v2_activation: self.pow_salt_v2_activation,
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
@@ -992,6 +1022,14 @@ pub const MAINNET_PARAMS: Params = Params {
     pom_activation: ForkActivation::new(37_780_000),
     very_light_activation: ForkActivation::new(38_951_445), // H2 = frozen frontier; mirrors miner VERY_LIGHT_ACTIVATION_DAA
 
+    // H2 inference_reward minimums (adds Qwen3-1.7B + 70B-Q2, missed when the H2 lineup shipped).
+    // FUTURE DAA — ~1 week of upgrade runway (tip 40_493_001 @ 2026-07-02 + ~6.0M blocks ≈ 7 days,
+    // activation ≈ 2026-07-09). Treated as a coordinated soft-fork (new-valid ⊆ old-valid): announce
+    // + upgrade nodes/pools before this score. NOT gated at very_light_activation (past) to avoid
+    // re-validation divergence.
+    inference_min_h2_activation: ForkActivation::new(46_500_000),
+    inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
+
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
     // DAA estimate: 16_501_908 (current) + 774_000 (21.5h × 10 BPS) = 17_275_908 → rounded down for 2 min margin.
     pow_salt_v2_activation: ForkActivation::new(17_275_000),
@@ -1085,6 +1123,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // difficulty drift). Mainnet stays `never()` until H and will need a difficulty reset.
     pom_activation: ForkActivation::new(5_000),
     very_light_activation: ForkActivation::never(), // testnet H2 DAA TBD — set with the miner to exercise the 5-tier lineup
+    // Set alongside very_light_activation above when exercising the H2 lineup on testnet.
+    inference_min_h2_activation: ForkActivation::never(),
+    inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
 
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
     // at DAA 1000 transitions on this testnet). Mainnet keeps new(17_275_000).
@@ -1152,6 +1193,8 @@ pub const SIMNET_PARAMS: Params = Params {
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
     very_light_activation: ForkActivation::never(),
+    inference_min_h2_activation: ForkActivation::never(),
+    inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
@@ -1204,6 +1247,8 @@ pub const DEVNET_PARAMS: Params = Params {
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
     very_light_activation: ForkActivation::never(),
+    inference_min_h2_activation: ForkActivation::never(),
+    inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
