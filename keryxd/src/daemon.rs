@@ -8,7 +8,7 @@ use keryx_consensus_core::{
     mining_rules::MiningRules,
 };
 use keryx_consensus_notify::{root::ConsensusNotificationRoot, service::NotifyService};
-use keryx_core::{core::Core, debug, info};
+use keryx_core::{core::Core, debug, info, warn};
 use keryx_core::{kaspad_env::version, task::tick::TickService};
 use keryx_database::{
     prelude::{CachePolicy, DbWriter, DirectDbWriter, RocksDbPreset},
@@ -544,6 +544,12 @@ Do you confirm? (y/n)";
     let add_peers = args.add_peers.iter().map(|x| x.normalize(config.default_p2p_port())).collect();
     let p2p_server_addr = args.listen.unwrap_or(ContextualNetAddress::unspecified()).normalize(config.default_p2p_port());
     // connect_peers means no DNS seeding and no outbound/inbound peers
+    if !connect_peers.is_empty() {
+        warn!(
+            "Exclusive --connect mode enabled: DNS discovery, regular outbound peer selection, and inbound P2P connections are disabled. \
+             The node will have no peers if all configured connections become unavailable; use --addpeer for preferred peers with fallback."
+        );
+    }
     let outbound_target = if connect_peers.is_empty() { args.outbound_target } else { 0 };
     let inbound_limit = if connect_peers.is_empty() { args.inbound_limit } else { 0 };
     let dns_seeders = if connect_peers.is_empty() && !args.disable_dns_seeding { config.dns_seeders } else { &[] };
