@@ -56,6 +56,16 @@ use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};
 use std::{iter::once, ops::Deref};
 
+/// Pre-resolved production-window context of a single validated block (its selected parent
+/// `m_sp`), shared by every rewarded blue of that block — see [`VirtualStateProcessor::production_window_ctx`].
+pub(super) enum ProductionWindowCtx {
+    /// `m_sp` is a committed selected-chain block: window = `(bottom, m_idx]` on the prefix index.
+    OnChain { m_idx: u64, bottom: u64 },
+    /// `m_sp` is on a side chain (mid-reorg / catch-up resolve batch): committed part `(lo, common]`
+    /// on the prefix index + the side-chain production above `lo`, pre-aggregated per SPK.
+    SideChain { common: u64, lo: u64, side_by_spk: std::collections::HashMap<ScriptPublicKey, u64> },
+}
+
 pub(crate) mod crescendo {
     use keryx_core::{info, log::CRESCENDO_KEYWORD};
     use std::sync::{
@@ -475,6 +485,9 @@ impl VirtualStateProcessor {
         // own committed-index + `view_diffs` correction (that index is exact and not the divergence source).
         let prod_floor = self.coinbase_manager.base_miner_cut(pov_daa_score).max(1);
         let w = self.ratio_reward_window;
+        // Window context depends only on the block's selected parent — resolve it ONCE and share it
+        // across every rewarded blue (it embeds the full side-chain aggregation in the Case B shape).
+        let window_ctx = self.production_window_ctx(ghostdag_data.selected_parent, w);
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             // Payout SPK = the blue's own miner cut, already resolved into the reward data.
             if let Some(reward) = mergeset_rewards.get(blue) {
@@ -482,7 +495,7 @@ impl VirtualStateProcessor {
                 let base = self.address_balance_store.get(spk).unwrap() as i128;
                 let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                 let balance = (base + delta).max(0) as u64;
-                let production = self.windowed_production_for_block(spk, ghostdag_data.selected_parent, w).max(prod_floor);
+                let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
                 map.insert(*blue, ratio_reward_bps(balance, production));
             }
         }
@@ -504,7 +517,7 @@ impl VirtualStateProcessor {
                         let base = self.address_balance_store.get(spk).unwrap() as i128;
                         let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                         let balance = (base + delta).max(0) as u64;
-                        let prefix = self.windowed_production_for_block(spk, ghostdag_data.selected_parent, w);
+                        let prefix = self.windowed_production_with_ctx(spk, &window_ctx);
                         debug!(
                             "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={}",
                             pov_daa_score, blue, sp_idx, balance, prefix, prod_floor,
@@ -574,6 +587,25 @@ impl VirtualStateProcessor {
         Some((spk, cut))
     }
 
+    /// Memoized [`block_production`]. A block's production contribution (its own coinbase SPK +
+    /// base cut at its own DAA score) is immutable per hash — reorgs never change it — so entries
+    /// are safe to keep indefinitely; the cache is only cleared to bound memory (~50 B/entry).
+    /// This is what breaks the quadratic RocksDB-read blowup of side-chain (Case B) windowed
+    /// production during catch-up: block k of a resolve batch re-reads the same k−1 coinbases
+    /// block k−1 just read.
+    pub(super) fn block_production_cached(&self, hash: Hash) -> Option<(ScriptPublicKey, u64)> {
+        if let Some(v) = self.block_production_cache.read().get(&hash) {
+            return v.clone();
+        }
+        let v = self.block_production(hash);
+        let mut cache = self.block_production_cache.write();
+        if cache.len() >= 200_000 {
+            cache.clear();
+        }
+        cache.insert(hash, v.clone());
+        v
+    }
+
     /// Gold-standard prefix-sum maintenance — advances the production index along `chain_path`, kept in
     /// lockstep with the selected chain (called from `commit_virtual_state` in the SAME batch as the
     /// selected-chain `apply_changes`, BEFORE it runs, so `sc` still reflects the pre-change chain).
@@ -601,13 +633,13 @@ impl VirtualStateProcessor {
             .removed
             .iter()
             .enumerate()
-            .filter_map(|(j, h)| self.block_production(*h).map(|(spk, _)| (spk, from_tip - j as u64)))
+            .filter_map(|(j, h)| self.block_production_cached(*h).map(|(spk, _)| (spk, from_tip - j as u64)))
             .collect();
         let additions: Vec<(ScriptPublicKey, u64, u64)> = chain_path
             .added
             .iter()
             .enumerate()
-            .filter_map(|(k, h)| self.block_production(*h).map(|(spk, cut)| (spk, common + 1 + k as u64, cut)))
+            .filter_map(|(k, h)| self.block_production_cached(*h).map(|(spk, cut)| (spk, common + 1 + k as u64, cut)))
             .collect();
         self.windowed_production_prefix_store.extend(batch, common, &removals, &additions).unwrap();
     }
@@ -630,7 +662,24 @@ impl VirtualStateProcessor {
     /// **Case A** — `m_sp` on the committed chain: `cum(idx) − cum(floor)`.
     /// **Case B** — `m_sp` off-chain (mid-reorg): committed-prefix part `(floor, common]` + the
     /// side-chain `added` blocks above the floor, summed directly.
+    ///
+    /// The window resolution depends only on `m_sp`, so it is split out into
+    /// [`production_window_ctx`], computed ONCE per validated block; the per-SPK query is
+    /// [`windowed_production_with_ctx`]. Keeping them fused per SPK (the previous shape) walked
+    /// the full committed-tip→`m_sp` chain path and re-read every side-chain coinbase for EVERY
+    /// rewarded blue of EVERY block of a catch-up resolve batch — quadratic in batch length, and
+    /// the measured cause of an IBD catch-up crawling at ~4 UTXO-validated blocks/s.
     pub(super) fn windowed_production_for_block(&self, spk: &ScriptPublicKey, m_sp: Hash, w: u64) -> u64 {
+        let ctx = self.production_window_ctx(m_sp, w);
+        self.windowed_production_with_ctx(spk, &ctx)
+    }
+
+    /// Resolves the production-window context of the block whose selected parent is `m_sp` —
+    /// everything of `windowed_production_for_block` that does not depend on the queried SPK.
+    /// Case B pre-aggregates the side-chain production into a per-SPK map (one pass over the
+    /// chain path, coinbases served by `block_production_cached`), so per-blue queries are O(1)
+    /// map lookups + two prefix-store reads.
+    pub(super) fn production_window_ctx(&self, m_sp: Hash, w: u64) -> ProductionWindowCtx {
         let sc = self.selected_chain_store.read();
         // Window floor: chain index of m_sp's committed pruning point (consensus). 0 if not on the
         // selected chain (no clamp) — should not happen for a valid block's pruning point.
@@ -638,10 +687,7 @@ impl VirtualStateProcessor {
             sc.get_by_hash(self.headers_store.get_header(m_sp).unwrap().pruning_point).unwrap_or(0);
         if let Ok(m_idx) = sc.get_by_hash(m_sp) {
             // Case A: m_sp is a committed chain block.
-            let bottom = m_idx.saturating_sub(w).max(pruning_idx);
-            let hi = self.windowed_production_prefix_store.cumulative_at(spk, m_idx).unwrap();
-            let lo_cum = self.windowed_production_prefix_store.cumulative_at(spk, bottom).unwrap();
-            return hi.saturating_sub(lo_cum);
+            return ProductionWindowCtx::OnChain { m_idx, bottom: m_idx.saturating_sub(w).max(pruning_idx) };
         }
         // Case B: m_sp is on a side chain. Reconstruct its window = committed-prefix part + side delta.
         let (committed_tip_index, committed_tip) = sc.get_tip().unwrap();
@@ -649,26 +695,40 @@ impl VirtualStateProcessor {
         let common = committed_tip_index - chain_path.removed.len() as u64;
         let m = common + chain_path.added.len() as u64; // m_sp's index along its OWN selected chain
         let lo = m.saturating_sub(w).max(pruning_idx); // window bottom, floored at the pruning point
-        // Shared part: committed-chain indices (lo, common] (empty when the whole window is side-chain).
-        let shared = if lo < common {
-            let hi = self.windowed_production_prefix_store.cumulative_at(spk, common).unwrap();
-            let bottom = self.windowed_production_prefix_store.cumulative_at(spk, lo).unwrap();
-            hi.saturating_sub(bottom)
-        } else {
-            0
-        };
         // Side part: added[k] sits at index common+1+k; include those inside the window (index > lo).
-        let mut side = 0u64;
+        let mut side_by_spk: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
         for (k, h) in chain_path.added.iter().enumerate() {
             let idx = common + 1 + k as u64;
             if idx > lo
-                && let Some((s, cut)) = self.block_production(*h)
-                && &s == spk
+                && let Some((s, cut)) = self.block_production_cached(*h)
             {
-                side += cut;
+                *side_by_spk.entry(s).or_default() += cut;
             }
         }
-        shared + side
+        ProductionWindowCtx::SideChain { common, lo, side_by_spk }
+    }
+
+    /// Windowed production of `spk` under a pre-resolved [`ProductionWindowCtx`]. Byte-identical
+    /// result to the previous fused computation: Case A/B formulas unchanged, only hoisted.
+    pub(super) fn windowed_production_with_ctx(&self, spk: &ScriptPublicKey, ctx: &ProductionWindowCtx) -> u64 {
+        match ctx {
+            ProductionWindowCtx::OnChain { m_idx, bottom } => {
+                let hi = self.windowed_production_prefix_store.cumulative_at(spk, *m_idx).unwrap();
+                let lo_cum = self.windowed_production_prefix_store.cumulative_at(spk, *bottom).unwrap();
+                hi.saturating_sub(lo_cum)
+            }
+            ProductionWindowCtx::SideChain { common, lo, side_by_spk } => {
+                // Shared part: committed-chain indices (lo, common] (empty when the whole window is side-chain).
+                let shared = if lo < common {
+                    let hi = self.windowed_production_prefix_store.cumulative_at(spk, *common).unwrap();
+                    let bottom = self.windowed_production_prefix_store.cumulative_at(spk, *lo).unwrap();
+                    hi.saturating_sub(bottom)
+                } else {
+                    0
+                };
+                shared + side_by_spk.get(spk).copied().unwrap_or(0)
+            }
+        }
     }
 
 

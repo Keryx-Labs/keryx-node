@@ -53,7 +53,7 @@ use crate::{
     },
 };
 use keryx_consensus_core::{
-    BlockHashSet, ChainPath,
+    BlockHashMap, BlockHashSet, ChainPath,
     acceptance_data::AcceptanceData,
     api::args::{TransactionValidationArgs, TransactionValidationBatchArgs},
     block::{BlockTemplate, MutableBlock, TemplateBuildMode, TemplateTransactionSelector},
@@ -149,6 +149,13 @@ pub struct VirtualStateProcessor {
     /// denominator (windowed production at a block's selected-parent view) is the difference of two
     /// cumulatives; read by `ratio_bps_by_block`.
     pub(super) windowed_production_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    /// Memo for `block_production` (chain block → producer SPK + base cut), i.e. a parsed-coinbase
+    /// cache. During catch-up, `resolve_virtual` validates the whole prev_sink→new_sink path in one
+    /// batch while the committed selected chain still ends at prev_sink, so every block on the path
+    /// takes the side-chain (Case B) branch of `windowed_production_for_block` and re-reads the SAME
+    /// growing prefix of coinbases — quadratic RocksDB reads without this memo (measured: virtual
+    /// thread pegged at ~4 UTXO-validated blocks/s on an IBD catch-up). Bounded by periodic clear.
+    pub(super) block_production_cache: parking_lot::RwLock<BlockHashMap<Option<(ScriptPublicKey, u64)>>>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -299,6 +306,7 @@ impl VirtualStateProcessor {
             acceptance_data_store: storage.acceptance_data_store.clone(),
             address_balance_store: storage.address_balance_store.clone(),
             windowed_production_prefix_store: storage.windowed_production_prefix_store.clone(),
+            block_production_cache: parking_lot::RwLock::new(BlockHashMap::default()),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_meta_stores: storage.pruning_meta_stores.clone(),
             lkg_virtual_state: storage.lkg_virtual_state.clone(),
@@ -1330,6 +1338,7 @@ impl VirtualStateProcessor {
             virtual_state.ghostdag_data.blue_work,
             virtual_state.ghostdag_data.blue_score,
             header_pruning_point,
+            0, // pom_final_state: filled by the miner from the winning walk (H3), like the nonce
         );
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();
