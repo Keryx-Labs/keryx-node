@@ -117,9 +117,9 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
 }
 
 fn request_database_deletion_approval(approve: bool) -> bool {
-    let msg = "Node database is from a different Kaspad *DB* version and needs to be fully deleted, do you confirm the delete? (y/n)";
+    let msg = "Node database is from a different Keryxd *DB* version and needs to be fully deleted, do you confirm the delete? (y/n)";
     get_user_approval_or_exit(msg, approve);
-    info!("Deleting databases from previous Kaspad version");
+    info!("Deleting databases from previous Keryxd version");
     true // if consensus not exited, always return true
 }
 fn get_user_approval_or_exit(message: &str, approve: bool) {
@@ -348,7 +348,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     // Reset Condition: User explicitly requested a reset
     if is_db_reset_needed && db_dir.exists() {
         let msg = "Reset DB was requested -- this means the current databases will be fully deleted,
-do you confirm? (answer y/n or pass --yes to the Kaspad command line to confirm all interactive questions)";
+do you confirm? (answer y/n or pass --yes to the Keryxd command line to confirm all interactive questions)";
         get_user_approval_or_exit(msg, args.yes);
         info!("Deleting databases");
         fs::remove_dir_all(&db_dir).unwrap();

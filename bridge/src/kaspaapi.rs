@@ -144,7 +144,7 @@ impl KaspaApi {
         coinbase_tag_suffix: Option<String>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) -> Result<Arc<Self>> {
-        info!("Connecting to Kaspa node at {}", address);
+        info!("Connecting to Keryx node at {}", address);
 
         // GrpcClient requires explicit "grpc://" prefix for connection
         // Always add it if not present (avoids unnecessary connection failure)
@@ -296,7 +296,7 @@ impl KaspaApi {
             let dag_response = match self.client.get_block_dag_info_call(None, GetBlockDagInfoRequest {}).await {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("failed to get network hashrate from kaspa, prom stats will be out of date: {}", e);
+                    warn!("failed to get network hashrate from keryxd, prom stats will be out of date: {}", e);
                     continue;
                 }
             };
@@ -321,7 +321,7 @@ impl KaspaApi {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("failed to get network hashrate from kaspa, prom stats will be out of date: {}", e);
+                    warn!("failed to get network hashrate from keryxd, prom stats will be out of date: {}", e);
                     continue;
                 }
             };
@@ -623,7 +623,7 @@ impl KaspaApi {
                 }
             }
 
-            warn!("Kaspa is not synced, waiting for sync before starting bridge");
+            warn!("Keryxd is not synced, waiting for sync before starting bridge");
 
             tokio::select! {
                 _ = shutdown_rx.wait_for(|v| *v) => {

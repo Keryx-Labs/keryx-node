@@ -299,7 +299,21 @@ pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
 /// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
+///
+/// PRE-H3 ONLY. This window was applied in SELECTED-CHAIN block units, but the chain advances at
+/// ~2.2 chain blocks/s (mergesets absorb the 10 BPS DAG width), so "24h" was really ~4.6 real
+/// days — and drifting with mergeset size. Superseded at `pom_level_activation` by
+/// [`RATIO_REWARD_WINDOW_DAA`].
 pub const RATIO_REWARD_WINDOW: u64 = 864_000;
+
+/// H3 ratio-reward window, in DAA score (true block count): 24h at 10 BPS = 864_000 DAA, a FIXED
+/// real-time duration regardless of mergeset width. Used for blocks at/after `pom_level_activation`
+/// together with per-blue production accounting (production = the base cuts of every PAID mergeset
+/// blue, the exact mirror of coinbase payment — replacing the selected-chain-only accounting whose
+/// ~1.7× connectivity bias and 4.6-day effective window drifted from the spec). The spec reading
+/// "top bracket = 30 days of production held" is exact again. HARD CONSTRAINT: spans far less
+/// selected-chain depth than the legacy window (~190k chain blocks), comfortably inside pruning.
+pub const RATIO_REWARD_WINDOW_DAA: u64 = 864_000;
 
 /// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
 /// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
@@ -734,7 +748,12 @@ pub struct Params {
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
     /// exercise the window slide. HARD CONSTRAINT: must stay `< pruning_depth`.
+    /// PRE-H3 ONLY — superseded by `ratio_reward_window_daa` at `pom_level_activation`.
     pub ratio_reward_window: u64,
+
+    /// H3 ratio-reward window in DAA score (fixed real-time duration, per-blue accounting era).
+    /// Defaults to `RATIO_REWARD_WINDOW_DAA`; a Params field so tests can shrink it.
+    pub ratio_reward_window_daa: u64,
 }
 
 impl Params {
@@ -934,6 +953,7 @@ impl Params {
             difficulty_reset_activation: self.difficulty_reset_activation,
 
             ratio_reward_window: self.ratio_reward_window,
+            ratio_reward_window_daa: self.ratio_reward_window_daa,
         }
     }
 }
@@ -1087,6 +1107,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // the real PoM hashrate within one window. MUST match across all honest nodes.
     difficulty_reset_activation: ForkActivation::new(38_951_445),
     ratio_reward_window: RATIO_REWARD_WINDOW,
+    ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -1169,8 +1190,9 @@ pub const TESTNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::never(),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
-    // rather than ~30 days. Still well under pruning_depth.
+    // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
     ratio_reward_window: 1_000,
+    ratio_reward_window_daa: 1_000,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -1228,6 +1250,7 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
+    ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -1283,4 +1306,5 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
+    ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 };

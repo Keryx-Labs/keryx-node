@@ -151,7 +151,7 @@ fn log_bridge_configuration(config: &BridgeConfig) {
     let instance_count = config.instances.len();
     tracing::info!("----------------------------------");
     tracing::info!("initializing bridge ({} instance{})", instance_count, if instance_count > 1 { "s" } else { "" });
-    tracing::info!("\tkaspad:          {} (shared)", config.global.kaspad_address);
+    tracing::info!("\tkeryxd:          {} (shared)", config.global.kaspad_address);
     tracing::info!("\tblock wait:      {:?}", config.global.block_wait_time);
     tracing::info!("\tprint stats:     {}", config.global.print_stats);
     tracing::info!("\tvar diff:        {}", config.global.var_diff);

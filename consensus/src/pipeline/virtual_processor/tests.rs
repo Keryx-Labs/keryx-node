@@ -491,6 +491,63 @@ async fn windowed_production_prefix_accumulates_per_producer_and_slides() {
     );
 }
 
+/// H3 era of the production index: per-blue accounting + daa-sized window. On a single chain each
+/// chain block's sole mergeset blue is its selected parent, so index `i` credits the producer of
+/// block `i−1` — payment-mirror semantics: a producer is credited when its block is MERGED, so the
+/// sink's own producer is not yet in the window. The window bottom is found by daa (fixed
+/// real-time duration) instead of a chain-block count.
+///
+/// `pom_level_activation` is `new(1)` (not `always()`): the same activation drives the global
+/// header-hashing switch (`init_pom_level_activation`), and genesis (daa 0) must keep its pinned
+/// legacy hash. Every non-genesis block of this consensus hashes with the (zero) `pom_final_state`
+/// committed — internally consistent, and `skip_proof_of_work` bypasses the PoM checks.
+#[tokio::test]
+async fn windowed_production_prefix_h3_per_blue_daa_window() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let mut params = MAINNET_PARAMS;
+    params.pom_level_activation = ForkActivation::new(1);
+    params.ratio_reward_window_daa = 3;
+    // Legacy window deliberately different so a wrong era pick is caught by the assertions below.
+    params.ratio_reward_window = 5;
+    let legacy_w = params.ratio_reward_window;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    // 7-block single chain (chain indices 1..=7, daa_score == chain index). The same producer
+    // mines blocks at indices 6 and 7 (0-indexed i=5,6).
+    let repeat = new_miner_data();
+    let mut producers: Vec<ScriptPublicKey> = Vec::new();
+    for i in 0..7 {
+        let md = if i == 5 || i == 6 { repeat.clone() } else { new_miner_data() };
+        producers.push(md.script_public_key.clone());
+        ctx.miner_data = md;
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+
+    let vp = ctx.consensus.virtual_processor().clone();
+    let sink = ctx.consensus.get_sink();
+    let sink_daa = ctx.consensus.headers_store().get_daa_score(sink).unwrap();
+    // Single chain: daa_score = chain index − 1 (genesis daa 0, block 1 daa 0, block i daa i−1).
+    assert_eq!(sink_daa, 6, "single chain ⇒ daa_score = chain index − 1");
+    let one_cut = vp.coinbase_manager.base_miner_cut(sink_daa);
+
+    let windowed = |spk: &ScriptPublicKey| vp.windowed_production_for_block(spk, sink, legacy_w);
+
+    // daa window = (6−3, 6] in daa units ⇒ chain indices 5,6,7 (daa 4,5,6), crediting the MERGED
+    // blues = the producers of blocks 4,5,6 (0-indexed producers[3], producers[4], producers[5]).
+    for i in 0..3 {
+        assert_eq!(windowed(&producers[i]), 0, "producer {i} merged below the daa window ⇒ zero");
+    }
+    assert_eq!(windowed(&producers[3]), one_cut, "block 4's producer is credited at merge index 5");
+    assert_eq!(windowed(&producers[4]), one_cut, "block 5's producer is credited at merge index 6");
+    // The repeat producer mined blocks 6 and 7, but only block 6 has been MERGED (at index 7);
+    // block 7 is the sink itself — its production is credited when a child merges it, exactly like
+    // its coinbase payment. Payment-mirror semantics: one cut, not two.
+    assert_eq!(windowed(&repeat.script_public_key), one_cut, "the sink's own production is not yet merged ⇒ one cut");
+}
+
 /// Fastsync production-window trust (Option A): `trust_coinbase()` must relax ratio-reward coinbase
 /// verification for exactly the `ratio_reward_window` selected-chain blocks following a pruning-point
 /// UTXO import (the only window during which a fast-synced node's freshly-cleared windowed-production
