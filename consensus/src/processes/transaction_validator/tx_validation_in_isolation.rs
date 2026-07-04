@@ -1,8 +1,7 @@
 use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
 use keryx_inference::{
-    AiChallengePayload, AiResponsePayload,
-    MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    AiChallengePayload, AiResponsePayload, MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
 };
 use std::collections::HashSet;
@@ -11,6 +10,12 @@ use super::{
     TransactionValidator,
     errors::{TxResult, TxRuleError},
 };
+
+// Each merge-set blue can contribute a fee-burn output plus miner and escrow/burn
+// subsidy outputs. Reds can add aggregate fee-burn and subsidy outputs, followed
+// by aggregate R&D and reward-burn outputs.
+const MAX_COINBASE_OUTPUTS_PER_BLUE: u64 = 3;
+const MAX_COINBASE_AGGREGATE_OUTPUTS: u64 = 4;
 
 impl TransactionValidator {
     /// Performs a variety of transaction validation checks which are independent of any
@@ -55,7 +60,10 @@ impl TransactionValidator {
             return Err(TxRuleError::CoinbaseNonZeroMassCommitment);
         }
 
-        let outputs_limit = self.ghostdag_k as u64 + 2;
+        // GHOSTDAG bounds merge-set blues at K + 1 (including the selected
+        // parent). Keep this limit aligned with the outputs emitted by the
+        // coinbase builder.
+        let outputs_limit = MAX_COINBASE_OUTPUTS_PER_BLUE * (self.ghostdag_k as u64 + 1) + MAX_COINBASE_AGGREGATE_OUTPUTS;
         if tx.outputs.len() as u64 > outputs_limit {
             return Err(TxRuleError::CoinbaseTooManyOutputs(tx.outputs.len(), outputs_limit));
         }
@@ -70,7 +78,8 @@ impl TransactionValidator {
 
     fn check_transaction_outputs_count(&self, tx: &Transaction) -> TxResult<()> {
         if tx.is_coinbase() {
-            // We already check coinbase outputs count vs. Ghostdag K + 2
+            // Coinbase has a tighter structural limit based on Ghostdag K and
+            // the outputs emitted per merge-set reward.
             return Ok(());
         }
         if tx.outputs.len() > self.max_tx_outputs {
@@ -262,6 +271,18 @@ mod tests {
         );
 
         tv.validate_tx_in_isolation(&valid_cb).unwrap();
+
+        let coinbase_outputs_limit = 3 * (params.ghostdag_k() as usize + 1) + 4;
+        let mut max_outputs_cb = valid_cb.clone();
+        max_outputs_cb.outputs = vec![valid_cb.outputs[0].clone(); coinbase_outputs_limit];
+        tv.validate_tx_in_isolation(&max_outputs_cb).unwrap();
+
+        max_outputs_cb.outputs.push(valid_cb.outputs[0].clone());
+        assert_match!(
+            tv.validate_tx_in_isolation(&max_outputs_cb),
+            Err(TxRuleError::CoinbaseTooManyOutputs(actual, limit))
+                if actual == coinbase_outputs_limit + 1 && limit == coinbase_outputs_limit as u64
+        );
 
         let valid_tx = Transaction::new(
             0,
