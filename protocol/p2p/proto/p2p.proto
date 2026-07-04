@@ -94,6 +94,10 @@ message BlockHeader{
   bytes blueWork = 10;
   Hash pruningPoint = 14;
   uint64 blueScore = 13;
+  // H3 (pom_level_activation): final state of the winning PoM possession walk, committed
+  // into the block hash — the header-only PoW value / block level derive from it.
+  // 0 (proto default, absent on the wire) for pre-fork blocks.
+  uint64 pomFinalState = 15;
 }
 
 message BlockLevelParents {

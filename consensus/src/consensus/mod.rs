@@ -178,6 +178,9 @@ impl Consensus {
         // Initialise the PoW SALT v2/v4 activation thresholds once, before any block processing.
         keryx_pow::init_pow_salt_v2_activation(params.pow_salt_v2_activation.daa_score());
         keryx_pow::init_pow_salt_v4_activation(params.pow_salt_v4_activation.daa_score());
+        // Same pattern for the PoM block-level fork (H3): header hashing commits to
+        // `pom_final_state` from this score on and has no access to Params.
+        keryx_consensus_core::pom::init_pom_level_activation(params.pom_level_activation.daa_score());
 
         //
         // Storage layer

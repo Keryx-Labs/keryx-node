@@ -153,6 +153,7 @@ mod mockery {
                 blue_score: mock(),
                 blue_work: mock(),
                 pruning_point: mock(),
+                pom_final_state: mock(),
             }
         }
     }
@@ -172,6 +173,7 @@ mod mockery {
                 blue_score: mock(),
                 blue_work: mock(),
                 pruning_point: mock(),
+                pom_final_state: mock(),
             }
         }
     }
@@ -422,6 +424,7 @@ mod mockery {
                 blue_score: mock(),
                 blue_work: mock(),
                 pruning_point: mock(),
+                pom_final_state: mock(),
             }
         }
     }
@@ -649,7 +652,7 @@ mod mockery {
 
     impl Mock for GetBlockTemplateResponse {
         fn mock() -> Self {
-            GetBlockTemplateResponse { block: mock(), is_synced: true }
+            GetBlockTemplateResponse { block: mock(), is_synced: true, inference_challenge: String::new() }
         }
     }
 

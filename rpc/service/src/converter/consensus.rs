@@ -228,6 +228,11 @@ impl ConsensusConverter {
             } else {
                 Default::default()
             },
+            pom_final_state: if verbosity.include_pom_final_state.unwrap_or(false) {
+                Some(header.pom_final_state)
+            } else {
+                Default::default()
+            },
         })
     }
 

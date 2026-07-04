@@ -154,6 +154,11 @@ impl BlockBodyProcessor {
             return Ok(());
         }
         let proof = block.pom_proof.as_ref().ok_or(RuleError::PomProofMissing)?;
+        // H3: the header commits to the walk's final state (block level + header-only PoW check
+        // derive from it) — pin it to the proof so a miner cannot claim a level it did not earn.
+        if self.pom_level_activation.is_active(header.daa_score) && proof.final_state != header.pom_final_state {
+            return Err(RuleError::PomFinalStateMismatch(header.pom_final_state, proof.final_state));
+        }
         // Tier set is gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
         // chosen from this block's own daa_score so archival/IBD recomputation stays canonical.
         let tiers = pom_tiers(self.very_light_activation.is_active(header.daa_score));
@@ -472,6 +477,7 @@ mod tests {
                 0.into(),
                 9,
                 Default::default(),
+                0,
             ),
             txs,
         );

@@ -668,6 +668,19 @@ pub struct Params {
     /// `VERY_LIGHT_ACTIVATION_DAA` for the running network. Dormant until the H2 DAA is chosen.
     pub very_light_activation: ForkActivation,
 
+    /// PoM block-level hardfork (H3) activation DAA score. At/after this score:
+    /// (1) `Header::pom_final_state` becomes consensus — hashed into the block hash and
+    /// cross-checked against `PomProof::final_state` in body validation; (2) the PoW value
+    /// `pom_pow_value(pom_final_state, pre_pow_hash)` is re-checked against the target at
+    /// header validation (header-only, no weights needed); (3) the block level is derived
+    /// from that value again instead of being forced to 0, un-degenerating the pruning proof
+    /// (level 0 alone carried the whole post-`pom_activation` span — 3.26M headers and
+    /// growing — which killed from-scratch IBD). Blocks in the dead zone
+    /// [`pom_activation`, here) keep level 0 forever; the proof fully self-heals once the
+    /// pruning point passes this score. MUST equal the miner's activation for the running
+    /// network — miners must fill `pom_final_state` from the winning walk.
+    pub pom_level_activation: ForkActivation,
+
     /// H2 per-model minimum inference_reward gate. From this score `inference_reward_minimums_v2_h2`
     /// (5-tier, incl. Qwen3-1.7B + 70B-Q2) replaces `inference_reward_minimums_v2`. MUST be a FUTURE
     /// DAA — never `very_light_activation` (already past) — so IBD re-validation of historical blocks
@@ -907,6 +920,8 @@ impl Params {
 
             very_light_activation: self.very_light_activation,
 
+            pom_level_activation: self.pom_level_activation,
+
             inference_min_h2_activation: self.inference_min_h2_activation,
             inference_reward_minimums_v2_h2: self.inference_reward_minimums_v2_h2,
 
@@ -1022,6 +1037,13 @@ pub const MAINNET_PARAMS: Params = Params {
     pom_activation: ForkActivation::new(37_780_000),
     very_light_activation: ForkActivation::new(38_951_445), // H2 = frozen frontier; mirrors miner VERY_LIGHT_ACTIVATION_DAA
 
+    // PoM block-level hardfork (H3): restores header-only PoW verification + real block levels
+    // (pruning proof un-degeneration, from-scratch IBD). Full hardfork — header format + hash
+    // change, every node AND miner must upgrade before this score. DAA picked 2026-07-04 21:23 UTC
+    // (tip 42,704,604) targeting activation ≈ 2026-07-05 16:00 UTC (15:52–16:26 at 10–9.7 DAA/s).
+    // MUST mirror the miner's H3 activation (POM_LEVEL_ACTIVATION_DAA) for the running network.
+    pom_level_activation: ForkActivation::new(43_370_000),
+
     // H2 inference_reward minimums (adds Qwen3-1.7B + 70B-Q2, missed when the H2 lineup shipped).
     // FUTURE DAA — ~1 week of upgrade runway (tip 40_493_001 @ 2026-07-02 + ~6.0M blocks ≈ 7 days,
     // activation ≈ 2026-07-09). Treated as a coordinated soft-fork (new-valid ⊆ old-valid): announce
@@ -1123,6 +1145,10 @@ pub const TESTNET_PARAMS: Params = Params {
     // difficulty drift). Mainnet stays `never()` until H and will need a difficulty reset.
     pom_activation: ForkActivation::new(5_000),
     very_light_activation: ForkActivation::never(), // testnet H2 DAA TBD — set with the miner to exercise the 5-tier lineup
+    // PoM block-level hardfork (H3): testnet DAA 6_000 to exercise the header-format transition
+    // (pre-H3 PoM blocks at level 0, post-H3 real levels + pom_final_state hashed) and the
+    // pruning-proof re-boundedness. MUST mirror the miner's testnet activation.
+    pom_level_activation: ForkActivation::new(6_000),
     // Set alongside very_light_activation above when exercising the H2 lineup on testnet.
     inference_min_h2_activation: ForkActivation::never(),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
@@ -1193,6 +1219,7 @@ pub const SIMNET_PARAMS: Params = Params {
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
     very_light_activation: ForkActivation::never(),
+    pom_level_activation: ForkActivation::never(),
     inference_min_h2_activation: ForkActivation::never(),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),
@@ -1247,6 +1274,7 @@ pub const DEVNET_PARAMS: Params = Params {
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
     very_light_activation: ForkActivation::never(),
+    pom_level_activation: ForkActivation::never(),
     inference_min_h2_activation: ForkActivation::never(),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),

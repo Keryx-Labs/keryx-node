@@ -28,6 +28,11 @@ pub struct RpcRawHeader {
     pub blue_work: BlueWorkType,
     pub blue_score: u64,
     pub pruning_point: Hash,
+    /// H3 (`pom_level_activation`): final state of the winning PoM possession walk, committed
+    /// into the block hash. Miners MUST fill it on submit_block, exactly like the nonce.
+    /// 0 for pre-fork blocks.
+    #[serde(default)]
+    pub pom_final_state: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -48,6 +53,10 @@ pub struct RpcHeader {
     pub blue_work: BlueWorkType,
     pub blue_score: u64,
     pub pruning_point: Hash,
+    /// H3 (`pom_level_activation`): final state of the winning PoM possession walk,
+    /// committed into the block hash. 0 for pre-fork blocks.
+    #[serde(default)]
+    pub pom_final_state: u64,
 }
 
 impl RpcHeader {
@@ -78,6 +87,7 @@ impl From<Header> for RpcHeader {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            pom_final_state: header.pom_final_state,
         }
     }
 }
@@ -98,6 +108,7 @@ impl From<&Header> for RpcHeader {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            pom_final_state: header.pom_final_state,
         }
     }
 }
@@ -119,6 +130,7 @@ impl TryFrom<RpcHeader> for Header {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            pom_final_state: header.pom_final_state,
         })
     }
 }
@@ -141,13 +153,14 @@ impl TryFrom<&RpcHeader> for Header {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            pom_final_state: header.pom_final_state,
         })
     }
 }
 
 impl Serializer for RpcHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
 
         store!(Hash, &self.hash, writer)?;
         store!(u16, &self.version, writer)?;
@@ -162,6 +175,7 @@ impl Serializer for RpcHeader {
         store!(BlueWorkType, &self.blue_work, writer)?;
         store!(u64, &self.blue_score, writer)?;
         store!(Hash, &self.pruning_point, writer)?;
+        store!(u64, &self.pom_final_state, writer)?;
 
         Ok(())
     }
@@ -169,7 +183,7 @@ impl Serializer for RpcHeader {
 
 impl Deserializer for RpcHeader {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let payload_version = load!(u16, reader)?;
 
         let hash = load!(Hash, reader)?;
         let version = load!(u16, reader)?;
@@ -184,6 +198,8 @@ impl Deserializer for RpcHeader {
         let blue_work = load!(BlueWorkType, reader)?;
         let blue_score = load!(u64, reader)?;
         let pruning_point = load!(Hash, reader)?;
+        // Struct-version 2 (H3): pom_final_state. Older senders (v1) simply omit it.
+        let pom_final_state = if payload_version >= 2 { load!(u64, reader)? } else { 0 };
 
         Ok(Self {
             hash,
@@ -199,6 +215,7 @@ impl Deserializer for RpcHeader {
             blue_work,
             blue_score,
             pruning_point,
+            pom_final_state,
         })
     }
 }
@@ -220,6 +237,7 @@ impl TryFrom<RpcRawHeader> for Header {
             header.blue_work,
             header.blue_score,
             header.pruning_point,
+            header.pom_final_state,
         ))
     }
 }
@@ -241,6 +259,7 @@ impl TryFrom<&RpcRawHeader> for Header {
             header.blue_work,
             header.blue_score,
             header.pruning_point,
+            header.pom_final_state,
         ))
     }
 }
@@ -260,6 +279,7 @@ impl From<&Header> for RpcRawHeader {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            pom_final_state: header.pom_final_state,
         }
     }
 }
@@ -279,13 +299,14 @@ impl From<Header> for RpcRawHeader {
             blue_work: header.blue_work,
             blue_score: header.blue_score,
             pruning_point: header.pruning_point,
+            pom_final_state: header.pom_final_state,
         }
     }
 }
 
 impl Serializer for RpcRawHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
 
         store!(u16, &self.version, writer)?;
         store!(Vec<Vec<Hash>>, &self.parents_by_level, writer)?;
@@ -299,6 +320,7 @@ impl Serializer for RpcRawHeader {
         store!(BlueWorkType, &self.blue_work, writer)?;
         store!(u64, &self.blue_score, writer)?;
         store!(Hash, &self.pruning_point, writer)?;
+        store!(u64, &self.pom_final_state, writer)?;
 
         Ok(())
     }
@@ -306,7 +328,7 @@ impl Serializer for RpcRawHeader {
 
 impl Deserializer for RpcRawHeader {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let payload_version = load!(u16, reader)?;
 
         let version = load!(u16, reader)?;
         let parents_by_level = load!(Vec<Vec<Hash>>, reader)?;
@@ -320,6 +342,8 @@ impl Deserializer for RpcRawHeader {
         let blue_work = load!(BlueWorkType, reader)?;
         let blue_score = load!(u64, reader)?;
         let pruning_point = load!(Hash, reader)?;
+        // Struct-version 2 (H3): pom_final_state. Older senders (v1) simply omit it.
+        let pom_final_state = if payload_version >= 2 { load!(u64, reader)? } else { 0 };
 
         Ok(Self {
             version,
@@ -334,6 +358,7 @@ impl Deserializer for RpcRawHeader {
             blue_work,
             blue_score,
             pruning_point,
+            pom_final_state,
         })
     }
 }

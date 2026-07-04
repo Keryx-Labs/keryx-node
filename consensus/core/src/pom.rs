@@ -13,6 +13,26 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// DAA score at which `Header::pom_final_state` becomes consensus (hashed into the block
+/// hash, cross-checked against `PomProof::final_state`, and used to derive the block level).
+/// u64::MAX means "never" (default — disabled until explicitly initialised from
+/// `Params::pom_level_activation`). Same startup-init pattern as the PoW salts.
+static POM_LEVEL_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::pom_level_activation`.
+/// Header hashing (`hashing::header::hash`) has no access to `Params`, so the
+/// activation is published through this global exactly like the PoW salt forks.
+pub fn init_pom_level_activation(daa_score: u64) {
+    POM_LEVEL_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Whether the PoM block-level fork is active for a block at `daa_score`.
+#[inline(always)]
+pub fn pom_level_active(daa_score: u64) -> bool {
+    daa_score >= POM_LEVEL_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
 
 /// A PoM tier binding: the model whose possession this tier proves, plus its canonical
 /// 32 B-chunk Merkle root `R_T` and chunk count `N` (from the offline `pom-rt-builder`).

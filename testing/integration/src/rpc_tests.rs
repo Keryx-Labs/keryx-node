@@ -104,12 +104,13 @@ async fn sanity_test() {
                     assert!(response.removed_chain_block_hashes.is_empty());
 
                     // Get a block template
-                    let GetBlockTemplateResponse { block, is_synced } = rpc_client
+                    let GetBlockTemplateResponse { block, is_synced, .. } = rpc_client
                         .get_block_template_call(
                             None,
                             GetBlockTemplateRequest {
                                 pay_address: Address::new(Prefix::Simnet, Version::PubKey, &[0u8; 32]),
                                 extra_data: Vec::new(),
+                                inference_result: String::new(),
                             },
                         )
                         .await

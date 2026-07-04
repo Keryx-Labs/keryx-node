@@ -37,6 +37,9 @@ export interface IHeader {
     blueWork: bigint | HexString;
     blueScore: bigint;
     pruningPoint: HexString;
+    // H3 (pom_level_activation): final state of the winning PoM possession walk,
+    // committed into the block hash. Optional; defaults to 0 (pre-fork blocks).
+    pomFinalState?: bigint;
 }
 
 /**
@@ -60,6 +63,9 @@ export interface IRawHeader {
     blueWork: bigint | HexString;
     blueScore: bigint;
     pruningPoint: HexString;
+    // H3 (pom_level_activation): final state of the winning PoM possession walk,
+    // committed into the block hash. Optional; defaults to 0 (pre-fork blocks).
+    pomFinalState?: bigint;
 }
 "#;
 
@@ -178,6 +184,16 @@ impl Header {
     #[wasm_bindgen(setter = blueScore)]
     pub fn set_blue_score(&mut self, blue_score: u64) {
         self.inner_mut().blue_score = blue_score
+    }
+
+    #[wasm_bindgen(getter = pomFinalState)]
+    pub fn pom_final_state(&self) -> u64 {
+        self.inner().pom_final_state
+    }
+
+    #[wasm_bindgen(setter = pomFinalState)]
+    pub fn set_pom_final_state(&mut self, pom_final_state: u64) {
+        self.inner_mut().pom_final_state = pom_final_state
     }
 
     #[wasm_bindgen(getter = hash)]
@@ -314,6 +330,8 @@ impl TryCastFromJs for Header {
                         .get_value("pruningPoint")?
                         .try_into_owned()
                         .map_err(|err| Error::convert("pruningPoint", err))?,
+                    // Optional for JS callers: absent on pre-H3 headers / legacy templates.
+                    pom_final_state: object.get_u64("pomFinalState").unwrap_or_default(),
                 };
 
                 Ok(header.into())

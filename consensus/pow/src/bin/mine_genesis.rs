@@ -40,6 +40,7 @@ fn main() {
         0.into(),
         0,
         ZERO_HASH,
+        0, // pom_final_state: genesis predates pom_level_activation
     );
 
     let state = State::new(&template);
@@ -97,6 +98,7 @@ fn main() {
         0.into(),
         0,
         ZERO_HASH,
+        0, // pom_final_state: genesis predates pom_level_activation
     );
 
     let block_hash = hashing::header::hash(&final_header);
