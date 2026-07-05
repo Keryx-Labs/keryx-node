@@ -1058,11 +1058,13 @@ pub const MAINNET_PARAMS: Params = Params {
     very_light_activation: ForkActivation::new(38_951_445), // H2 = frozen frontier; mirrors miner VERY_LIGHT_ACTIVATION_DAA
 
     // PoM block-level hardfork (H3): restores header-only PoW verification + real block levels
-    // (pruning proof un-degeneration, from-scratch IBD). Full hardfork — header format + hash
-    // change, every node AND miner must upgrade before this score. DAA picked 2026-07-04 21:23 UTC
-    // (tip 42,704,604) targeting activation ≈ 2026-07-05 16:00 UTC (15:52–16:26 at 10–9.7 DAA/s).
+    // (pruning proof un-degeneration, from-scratch IBD), salts the pph words feeding the PoM
+    // folds (POM_H3_PPH_SALT, forced update) and aligns the coinbase output cap with the OPoI
+    // builder (3*(K+1)+4). Full hardfork — header format + hash change, every node AND miner
+    // must upgrade before this score. DAA picked 2026-07-05 08:49 UTC (tip 43,117,871)
+    // targeting activation ≈ 2026-07-05 18:00 UTC (~17:55–18:10 at 10–9.7 DAA/s).
     // MUST mirror the miner's H3 activation (POM_LEVEL_ACTIVATION_DAA) for the running network.
-    pom_level_activation: ForkActivation::new(43_370_000),
+    pom_level_activation: ForkActivation::new(43_450_000),
 
     // H2 inference_reward minimums (adds Qwen3-1.7B + 70B-Q2, missed when the H2 lineup shipped).
     // FUTURE DAA — ~1 week of upgrade runway (tip 40_493_001 @ 2026-07-02 + ~6.0M blocks ≈ 7 days,
