@@ -2,6 +2,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
+use crate::processes::{coinbase::coinbase_outputs_limit, transaction_validator::errors::TxRuleError};
 use keryx_consensus_core::{
     block::Block,
     config::params::{POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
@@ -18,6 +19,7 @@ impl BlockBodyProcessor {
         Self::check_has_transactions(block)?;
         Self::check_hash_merkle_root(block)?;
         Self::check_only_one_coinbase(block)?;
+        self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
@@ -58,6 +60,22 @@ impl BlockBodyProcessor {
             return Err(RuleError::MultipleCoinbases(i));
         }
 
+        Ok(())
+    }
+
+    /// Era-exact coinbase output-count bound (see `coinbase_outputs_limit`). Lives here rather
+    /// than in `validate_tx_in_isolation` because it is activation-dependent and needs the
+    /// header's daa_score — tx-in-isolation checks must stay context-free (mempool/BBT reuse
+    /// them). The tx-level check keeps the H3 structural max as an absolute upper bound.
+    fn check_coinbase_outputs_count(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let coinbase = &block.transactions[0];
+        let limit = coinbase_outputs_limit(self.ghostdag_k as u64, self.pom_level_activation.is_active(block.header.daa_score));
+        if coinbase.outputs.len() as u64 > limit {
+            return Err(RuleError::TxInIsolationValidationFailed(
+                coinbase.id(),
+                TxRuleError::CoinbaseTooManyOutputs(coinbase.outputs.len(), limit),
+            ));
+        }
         Ok(())
     }
 

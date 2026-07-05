@@ -45,6 +45,22 @@ const BURN_SEED: &[u8] = b"KERYX_PROOF_OF_BURN_V1";
 pub const RD_ALLOCATION_ADDRESS: &str =
     "keryx:qp8zp9wnpqhgygpsv25px8whw0ee7md72s0tgy78x5wt7ryk6w525aqm045zv";
 
+/// Consensus bound on coinbase output count for the era selected by `h3` (`pom_level_activation`).
+///
+/// Pre-H3: the legacy `K + 2` cap inherited from the upstream one-output-per-blue builder.
+/// Post-H3: the OPoI builder's structural max — up to three outputs per mergeset blue (fee
+/// burn, miner cut, escrow/burn; blues are bounded by K + 1) plus four aggregates (red-fee
+/// burn, red reward, R&D allocation, reward burn) = `3 * (K + 1) + 4` (379 on mainnet, K=124).
+///
+/// The legacy cap contradicts this builder: with zero fees (2 outputs per blue) a chain block
+/// merging ≥ 62 blues can only build a coinbase every validator rejects, halting the network
+/// — the 2026-07-04 storm peaked at 123 outputs (~60 blues), 2 blues short. Aligning the
+/// validator is a consensus loosening, hence the H3 gate (all nodes upgrade at that DAA).
+/// Root-caused by Dizzztroyer (PR #16).
+pub fn coinbase_outputs_limit(ghostdag_k: u64, h3: bool) -> u64 {
+    if h3 { 3 * (ghostdag_k + 1) + 4 } else { ghostdag_k + 2 }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 const LENGTH_OF_BLUE_SCORE: usize = size_of::<u64>();
@@ -515,6 +531,18 @@ mod tests {
         config::params::Params,
         constants::SOMPI_PER_KASPA,
     };
+
+    #[test]
+    fn coinbase_outputs_limit_by_era() {
+        let k = MAINNET_PARAMS.ghostdag_k() as u64;
+        assert_eq!(k, 124, "10 BPS ghostdag K");
+        // Pre-H3: legacy upstream cap. Post-H3: builder structural max (3 per blue + 4 aggregates).
+        assert_eq!(coinbase_outputs_limit(k, false), 126);
+        assert_eq!(coinbase_outputs_limit(k, true), 379);
+        // The H3 bound must cover the worst case the builder can emit: 3 outputs for each of the
+        // K+1 mergeset blues plus the 4 aggregate outputs.
+        assert_eq!(coinbase_outputs_limit(k, true), 3 * (k + 1) + 4);
+    }
 
     fn create_manager(params: &Params) -> CoinbaseManager {
         CoinbaseManager::new(

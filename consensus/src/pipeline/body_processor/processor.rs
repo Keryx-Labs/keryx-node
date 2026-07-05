@@ -60,7 +60,7 @@ pub struct BlockBodyProcessor {
     // Config
     pub(super) max_block_mass: u64,
     pub(super) genesis: GenesisBlock,
-    pub(super) _ghostdag_k: KType,
+    pub(super) ghostdag_k: KType,
     pub(super) skip_opoi: bool,
     /// PoM possession activation — when active at a block's daa_score, its `pom_proof` is verified.
     pub(super) pom_activation: ForkActivation,
@@ -126,7 +126,7 @@ impl BlockBodyProcessor {
 
             max_block_mass: params.max_block_mass,
             genesis: params.genesis.clone(),
-            _ghostdag_k: params.ghostdag_k(),
+            ghostdag_k: params.ghostdag_k(),
             skip_opoi: params.skip_proof_of_work,
             pom_activation: params.pom_activation,
             very_light_activation: params.very_light_activation,

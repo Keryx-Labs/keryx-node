@@ -55,7 +55,11 @@ impl TransactionValidator {
             return Err(TxRuleError::CoinbaseNonZeroMassCommitment);
         }
 
-        let outputs_limit = self.ghostdag_k as u64 + 2;
+        // Absolute structural bound only (the H3 builder max, 3*(K+1)+4 — see
+        // `coinbase_outputs_limit`). The era-exact cap (legacy K+2 pre-H3) is activation-
+        // dependent, so it is enforced with header context in the body processor's
+        // `check_coinbase_outputs_count` — checks in this module must stay context-free.
+        let outputs_limit = crate::processes::coinbase::coinbase_outputs_limit(self.ghostdag_k as u64, true);
         if tx.outputs.len() as u64 > outputs_limit {
             return Err(TxRuleError::CoinbaseTooManyOutputs(tx.outputs.len(), outputs_limit));
         }
@@ -70,7 +74,8 @@ impl TransactionValidator {
 
     fn check_transaction_outputs_count(&self, tx: &Transaction) -> TxResult<()> {
         if tx.is_coinbase() {
-            // We already check coinbase outputs count vs. Ghostdag K + 2
+            // Coinbase output count is bounded by the structural builder max in
+            // check_coinbase_in_isolation (and era-exactly in the body processor)
             return Ok(());
         }
         if tx.outputs.len() > self.max_tx_outputs {
@@ -262,6 +267,21 @@ mod tests {
         );
 
         tv.validate_tx_in_isolation(&valid_cb).unwrap();
+
+        // Structural coinbase output bound = 3*(K+1)+4 (H3 builder max — 3 outputs per mergeset
+        // blue + 4 aggregates). The boundary is accepted, one above is rejected. The stricter
+        // pre-H3 cap (K+2) is era-gated in the body processor, not here.
+        let structural_max = 3 * (params.ghostdag_k() as u64 + 1) + 4;
+        let cb_with = |n: u64| {
+            let mut cb = valid_cb.clone();
+            cb.outputs = vec![valid_cb.outputs[0].clone(); n as usize];
+            cb
+        };
+        tv.validate_tx_in_isolation(&cb_with(structural_max)).unwrap();
+        assert_match!(
+            tv.validate_tx_in_isolation(&cb_with(structural_max + 1)),
+            Err(TxRuleError::CoinbaseTooManyOutputs(_, _))
+        );
 
         let valid_tx = Transaction::new(
             0,
