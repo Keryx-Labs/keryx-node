@@ -111,13 +111,14 @@ pub fn calc_level_from_pow(pow: Uint256, max_block_level: BlockLevel) -> BlockLe
 }
 
 /// H3 (PoM block-level fork): the PoW value of a post-`pom_level_activation` block, derived
-/// from the header alone — `pom_pow_value(header.pom_final_state, pre_pow_hash)`. The header
-/// commits to the walk's final state, so no weights are needed. NOT possession by itself
-/// (the fold is cheap to grind); possession is enforced by `check_pom_proof`, which pins
+/// from the header alone — `pom_pow_value_h3(header.pom_final_state, pre_pow_hash)` (H3 salts
+/// the pph words feeding the fold — see `POM_H3_PPH_SALT`). The header commits to the walk's
+/// final state, so no weights are needed. NOT possession by itself (the fold is cheap to
+/// grind); possession is enforced by `check_pom_proof`, which pins
 /// `proof.final_state == header.pom_final_state`.
 pub fn calc_pom_pow(header: &Header) -> Uint256 {
     let pre_pow_hash = hashing::header::hash_override_nonce_time(header, 0, 0);
-    Uint256::from_le_bytes(keryx_consensus_core::pom::pom_pow_value(header.pom_final_state, &pre_pow_hash.as_bytes()))
+    Uint256::from_le_bytes(keryx_consensus_core::pom::pom_pow_value_h3(header.pom_final_state, &pre_pow_hash.as_bytes()))
 }
 
 /// H3 block level + target check from the header alone. The exact PoM-era mirror of

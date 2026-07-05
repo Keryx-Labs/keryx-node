@@ -1157,21 +1157,21 @@ pub const TESTNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // OPoI v2: testnet lineup swap (legacy → uncensored) at DAA 1000. Must match the
-    // miner's OPOI_V2_ACTIVATION_DAA. Test value — tune before release.
-    opoi_v2_activation: ForkActivation::new(5_000),
+    // Testnet mirrors the current mainnet state from genesis: every pre-H3 fork
+    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward) is active at
+    // DAA 0, so the only transition exercised on this testnet is H3 below.
+    opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoM possession: testnet DAA 5_000 to observe the kHeavyHash→PoM transition (incl.
-    // difficulty drift). Mainnet stays `never()` until H and will need a difficulty reset.
-    pom_activation: ForkActivation::new(5_000),
-    very_light_activation: ForkActivation::never(), // testnet H2 DAA TBD — set with the miner to exercise the 5-tier lineup
-    // PoM block-level hardfork (H3): testnet DAA 6_000 to exercise the header-format transition
-    // (pre-H3 PoM blocks at level 0, post-H3 real levels + pom_final_state hashed) and the
-    // pruning-proof re-boundedness. MUST mirror the miner's testnet activation.
-    pom_level_activation: ForkActivation::new(6_000),
-    // Set alongside very_light_activation above when exercising the H2 lineup on testnet.
-    inference_min_h2_activation: ForkActivation::never(),
+    // PoM possession: active from genesis (mainnet-state baseline).
+    pom_activation: ForkActivation::new(0),
+    very_light_activation: ForkActivation::new(0), // H2 5-tier lineup from genesis
+    // PoM block-level hardfork (H3): testnet DAA 2_000 to exercise the header-format
+    // transition (pre-H3 PoM blocks at level 0, post-H3 real levels + pom_final_state
+    // hashed) and the pruning-proof re-boundedness. MUST mirror the miner's testnet
+    // activation.
+    pom_level_activation: ForkActivation::new(2_000),
+    inference_min_h2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
 
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
@@ -1182,9 +1182,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
     pow_salt_v4_activation: ForkActivation::new(0),
 
-    // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
-    // populates the bps store; the placeholder map is empty until then.
-    ratio_reward_activation: ForkActivation::new(5_000),
+    // Ratio-reward: active from genesis (mainnet-state baseline).
+    ratio_reward_activation: ForkActivation::new(0),
     ratio_verification_activation: ForkActivation::new(0), // no corrupted history on testnet — verify all
     // Testnet has no frozen-chain history to relaunch from; difficulty reset stays disabled.
     difficulty_reset_activation: ForkActivation::never(),

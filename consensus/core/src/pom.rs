@@ -165,10 +165,24 @@ fn pph_words(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
     w
 }
 
-/// Canonical PoM block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
-/// BYTE-IDENTICAL to the miner kernel `pom_mine.cu::pom_seed_fold` and `src/pom.rs`.
-pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
-    let p = pph_words(pre_pow_hash);
+/// H3 domain salt applied to the pre_pow_hash words feeding both PoM folds at/after
+/// `pom_level_activation`. Forced-update mechanism (same spirit as the kHeavyHash matrix
+/// salts): every walk trajectory and pow value changes at the gate, so pre-H3 binaries —
+/// even ones patched to echo `pom_final_state` — produce proofs that verify false.
+/// Derivation: sha256("keryx-h3-pom-pph-salt") read as 4 little-endian u64 words.
+pub const POM_H3_PPH_SALT: [u64; 4] = [0x7C99D381176D4EC4, 0xC2E28E3E28118C36, 0xD496CE1B129B76CA, 0x47CF0979FA580BCE];
+
+#[inline]
+fn pph_words_h3(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = pph_words(pre_pow_hash);
+    for (wi, si) in w.iter_mut().zip(POM_H3_PPH_SALT.iter()) {
+        *wi ^= si;
+    }
+    w
+}
+
+#[inline]
+fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
     let mut s = mix64(nonce ^ 0x4B65727978531);
     s = mix64(s ^ timestamp);
     s = mix64(s ^ p[0]);
@@ -178,11 +192,20 @@ pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u6
     s
 }
 
-/// Canonical PoM pow value (256-bit, little-endian) compared against the target. mix64-fold of
-/// (final_state, pre_pow_hash) — the memory-hardness is already paid by the K data-dependent
-/// reads. BYTE-IDENTICAL to the miner kernel `pom_mine.cu::pom_pow_fold` and `src/pom.rs`.
-pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
-    let p = pph_words(pre_pow_hash);
+/// Canonical PoM block seed = initial walk state. mix64-fold of (nonce, time, pre_pow_hash).
+/// Pre-H3 era only. BYTE-IDENTICAL to the miner kernel `pom_mine.cu::pom_seed_fold` and `src/pom.rs`.
+pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words(pre_pow_hash), timestamp, nonce)
+}
+
+/// H3-era block seed: same fold over the salted pre_pow_hash words. The miner kernel is
+/// unchanged — it folds whatever pph words the host feeds it (the host salts them post-gate).
+pub fn pom_block_seed_h3(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words_h3(pre_pow_hash), timestamp, nonce)
+}
+
+#[inline]
+fn pom_pow_value_from_words(final_state: u64, p: &[u64; 4]) -> [u8; 32] {
     let o0 = mix64(final_state ^ p[0] ^ 0x9E3779B97F4A7C15);
     let o1 = mix64(o0 ^ p[1] ^ 0xC2B2AE3D27D4EB4F);
     let o2 = mix64(o1 ^ p[2] ^ 0x165667B19E3779F9);
@@ -193,6 +216,18 @@ pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
     out[16..24].copy_from_slice(&o2.to_le_bytes());
     out[24..32].copy_from_slice(&o3.to_le_bytes());
     out
+}
+
+/// Canonical PoM pow value (256-bit, little-endian) compared against the target. mix64-fold of
+/// (final_state, pre_pow_hash) — the memory-hardness is already paid by the K data-dependent
+/// reads. Pre-H3 era only. BYTE-IDENTICAL to the miner kernel `pom_mine.cu::pom_pow_fold` and `src/pom.rs`.
+pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    pom_pow_value_from_words(final_state, &pph_words(pre_pow_hash))
+}
+
+/// H3-era pow value: same fold over the salted pre_pow_hash words.
+pub fn pom_pow_value_h3(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    pom_pow_value_from_words(final_state, &pph_words_h3(pre_pow_hash))
 }
 
 #[inline]
