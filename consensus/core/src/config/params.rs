@@ -1067,11 +1067,11 @@ pub const MAINNET_PARAMS: Params = Params {
     pom_level_activation: ForkActivation::new(43_450_000),
 
     // H2 inference_reward minimums (adds Qwen3-1.7B + 70B-Q2, missed when the H2 lineup shipped).
-    // FUTURE DAA — ~1 week of upgrade runway (tip 40_493_001 @ 2026-07-02 + ~6.0M blocks ≈ 7 days,
-    // activation ≈ 2026-07-09). Treated as a coordinated soft-fork (new-valid ⊆ old-valid): announce
-    // + upgrade nodes/pools before this score. NOT gated at very_light_activation (past) to avoid
-    // re-validation divergence.
-    inference_min_h2_activation: ForkActivation::new(46_500_000),
+    // Gated at the H3 DAA (43_450_000): H3 is a hard fork that forces every node onto v1.3.1,
+    // which already carries this floor table, so the minimums activate in the same single event
+    // instead of a separate ~2026-07-09 point to coordinate. Soft-fork semantics (new-valid ⊆
+    // old-valid). NOT gated at very_light_activation (past) to avoid re-validation divergence.
+    inference_min_h2_activation: ForkActivation::new(43_450_000),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
 
     // PoW SALT v2: emergency activation 2026-05-30 ~15:00 UTC.
