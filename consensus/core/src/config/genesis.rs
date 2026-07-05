@@ -42,6 +42,7 @@ impl From<&GenesisBlock> for Header {
             0.into(),
             0,
             ZERO_HASH,
+            0, // pom_final_state: genesis predates pom_level_activation on every network
         )
     }
 }
@@ -246,6 +247,7 @@ mod tests {
                 0.into(),
                 0,
                 ZERO_HASH,
+                0,
             );
 
             println!("\n=== {} ===", name);

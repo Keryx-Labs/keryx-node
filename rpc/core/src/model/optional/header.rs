@@ -35,6 +35,10 @@ pub struct RpcOptionalHeader {
     pub blue_score: Option<u64>,
     /// Level: Full
     pub pruning_point: Option<Hash>,
+    /// Level: Low - H3 (`pom_level_activation`): final state of the winning PoM possession
+    /// walk, committed into the block hash. None/0 for pre-fork blocks.
+    #[serde(default)]
+    pub pom_final_state: Option<u64>,
 }
 
 impl RpcOptionalHeader {
@@ -52,6 +56,7 @@ impl RpcOptionalHeader {
             && self.blue_work.is_none()
             && self.blue_score.is_none()
             && self.pruning_point.is_none()
+            && self.pom_final_state.is_none()
     }
 }
 
@@ -77,6 +82,7 @@ impl From<Header> for RpcOptionalHeader {
             blue_work: Some(header.blue_work),
             blue_score: Some(header.blue_score),
             pruning_point: Some(header.pruning_point),
+            pom_final_state: Some(header.pom_final_state),
         }
     }
 }
@@ -97,6 +103,7 @@ impl From<&Header> for RpcOptionalHeader {
             blue_work: Some(header.blue_work),
             blue_score: Some(header.blue_score),
             pruning_point: Some(header.pruning_point),
+            pom_final_state: Some(header.pom_final_state),
         }
     }
 }
@@ -129,6 +136,9 @@ impl TryFrom<RpcOptionalHeader> for Header {
             pruning_point: header
                 .pruning_point
                 .ok_or(RpcError::MissingRpcFieldError("RpcHeader".to_owned(), "pruning_point".to_owned()))?,
+            // Optional: absent on pre-H3 headers and verbosity-filtered responses (the cached
+            // `hash` above is carried verbatim, so the block identity cannot be corrupted).
+            pom_final_state: header.pom_final_state.unwrap_or_default(),
         })
     }
 }
@@ -162,13 +172,16 @@ impl TryFrom<&RpcOptionalHeader> for Header {
             pruning_point: header
                 .pruning_point
                 .ok_or(RpcError::MissingRpcFieldError("RpcHeader".to_owned(), "pruning_point".to_owned()))?,
+            // Optional: absent on pre-H3 headers and verbosity-filtered responses (the cached
+            // `hash` above is carried verbatim, so the block identity cannot be corrupted).
+            pom_final_state: header.pom_final_state.unwrap_or_default(),
         })
     }
 }
 
 impl Serializer for RpcOptionalHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
 
         store!(Option<Hash>, &self.hash, writer)?;
         store!(Option<u16>, &self.version, writer)?;
@@ -183,6 +196,7 @@ impl Serializer for RpcOptionalHeader {
         store!(Option<BlueWorkType>, &self.blue_work, writer)?;
         store!(Option<u64>, &self.blue_score, writer)?;
         store!(Option<Hash>, &self.pruning_point, writer)?;
+        store!(Option<u64>, &self.pom_final_state, writer)?;
 
         Ok(())
     }
@@ -190,7 +204,7 @@ impl Serializer for RpcOptionalHeader {
 
 impl Deserializer for RpcOptionalHeader {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let payload_version = load!(u16, reader)?;
 
         let hash = load!(Option<Hash>, reader)?;
         let version = load!(Option<u16>, reader)?;
@@ -205,6 +219,8 @@ impl Deserializer for RpcOptionalHeader {
         let blue_work = load!(Option<BlueWorkType>, reader)?;
         let blue_score = load!(Option<u64>, reader)?;
         let pruning_point = load!(Option<Hash>, reader)?;
+        // Struct-version 2 (H3): pom_final_state. Older senders (v1) simply omit it.
+        let pom_final_state = if payload_version >= 2 { load!(Option<u64>, reader)? } else { None };
 
         Ok(Self {
             hash,
@@ -220,6 +236,7 @@ impl Deserializer for RpcOptionalHeader {
             blue_work,
             blue_score,
             pruning_point,
+            pom_final_state,
         })
     }
 }

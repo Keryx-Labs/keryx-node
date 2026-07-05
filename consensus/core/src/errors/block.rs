@@ -102,6 +102,9 @@ pub enum RuleError {
     #[error("invalid PoM possession proof: {0:?}")]
     BadPomProof(crate::pom::PomVerifyError),
 
+    #[error("header pom_final_state {0} does not match the possession proof final state {1}")]
+    PomFinalStateMismatch(u64, u64),
+
     #[error("coinbase blue score of {0} is not the expected value of {1}")]
     BadCoinbasePayloadBlueScore(u64, u64),
 

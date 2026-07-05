@@ -53,7 +53,7 @@ use crate::{
     },
 };
 use keryx_consensus_core::{
-    BlockHashSet, ChainPath,
+    BlockHashMap, BlockHashSet, ChainPath,
     acceptance_data::AcceptanceData,
     api::args::{TransactionValidationArgs, TransactionValidationBatchArgs},
     block::{BlockTemplate, MutableBlock, TemplateBuildMode, TemplateTransactionSelector},
@@ -149,6 +149,14 @@ pub struct VirtualStateProcessor {
     /// denominator (windowed production at a block's selected-parent view) is the difference of two
     /// cumulatives; read by `ratio_bps_by_block`.
     pub(super) windowed_production_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    /// Memo for `block_productions` (chain block → its era-aware production contribution list),
+    /// i.e. a parsed-coinbase/mergeset cache. During catch-up, `resolve_virtual` validates the
+    /// whole prev_sink→new_sink path in one batch while the committed selected chain still ends at
+    /// prev_sink, so every block on the path takes the side-chain (Case B) branch of
+    /// `windowed_production_for_block` and re-reads the SAME growing prefix of coinbases —
+    /// quadratic RocksDB reads without this memo (measured: virtual thread pegged at ~4
+    /// UTXO-validated blocks/s on an IBD catch-up). Bounded by periodic clear.
+    pub(super) block_production_cache: parking_lot::RwLock<BlockHashMap<std::sync::Arc<Vec<(ScriptPublicKey, u64)>>>>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -212,11 +220,16 @@ pub struct VirtualStateProcessor {
     pub(super) very_light_activation: ForkActivation,
     // Ratio-reward activation: empty ratio-bps map before this score ⇒ no penalty.
     pub(super) ratio_reward_activation: ForkActivation,
+    // H3 gate: per-blue production accounting + DAA-sized ratio window (see `block_productions`
+    // and `production_window_ctx`). Same activation as the PoM block-level hardfork.
+    pub(super) pom_level_activation: ForkActivation,
     // Coinbase ratio/tier VERIFICATION boundary: trust coinbases below this score (non-revalidatable
     // pre-relaunch history), verify with the prefix-sum at/above. Consensus rule (see params doc).
     pub(super) ratio_verification_activation: ForkActivation,
     // Trailing selected-chain window length (blocks) for the ratio-reward production index.
     pub(super) ratio_reward_window: u64,
+    // H3 window length in DAA score (fixed real-time duration, per-blue era).
+    pub(super) ratio_reward_window_daa: u64,
 
     // Skip ratio/tier coinbase verification while following the chain. Three independent reasons,
     // ORed together and re-checked live (see `trust_coinbase()`) rather than fixed at construction:
@@ -299,6 +312,7 @@ impl VirtualStateProcessor {
             acceptance_data_store: storage.acceptance_data_store.clone(),
             address_balance_store: storage.address_balance_store.clone(),
             windowed_production_prefix_store: storage.windowed_production_prefix_store.clone(),
+            block_production_cache: parking_lot::RwLock::new(BlockHashMap::default()),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_meta_stores: storage.pruning_meta_stores.clone(),
             lkg_virtual_state: storage.lkg_virtual_state.clone(),
@@ -337,8 +351,10 @@ impl VirtualStateProcessor {
             pom_activation: params.pom_activation,
             very_light_activation: params.very_light_activation,
             ratio_reward_activation: params.ratio_reward_activation,
+            pom_level_activation: params.pom_level_activation,
             ratio_verification_activation: params.ratio_verification_activation,
             ratio_reward_window: params.ratio_reward_window,
+            ratio_reward_window_daa: params.ratio_reward_window_daa,
             is_archival,
             trust_coinbase_env,
         }
@@ -781,13 +797,16 @@ impl VirtualStateProcessor {
         let mut cum: HashMap<ScriptPublicKey, u64> = HashMap::new();
         let mut written = 0u64;
         for i in lo..=tip_idx {
-            if let Ok(h) = sc.get_by_index(i)
-                && let Some((spk, cut)) = self.block_production(h)
-            {
-                let c = cum.entry(spk.clone()).or_insert(0);
-                *c += cut;
-                self.windowed_production_prefix_store.put_cumulative(&mut batch, &spk, i, *c);
-                written += 1;
+            if let Ok(h) = sc.get_by_index(i) {
+                // Era-aware (H3): per paid mergeset blue at/after `pom_level_activation`, the chain
+                // block's own producer below — identical to what lockstep maintenance appended, so a
+                // fresh rebuild and an incrementally-maintained index derive byte-identical values.
+                for (spk, cut) in self.block_productions(h) {
+                    let c = cum.entry(spk.clone()).or_insert(0);
+                    *c += cut;
+                    self.windowed_production_prefix_store.put_cumulative(&mut batch, &spk, i, *c);
+                    written += 1;
+                }
             }
         }
         self.db.write(batch).unwrap();
@@ -1330,6 +1349,7 @@ impl VirtualStateProcessor {
             virtual_state.ghostdag_data.blue_work,
             virtual_state.ghostdag_data.blue_score,
             header_pruning_point,
+            0, // pom_final_state: filled by the miner from the winning walk (H3), like the nonce
         );
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();

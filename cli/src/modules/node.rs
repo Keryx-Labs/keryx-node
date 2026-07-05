@@ -241,12 +241,12 @@ impl Node {
                 term.refresh_prompt();
             }
             Event::Exit(_code) => {
-                tprintln!(ctx, "Kaspad has exited");
+                tprintln!(ctx, "Keryxd has exited");
                 self.is_running.store(false, Ordering::SeqCst);
                 term.refresh_prompt();
             }
             Event::Error(error) => {
-                tprintln!(ctx, "{}", style(format!("Kaspad error: {error}")).red());
+                tprintln!(ctx, "{}", style(format!("Keryxd error: {error}")).red());
                 self.is_running.store(false, Ordering::SeqCst);
                 term.refresh_prompt();
             }

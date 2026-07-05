@@ -17,7 +17,7 @@ use keryx_database::{
     utils::DbLifetime,
 };
 use keryx_hashes::Hash;
-use keryx_pow::{calc_block_level, calc_block_level_check_pow};
+use keryx_pow::calc_block_level_check_pow;
 use keryx_utils::vec::VecExtensions;
 use parking_lot::RwLock;
 use rocksdb::WriteBatch;
@@ -165,7 +165,10 @@ impl ProofContext {
         }
 
         let proof_pp_header = proof[0].last().expect("checked if empty").clone();
-        let proof_pp_level = calc_block_level(&proof_pp_header, ppm.max_block_level);
+        // Must mirror the builder's `pp_header.block_level` (headers_store, PoM-aware): the
+        // level anchoring checks below compare against the level the builder actually used.
+        let proof_pp_level =
+            super::pom_aware_block_level(&proof_pp_header, ppm.max_block_level, ppm.pom_activation, ppm.pom_level_activation);
         let proof_pp = proof_pp_header.hash;
 
         //
@@ -186,16 +189,24 @@ impl ProofContext {
             let mut selected_tip =
                 proof[level as usize].first().map(|header| header.hash).ok_or(PruningImportError::PruningProofNotEnoughHeaders)?;
             for (i, header) in proof[level as usize].iter().enumerate() {
-                // `header_level` keeps the real PoW-derived level so it stays consistent with the
-                // builder's per-level placement. But post-PoM kHeavyHash is not the PoW (PoM
-                // possession is, verified in body validation) — post-pom headers carry no valid
-                // kHeavyHash, so the pass/fail PoW check must be bypassed for them, else the proof
-                // rejects every post-pom block with ProofOfWorkFailed and no from-scratch node can
-                // sync across pom_activation. Pre-pom history is still fully PoW-validated; post-pom
-                // blocks are trusted (PoM security model — same as the normal-validation skip in
-                // `pre_ghostdag_validation::check_pow_and_calc_block_level`).
-                let (header_level, pow_passes) = calc_block_level_check_pow(header, ppm.max_block_level);
-                let pow_passes = pow_passes || ppm.pom_activation.is_active(header.daa_score);
+                // `header_level` keeps the PoW-derived level so it stays consistent with the
+                // builder's per-level placement (`pom_aware_block_level`), across the three eras:
+                // - H3 (`pom_level_activation`): the header commits to the walk's final state, so
+                //   the PoW value AND the level are verifiable header-only again — full check.
+                // - Dead zone [`pom_activation`, `pom_level_activation`): headers carry no
+                //   header-derivable PoW (PoM possession replaced kHeavyHash, `pom_final_state`
+                //   not committed yet). Level is the builder's forced 0 and the pass/fail check
+                //   must be bypassed, else the proof rejects every dead-zone block with
+                //   ProofOfWorkFailed and no from-scratch node can sync across pom_activation
+                //   (same trust model as the skip in `check_pow_and_calc_block_level`).
+                // - Pre-PoM history: fully kHeavyHash-validated as always.
+                let (header_level, pow_passes) = if ppm.pom_level_activation.is_active(header.daa_score) {
+                    keryx_pow::calc_pom_block_level_check_pow(header, ppm.max_block_level)
+                } else if ppm.pom_activation.is_active(header.daa_score) {
+                    (0, true)
+                } else {
+                    calc_block_level_check_pow(header, ppm.max_block_level)
+                };
                 if header_level < level {
                     return Err(PruningImportError::PruningProofWrongBlockLevel(header.hash, header_level, level));
                 }

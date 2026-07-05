@@ -146,6 +146,13 @@ pub struct Header {
     pub blue_work: BlueWorkType,
     pub blue_score: u64,
     pub pruning_point: Hash,
+    /// Final state of the winning PoM possession walk. Consensus at/after
+    /// `pom_level_activation`: hashed into the block hash (but NOT into `pre_pow_hash` —
+    /// the walk seed derives from it, so including it would be circular), cross-checked
+    /// against `PomProof::final_state` in body validation, and folded via `pom_pow_value`
+    /// to derive the header-only verifiable PoW value and block level. Zero before the fork.
+    #[serde(default)]
+    pub pom_final_state: u64,
 }
 
 impl Header {
@@ -163,6 +170,7 @@ impl Header {
         blue_work: BlueWorkType,
         blue_score: u64,
         pruning_point: Hash,
+        pom_final_state: u64,
     ) -> Self {
         let mut header = Self {
             hash: Default::default(), // Temp init before the finalize below
@@ -178,6 +186,7 @@ impl Header {
             blue_work,
             blue_score,
             pruning_point,
+            pom_final_state,
         };
         header.finalize();
         header
@@ -211,6 +220,7 @@ impl Header {
             blue_work: 0.into(),
             blue_score: 0,
             pruning_point: Default::default(),
+            pom_final_state: 0,
         }
     }
 }
@@ -268,6 +278,7 @@ mod tests {
             Uint192([0x1234567890abcfed, 0xc0dec0ffeec0ffee, 0x1234567890abcdef]),
             u64::MAX,
             Default::default(),
+            0,
         );
         let json = serde_json::to_string(&header).unwrap();
         println!("{}", json);

@@ -13,7 +13,7 @@ use crate::{
     model::stores::{
         block_transactions::BlockTransactionsStoreReader,
         daa::DaaStoreReader,
-        ghostdag::{CompactGhostdagData, GhostdagData},
+        ghostdag::{CompactGhostdagData, GhostdagData, GhostdagStoreReader},
         headers::HeaderStoreReader,
     },
     processes::{
@@ -55,6 +55,16 @@ use keryx_utils::refs::Refs;
 use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};
 use std::{iter::once, ops::Deref};
+
+/// Pre-resolved production-window context of a single validated block (its selected parent
+/// `m_sp`), shared by every rewarded blue of that block — see [`VirtualStateProcessor::production_window_ctx`].
+pub(super) enum ProductionWindowCtx {
+    /// `m_sp` is a committed selected-chain block: window = `(bottom, m_idx]` on the prefix index.
+    OnChain { m_idx: u64, bottom: u64 },
+    /// `m_sp` is on a side chain (mid-reorg / catch-up resolve batch): committed part `(lo, common]`
+    /// on the prefix index + the side-chain production above `lo`, pre-aggregated per SPK.
+    SideChain { common: u64, lo: u64, side_by_spk: std::collections::HashMap<ScriptPublicKey, u64> },
+}
 
 pub(crate) mod crescendo {
     use keryx_core::{info, log::CRESCENDO_KEYWORD};
@@ -277,6 +287,17 @@ impl VirtualStateProcessor {
             );
         }
 
+        // H3 hardfork (PoM block-level): log once at the exact activation DAA score.
+        if header.daa_score == self.pom_level_activation.daa_score() {
+            info!("════════════════ KERYX HARDFORK H3 · DAA {} ════════════════", header.daa_score);
+            info!("  Header        — pomFinalState committed in the block hash; header-only PoW checks restored");
+            info!("  Block levels  — real levels back (bounded pruning proof, from-scratch IBD)");
+            info!("  PoM salt      — walk + pow folds now salted; pre-H3 binaries rejected");
+            info!("  Ratio v2      — production counted per paid blue over a DAA-sized 24h window");
+            info!("  Coinbase cap  — output limit aligned with the OPoI builder (3*(K+1)+4)");
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         // Bundled hardfork (OPoI v2 + PoM + holder-reward share one mainnet activation DAA). Emit a
         // single consolidated banner listing whichever of the three activate exactly at this block's
         // DAA score. The gates are independent fields, so on a network that staggers them the banner
@@ -475,6 +496,9 @@ impl VirtualStateProcessor {
         // own committed-index + `view_diffs` correction (that index is exact and not the divergence source).
         let prod_floor = self.coinbase_manager.base_miner_cut(pov_daa_score).max(1);
         let w = self.ratio_reward_window;
+        // Window context depends only on the block's selected parent — resolve it ONCE and share it
+        // across every rewarded blue (it embeds the full side-chain aggregation in the Case B shape).
+        let window_ctx = self.production_window_ctx(ghostdag_data.selected_parent, w);
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             // Payout SPK = the blue's own miner cut, already resolved into the reward data.
             if let Some(reward) = mergeset_rewards.get(blue) {
@@ -482,7 +506,7 @@ impl VirtualStateProcessor {
                 let base = self.address_balance_store.get(spk).unwrap() as i128;
                 let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                 let balance = (base + delta).max(0) as u64;
-                let production = self.windowed_production_for_block(spk, ghostdag_data.selected_parent, w).max(prod_floor);
+                let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
                 map.insert(*blue, ratio_reward_bps(balance, production));
             }
         }
@@ -504,7 +528,7 @@ impl VirtualStateProcessor {
                         let base = self.address_balance_store.get(spk).unwrap() as i128;
                         let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                         let balance = (base + delta).max(0) as u64;
-                        let prefix = self.windowed_production_for_block(spk, ghostdag_data.selected_parent, w);
+                        let prefix = self.windowed_production_with_ctx(spk, &window_ctx);
                         debug!(
                             "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={}",
                             pov_daa_score, blue, sp_idx, balance, prefix, prod_floor,
@@ -532,11 +556,21 @@ impl VirtualStateProcessor {
             }
             let sc = self.selected_chain_store.read();
             if let Ok(sp_idx) = sc.get_by_hash(ghostdag_data.selected_parent) {
-                let lo = sp_idx.saturating_sub(w - 1).max(1);
+                // Era-aware window bottom (exclusive), mirroring `production_window_ctx`:
+                // legacy = last `w` chain blocks; H3 = daa-sized window found by binary search.
+                let sp_header = self.headers_store.get_header(ghostdag_data.selected_parent).unwrap();
+                let bottom = if self.pom_level_activation.is_active(sp_header.daa_score) {
+                    let pruning_idx = sc.get_by_hash(sp_header.pruning_point).unwrap_or(0);
+                    let daa_bound = sp_header.daa_score.saturating_sub(self.ratio_reward_window_daa);
+                    self.chain_index_at_or_below_daa(&*sc, daa_bound, sp_idx, pruning_idx)
+                } else {
+                    sp_idx.saturating_sub(w)
+                };
+                let lo = (bottom + 1).max(1);
                 let mut direct: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
                 for i in lo..=sp_idx {
                     if let Ok(h) = sc.get_by_index(i) {
-                        if let Some((spk, cut)) = self.block_production(h) {
+                        for (spk, cut) in self.block_productions(h) {
                             *direct.entry(spk).or_default() += cut;
                         }
                     }
@@ -574,6 +608,51 @@ impl VirtualStateProcessor {
         Some((spk, cut))
     }
 
+    /// Production contributions attributed at chain block `hash`'s index in the prefix-sum index,
+    /// era-aware. The era is gated by the CHAIN BLOCK's own daa_score — a pure per-block property,
+    /// so the index remains a pure, IBD-re-derivable function of the chain across the fork:
+    /// - pre-`pom_level_activation` (legacy): one entry — the chain block's own producer. Only
+    ///   selected-chain producers accumulated production, undercounting badly-peered miners whose
+    ///   blocks are merged as blues (~1.7× connectivity bias).
+    /// - at/after `pom_level_activation` (H3): one entry per PAID mergeset blue of the chain block
+    ///   (non-DAA blues excluded — the exact set the coinbase pays and `ratio_bps_by_block`
+    ///   iterates), each = (blue's own coinbase SPK, `base_miner_cut(blue.daa_score)`). Production
+    ///   becomes the exact mirror of payment: every blue is merged by exactly one chain block, so
+    ///   every paid block is counted exactly once, connectivity-bias-free.
+    pub(super) fn block_productions(&self, hash: Hash) -> Vec<(ScriptPublicKey, u64)> {
+        if self.pom_level_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
+            let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
+            let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
+            ghostdag_data
+                .mergeset_blues
+                .iter()
+                .filter(|b| !non_daa.contains(b))
+                .filter_map(|b| self.block_production(*b))
+                .collect()
+        } else {
+            self.block_production(hash).into_iter().collect()
+        }
+    }
+
+    /// Memoized [`block_productions`]. A chain block's contribution list (its era, its mergeset,
+    /// the blues' coinbase SPKs and base cuts) is immutable per hash — reorgs never change it — so
+    /// entries are safe to keep indefinitely; the cache is only cleared to bound memory.
+    /// This is what breaks the quadratic RocksDB-read blowup of side-chain (Case B) windowed
+    /// production during catch-up: block k of a resolve batch re-reads the same k−1 mergesets
+    /// block k−1 just read.
+    pub(super) fn block_productions_cached(&self, hash: Hash) -> std::sync::Arc<Vec<(ScriptPublicKey, u64)>> {
+        if let Some(v) = self.block_production_cache.read().get(&hash) {
+            return v.clone();
+        }
+        let v = std::sync::Arc::new(self.block_productions(hash));
+        let mut cache = self.block_production_cache.write();
+        if cache.len() >= 200_000 {
+            cache.clear();
+        }
+        cache.insert(hash, v.clone());
+        v
+    }
+
     /// Gold-standard prefix-sum maintenance — advances the production index along `chain_path`, kept in
     /// lockstep with the selected chain (called from `commit_virtual_state` in the SAME batch as the
     /// selected-chain `apply_changes`, BEFORE it runs, so `sc` still reflects the pre-change chain).
@@ -597,17 +676,28 @@ impl VirtualStateProcessor {
     ) {
         let from_tip = sc.get_tip().unwrap().0;
         let common = from_tip - chain_path.removed.len() as u64;
+        // Era-aware (H3): a chain block contributes one entry per paid mergeset blue, so several
+        // (spk, index[, cut]) tuples can share an index. Deletion of duplicate keys is idempotent;
+        // on the addition side `extend`'s per-SPK running accumulator chains same-key puts, so the
+        // last write carries the summed cumulative — no pre-aggregation needed.
         let removals: Vec<(ScriptPublicKey, u64)> = chain_path
             .removed
             .iter()
             .enumerate()
-            .filter_map(|(j, h)| self.block_production(*h).map(|(spk, _)| (spk, from_tip - j as u64)))
+            .flat_map(|(j, h)| {
+                self.block_productions_cached(*h).iter().map(|(spk, _)| (spk.clone(), from_tip - j as u64)).collect::<Vec<_>>()
+            })
             .collect();
         let additions: Vec<(ScriptPublicKey, u64, u64)> = chain_path
             .added
             .iter()
             .enumerate()
-            .filter_map(|(k, h)| self.block_production(*h).map(|(spk, cut)| (spk, common + 1 + k as u64, cut)))
+            .flat_map(|(k, h)| {
+                self.block_productions_cached(*h)
+                    .iter()
+                    .map(|(spk, cut)| (spk.clone(), common + 1 + k as u64, *cut))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         self.windowed_production_prefix_store.extend(batch, common, &removals, &additions).unwrap();
     }
@@ -630,45 +720,130 @@ impl VirtualStateProcessor {
     /// **Case A** — `m_sp` on the committed chain: `cum(idx) − cum(floor)`.
     /// **Case B** — `m_sp` off-chain (mid-reorg): committed-prefix part `(floor, common]` + the
     /// side-chain `added` blocks above the floor, summed directly.
+    ///
+    /// The window resolution depends only on `m_sp`, so it is split out into
+    /// [`production_window_ctx`], computed ONCE per validated block; the per-SPK query is
+    /// [`windowed_production_with_ctx`]. Keeping them fused per SPK (the previous shape) walked
+    /// the full committed-tip→`m_sp` chain path and re-read every side-chain coinbase for EVERY
+    /// rewarded blue of EVERY block of a catch-up resolve batch — quadratic in batch length, and
+    /// the measured cause of an IBD catch-up crawling at ~4 UTXO-validated blocks/s.
     pub(super) fn windowed_production_for_block(&self, spk: &ScriptPublicKey, m_sp: Hash, w: u64) -> u64 {
+        let ctx = self.production_window_ctx(m_sp, w);
+        self.windowed_production_with_ctx(spk, &ctx)
+    }
+
+    /// Resolves the production-window context of the block whose selected parent is `m_sp` —
+    /// everything of `windowed_production_for_block` that does not depend on the queried SPK.
+    /// Case B pre-aggregates the side-chain production into a per-SPK map (one pass over the
+    /// chain path, mergesets served by `block_productions_cached`), so per-blue queries are O(1)
+    /// map lookups + two prefix-store reads.
+    ///
+    /// Window sizing is era-gated on `m_sp`'s daa_score (a header value — identical for the
+    /// producer and every validator):
+    /// - pre-`pom_level_activation`: the last `w` SELECTED-CHAIN blocks (legacy; ~4.6 real days
+    ///   at mainnet mergeset width, drifting with it);
+    /// - at/after: the chain blocks whose daa_score lies in `(m_sp.daa − ratio_reward_window_daa,
+    ///   m_sp.daa]` — a FIXED 24h regardless of DAG width. The bottom index is found by binary
+    ///   search (daa is strictly increasing along the selected chain: every chain block adds at
+    ///   least itself to the DAA count).
+    ///
+    /// Both eras keep the pruning-point clamp (option C, see `windowed_production_for_block`).
+    pub(super) fn production_window_ctx(&self, m_sp: Hash, w: u64) -> ProductionWindowCtx {
         let sc = self.selected_chain_store.read();
+        let m_sp_header = self.headers_store.get_header(m_sp).unwrap();
         // Window floor: chain index of m_sp's committed pruning point (consensus). 0 if not on the
         // selected chain (no clamp) — should not happen for a valid block's pruning point.
-        let pruning_idx =
-            sc.get_by_hash(self.headers_store.get_header(m_sp).unwrap().pruning_point).unwrap_or(0);
+        let pruning_idx = sc.get_by_hash(m_sp_header.pruning_point).unwrap_or(0);
+        let h3 = self.pom_level_activation.is_active(m_sp_header.daa_score);
+        // H3 window bottom in daa units — entries strictly above this daa are inside the window.
+        let daa_bound = m_sp_header.daa_score.saturating_sub(self.ratio_reward_window_daa);
         if let Ok(m_idx) = sc.get_by_hash(m_sp) {
             // Case A: m_sp is a committed chain block.
-            let bottom = m_idx.saturating_sub(w).max(pruning_idx);
-            let hi = self.windowed_production_prefix_store.cumulative_at(spk, m_idx).unwrap();
-            let lo_cum = self.windowed_production_prefix_store.cumulative_at(spk, bottom).unwrap();
-            return hi.saturating_sub(lo_cum);
+            let bottom = if h3 {
+                self.chain_index_at_or_below_daa(&*sc, daa_bound, m_idx, pruning_idx)
+            } else {
+                m_idx.saturating_sub(w)
+            }
+            .max(pruning_idx);
+            return ProductionWindowCtx::OnChain { m_idx, bottom };
         }
         // Case B: m_sp is on a side chain. Reconstruct its window = committed-prefix part + side delta.
         let (committed_tip_index, committed_tip) = sc.get_tip().unwrap();
         let chain_path = self.dag_traversal_manager.calculate_chain_path(committed_tip, m_sp, None);
         let common = committed_tip_index - chain_path.removed.len() as u64;
         let m = common + chain_path.added.len() as u64; // m_sp's index along its OWN selected chain
-        let lo = m.saturating_sub(w).max(pruning_idx); // window bottom, floored at the pruning point
-        // Shared part: committed-chain indices (lo, common] (empty when the whole window is side-chain).
-        let shared = if lo < common {
-            let hi = self.windowed_production_prefix_store.cumulative_at(spk, common).unwrap();
-            let bottom = self.windowed_production_prefix_store.cumulative_at(spk, lo).unwrap();
-            hi.saturating_sub(bottom)
-        } else {
-            0
-        };
-        // Side part: added[k] sits at index common+1+k; include those inside the window (index > lo).
-        let mut side = 0u64;
+        // Window bottom over the COMMITTED part, floored at the pruning point. In the H3 era the
+        // committed part of the window is bounded by daa (searched up to `common`); side-chain
+        // added blocks are filtered by their own daa below instead of by index.
+        let lo = if h3 { self.chain_index_at_or_below_daa(&*sc, daa_bound, common, pruning_idx) } else { m.saturating_sub(w) }
+            .max(pruning_idx);
+        // Side part: added[k] sits at index common+1+k; include those inside the window
+        // (legacy: index > lo; H3: the block's own daa above the daa bound).
+        let mut side_by_spk: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
         for (k, h) in chain_path.added.iter().enumerate() {
-            let idx = common + 1 + k as u64;
-            if idx > lo
-                && let Some((s, cut)) = self.block_production(*h)
-                && &s == spk
-            {
-                side += cut;
+            let in_window = if h3 {
+                self.headers_store.get_daa_score(*h).unwrap() > daa_bound
+            } else {
+                common + 1 + k as u64 > lo
+            };
+            if in_window {
+                for (s, cut) in self.block_productions_cached(*h).iter() {
+                    *side_by_spk.entry(s.clone()).or_default() += cut;
+                }
             }
         }
-        shared + side
+        ProductionWindowCtx::SideChain { common, lo, side_by_spk }
+    }
+
+    /// Largest selected-chain index in `[search floor, hi_idx]` whose block's daa_score is
+    /// ≤ `bound_daa` — the exclusive window bottom for a daa-sized production window. Binary
+    /// search, valid because daa_score is strictly increasing along the selected chain. The search
+    /// floor is `max(hi_idx − ratio_reward_window_daa, floor_idx)`: the chain gains at most one
+    /// index per daa point, so the bottom can never sit more than `ratio_reward_window_daa`
+    /// indices below `hi_idx`; `floor_idx` (the pruning clamp) keeps every probe inside retained,
+    /// consensus-shared history. If even the floor's daa exceeds the bound (window truncated by
+    /// pruning), the floor itself is returned — the caller clamps to it anyway.
+    fn chain_index_at_or_below_daa(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        bound_daa: u64,
+        hi_idx: u64,
+        floor_idx: u64,
+    ) -> u64 {
+        let daa_at = |i: u64| self.headers_store.get_daa_score(sc.get_by_index(i).unwrap()).unwrap();
+        let mut lo = hi_idx.saturating_sub(self.ratio_reward_window_daa).max(floor_idx);
+        let mut hi = hi_idx;
+        if lo >= hi || daa_at(lo) > bound_daa {
+            return lo;
+        }
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if daa_at(mid) <= bound_daa { lo = mid } else { hi = mid - 1 }
+        }
+        lo
+    }
+
+    /// Windowed production of `spk` under a pre-resolved [`ProductionWindowCtx`]. Byte-identical
+    /// result to the previous fused computation: Case A/B formulas unchanged, only hoisted.
+    pub(super) fn windowed_production_with_ctx(&self, spk: &ScriptPublicKey, ctx: &ProductionWindowCtx) -> u64 {
+        match ctx {
+            ProductionWindowCtx::OnChain { m_idx, bottom } => {
+                let hi = self.windowed_production_prefix_store.cumulative_at(spk, *m_idx).unwrap();
+                let lo_cum = self.windowed_production_prefix_store.cumulative_at(spk, *bottom).unwrap();
+                hi.saturating_sub(lo_cum)
+            }
+            ProductionWindowCtx::SideChain { common, lo, side_by_spk } => {
+                // Shared part: committed-chain indices (lo, common] (empty when the whole window is side-chain).
+                let shared = if lo < common {
+                    let hi = self.windowed_production_prefix_store.cumulative_at(spk, *common).unwrap();
+                    let bottom = self.windowed_production_prefix_store.cumulative_at(spk, *lo).unwrap();
+                    hi.saturating_sub(bottom)
+                } else {
+                    0
+                };
+                shared + side_by_spk.get(spk).copied().unwrap_or(0)
+            }
+        }
     }
 
 

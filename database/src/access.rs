@@ -90,18 +90,42 @@ where
         TData: DeserializeOwned,
         TFallbackDeser: DeserializeOwned + Into<TData>,
     {
+        self.read_with_fallbacks::<TData, TFallbackDeser>(fallback_prefix, key)
+    }
+
+    /// Like `read_with_fallback`, with an additional in-place decode fallback: if the main-column
+    /// bytes fail to decode as `TData`, the SAME bytes are re-tried as `TDecodeFallback` (a
+    /// previous layout of `TData`) and converted. Needed when a persisted struct gains a trailing
+    /// field: entries written by an older node keep the old layout in the same column, and
+    /// bincode (positional, no defaults) fails on them with a length error rather than falling
+    /// back. Safe both ways: old bytes decoded as the grown `TData` always underflow (error, never
+    /// silently mis-decode), and `TDecodeFallback` is only attempted after `TData` failed.
+    pub fn read_with_fallbacks<TDecodeFallback, TPrefixFallback>(
+        &self,
+        fallback_prefix: &[u8],
+        key: TKey,
+    ) -> Result<TData, StoreError>
+    where
+        TKey: Clone + AsRef<[u8]> + ToString,
+        TData: DeserializeOwned,
+        TDecodeFallback: DeserializeOwned + Into<TData>,
+        TPrefixFallback: DeserializeOwned + Into<TData>,
+    {
         if let Some(data) = self.cache.get(&key) {
             Ok(data)
         } else {
             let db_key = DbKey::new(&self.prefix, key.clone());
             if let Some(slice) = self.db.get_pinned(&db_key)? {
-                let data: TData = bincode::deserialize(&slice)?;
+                let data: TData = match bincode::deserialize(&slice) {
+                    Ok(data) => data,
+                    Err(_) => bincode::deserialize::<TDecodeFallback>(&slice)?.into(),
+                };
                 self.cache.insert(key, data.clone());
                 Ok(data)
             } else {
                 let db_key = DbKey::new(fallback_prefix, key.clone());
                 if let Some(slice) = self.db.get_pinned(&db_key)? {
-                    let data: TFallbackDeser = bincode::deserialize(&slice)?;
+                    let data: TPrefixFallback = bincode::deserialize(&slice)?;
                     let data: TData = data.into();
                     self.cache.insert(key, data.clone());
                     Ok(data)

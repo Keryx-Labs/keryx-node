@@ -401,7 +401,7 @@ impl Router {
 
     /// Enqueues a locally-originated message to be sent to the network peer
     pub async fn enqueue(&self, msg: KaspadMessage) -> Result<(), ProtocolError> {
-        assert!(msg.payload.is_some(), "Kaspad P2P message should always have a value");
+        assert!(msg.payload.is_some(), "Keryxd P2P message should always have a value");
         match self.outgoing_route.try_send(msg) {
             Ok(_) => Ok(()),
             Err(TrySendError::Closed(_)) => Err(ProtocolError::ConnectionClosed),

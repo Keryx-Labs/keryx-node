@@ -309,7 +309,7 @@ impl KaspaCli {
                                     this.term().refresh_prompt();
                                 },
                                 Events::UtxoIndexNotEnabled { .. } => {
-                                    tprintln!(this, "Error: Kaspa node UTXO index is not enabled...")
+                                    tprintln!(this, "Error: Keryx node UTXO index is not enabled...")
                                 },
                                 Events::SyncState { sync_state } => {
 

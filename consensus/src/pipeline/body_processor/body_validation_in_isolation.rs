@@ -2,13 +2,14 @@ use std::{collections::HashSet, sync::Arc};
 
 use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
+use crate::processes::{coinbase::coinbase_outputs_limit, transaction_validator::errors::TxRuleError};
 use keryx_consensus_core::{
     block::Block,
     config::params::{POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
-    pom::{pom_block_seed, pom_pow_value, verify_pom_proof},
+    pom::{pom_block_seed, pom_block_seed_h3, pom_pow_value, pom_pow_value_h3, verify_pom_proof},
     tx::TransactionOutpoint,
 };
 use keryx_math::Uint256;
@@ -18,6 +19,7 @@ impl BlockBodyProcessor {
         Self::check_has_transactions(block)?;
         Self::check_hash_merkle_root(block)?;
         Self::check_only_one_coinbase(block)?;
+        self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
@@ -58,6 +60,22 @@ impl BlockBodyProcessor {
             return Err(RuleError::MultipleCoinbases(i));
         }
 
+        Ok(())
+    }
+
+    /// Era-exact coinbase output-count bound (see `coinbase_outputs_limit`). Lives here rather
+    /// than in `validate_tx_in_isolation` because it is activation-dependent and needs the
+    /// header's daa_score — tx-in-isolation checks must stay context-free (mempool/BBT reuse
+    /// them). The tx-level check keeps the H3 structural max as an absolute upper bound.
+    fn check_coinbase_outputs_count(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let coinbase = &block.transactions[0];
+        let limit = coinbase_outputs_limit(self.ghostdag_k as u64, self.pom_level_activation.is_active(block.header.daa_score));
+        if coinbase.outputs.len() as u64 > limit {
+            return Err(RuleError::TxInIsolationValidationFailed(
+                coinbase.id(),
+                TxRuleError::CoinbaseTooManyOutputs(coinbase.outputs.len(), limit),
+            ));
+        }
         Ok(())
     }
 
@@ -154,6 +172,13 @@ impl BlockBodyProcessor {
             return Ok(());
         }
         let proof = block.pom_proof.as_ref().ok_or(RuleError::PomProofMissing)?;
+        // H3: the header commits to the walk's final state (block level + header-only PoW check
+        // derive from it) — pin it to the proof so a miner cannot claim a level it did not earn.
+        // H3 also salts the pph words feeding both folds (forced update — see POM_H3_PPH_SALT).
+        let h3 = self.pom_level_activation.is_active(header.daa_score);
+        if h3 && proof.final_state != header.pom_final_state {
+            return Err(RuleError::PomFinalStateMismatch(header.pom_final_state, proof.final_state));
+        }
         // Tier set is gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
         // chosen from this block's own daa_score so archival/IBD recomputation stays canonical.
         let tiers = pom_tiers(self.very_light_activation.is_active(header.daa_score));
@@ -161,7 +186,11 @@ impl BlockBodyProcessor {
 
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
         let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
-        let seed = pom_block_seed(&pre_pow_hash, header.timestamp, header.nonce);
+        let seed = if h3 {
+            pom_block_seed_h3(&pre_pow_hash, header.timestamp, header.nonce)
+        } else {
+            pom_block_seed(&pre_pow_hash, header.timestamp, header.nonce)
+        };
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
 
         verify_pom_proof(
@@ -174,7 +203,7 @@ impl BlockBodyProcessor {
             POM_OPENINGS,
             &tier.root,
             &target,
-            |s| pom_pow_value(s, &pre_pow_hash),
+            |s| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) },
         )
         .map_err(RuleError::BadPomProof)
     }
@@ -472,6 +501,7 @@ mod tests {
                 0.into(),
                 9,
                 Default::default(),
+                0,
             ),
             txs,
         );

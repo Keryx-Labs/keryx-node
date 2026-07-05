@@ -53,11 +53,14 @@ pub struct RpcHeaderVerbosity {
     pub include_blue_work: Option<bool>,
     pub include_blue_score: Option<bool>,
     pub include_pruning_point: Option<bool>,
+    /// H3: `pom_final_state` (miner-filled PoW-solution field, like the nonce)
+    #[serde(default)]
+    pub include_pom_final_state: Option<bool>,
 }
 
 impl Serializer for RpcHeaderVerbosity {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
 
         store!(Option<bool>, &self.include_hash, writer)?;
         store!(Option<bool>, &self.include_version, writer)?;
@@ -72,6 +75,7 @@ impl Serializer for RpcHeaderVerbosity {
         store!(Option<bool>, &self.include_blue_work, writer)?;
         store!(Option<bool>, &self.include_blue_score, writer)?;
         store!(Option<bool>, &self.include_pruning_point, writer)?;
+        store!(Option<bool>, &self.include_pom_final_state, writer)?;
 
         Ok(())
     }
@@ -79,7 +83,7 @@ impl Serializer for RpcHeaderVerbosity {
 
 impl Deserializer for RpcHeaderVerbosity {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let payload_version = load!(u16, reader)?;
 
         let include_hash = load!(Option<bool>, reader)?;
         let include_version = load!(Option<bool>, reader)?;
@@ -94,6 +98,8 @@ impl Deserializer for RpcHeaderVerbosity {
         let include_blue_work = load!(Option<bool>, reader)?;
         let include_blue_score = load!(Option<bool>, reader)?;
         let include_pruning_point = load!(Option<bool>, reader)?;
+        // Struct-version 2 (H3): include_pom_final_state. Older senders (v1) omit it.
+        let include_pom_final_state = if payload_version >= 2 { load!(Option<bool>, reader)? } else { None };
 
         Ok(Self {
             include_hash,
@@ -109,6 +115,7 @@ impl Deserializer for RpcHeaderVerbosity {
             include_blue_work,
             include_blue_score,
             include_pruning_point,
+            include_pom_final_state,
         })
     }
 }

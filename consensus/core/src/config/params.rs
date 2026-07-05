@@ -299,7 +299,21 @@ pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
 /// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
+///
+/// PRE-H3 ONLY. This window was applied in SELECTED-CHAIN block units, but the chain advances at
+/// ~2.2 chain blocks/s (mergesets absorb the 10 BPS DAG width), so "24h" was really ~4.6 real
+/// days — and drifting with mergeset size. Superseded at `pom_level_activation` by
+/// [`RATIO_REWARD_WINDOW_DAA`].
 pub const RATIO_REWARD_WINDOW: u64 = 864_000;
+
+/// H3 ratio-reward window, in DAA score (true block count): 24h at 10 BPS = 864_000 DAA, a FIXED
+/// real-time duration regardless of mergeset width. Used for blocks at/after `pom_level_activation`
+/// together with per-blue production accounting (production = the base cuts of every PAID mergeset
+/// blue, the exact mirror of coinbase payment — replacing the selected-chain-only accounting whose
+/// ~1.7× connectivity bias and 4.6-day effective window drifted from the spec). The spec reading
+/// "top bracket = 30 days of production held" is exact again. HARD CONSTRAINT: spans far less
+/// selected-chain depth than the legacy window (~190k chain blocks), comfortably inside pruning.
+pub const RATIO_REWARD_WINDOW_DAA: u64 = 864_000;
 
 /// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
 /// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
@@ -668,6 +682,19 @@ pub struct Params {
     /// `VERY_LIGHT_ACTIVATION_DAA` for the running network. Dormant until the H2 DAA is chosen.
     pub very_light_activation: ForkActivation,
 
+    /// PoM block-level hardfork (H3) activation DAA score. At/after this score:
+    /// (1) `Header::pom_final_state` becomes consensus — hashed into the block hash and
+    /// cross-checked against `PomProof::final_state` in body validation; (2) the PoW value
+    /// `pom_pow_value(pom_final_state, pre_pow_hash)` is re-checked against the target at
+    /// header validation (header-only, no weights needed); (3) the block level is derived
+    /// from that value again instead of being forced to 0, un-degenerating the pruning proof
+    /// (level 0 alone carried the whole post-`pom_activation` span — 3.26M headers and
+    /// growing — which killed from-scratch IBD). Blocks in the dead zone
+    /// [`pom_activation`, here) keep level 0 forever; the proof fully self-heals once the
+    /// pruning point passes this score. MUST equal the miner's activation for the running
+    /// network — miners must fill `pom_final_state` from the winning walk.
+    pub pom_level_activation: ForkActivation,
+
     /// H2 per-model minimum inference_reward gate. From this score `inference_reward_minimums_v2_h2`
     /// (5-tier, incl. Qwen3-1.7B + 70B-Q2) replaces `inference_reward_minimums_v2`. MUST be a FUTURE
     /// DAA — never `very_light_activation` (already past) — so IBD re-validation of historical blocks
@@ -721,7 +748,12 @@ pub struct Params {
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
     /// exercise the window slide. HARD CONSTRAINT: must stay `< pruning_depth`.
+    /// PRE-H3 ONLY — superseded by `ratio_reward_window_daa` at `pom_level_activation`.
     pub ratio_reward_window: u64,
+
+    /// H3 ratio-reward window in DAA score (fixed real-time duration, per-blue accounting era).
+    /// Defaults to `RATIO_REWARD_WINDOW_DAA`; a Params field so tests can shrink it.
+    pub ratio_reward_window_daa: u64,
 }
 
 impl Params {
@@ -907,6 +939,8 @@ impl Params {
 
             very_light_activation: self.very_light_activation,
 
+            pom_level_activation: self.pom_level_activation,
+
             inference_min_h2_activation: self.inference_min_h2_activation,
             inference_reward_minimums_v2_h2: self.inference_reward_minimums_v2_h2,
 
@@ -919,6 +953,7 @@ impl Params {
             difficulty_reset_activation: self.difficulty_reset_activation,
 
             ratio_reward_window: self.ratio_reward_window,
+            ratio_reward_window_daa: self.ratio_reward_window_daa,
         }
     }
 }
@@ -1022,6 +1057,15 @@ pub const MAINNET_PARAMS: Params = Params {
     pom_activation: ForkActivation::new(37_780_000),
     very_light_activation: ForkActivation::new(38_951_445), // H2 = frozen frontier; mirrors miner VERY_LIGHT_ACTIVATION_DAA
 
+    // PoM block-level hardfork (H3): restores header-only PoW verification + real block levels
+    // (pruning proof un-degeneration, from-scratch IBD), salts the pph words feeding the PoM
+    // folds (POM_H3_PPH_SALT, forced update) and aligns the coinbase output cap with the OPoI
+    // builder (3*(K+1)+4). Full hardfork — header format + hash change, every node AND miner
+    // must upgrade before this score. DAA picked 2026-07-05 08:49 UTC (tip 43,117,871)
+    // targeting activation ≈ 2026-07-05 18:00 UTC (~17:55–18:10 at 10–9.7 DAA/s).
+    // MUST mirror the miner's H3 activation (POM_LEVEL_ACTIVATION_DAA) for the running network.
+    pom_level_activation: ForkActivation::new(43_450_000),
+
     // H2 inference_reward minimums (adds Qwen3-1.7B + 70B-Q2, missed when the H2 lineup shipped).
     // FUTURE DAA — ~1 week of upgrade runway (tip 40_493_001 @ 2026-07-02 + ~6.0M blocks ≈ 7 days,
     // activation ≈ 2026-07-09). Treated as a coordinated soft-fork (new-valid ⊆ old-valid): announce
@@ -1065,6 +1109,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // the real PoM hashrate within one window. MUST match across all honest nodes.
     difficulty_reset_activation: ForkActivation::new(38_951_445),
     ratio_reward_window: RATIO_REWARD_WINDOW,
+    ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -1114,17 +1159,21 @@ pub const TESTNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // OPoI v2: testnet lineup swap (legacy → uncensored) at DAA 1000. Must match the
-    // miner's OPOI_V2_ACTIVATION_DAA. Test value — tune before release.
-    opoi_v2_activation: ForkActivation::new(5_000),
+    // Testnet mirrors the current mainnet state from genesis: every pre-H3 fork
+    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward) is active at
+    // DAA 0, so the only transition exercised on this testnet is H3 below.
+    opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
-    // PoM possession: testnet DAA 5_000 to observe the kHeavyHash→PoM transition (incl.
-    // difficulty drift). Mainnet stays `never()` until H and will need a difficulty reset.
-    pom_activation: ForkActivation::new(5_000),
-    very_light_activation: ForkActivation::never(), // testnet H2 DAA TBD — set with the miner to exercise the 5-tier lineup
-    // Set alongside very_light_activation above when exercising the H2 lineup on testnet.
-    inference_min_h2_activation: ForkActivation::never(),
+    // PoM possession: active from genesis (mainnet-state baseline).
+    pom_activation: ForkActivation::new(0),
+    very_light_activation: ForkActivation::new(0), // H2 5-tier lineup from genesis
+    // PoM block-level hardfork (H3): testnet DAA 2_000 to exercise the header-format
+    // transition (pre-H3 PoM blocks at level 0, post-H3 real levels + pom_final_state
+    // hashed) and the pruning-proof re-boundedness. MUST mirror the miner's testnet
+    // activation.
+    pom_level_activation: ForkActivation::new(2_000),
+    inference_min_h2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
 
     // PoW SALT v2: testnet active from genesis (no mid-chain transition — only opoi_v2
@@ -1135,16 +1184,16 @@ pub const TESTNET_PARAMS: Params = Params {
     // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
     pow_salt_v4_activation: ForkActivation::new(0),
 
-    // Ratio-reward: testnet staging gate. Inert until Stage 2 (the balance + production indexes)
-    // populates the bps store; the placeholder map is empty until then.
-    ratio_reward_activation: ForkActivation::new(5_000),
+    // Ratio-reward: active from genesis (mainnet-state baseline).
+    ratio_reward_activation: ForkActivation::new(0),
     ratio_verification_activation: ForkActivation::new(0), // no corrupted history on testnet — verify all
     // Testnet has no frozen-chain history to relaunch from; difficulty reset stays disabled.
     difficulty_reset_activation: ForkActivation::never(),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
-    // rather than ~30 days. Still well under pruning_depth.
+    // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
     ratio_reward_window: 1_000,
+    ratio_reward_window_daa: 1_000,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -1193,6 +1242,7 @@ pub const SIMNET_PARAMS: Params = Params {
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
     very_light_activation: ForkActivation::never(),
+    pom_level_activation: ForkActivation::never(),
     inference_min_h2_activation: ForkActivation::never(),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),
@@ -1201,6 +1251,7 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
+    ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -1247,6 +1298,7 @@ pub const DEVNET_PARAMS: Params = Params {
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
     pom_activation: ForkActivation::never(),
     very_light_activation: ForkActivation::never(),
+    pom_level_activation: ForkActivation::never(),
     inference_min_h2_activation: ForkActivation::never(),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),
@@ -1255,4 +1307,5 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
+    ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 };

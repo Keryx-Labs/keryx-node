@@ -51,6 +51,7 @@ impl From<(HeaderFormat, &Header)> for protowire::BlockHeader {
             blue_work: item.blue_work.to_be_bytes_var(),
             blue_score: item.blue_score,
             pruning_point: Some(item.pruning_point.into()),
+            pom_final_state: item.pom_final_state,
         }
     }
 }
@@ -107,6 +108,7 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
             BlueWorkType::from_be_bytes_var(&item.blue_work)?,
             item.blue_score,
             item.pruning_point.try_into_ex()?,
+            item.pom_final_state,
         ))
     }
 }

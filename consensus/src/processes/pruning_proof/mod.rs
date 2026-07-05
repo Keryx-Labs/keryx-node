@@ -121,6 +121,9 @@ pub struct PruningProofManager {
     // Post-PoM blocks carry no valid kHeavyHash PoW (PoM possession replaces it), so the proof's
     // per-level PoW check must skip them — mirror `pre_ghostdag_validation::check_pow_and_calc_block_level`.
     pom_activation: ForkActivation,
+    // H3: from this score headers commit to `pom_final_state` and the PoW value / block level
+    // are header-only derivable again — see `pom_aware_block_level`.
+    pom_level_activation: ForkActivation,
 
     is_consensus_exiting: Arc<AtomicBool>,
 }
@@ -142,6 +145,7 @@ impl PruningProofManager {
         ghostdag_k: KType,
         skip_proof_of_work: bool,
         pom_activation: ForkActivation,
+        pom_level_activation: ForkActivation,
         is_consensus_exiting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -177,6 +181,7 @@ impl PruningProofManager {
             ghostdag_k,
             skip_proof_of_work,
             pom_activation,
+            pom_level_activation,
 
             is_consensus_exiting,
         }
@@ -207,7 +212,7 @@ impl PruningProofManager {
                 continue;
             }
 
-            let block_level = pom_aware_block_level(header, self.max_block_level, self.pom_activation);
+            let block_level = pom_aware_block_level(header, self.max_block_level, self.pom_activation, self.pom_level_activation);
             self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
         }
 
@@ -413,9 +418,14 @@ where
 impl<T: GhostdagStoreReader> GhostdagReaderExt for T {}
 
 /// Computes the block level to persist for a pruning-point-proof header, mirroring
-/// `pre_ghostdag_validation::check_pow_and_calc_block_level`'s real-time behavior: post-PoM
-/// headers carry no valid kHeavyHash PoW (PoM possession replaces it), so their level is forced
-/// to 0 rather than derived from `calc_block_level`'s (meaningless, post-fork) leading-zero count.
+/// `pre_ghostdag_validation::check_pow_and_calc_block_level`'s real-time behavior across the
+/// three eras:
+/// - pre-`pom_activation`: legacy kHeavyHash-derived level (`calc_block_level`);
+/// - dead zone [`pom_activation`, `pom_level_activation`): headers carry no header-derivable
+///   PoW value (PoM possession replaced kHeavyHash, and `pom_final_state` was not committed
+///   yet), so the level is forced to 0;
+/// - at/after `pom_level_activation` (H3): the header commits to the walk's final state, so
+///   the level is derived from `pom_pow_value` again (`calc_pom_block_level_check_pow`).
 ///
 /// This matters because `import_pruning_points` persists the result into the SAME shared
 /// `headers_store` that real-time header processing populates. Before this helper existed, this
@@ -424,8 +434,19 @@ impl<T: GhostdagStoreReader> GhostdagReaderExt for T {}
 /// had it arrived through normal sync. Readers of `headers_store` (e.g. `parents_builder` and
 /// `post_pow_validation::check_indirect_parents`) assume a single consistent level per block
 /// regardless of which path stored it, so the two computations must agree.
-fn pom_aware_block_level(header: &Header, max_block_level: BlockLevel, pom_activation: ForkActivation) -> BlockLevel {
-    if pom_activation.is_active(header.daa_score) { 0 } else { calc_block_level(header, max_block_level) }
+fn pom_aware_block_level(
+    header: &Header,
+    max_block_level: BlockLevel,
+    pom_activation: ForkActivation,
+    pom_level_activation: ForkActivation,
+) -> BlockLevel {
+    if pom_level_activation.is_active(header.daa_score) {
+        keryx_pow::calc_pom_block_level_check_pow(header, max_block_level).0
+    } else if pom_activation.is_active(header.daa_score) {
+        0
+    } else {
+        calc_block_level(header, max_block_level)
+    }
 }
 
 #[cfg(test)]
@@ -447,12 +468,12 @@ mod tests {
         let raw = calc_block_level(&header, 225);
 
         // Before activation: behaves exactly like the raw, non-PoM-aware calculation.
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::never()), raw);
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_001)), raw);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::never(), ForkActivation::never()), raw);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_001), ForkActivation::never()), raw);
 
         // At and after activation: forced to 0 regardless of what the raw PoW-derived level is.
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_000)), 0);
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::always()), 0);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_000), ForkActivation::never()), 0);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::always(), ForkActivation::never()), 0);
     }
 
     #[test]
@@ -465,9 +486,28 @@ mod tests {
 
         let before = header_with_daa_score(37_779_999);
         let raw_before = calc_block_level(&before, 225);
-        assert_eq!(pom_aware_block_level(&before, 225, activation), raw_before);
+        assert_eq!(pom_aware_block_level(&before, 225, activation, ForkActivation::never()), raw_before);
 
         let at = header_with_daa_score(37_780_000);
-        assert_eq!(pom_aware_block_level(&at, 225, activation), 0);
+        assert_eq!(pom_aware_block_level(&at, 225, activation, ForkActivation::never()), 0);
+    }
+
+    #[test]
+    fn pom_aware_block_level_h3_derives_from_committed_final_state() {
+        // At/after `pom_level_activation` the level comes from the header-committed
+        // `pom_final_state` fold, mirroring `calc_pom_block_level_check_pow` exactly —
+        // NOT the legacy kHeavyHash level and NOT the dead-zone 0.
+        let pom = ForkActivation::new(1_000);
+        let h3 = ForkActivation::new(2_000);
+
+        let mut header = header_with_daa_score(2_000);
+        header.pom_final_state = 0xdead_beef_cafe_f00d;
+        let expected = keryx_pow::calc_pom_block_level_check_pow(&header, 225).0;
+        assert_eq!(pom_aware_block_level(&header, 225, pom, h3), expected);
+
+        // One score below H3: still the dead-zone 0.
+        let mut before = header_with_daa_score(1_999);
+        before.pom_final_state = 0xdead_beef_cafe_f00d;
+        assert_eq!(pom_aware_block_level(&before, 225, pom, h3), 0);
     }
 }

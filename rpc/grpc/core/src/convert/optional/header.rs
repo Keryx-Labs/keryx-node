@@ -43,6 +43,7 @@ from!(item: &keryx_rpc_core::RpcOptionalHeader, protowire::RpcOptionalHeader, {
         blue_work: item.blue_work.map(|x| x.to_rpc_hex()),
         blue_score: item.blue_score,
         pruning_point: item.pruning_point.map(|x| x.to_string()),
+        pom_final_state: item.pom_final_state,
     }
 });
 
@@ -65,5 +66,6 @@ try_from!(item: &protowire::RpcOptionalHeader, keryx_rpc_core::RpcOptionalHeader
         blue_work: item.blue_work.as_ref().map(|x| keryx_rpc_core::RpcBlueWorkType::from_rpc_hex(x)).transpose()?,
         blue_score: item.blue_score,
         pruning_point: item.pruning_point.as_ref().map(|x| RpcHash::from_str(x)).transpose()?,
+        pom_final_state: item.pom_final_state,
     }
 });

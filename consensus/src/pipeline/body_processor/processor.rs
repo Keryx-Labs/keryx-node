@@ -60,12 +60,16 @@ pub struct BlockBodyProcessor {
     // Config
     pub(super) max_block_mass: u64,
     pub(super) genesis: GenesisBlock,
-    pub(super) _ghostdag_k: KType,
+    pub(super) ghostdag_k: KType,
     pub(super) skip_opoi: bool,
     /// PoM possession activation — when active at a block's daa_score, its `pom_proof` is verified.
     pub(super) pom_activation: ForkActivation,
     /// H2 lineup gate — selects the 5-tier `pom_tiers` set when active at a block's daa_score.
     pub(super) very_light_activation: ForkActivation,
+    /// H3 gate — when active at a block's daa_score, `check_pom_proof` additionally pins
+    /// `proof.final_state == header.pom_final_state` (the header commitment the block level
+    /// and header-only PoW check derive from).
+    pub(super) pom_level_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -122,10 +126,11 @@ impl BlockBodyProcessor {
 
             max_block_mass: params.max_block_mass,
             genesis: params.genesis.clone(),
-            _ghostdag_k: params.ghostdag_k(),
+            ghostdag_k: params.ghostdag_k(),
             skip_opoi: params.skip_proof_of_work,
             pom_activation: params.pom_activation,
             very_light_activation: params.very_light_activation,
+            pom_level_activation: params.pom_level_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
