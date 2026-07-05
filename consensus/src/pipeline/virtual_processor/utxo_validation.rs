@@ -287,6 +287,17 @@ impl VirtualStateProcessor {
             );
         }
 
+        // H3 hardfork (PoM block-level): log once at the exact activation DAA score.
+        if header.daa_score == self.pom_level_activation.daa_score() {
+            info!("════════════════ KERYX HARDFORK H3 · DAA {} ════════════════", header.daa_score);
+            info!("  Header        — pomFinalState committed in the block hash; header-only PoW checks restored");
+            info!("  Block levels  — real levels back (bounded pruning proof, from-scratch IBD)");
+            info!("  PoM salt      — walk + pow folds now salted; pre-H3 binaries rejected");
+            info!("  Ratio v2      — production counted per paid blue over a DAA-sized 24h window");
+            info!("  Coinbase cap  — output limit aligned with the OPoI builder (3*(K+1)+4)");
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         // Bundled hardfork (OPoI v2 + PoM + holder-reward share one mainnet activation DAA). Emit a
         // single consolidated banner listing whichever of the three activate exactly at this block's
         // DAA score. The gates are independent fields, so on a network that staggers them the banner
