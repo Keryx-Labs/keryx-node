@@ -277,7 +277,11 @@ pub fn cli() -> Command {
                 .action(ArgAction::Append)
                 .require_equals(true)
                 .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Connect only to the specified peers at startup."),
+                .help(
+                    "Connect exclusively to the specified peers. This disables DNS discovery, regular outbound peer selection, \
+                     and inbound P2P connections for the lifetime of the process. Use --addpeer for preferred peers without \
+                     isolating the node.",
+                ),
         )
         .arg(
             Arg::new("add-peers")
