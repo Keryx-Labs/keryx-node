@@ -37,10 +37,24 @@ fn make_weights(rows: usize, cols: usize, layer_id: u64, he: i64) -> Vec<i32> {
     (0..rows * cols).map(|_| lcg_weight(&mut s, he)).collect()
 }
 
+/// All three layer matrices, generated once — the weights are a pure function
+/// of the compile-time MODEL_SEED, so every `forward` call shares this table.
+struct Weights {
+    w1: Vec<i32>,
+    w2: Vec<i32>,
+    w3: Vec<i32>,
+}
+
+static WEIGHTS: std::sync::LazyLock<Weights> = std::sync::LazyLock::new(|| Weights {
+    w1: make_weights(N_H1, N_IN, 0, HE_L1),
+    w2: make_weights(N_H2, N_H1, 1, HE_L2),
+    w3: make_weights(N_OUT, N_H2, 2, HE_L3),
+});
+
 fn forward(input: &[u8; 32]) -> [u8; 32] {
+    let Weights { w1, w2, w3 } = &*WEIGHTS;
     let x: Vec<i64> = input.iter().map(|&b| b as i64 - 128).collect();
 
-    let w1 = make_weights(N_H1, N_IN, 0, HE_L1);
     let h1: Vec<i64> = (0..N_H1)
         .map(|i| {
             let acc: i64 = (0..N_IN).map(|j| x[j] * w1[i * N_IN + j] as i64).sum();
@@ -48,7 +62,6 @@ fn forward(input: &[u8; 32]) -> [u8; 32] {
         })
         .collect();
 
-    let w2 = make_weights(N_H2, N_H1, 1, HE_L2);
     let h2: Vec<i64> = (0..N_H2)
         .map(|i| {
             let acc: i64 = (0..N_H1).map(|j| h1[j] * w2[i * N_H1 + j] as i64).sum();
@@ -56,7 +69,6 @@ fn forward(input: &[u8; 32]) -> [u8; 32] {
         })
         .collect();
 
-    let w3 = make_weights(N_OUT, N_H2, 2, HE_L3);
     let h3: Vec<i64> = (0..N_OUT)
         .map(|i| (0..N_H2).map(|j| h2[j] * w3[i * N_H2 + j] as i64).sum())
         .collect();

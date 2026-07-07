@@ -15,6 +15,7 @@
 /// before being fed into the next layer.
 
 use crate::task::MODEL_SEED;
+use std::sync::LazyLock;
 
 /// Normalization right-shift applied after each hidden-layer accumulation.
 /// Divides by 2^10 = 1024 to prevent unbounded magnitude growth.
@@ -61,11 +62,27 @@ fn make_weights(rows: usize, cols: usize, layer_id: u64, he: i64) -> Vec<i32> {
     (0..rows * cols).map(|_| lcg_weight(&mut s, he)).collect()
 }
 
+/// All three layer matrices, generated once — the weights are a pure function
+/// of the compile-time MODEL_SEED, so every `forward` call shares this table.
+struct Weights {
+    w1: Vec<i32>,
+    w2: Vec<i32>,
+    w3: Vec<i32>,
+}
+
+static WEIGHTS: LazyLock<Weights> = LazyLock::new(|| Weights {
+    w1: make_weights(N_H1, N_IN, 0, HE_L1),
+    w2: make_weights(N_H2, N_H1, 1, HE_L2),
+    w3: make_weights(N_OUT, N_H2, 2, HE_L3),
+});
+
 /// Run the fixed-point forward pass.
 ///
 /// Returns 32 output bytes.  The first 8 are used as the Phase 2 OPoI tag
 /// (encoded as 16 lowercase hex chars appended to the coinbase `extra_data`).
 pub fn forward(input: &[u8; 32]) -> [u8; 32] {
+    let Weights { w1, w2, w3 } = &*WEIGHTS;
+
     // Centre input: raw [0, 255] → signed [-128, 127]
     let x: Vec<i64> = input.iter().map(|&b| b as i64 - 128).collect();
 
@@ -73,7 +90,6 @@ pub fn forward(input: &[u8; 32]) -> [u8; 32] {
     //
     // Accumulator worst-case: N_IN × 128 × HE_L1 = 32 × 128 × 256 = 1,048,576
     // After >> NORM_SHIFT: max activation ≈ 1,024  (range: [0, 1024])
-    let w1 = make_weights(N_H1, N_IN, 0, HE_L1);
     let h1: Vec<i64> = (0..N_H1)
         .map(|i| {
             let acc: i64 = (0..N_IN)
@@ -87,7 +103,6 @@ pub fn forward(input: &[u8; 32]) -> [u8; 32] {
     //
     // Accumulator worst-case: N_H1 × 1_024 × HE_L2 = 256 × 1_024 × 90 = 23,592,960
     // After >> NORM_SHIFT: max activation ≈ 23,040  (range: [0, 23040])
-    let w2 = make_weights(N_H2, N_H1, 1, HE_L2);
     let h2: Vec<i64> = (0..N_H2)
         .map(|i| {
             let acc: i64 = (0..N_H1)
@@ -101,7 +116,6 @@ pub fn forward(input: &[u8; 32]) -> [u8; 32] {
     //
     // Accumulator worst-case: N_H2 × 23_040 × HE_L3 = 128 × 23_040 × 128 = 377,487,360
     // Fits comfortably in i64.  No normalisation needed — we fold to bytes directly.
-    let w3 = make_weights(N_OUT, N_H2, 2, HE_L3);
     let h3: Vec<i64> = (0..N_OUT)
         .map(|i| {
             (0..N_H2)
