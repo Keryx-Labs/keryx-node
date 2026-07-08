@@ -529,10 +529,14 @@ impl VirtualStateProcessor {
                         let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                         let balance = (base + delta).max(0) as u64;
                         let prefix = self.windowed_production_with_ctx(spk, &window_ctx);
+                        // Also emit the producer's script-public-key (version + script hex) so an
+                        // external tailer can key `prod_prefix`/`balance` by address without a
+                        // separate blue->coinbase lookup. Appended last to keep existing parsers valid.
+                        let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
                         debug!(
-                            "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={}",
+                            "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={} spk_ver={} spk={}",
                             pov_daa_score, blue, sp_idx, balance, prefix, prod_floor,
-                            map.get(blue).copied().unwrap_or(0)
+                            map.get(blue).copied().unwrap_or(0), spk.version(), spk_hex
                         );
                     }
                 }
