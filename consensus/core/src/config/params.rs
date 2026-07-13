@@ -315,6 +315,14 @@ pub const RATIO_REWARD_WINDOW: u64 = 864_000;
 /// selected-chain depth than the legacy window (~190k chain blocks), comfortably inside pruning.
 pub const RATIO_REWARD_WINDOW_DAA: u64 = 864_000;
 
+/// Coin-age (holder-reward v3) maturity period, in DAA score: 7 days at 10 BPS. A coin younger
+/// than this counts toward the ratio numerator at the linear prorata of its age (`v·age/W`);
+/// at/after it, at its full face value. Deliberately LONGER than the 24h production window and
+/// decoupled from it: the anti-rotation cost is holding the pot in place for a full week per
+/// address, making bracket-farming by address hopping unprofitable. See
+/// KERYX-KRX/coin_age_holder_reward_spec.md §2/§9. Used at/after `coin_age_activation`.
+pub const COIN_AGE_MATURITY_W: u64 = 6_048_000;
+
 /// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
 /// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
 /// (a zero-history / freshly-rotated address would otherwise hit the top bracket for free).
@@ -754,6 +762,24 @@ pub struct Params {
     /// H3 ratio-reward window in DAA score (fixed real-time duration, per-blue accounting era).
     /// Defaults to `RATIO_REWARD_WINDOW_DAA`; a Params field so tests can shrink it.
     pub ratio_reward_window_daa: u64,
+
+    /// Coin-age holder-reward (v3, H4) activation DAA score. At/after this score the ratio-reward
+    /// numerator switches from the instantaneous balance to the per-coin-capped effective balance
+    /// (`coin_age::eff_balance_from_buckets`), closing the "rotation" exploit (bracket-farming by
+    /// hopping the pot across fresh addresses). Requires the `effective_daa` UtxoEntry field
+    /// (hard fork: UTXO commitment changes at this boundary). `never()` until H4 is scheduled.
+    pub coin_age_activation: ForkActivation,
+
+    /// Coin-age VERIFICATION boundary (mirrors `ratio_verification_activation`): coinbase outputs
+    /// are re-derived with the coin-age numerator and enforced only at/after this score, covering
+    /// the post-activation migration window where trusted transition blocks may precede full
+    /// cross-node determinism. `never()` until H4 is scheduled.
+    pub coin_age_verification_activation: ForkActivation,
+
+    /// Coin-age maturity period in DAA score. Defaults to `COIN_AGE_MATURITY_W` (7 days); a
+    /// Params field (not the const) so tests can shrink it to exercise the maturity ramp and
+    /// the immature→mature bucket promotion.
+    pub coin_age_maturity_w: u64,
 }
 
 impl Params {
@@ -954,6 +980,10 @@ impl Params {
 
             ratio_reward_window: self.ratio_reward_window,
             ratio_reward_window_daa: self.ratio_reward_window_daa,
+
+            coin_age_activation: self.coin_age_activation,
+            coin_age_verification_activation: self.coin_age_verification_activation,
+            coin_age_maturity_w: self.coin_age_maturity_w,
         }
     }
 }
@@ -1110,6 +1140,12 @@ pub const MAINNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::new(38_951_445),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
+
+    // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
+    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue) gates here.
+    coin_age_activation: ForkActivation::never(),
+    coin_age_verification_activation: ForkActivation::never(),
+    coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -1194,6 +1230,13 @@ pub const TESTNET_PARAMS: Params = Params {
     // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
     ratio_reward_window: 1_000,
     ratio_reward_window_daa: 1_000,
+
+    // Coin-age holder-reward (v3): dormant here too until the implementation lands; will flip to
+    // a small DAA (with a shrunk maturity, mirroring the shrunk windows above) to exercise the
+    // activation transition and the maturity ramp on testnet before mainnet H4.
+    coin_age_activation: ForkActivation::never(),
+    coin_age_verification_activation: ForkActivation::never(),
+    coin_age_maturity_w: 2_000,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -1252,6 +1295,12 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
+
+    // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
+    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue) gates here.
+    coin_age_activation: ForkActivation::never(),
+    coin_age_verification_activation: ForkActivation::never(),
+    coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -1308,4 +1357,10 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
+
+    // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
+    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue) gates here.
+    coin_age_activation: ForkActivation::never(),
+    coin_age_verification_activation: ForkActivation::never(),
+    coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };

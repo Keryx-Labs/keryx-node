@@ -19,6 +19,7 @@ pub mod collateral;
 pub mod block;
 pub mod blockhash;
 pub mod blockstatus;
+pub mod coin_age;
 pub mod coinbase;
 pub mod config;
 pub mod constants;
