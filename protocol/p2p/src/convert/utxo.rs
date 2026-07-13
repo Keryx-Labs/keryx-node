@@ -12,6 +12,9 @@ impl From<&UtxoEntry> for protowire::UtxoEntry {
             script_public_key: Some((&entry.script_public_key).into()),
             block_daa_score: entry.block_daa_score,
             is_coinbase: entry.is_coinbase,
+            // Always sent explicitly (presence-tracked field): pre-H4 it equals block_daa_score
+            // (the invariant), post-H4 it carries the FIFO-inherited coin-age anchor.
+            effective_daa_score: Some(entry.effective_daa),
         }
     }
 }

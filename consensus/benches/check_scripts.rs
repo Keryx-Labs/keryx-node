@@ -39,6 +39,7 @@ fn mock_tx_with_payload(inputs_count: usize, non_uniq_signatures: usize, payload
             amount: thread_rng().r#gen::<u32>() as u64,
             script_public_key: pay_to_address_script(&address),
             block_daa_score: 333,
+            effective_daa: 333,
             is_coinbase: false,
         });
         kps.push(kp);
@@ -52,6 +53,7 @@ fn mock_tx_with_payload(inputs_count: usize, non_uniq_signatures: usize, payload
             amount: thread_rng().r#gen::<u32>() as u64,
             script_public_key: pay_to_address_script(&address),
             block_daa_score: 444,
+            effective_daa: 444,
             is_coinbase: false,
         });
     }

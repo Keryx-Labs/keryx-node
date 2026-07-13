@@ -303,6 +303,7 @@ mod tests {
                 amount: 20879456551,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 32022768,
+                effective_daa: 32022768,
                 is_coinbase: false,
             }],
         );
@@ -373,6 +374,7 @@ mod tests {
                 amount: 20879456551,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_2),
                 block_daa_score: 32022768,
+                effective_daa: 32022768,
                 is_coinbase: false,
             }],
         );
@@ -447,6 +449,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -517,6 +520,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -587,6 +591,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -657,6 +662,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -718,6 +724,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -790,18 +797,21 @@ mod tests {
                 amount: 100,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
             UtxoEntry {
                 amount: 200,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
             UtxoEntry {
                 amount: 300,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
         ];

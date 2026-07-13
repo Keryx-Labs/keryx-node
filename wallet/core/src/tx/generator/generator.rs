@@ -1202,6 +1202,7 @@ impl Generator {
             amount,
             script_public_key,
             block_daa_score: UNACCEPTED_DAA_SCORE,
+            effective_daa: UNACCEPTED_DAA_SCORE,
             is_coinbase: false, // entry
         };
         UtxoEntryReference { utxo: Arc::new(utxo) }

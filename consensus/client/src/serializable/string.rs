@@ -112,6 +112,7 @@ impl TryFrom<&SerializableTransactionInput> for UtxoEntryReference {
             amount: input.utxo.amount.parse()?,
             script_public_key: input.utxo.script_public_key.clone(),
             block_daa_score: input.utxo.block_daa_score.parse()?,
+            effective_daa: input.utxo.block_daa_score.parse()?,
             is_coinbase: input.utxo.is_coinbase,
         };
 

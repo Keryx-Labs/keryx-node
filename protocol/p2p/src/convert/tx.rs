@@ -104,7 +104,11 @@ impl TryFrom<protowire::UtxoEntry> for UtxoEntry {
     type Error = ConversionError;
 
     fn try_from(value: protowire::UtxoEntry) -> Result<Self, Self::Error> {
-        Ok(Self::new(value.amount, value.script_public_key.try_into_ex()?, value.block_daa_score, value.is_coinbase))
+        // Coin-age anchor: taken verbatim when present; an old peer that doesn't send it falls
+        // back to block_daa_score — the pre-H4 invariant (post-H4 peers always send it, and the
+        // utxo_commitment check catches any mismatch on the pruning-point sync path).
+        let effective_daa = value.effective_daa_score.unwrap_or(value.block_daa_score);
+        Ok(Self::new_aged(value.amount, value.script_public_key.try_into_ex()?, value.block_daa_score, value.is_coinbase, effective_daa))
     }
 }
 

@@ -63,17 +63,21 @@ impl TryFrom<RpcOptionalUtxoEntry> for UtxoEntry {
     type Error = RpcError;
 
     fn try_from(entry: RpcOptionalUtxoEntry) -> RpcResult<Self> {
+        let block_daa_score = entry
+            .block_daa_score
+            .ok_or(RpcError::MissingRpcFieldError("RpcUtxoEntry".to_string(), "block_daa_score".to_string()))?;
         Ok(Self {
             amount: entry.amount.ok_or(RpcError::MissingRpcFieldError("RpcUtxoEntry".to_string(), "amount".to_string()))?,
             script_public_key: entry
                 .script_public_key
                 .ok_or(RpcError::MissingRpcFieldError("RpcUtxoEntry".to_string(), "script_public_key".to_string()))?,
-            block_daa_score: entry
-                .block_daa_score
-                .ok_or(RpcError::MissingRpcFieldError("RpcUtxoEntry".to_string(), "block_daa_score".to_string()))?,
+            block_daa_score,
             is_coinbase: entry
                 .is_coinbase
                 .ok_or(RpcError::MissingRpcFieldError("RpcUtxoEntry".to_string(), "is_coinbase".to_string()))?,
+            // The RPC type does not carry the coin-age anchor; anchor at the creation score
+            // (pre-H4 invariant). RPC-sourced entries never enter consensus state.
+            effective_daa: block_daa_score,
         })
     }
 }

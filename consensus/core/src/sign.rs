@@ -233,18 +233,21 @@ mod tests {
                 amount: 100,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
             UtxoEntry {
                 amount: 200,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
             UtxoEntry {
                 amount: 300,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key2),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
         ];

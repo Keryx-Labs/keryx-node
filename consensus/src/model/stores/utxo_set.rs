@@ -1,10 +1,11 @@
 use keryx_consensus_core::{
-    tx::{TransactionIndexType, TransactionOutpoint, UtxoEntry},
+    tx::{ScriptPublicKey, TransactionIndexType, TransactionOutpoint, UtxoEntry},
     utxo::{
         utxo_diff::{ImmutableUtxoDiff, UtxoDiff},
         utxo_view::UtxoView,
     },
 };
+use serde::Deserialize;
 use keryx_database::prelude::DB;
 use keryx_database::prelude::StoreResultExt;
 use keryx_database::prelude::{BatchDbWriter, CachedDbAccess, DirectDbWriter};
@@ -87,6 +88,26 @@ impl From<UtxoKey> for TransactionOutpoint {
     }
 }
 
+/// The utxoset value layout before the coin-age `effective_daa` field was appended (holder-reward
+/// v3). Entries written by an older binary keep this positional bincode layout in the same column;
+/// every read path decodes with a fallback to it and backfills `effective_daa = block_daa_score` —
+/// exactly the pre-H4 invariant, so lazy migration is deterministic regardless of when a node
+/// upgrades. Same mechanism as the H3 `HeaderWithBlockLevelPreH3` header-store fallback.
+#[derive(Deserialize)]
+struct UtxoEntryPreH4 {
+    amount: u64,
+    script_public_key: ScriptPublicKey,
+    block_daa_score: u64,
+    is_coinbase: bool,
+}
+
+impl From<UtxoEntryPreH4> for Arc<UtxoEntry> {
+    fn from(e: UtxoEntryPreH4) -> Self {
+        // Pre-H4 invariant: the age anchor is the creation score.
+        Arc::new(UtxoEntry::new(e.amount, e.script_public_key, e.block_daa_score, e.is_coinbase))
+    }
+}
+
 #[derive(Clone)]
 pub struct DbUtxoSetStore {
     db: Arc<DB>,
@@ -112,7 +133,7 @@ impl DbUtxoSetStore {
     }
 
     pub fn iterator(&self) -> impl Iterator<Item = Result<(TransactionOutpoint, Arc<UtxoEntry>), Box<dyn Error>>> + '_ {
-        self.access.iterator().map(|iter_result| match iter_result {
+        self.access.iterator_with_decode_fallback::<UtxoEntryPreH4>().map(|iter_result| match iter_result {
             Ok((key_bytes, utxo_entry)) => match UtxoKey::try_from(key_bytes.as_ref()) {
                 Ok(utxo_key) => {
                     let outpoint: TransactionOutpoint = utxo_key.into();
@@ -148,12 +169,12 @@ impl UtxoView for DbUtxoSetStore {
 
 impl UtxoSetStoreReader for DbUtxoSetStore {
     fn get(&self, outpoint: &TransactionOutpoint) -> Result<Arc<UtxoEntry>, StoreError> {
-        self.access.read((*outpoint).into())
+        self.access.read_with_decode_fallback::<UtxoEntryPreH4>((*outpoint).into())
     }
 
     fn seek_iterator(&self, from_outpoint: Option<TransactionOutpoint>, limit: usize, skip_first: bool) -> UtxoCollectionIterator<'_> {
         let seek_key = from_outpoint.map(UtxoKey::from);
-        Box::new(self.access.seek_iterator(None, seek_key, limit, skip_first).map(|res| {
+        Box::new(self.access.seek_iterator_with_decode_fallback::<UtxoEntryPreH4>(None, seek_key, limit, skip_first).map(|res| {
             let (key, entry) = res?;
             let outpoint: TransactionOutpoint = UtxoKey::try_from(key.as_ref()).unwrap().into();
             Ok((outpoint, UtxoEntry::clone(&entry)))
