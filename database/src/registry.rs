@@ -99,6 +99,15 @@ pub enum DatabaseStorePrefixes {
     /// rebuilt from it at startup; read by the ratio numerator at/after `coin_age_activation`.
     AgeBuckets = 48,
 
+    /// Coin-age maturation queue: key `be(maturity_daa) || outpoint` → `(SPK, amount, anchor)`
+    /// for IMMATURE coins only (see `maturation_queue`). Swept at each virtual commit to promote
+    /// coins whose `effective_daa + W` fell at/below the new virtual score.
+    MaturationQueue = 49,
+
+    /// Coin-age promotion watermark (single key): the highest virtual daa score up to which the
+    /// maturation queue has been swept. A decrease (deep reorg) triggers a full coin-age rebuild.
+    CoinAgeWatermark = 51,
+
     // ---- Retention Period Root ----
     RetentionPeriodRoot = 50,
 

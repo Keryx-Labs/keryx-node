@@ -26,6 +26,7 @@ use crate::{
 };
 use crate::model::stores::address_amount::AddressAmountStoreReader;
 use crate::model::stores::age_buckets::{AgeBuckets, AgeBucketsStoreReader};
+use crate::model::stores::maturation_queue::MaturationEntry;
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
@@ -40,7 +41,7 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, UtxoEntry, ValidatedTransaction, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -890,20 +891,32 @@ impl VirtualStateProcessor {
         // (b_mat delta, b_imm delta, a_imm delta) per SPK. i128 accommodates sompi × DAA products.
         let mut deltas: std::collections::HashMap<ScriptPublicKey, (i128, i128, i128)> = std::collections::HashMap::new();
         let mature_bound = pov_daa_score.saturating_sub(self.coin_age_maturity_w);
-        let mut fold = |entry: &UtxoEntry, sign: i128| {
+        for (outpoint, entry) in diff.add.iter() {
             let d = deltas.entry(entry.script_public_key.clone()).or_default();
             if entry.effective_daa <= mature_bound {
-                d.0 += sign * entry.amount as i128;
+                d.0 += entry.amount as i128;
             } else {
-                d.1 += sign * entry.amount as i128;
-                d.2 += sign * (entry.amount as i128) * (entry.effective_daa as i128);
+                d.1 += entry.amount as i128;
+                d.2 += (entry.amount as i128) * (entry.effective_daa as i128);
+                // Immature coin: enqueue at its maturity score so the sweep promotes it in time.
+                let queued = MaturationEntry {
+                    script_public_key: entry.script_public_key.clone(),
+                    amount: entry.amount,
+                    anchor: entry.effective_daa,
+                };
+                self.maturation_queue_store.insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued).unwrap();
             }
-        };
-        for entry in diff.add.values() {
-            fold(entry, 1);
         }
-        for entry in diff.remove.values() {
-            fold(entry, -1);
+        for (outpoint, entry) in diff.remove.iter() {
+            let d = deltas.entry(entry.script_public_key.clone()).or_default();
+            if entry.effective_daa <= mature_bound {
+                d.0 -= entry.amount as i128;
+            } else {
+                d.1 -= entry.amount as i128;
+                d.2 -= (entry.amount as i128) * (entry.effective_daa as i128);
+                // Spent while immature: drop its pending promotion.
+                self.maturation_queue_store.delete_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint).unwrap();
+            }
         }
         for (spk, (dm, div, dia)) in deltas {
             if (dm, div, dia) == (0, 0, 0) {
@@ -917,6 +930,37 @@ impl VirtualStateProcessor {
             };
             self.age_buckets_store.set_batch(batch, &spk, next).unwrap();
         }
+    }
+
+    /// Coin-age maturation sweep — the time-driven bucket transition. Promotes every queued coin
+    /// whose maturity score (`anchor + W`) fell at/below the NEW virtual score: `b_imm/a_imm →
+    /// b_mat`, queue entry deleted, watermark advanced. Runs BEFORE `apply_age_diff` in the same
+    /// commit so a coin that is both due and spent is first promoted, then removed as mature —
+    /// mirroring the remove-path classification (which sees it at/below `d − W`).
+    ///
+    /// Returns `true` when the virtual score moved BELOW the watermark (deep reorg past a
+    /// maturity boundary): incremental promotions can't be unwound, so the caller must run a full
+    /// `rebuild_age_buckets_index` after the commit instead (exact from the UTXO set).
+    pub(super) fn sweep_maturation_queue(&self, batch: &mut rocksdb::WriteBatch, new_daa_score: u64) -> bool {
+        if let Some(watermark) = self.maturation_queue_store.get_watermark().unwrap() {
+            if new_daa_score < watermark {
+                return true;
+            }
+        }
+        for (raw_key, due) in self.maturation_queue_store.due(new_daa_score) {
+            // Consecutive read-modify-writes on the same SPK stay coherent through the store's
+            // write-through cache (set_batch inserts the cache before the batch lands).
+            let b = self.age_buckets_store.get(&due.script_public_key).unwrap();
+            let next = AgeBuckets {
+                b_mat: b.b_mat.saturating_add(due.amount),
+                b_imm: b.b_imm.saturating_sub(due.amount),
+                a_imm: b.a_imm.saturating_sub(due.amount as u128 * due.anchor as u128),
+            };
+            self.age_buckets_store.set_batch(batch, &due.script_public_key, next).unwrap();
+            self.maturation_queue_store.delete_raw_batch(batch, &raw_key).unwrap();
+        }
+        self.maturation_queue_store.set_watermark_batch(batch, new_daa_score).unwrap();
+        false
     }
 
     fn check_ai_response_model_caps(&self, txs: &[Transaction]) -> BlockProcessResult<()> {

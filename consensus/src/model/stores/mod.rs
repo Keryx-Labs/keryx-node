@@ -1,6 +1,7 @@
 pub mod acceptance_data;
 pub mod address_amount;
 pub mod age_buckets;
+pub mod maturation_queue;
 pub mod ai_slash;
 pub mod collateral;
 pub mod block_transactions;

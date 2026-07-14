@@ -5,6 +5,7 @@ use crate::{
         acceptance_data::DbAcceptanceDataStore,
         address_amount::DbAddressAmountStore,
         age_buckets::DbAgeBucketsStore,
+        maturation_queue::DbMaturationQueueStore,
         ai_slash::{DbAiResponseStore, DbAiSlashedStore},
         block_transactions::DbBlockTransactionsStore,
         block_window_cache::BlockWindowCacheStore,
@@ -78,6 +79,7 @@ pub struct ConsensusStorage {
     // Ratio-reward indexes (Stage 2): mutable per-SPK aggregates kept in lockstep with the UTXO set
     pub address_balance_store: Arc<DbAddressAmountStore>,
     pub age_buckets_store: Arc<DbAgeBucketsStore>,
+    pub maturation_queue_store: Arc<DbMaturationQueueStore>,
     /// Gold-standard ratio-reward production index: per-SPK prefix sum over the selected chain. A
     /// pure function of the chain (no path-dependent running sum), so all nodes compute identical
     /// windowed values. Maintained in lockstep with the selected chain; read by `ratio_bps_by_block`.
@@ -244,6 +246,7 @@ impl ConsensusStorage {
             Arc::new(DbAddressAmountStore::new(db.clone(), utxo_set_builder.build(), DatabaseStorePrefixes::AddressBalance.into()));
         // Coin-age (v3) bucket aggregates: same keyspace scale and cache class as the balance index.
         let age_buckets_store = Arc::new(DbAgeBucketsStore::new(db.clone(), utxo_set_builder.build()));
+        let maturation_queue_store = Arc::new(DbMaturationQueueStore::new(db.clone()));
         let windowed_production_prefix_store = Arc::new(DbWindowedProductionPrefixStore::new(db.clone()));
 
         // OPoI slash stores
@@ -287,6 +290,7 @@ impl ConsensusStorage {
             acceptance_data_store,
             address_balance_store,
             age_buckets_store,
+            maturation_queue_store,
             windowed_production_prefix_store,
             ai_response_store,
             ai_slashed_store,
