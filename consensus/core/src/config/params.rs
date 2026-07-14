@@ -1195,20 +1195,19 @@ pub const TESTNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // Testnet mirrors the current mainnet state from genesis: every pre-H3 fork
-    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward) is active at
-    // DAA 0, so the only transition exercised on this testnet is H3 below.
+    // Testnet mirrors the current mainnet state from genesis: every shipped fork
+    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels)
+    // is active at DAA 0, so the only transition exercised on this testnet is the
+    // coin-age H4 rehearsal below.
     opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
     // PoM possession: active from genesis (mainnet-state baseline).
     pom_activation: ForkActivation::new(0),
     very_light_activation: ForkActivation::new(0), // H2 5-tier lineup from genesis
-    // PoM block-level hardfork (H3): testnet DAA 2_000 to exercise the header-format
-    // transition (pre-H3 PoM blocks at level 0, post-H3 real levels + pom_final_state
-    // hashed) and the pruning-proof re-boundedness. MUST mirror the miner's testnet
-    // activation.
-    pom_level_activation: ForkActivation::new(2_000),
+    // H3 block levels: active from genesis (mainnet-state baseline; the H3 transition was
+    // rehearsed on the previous testnet). MUST mirror the miner's testnet activation.
+    pom_level_activation: ForkActivation::new(0),
     inference_min_h2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
 
@@ -1231,11 +1230,13 @@ pub const TESTNET_PARAMS: Params = Params {
     ratio_reward_window: 1_000,
     ratio_reward_window_daa: 1_000,
 
-    // Coin-age holder-reward (v3): dormant here too until the implementation lands; will flip to
-    // a small DAA (with a shrunk maturity, mirroring the shrunk windows above) to exercise the
-    // activation transition and the maturity ramp on testnet before mainnet H4.
-    coin_age_activation: ForkActivation::never(),
-    coin_age_verification_activation: ForkActivation::never(),
+    // Coin-age holder-reward (v3): the ONLY mid-chain transition on this testnet — from genesis
+    // the chain is in the current-mainnet state (everything above at 0), then at DAA 3_000 the H4
+    // boundary fires: FIFO anchors start, the per-coin muhash field appears, the ratio numerator
+    // switches to the effective balance, and the shrunk maturity ramp (W=2_000) + queue
+    // promotions kick in. Rehearses the mainnet H4 gate end-to-end.
+    coin_age_activation: ForkActivation::new(3_000),
+    coin_age_verification_activation: ForkActivation::new(3_000),
     coin_age_maturity_w: 2_000,
 };
 

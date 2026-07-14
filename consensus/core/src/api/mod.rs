@@ -259,7 +259,7 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
-    fn append_imported_pruning_point_utxos(&self, utxoset_chunk: &[(TransactionOutpoint, UtxoEntry)], current_multiset: &mut MuHash, pov_daa_score: u64) {
+    fn append_imported_pruning_point_utxos(&self, utxoset_chunk: &[(TransactionOutpoint, UtxoEntry)], current_multiset: &mut MuHash) {
         unimplemented!()
     }
 

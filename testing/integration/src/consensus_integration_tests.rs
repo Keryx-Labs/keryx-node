@@ -20,6 +20,7 @@ use keryx_consensus::pipeline::ProcessingCounters;
 use keryx_consensus::pipeline::monitor::ConsensusMonitor;
 use keryx_consensus::processes::reachability::tests::{DagBlock, DagBuilder, StoreValidationExtensions};
 use keryx_consensus::processes::window::{WindowManager, WindowType};
+use keryx_consensus_core::config::params::ForkActivation;
 use keryx_consensus_core::api::args::TransactionValidationArgs;
 use keryx_consensus_core::api::{BlockValidationFutures, ConsensusApi};
 use keryx_consensus_core::block::Block;
@@ -819,7 +820,7 @@ async fn json_test(file_path: &str, concurrency: bool) {
         info!("Importing the UTXO set...");
         let mut multiset = MuHash::new();
         for outpoint_utxo_pairs in gzip_file_lines(&main_path.join("pp-utxo.json.gz")).map(json_line_to_utxo_pairs) {
-            tc.append_imported_pruning_point_utxos(&outpoint_utxo_pairs, &mut multiset, 0);
+            tc.append_imported_pruning_point_utxos(&outpoint_utxo_pairs, &mut multiset);
         }
 
         tc.import_pruning_point_utxo_set(pruning_point.unwrap(), multiset).unwrap();
@@ -1441,7 +1442,7 @@ async fn kip10_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo, false);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();
@@ -1454,7 +1455,7 @@ async fn kip10_test() {
 
     let consensus = TestConsensus::new(&config);
     let mut genesis_multiset = MuHash::new();
-    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset, 0);
+    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset);
     consensus.import_pruning_point_utxo_set(config.genesis.hash, genesis_multiset).unwrap();
     consensus.init();
 
@@ -1565,7 +1566,7 @@ async fn payload_for_native_tx_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo, false);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();
@@ -1575,7 +1576,7 @@ async fn payload_for_native_tx_test() {
 
     let consensus = TestConsensus::new(&config);
     let mut genesis_multiset = MuHash::new();
-    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset, 0);
+    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset);
     consensus.import_pruning_point_utxo_set(config.genesis.hash, genesis_multiset).unwrap();
     consensus.init();
 
@@ -1668,7 +1669,7 @@ async fn runtime_sig_op_counting_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo, false);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();
@@ -1681,7 +1682,7 @@ async fn runtime_sig_op_counting_test() {
 
     let consensus = TestConsensus::new(&config);
     let mut genesis_multiset = MuHash::new();
-    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset, 0);
+    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset);
     consensus.import_pruning_point_utxo_set(config.genesis.hash, genesis_multiset).unwrap();
     consensus.init();
 
@@ -1777,7 +1778,7 @@ async fn sighash_type_commitment_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo, false);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();
@@ -1787,7 +1788,7 @@ async fn sighash_type_commitment_test() {
 
     let consensus = TestConsensus::new(&config);
     let mut genesis_multiset = MuHash::new();
-    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset, 0);
+    consensus.append_imported_pruning_point_utxos(&initial_utxo_collection, &mut genesis_multiset);
     consensus.import_pruning_point_utxo_set(config.genesis.hash, genesis_multiset).unwrap();
     consensus.init();
 

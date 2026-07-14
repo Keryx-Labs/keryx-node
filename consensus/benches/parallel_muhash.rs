@@ -1,5 +1,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use itertools::Itertools;
+use keryx_consensus_core::config::params::ForkActivation;
 use keryx_consensus_core::{
     muhash::MuHashExtensions,
     subnets::SUBNETWORK_ID_NATIVE,
@@ -37,7 +38,7 @@ pub fn parallel_muhash_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let mut mh = MuHash::new();
             for tx in txs.iter() {
-                mh.add_transaction(&tx.as_verifiable(), 222, false);
+                mh.add_transaction(&tx.as_verifiable(), 222, ForkActivation::never());
             }
             black_box(mh)
         })
@@ -49,7 +50,7 @@ pub fn parallel_muhash_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 pool.install(|| {
                     let mh =
-                        txs.par_iter().map(|tx| MuHash::from_transaction(&tx.as_verifiable(), 222, false)).reduce(MuHash::new, |mut a, b| {
+                        txs.par_iter().map(|tx| MuHash::from_transaction(&tx.as_verifiable(), 222, ForkActivation::never())).reduce(MuHash::new, |mut a, b| {
                             a.combine(&b);
                             a
                         });

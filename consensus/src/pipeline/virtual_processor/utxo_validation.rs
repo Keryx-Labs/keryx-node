@@ -146,7 +146,7 @@ impl VirtualStateProcessor {
         let coin_age_active = self.coin_age_activation.is_active(pov_daa_score);
 
         ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score, coin_age_active).unwrap();
-        ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score, coin_age_active);
+        ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score, self.coin_age_activation);
         let validated_coinbase_id = validated_coinbase.id();
         ctx.accepted_tx_ids.push(validated_coinbase_id);
 
@@ -1063,9 +1063,6 @@ impl VirtualStateProcessor {
         pov_daa_score: u64,
         flags: TxValidationFlags,
     ) -> (SmallVec<[(ValidatedTransaction<'a>, u32); 2]>, MuHash) {
-        // Coin-age era of the POV block (see `MuHashExtensions`): the commitment includes the
-        // age anchors at/after `coin_age_activation`.
-        let coin_age_active = self.coin_age_activation.is_active(pov_daa_score);
         self.thread_pool.install(|| {
             txs
                 .par_iter() // We can do this in parallel without complications since block body validation already ensured
@@ -1073,7 +1070,7 @@ impl VirtualStateProcessor {
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
                 .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags).ok().map(|vtx| {
-                    let mh = MuHash::from_transaction(&vtx, pov_daa_score, coin_age_active);
+                    let mh = MuHash::from_transaction(&vtx, pov_daa_score, self.coin_age_activation);
                     (smallvec![(vtx, i as u32)], mh)
                 }
                 ))

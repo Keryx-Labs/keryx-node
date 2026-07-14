@@ -12,11 +12,9 @@ mod utxo_set_override_inner {
     use crate::consensus::Consensus;
 
     pub fn set_genesis_utxo_commitment_from_config(config: &mut Config) {
-        // Genesis commits in the genesis era (daa 0) — coin-age applies only if active from launch.
-        let coin_age_active = config.params.coin_age_activation.is_active(0);
         let mut genesis_multiset = MuHash::new();
         for (outpoint, entry) in config.initial_utxo_set.iter() {
-            genesis_multiset.add_utxo(outpoint, entry, coin_age_active);
+            genesis_multiset.add_utxo(outpoint, entry, config.params.coin_age_activation);
         }
 
         config.params.genesis.utxo_commitment = genesis_multiset.finalize();
@@ -27,7 +25,7 @@ mod utxo_set_override_inner {
     pub fn set_initial_utxo_set(initial_utxo_set: &UtxoCollection, consensus: Arc<Consensus>, genesis_hash: Hash) {
         let utxo_slice = &initial_utxo_set.iter().map(|(op, entry)| (*op, entry.clone())).collect_vec()[..];
         let mut genesis_multiset = MuHash::new();
-        consensus.append_imported_pruning_point_utxos(utxo_slice, &mut genesis_multiset, 0);
+        consensus.append_imported_pruning_point_utxos(utxo_slice, &mut genesis_multiset);
         consensus.import_pruning_point_utxo_set(genesis_hash, genesis_multiset).unwrap();
     }
 }
