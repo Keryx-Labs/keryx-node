@@ -17,6 +17,14 @@ const VERSION_TYPE_SIZE: usize = size_of::<ScriptPublicKeyVersion>();
 #[derive(Eq, Hash, PartialEq, Debug, Clone)]
 pub struct ScriptPublicKeyBucket(Vec<u8>);
 
+impl ScriptPublicKeyBucket {
+    /// Rewraps raw key bytes read back from the DB (iterator paths of stores sharing this key
+    /// encoding, e.g. the coin-age `age_buckets` index).
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
 impl From<&ScriptPublicKey> for ScriptPublicKeyBucket {
     fn from(script_public_key: &ScriptPublicKey) -> Self {
         let mut bytes: Vec<u8> = Vec::with_capacity(VERSION_TYPE_SIZE + size_of::<u64>() + script_public_key.script().len());

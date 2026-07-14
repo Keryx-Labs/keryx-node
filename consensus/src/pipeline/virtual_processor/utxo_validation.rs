@@ -25,6 +25,7 @@ use crate::{
     },
 };
 use crate::model::stores::address_amount::AddressAmountStoreReader;
+use crate::model::stores::age_buckets::{AgeBuckets, AgeBucketsStoreReader};
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
@@ -39,7 +40,7 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, UtxoEntry, ValidatedTransaction, VerifiableTransaction},
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -873,6 +874,48 @@ impl VirtualStateProcessor {
             }
             let new_balance = (self.address_balance_store.get(&spk).unwrap() as i128 + delta).max(0) as u64;
             self.address_balance_store.set_batch(batch, &spk, new_balance).unwrap();
+        }
+    }
+
+    /// Coin-age (holder-reward v3) — advances the bucket index by `diff`, in lockstep with the
+    /// virtual UTXO set (same batch as `apply_balance_diff`). Each entry is classified at the new
+    /// virtual score: MATURE (`effective_daa <= d − W`) contributes its face value to `b_mat`,
+    /// IMMATURE contributes `(amount, amount·effective_daa)` to `(b_imm, a_imm)`. Deltas are
+    /// folded per SPK first, then each touched address is read-modify-written once; all-zero
+    /// aggregates delete their entry. Maintained ungated (passive aggregate, same discipline as
+    /// the balance index); nothing reads it before `coin_age_activation`, and the startup rebuild
+    /// re-derives it exactly from the UTXO set — which also re-classifies any coin that matured
+    /// in place until the maturation-queue promotions land.
+    pub(super) fn apply_age_diff(&self, batch: &mut rocksdb::WriteBatch, diff: &UtxoDiff, pov_daa_score: u64) {
+        // (b_mat delta, b_imm delta, a_imm delta) per SPK. i128 accommodates sompi × DAA products.
+        let mut deltas: std::collections::HashMap<ScriptPublicKey, (i128, i128, i128)> = std::collections::HashMap::new();
+        let mature_bound = pov_daa_score.saturating_sub(self.coin_age_maturity_w);
+        let mut fold = |entry: &UtxoEntry, sign: i128| {
+            let d = deltas.entry(entry.script_public_key.clone()).or_default();
+            if entry.effective_daa <= mature_bound {
+                d.0 += sign * entry.amount as i128;
+            } else {
+                d.1 += sign * entry.amount as i128;
+                d.2 += sign * (entry.amount as i128) * (entry.effective_daa as i128);
+            }
+        };
+        for entry in diff.add.values() {
+            fold(entry, 1);
+        }
+        for entry in diff.remove.values() {
+            fold(entry, -1);
+        }
+        for (spk, (dm, div, dia)) in deltas {
+            if (dm, div, dia) == (0, 0, 0) {
+                continue;
+            }
+            let b = self.age_buckets_store.get(&spk).unwrap();
+            let next = AgeBuckets {
+                b_mat: (b.b_mat as i128 + dm).max(0) as u64,
+                b_imm: (b.b_imm as i128 + div).max(0) as u64,
+                a_imm: (b.a_imm as i128 + dia).max(0) as u128,
+            };
+            self.age_buckets_store.set_batch(batch, &spk, next).unwrap();
         }
     }
 

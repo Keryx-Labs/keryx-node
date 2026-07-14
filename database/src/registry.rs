@@ -94,6 +94,11 @@ pub enum DatabaseStorePrefixes {
     /// (so `cum(b−W)` stays exact after pruning). See `windowed_production_prefix::advance_floor`.
     WindowedProductionFloor = 47,
 
+    /// Coin-age (holder-reward v3) bucket aggregates: key `SPK` → `{b_mat, b_imm, a_imm}` (see
+    /// `consensus::model::stores::age_buckets`). Maintained in lockstep with the virtual UTXO set,
+    /// rebuilt from it at startup; read by the ratio numerator at/after `coin_age_activation`.
+    AgeBuckets = 48,
+
     // ---- Retention Period Root ----
     RetentionPeriodRoot = 50,
 

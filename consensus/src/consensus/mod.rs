@@ -350,6 +350,11 @@ impl Consensus {
         // Authoritative (Σ UTXO); incremental maintenance carries it forward from here. See its doc.
         this.virtual_processor.rebuild_address_balance_index();
 
+        // Coin-age (v3) bucket index: recompute from the UTXO set (each entry carries its
+        // `effective_daa` anchor). Also re-classifies coins that matured in place since the last
+        // run — the startup-time counterpart of the maturation-queue promotions.
+        this.virtual_processor.rebuild_age_buckets_index();
+
         this
     }
 

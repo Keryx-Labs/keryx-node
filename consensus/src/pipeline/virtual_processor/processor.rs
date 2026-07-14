@@ -23,6 +23,7 @@ use crate::{
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
             address_amount::DbAddressAmountStore,
+            age_buckets::{AgeBuckets, DbAgeBucketsStore},
             windowed_production_prefix::DbWindowedProductionPrefixStore,
             past_pruning_points::DbPastPruningPointsStore,
             pom_tier::DbPomTierStore,
@@ -144,6 +145,7 @@ pub struct VirtualStateProcessor {
     /// Ratio-reward balance index (Stage 2b): payout SPK → Σ unspent amount, kept in lockstep
     /// with the virtual UTXO set. Read to anchor `ratio_bps` at a block's selected-parent view.
     pub(super) address_balance_store: Arc<DbAddressAmountStore>,
+    pub(super) age_buckets_store: Arc<DbAgeBucketsStore>,
     /// Gold-standard prefix-sum production index (pure function of the chain): producer payout SPK → Σ
     /// `base_miner_cut` cumulated over the selected chain, kept in lockstep with it. The ratio
     /// denominator (windowed production at a block's selected-parent view) is the difference of two
@@ -234,6 +236,8 @@ pub struct VirtualStateProcessor {
     // FIFO-inherited `effective_daa` anchors (see `UtxoDiff::add_transaction`) and the ratio
     // numerator switches to the per-coin-capped effective balance. Dormant (`never()`) until H4.
     pub(super) coin_age_activation: ForkActivation,
+    // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
+    pub(super) coin_age_maturity_w: u64,
 
     // Skip ratio/tier coinbase verification while following the chain. Three independent reasons,
     // ORed together and re-checked live (see `trust_coinbase()`) rather than fixed at construction:
@@ -315,6 +319,7 @@ impl VirtualStateProcessor {
             utxo_multisets_store: storage.utxo_multisets_store.clone(),
             acceptance_data_store: storage.acceptance_data_store.clone(),
             address_balance_store: storage.address_balance_store.clone(),
+            age_buckets_store: storage.age_buckets_store.clone(),
             windowed_production_prefix_store: storage.windowed_production_prefix_store.clone(),
             block_production_cache: parking_lot::RwLock::new(BlockHashMap::default()),
             virtual_stores: storage.virtual_stores.clone(),
@@ -360,6 +365,7 @@ impl VirtualStateProcessor {
             ratio_reward_window: params.ratio_reward_window,
             ratio_reward_window_daa: params.ratio_reward_window_daa,
             coin_age_activation: params.coin_age_activation,
+            coin_age_maturity_w: params.coin_age_maturity_w,
             is_archival,
             trust_coinbase_env,
         }
@@ -730,6 +736,11 @@ impl VirtualStateProcessor {
         // for from-genesis nodes (fast-sync reconstruction from the pruning-point snapshot is 2b-3).
         self.apply_balance_diff(&mut batch, accumulated_diff);
 
+        // Coin-age (v3): advance the bucket index by the SAME diff, in the SAME batch (lockstep,
+        // like the balance index above). Classification at the NEW virtual score. Ungated passive
+        // aggregate — read only at/after `coin_age_activation`.
+        self.apply_age_diff(&mut batch, accumulated_diff, new_virtual_state.daa_score);
+
         // Ratio-reward (Stage 2b-2b): advance the prefix-sum production index along the SAME chain
         // path, in the SAME batch, BEFORE `apply_changes` mutates the selected chain — so the index
         // reads the pre-change chain (its current anchor) and stays in lockstep with it. Pure function
@@ -777,6 +788,37 @@ impl VirtualStateProcessor {
         }
         self.db.write(batch).unwrap();
         info!("address-balance rebuild: done — {} addresses written (canonical Σ UTXO).", n);
+    }
+
+    /// Rebuild the coin-age BUCKET index (`age_buckets_store`) from the current virtual UTXO set at
+    /// startup — the exact mirror of `rebuild_address_balance_index` for the v3 aggregates. Every
+    /// UTXO carries its `effective_daa` anchor, so classifying each coin against the CURRENT virtual
+    /// score re-derives `{b_mat, b_imm, a_imm}` exactly — which also absorbs any coin that matured
+    /// in place since the last run (until the maturation-queue promotions maintain that in-flight).
+    pub(crate) fn rebuild_age_buckets_index(&self) {
+        let virtual_read = self.virtual_stores.read();
+        let daa_score = virtual_read.state.get().unwrap().daa_score;
+        let mature_bound = daa_score.saturating_sub(self.coin_age_maturity_w);
+        let mut buckets: HashMap<ScriptPublicKey, AgeBuckets> = HashMap::new();
+        for item in virtual_read.utxo_set.iterator() {
+            let (_, entry) = item.unwrap();
+            let b = buckets.entry(entry.script_public_key.clone()).or_default();
+            if entry.effective_daa <= mature_bound {
+                b.b_mat = b.b_mat.saturating_add(entry.amount);
+            } else {
+                b.b_imm = b.b_imm.saturating_add(entry.amount);
+                b.a_imm = b.a_imm.saturating_add(entry.amount as u128 * entry.effective_daa as u128);
+            }
+        }
+        let n = buckets.len();
+        info!("age-buckets rebuild: recomputing the coin-age bucket index from the UTXO set ({} addresses)...", n);
+        let mut batch = WriteBatch::default();
+        self.age_buckets_store.clear(&mut batch).unwrap();
+        for (spk, b) in buckets {
+            self.age_buckets_store.set_batch(&mut batch, &spk, b).unwrap();
+        }
+        self.db.write(batch).unwrap();
+        info!("age-buckets rebuild: done — {} addresses written (canonical Σ UTXO split at d−W).", n);
     }
 
     /// One-time from-chain build of the gold-standard prefix-sum production index (run at startup when

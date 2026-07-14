@@ -112,8 +112,8 @@ fn fifo_survivor_anchor(group: &[(u64, u64)], out_v: u64, current_daa: u64) -> u
 /// "maturity battery" (an old holder instantly maturing a fresh pot under an aggregate cap,
 /// spec §4④). The immature term is < `b_imm` by construction (each age < `w`); the explicit
 /// clamps only guard rounding/inconsistent-input edges. `u128` avoids overflow on `d·B_imm`.
-pub fn eff_balance_from_buckets(b_mat: u64, b_imm: u64, a_imm: u64, current_daa: u64, w: u64) -> u64 {
-    let ramp_mass = ((current_daa as u128) * (b_imm as u128)).saturating_sub(a_imm as u128);
+pub fn eff_balance_from_buckets(b_mat: u64, b_imm: u64, a_imm: u128, current_daa: u64, w: u64) -> u64 {
+    let ramp_mass = ((current_daa as u128) * (b_imm as u128)).saturating_sub(a_imm);
     let immature = (ramp_mass / (w.max(1) as u128)).min(b_imm as u128) as u64;
     b_mat.saturating_add(immature)
 }
@@ -228,7 +228,7 @@ mod tests {
         // "pre-charge" maturity for incoming coins (the aggregate-cap exploit).
         let mature = 1_000_000u64;
         let fresh = 40_000_000u64;
-        assert_eq!(eff_balance_from_buckets(mature, fresh, fresh * D, D, W), mature);
+        assert_eq!(eff_balance_from_buckets(mature, fresh, fresh as u128 * D as u128, D, W), mature);
     }
 
     #[test]
@@ -236,14 +236,14 @@ mod tests {
         // Spec §4 table: 3_500 held at half maturity ⇒ eff_balance 1_750.
         let v = 3_500u64;
         let anchor = D - W / 2; // created half a maturity period ago
-        let a_imm = v * anchor; // fits u64 for these magnitudes? v·anchor ≈ 3.5e3·5e7 = 1.75e11 ✓
+        let a_imm = v as u128 * anchor as u128;
         assert_eq!(eff_balance_from_buckets(0, v, a_imm, D, W), v / 2);
     }
 
     #[test]
     fn fully_fresh_counts_zero_and_mature_counts_full() {
         let v = 3_500u64;
-        assert_eq!(eff_balance_from_buckets(0, v, v * D, D, W), 0); // age 0 ⇒ nothing
+        assert_eq!(eff_balance_from_buckets(0, v, v as u128 * D as u128, D, W), 0); // age 0 ⇒ nothing
         assert_eq!(eff_balance_from_buckets(v, 0, 0, D, W), v); // mature ⇒ face value
     }
 
