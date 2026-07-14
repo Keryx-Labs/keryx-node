@@ -230,6 +230,10 @@ pub struct VirtualStateProcessor {
     pub(super) ratio_reward_window: u64,
     // H3 window length in DAA score (fixed real-time duration, per-blue era).
     pub(super) ratio_reward_window_daa: u64,
+    // Coin-age holder-reward v3 (H4) gate: at/after this score, utxo-diff population assigns
+    // FIFO-inherited `effective_daa` anchors (see `UtxoDiff::add_transaction`) and the ratio
+    // numerator switches to the per-coin-capped effective balance. Dormant (`never()`) until H4.
+    pub(super) coin_age_activation: ForkActivation,
 
     // Skip ratio/tier coinbase verification while following the chain. Three independent reasons,
     // ORed together and re-checked live (see `trust_coinbase()`) rather than fixed at construction:
@@ -355,6 +359,7 @@ impl VirtualStateProcessor {
             ratio_verification_activation: params.ratio_verification_activation,
             ratio_reward_window: params.ratio_reward_window,
             ratio_reward_window_daa: params.ratio_reward_window_daa,
+            coin_age_activation: params.coin_age_activation,
             is_archival,
             trust_coinbase_env,
         }

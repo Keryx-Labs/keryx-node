@@ -138,7 +138,11 @@ impl VirtualStateProcessor {
         let selected_parent_transactions = self.block_transactions_store.get(ctx.selected_parent()).unwrap();
         let validated_coinbase = ValidatedTransaction::new_coinbase(&selected_parent_transactions[0]);
 
-        ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score).unwrap();
+        // Coin-age era flag (holder-reward v3), derived from the POV block's own daa score —
+        // same gating discipline as every other fork so IBD re-validation stays canonical.
+        let coin_age_active = self.coin_age_activation.is_active(pov_daa_score);
+
+        ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score, coin_age_active).unwrap();
         ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score);
         let validated_coinbase_id = validated_coinbase.id();
         ctx.accepted_tx_ids.push(validated_coinbase_id);
@@ -167,7 +171,7 @@ impl VirtualStateProcessor {
 
             let mut block_fee = 0u64;
             for (validated_tx, _) in validated_transactions.iter() {
-                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score).unwrap();
+                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score, coin_age_active).unwrap();
                 ctx.accepted_tx_ids.push(validated_tx.id());
                 block_fee += validated_tx.calculated_fee;
             }
