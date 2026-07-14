@@ -107,11 +107,41 @@ impl DbMaturationQueueStore {
     /// All queue entries due at/below `daa_bound`, in maturity order — the promotion sweep input.
     /// Returns the raw key bytes alongside each entry so the caller can delete exactly what it saw.
     pub fn due(&self, daa_bound: u64) -> Vec<(Box<[u8]>, MaturationEntry)> {
+        self.due_range(0, daa_bound)
+    }
+
+    /// Queue entries with maturity in `(from_exclusive, to_inclusive]`, in maturity order. The
+    /// sweep promotes exactly one such disjoint range per commit (from the previous watermark to
+    /// the new virtual score); the ratio read path scans the same shape to reconcile the committed
+    /// split with a POV score that differs from the watermark (see `eff_balance_for_spk`).
+    pub fn due_range(&self, from_exclusive: u64, to_inclusive: u64) -> Vec<(Box<[u8]>, MaturationEntry)> {
+        if from_exclusive >= to_inclusive {
+            return Vec::new();
+        }
+        // Seek to the first possible key of maturity `from+1` (zeroed outpoint sorts first).
+        let seek = MaturationKey::new(from_exclusive + 1, &TransactionOutpoint::default());
         self.access
-            .seek_iterator(None, None, usize::MAX, false)
+            .seek_iterator(None, Some(seek), usize::MAX, false)
             .map(|res| res.unwrap())
-            .take_while(|(raw, _)| MaturationKey::maturity_of(raw) <= daa_bound)
+            .take_while(|(raw, _)| MaturationKey::maturity_of(raw) <= to_inclusive)
             .collect()
+    }
+
+    /// Deletes every retained entry with maturity at/below `bound` — the retention pruning pass.
+    /// Promoted entries are kept for a bounded horizon so the read path can DEMOTE when validating
+    /// a POV below the watermark (deep side-chain); beyond the horizon they are garbage.
+    pub fn prune_below(&self, batch: &mut WriteBatch, bound: u64) -> Result<(), StoreError> {
+        for (raw, _) in self.due(bound) {
+            self.delete_raw_batch(batch, &raw)?;
+        }
+        Ok(())
+    }
+
+    /// The outpoint encoded in raw key bytes returned by `due`/`due_range`.
+    pub fn outpoint_of(raw: &[u8]) -> TransactionOutpoint {
+        let transaction_id = keryx_hashes::Hash::from_slice(&raw[8..8 + HASH_SIZE]);
+        let index = u32::from_le_bytes(raw[8 + HASH_SIZE..].try_into().expect("queue key ends with a le u32"));
+        TransactionOutpoint::new(transaction_id, index)
     }
 
     /// Deletes a swept entry by its raw key bytes (as returned by `due`).

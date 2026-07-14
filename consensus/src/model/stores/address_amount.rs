@@ -19,7 +19,8 @@ pub struct ScriptPublicKeyBucket(Vec<u8>);
 
 impl ScriptPublicKeyBucket {
     /// Rewraps raw key bytes read back from the DB (iterator paths of stores sharing this key
-    /// encoding, e.g. the coin-age `age_buckets` index).
+    /// encoding, e.g. the coin-age `age_buckets` index test helper).
+    #[cfg(test)]
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }

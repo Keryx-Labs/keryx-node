@@ -240,6 +240,10 @@ pub struct VirtualStateProcessor {
     pub(super) coin_age_activation: ForkActivation,
     // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
     pub(super) coin_age_maturity_w: u64,
+    // Retention horizon (DAA score) for PROMOTED maturation-queue entries, enabling read-path
+    // demotion for POVs below the watermark (side chains). Finality-deep — beyond it a POV would
+    // be rejected anyway.
+    pub(super) coin_age_retention: u64,
 
     // Skip ratio/tier coinbase verification while following the chain. Three independent reasons,
     // ORed together and re-checked live (see `trust_coinbase()`) rather than fixed at construction:
@@ -369,6 +373,7 @@ impl VirtualStateProcessor {
             ratio_reward_window_daa: params.ratio_reward_window_daa,
             coin_age_activation: params.coin_age_activation,
             coin_age_maturity_w: params.coin_age_maturity_w,
+            coin_age_retention: params.finality_depth(),
             is_archival,
             trust_coinbase_env,
         }
