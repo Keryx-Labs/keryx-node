@@ -1114,13 +1114,15 @@ impl ConsensusApi for Consensus {
         self.services.pruning_proof_manager.import_pruning_points(&pruning_points)
     }
 
-    fn append_imported_pruning_point_utxos(&self, utxoset_chunk: &[(TransactionOutpoint, UtxoEntry)], current_multiset: &mut MuHash) {
+    fn append_imported_pruning_point_utxos(&self, utxoset_chunk: &[(TransactionOutpoint, UtxoEntry)], current_multiset: &mut MuHash, pov_daa_score: u64) {
         let mut pruning_meta_write = self.pruning_meta_stores.write();
         pruning_meta_write.utxo_set.write_many(utxoset_chunk).unwrap();
 
+        // Coin-age era of the pruning point whose commitment this multiset must reproduce.
+        let coin_age_active = self.config.params.coin_age_activation.is_active(pov_daa_score);
         // Parallelize processing using the context of an existing thread pool.
         let inner_multiset = self.virtual_processor.install(|| {
-            utxoset_chunk.par_iter().map(|(outpoint, entry)| MuHash::from_utxo(outpoint, entry)).reduce(MuHash::new, |mut a, b| {
+            utxoset_chunk.par_iter().map(|(outpoint, entry)| MuHash::from_utxo(outpoint, entry, coin_age_active)).reduce(MuHash::new, |mut a, b| {
                 a.combine(&b);
                 a
             })

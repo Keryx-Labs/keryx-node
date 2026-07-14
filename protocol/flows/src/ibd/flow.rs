@@ -751,12 +751,15 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             ))
             .await?;
         let mut chunk_stream = PruningPointUtxosetChunkStream::new(&self.router, &mut self.incoming_route);
+        // Coin-age era of the imported pruning point: its commitment is reproduced from the
+        // streamed entries, so the muhash encoding must match the pp's own daa era.
+        let pp_daa_score = consensus.async_get_header(pruning_point).await?.daa_score;
         let mut multiset = MuHash::new();
         while let Some(chunk) = chunk_stream.next().await? {
             multiset = consensus
                 .clone()
                 .spawn_blocking(move |c| {
-                    c.append_imported_pruning_point_utxos(&chunk, &mut multiset);
+                    c.append_imported_pruning_point_utxos(&chunk, &mut multiset, pp_daa_score);
                     multiset
                 })
                 .await;

@@ -37,7 +37,7 @@ pub fn parallel_muhash_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let mut mh = MuHash::new();
             for tx in txs.iter() {
-                mh.add_transaction(&tx.as_verifiable(), 222);
+                mh.add_transaction(&tx.as_verifiable(), 222, false);
             }
             black_box(mh)
         })
@@ -49,7 +49,7 @@ pub fn parallel_muhash_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 pool.install(|| {
                     let mh =
-                        txs.par_iter().map(|tx| MuHash::from_transaction(&tx.as_verifiable(), 222)).reduce(MuHash::new, |mut a, b| {
+                        txs.par_iter().map(|tx| MuHash::from_transaction(&tx.as_verifiable(), 222, false)).reduce(MuHash::new, |mut a, b| {
                             a.combine(&b);
                             a
                         });
