@@ -88,7 +88,7 @@ pub fn generate_tx_dag(
             .into_iter()
             .for_each(|signed_tx| {
                 // Pre-H4 semantics (coin-age inactive): anchors at the creation score.
-                utxo_diff.add_transaction(&signed_tx.as_verifiable(), 0, false, 0).unwrap();
+                utxo_diff.add_transaction(&signed_tx.as_verifiable(), 0, false).unwrap();
                 txs.push(Arc::new(signed_tx.tx));
             });
         utxoset.remove_collection(&utxo_diff.remove);

@@ -229,15 +229,8 @@ impl UtxoDiff {
     /// `coin_age::assign_output_effective_daa`); when inactive, every output anchors at its
     /// creation score (`effective_daa == block_daa_score`, the pre-H4 invariant). The caller
     /// derives the flag from the POV block's own daa score so IBD re-validation of pre-fork
-    /// history stays canonical, and passes `coin_age_maturity_w` from the same params the bucket
-    /// arithmetic uses (it caps the age a merge may carry — ignored when inactive).
-    pub fn add_transaction(
-        &mut self,
-        transaction: &impl VerifiableTransaction,
-        block_daa_score: u64,
-        coin_age_active: bool,
-        coin_age_maturity_w: u64,
-    ) -> UtxoResult<()> {
+    /// history stays canonical.
+    pub fn add_transaction(&mut self, transaction: &impl VerifiableTransaction, block_daa_score: u64, coin_age_active: bool) -> UtxoResult<()> {
         // Anchors are resolved BEFORE entries are consumed: the FIFO rule reads the spent inputs'
         // (spk, amount, effective_daa) in tx input order — the consensus-canonical tie-break.
         let anchors: Option<Vec<u64>> = if coin_age_active {
@@ -246,7 +239,7 @@ impl UtxoDiff {
                 .map(|(_, entry)| (&entry.script_public_key, entry.amount, entry.effective_daa))
                 .collect();
             let outputs: Vec<_> = transaction.outputs().iter().map(|output| (&output.script_public_key, output.value)).collect();
-            Some(assign_output_effective_daa(&inputs, &outputs, block_daa_score, coin_age_maturity_w))
+            Some(assign_output_effective_daa(&inputs, &outputs, block_daa_score))
         } else {
             None
         };
@@ -306,7 +299,6 @@ mod tests {
     #[test]
     fn add_transaction_assigns_coin_age_anchors() {
         const D: u64 = 5_000_000; // POV daa score
-        const W: u64 = 6_048_000; // maturity: exceeds D here, so no carried anchor is capped
         let spk_a = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1u8; 3]));
         let spk_b = ScriptPublicKey::new(0, ScriptVec::from_slice(&[2u8; 3]));
         let prev: TransactionId = 7.into();
@@ -344,7 +336,7 @@ mod tests {
         // Coin-age era: change keeps the FIFO survivor, transfer resets to D.
         let mtx = MutableTransaction::with_entries(make_tx(), entries());
         let mut diff = UtxoDiff::default();
-        diff.add_transaction(&mtx.as_verifiable(), D, true, W).unwrap();
+        diff.add_transaction(&mtx.as_verifiable(), D, true).unwrap();
         let tx_id = mtx.tx.id();
         let change = &diff.add[&TransactionOutpoint::new(tx_id, 0)];
         let transfer = &diff.add[&TransactionOutpoint::new(tx_id, 1)];
@@ -355,7 +347,7 @@ mod tests {
         // Pre-H4: every output anchors at its creation score.
         let mtx = MutableTransaction::with_entries(make_tx(), entries());
         let mut diff = UtxoDiff::default();
-        diff.add_transaction(&mtx.as_verifiable(), D, false, W).unwrap();
+        diff.add_transaction(&mtx.as_verifiable(), D, false).unwrap();
         assert_eq!(diff.add[&TransactionOutpoint::new(tx_id, 0)].effective_daa, D);
         assert_eq!(diff.add[&TransactionOutpoint::new(tx_id, 1)].effective_daa, D);
     }
