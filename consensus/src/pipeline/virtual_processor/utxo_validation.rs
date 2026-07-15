@@ -57,7 +57,18 @@ use keryx_utils::refs::Refs;
 
 use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};
-use std::{iter::once, ops::Deref};
+use std::{
+    iter::once,
+    ops::Deref,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+/// One-shot guard for the H4 banner below. Unlike the other hardfork banners — which match the
+/// activation DAA score exactly — H4 fires on the FIRST block seen at or after the gate. A chain
+/// block's `daa_score` advances by its mergeset's DAA-added count, so at 10 BPS it routinely
+/// SKIPS the exact activation value and an equality-matched banner never prints. Logging only, so
+/// a process-global guard is fine: it has no bearing on consensus.
+static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Pre-resolved production-window context of a single validated block (its selected parent
 /// `m_sp`), shared by every rewarded blue of that block — see [`VirtualStateProcessor::production_window_ctx`].
@@ -329,6 +340,26 @@ impl VirtualStateProcessor {
             }
         }
 
+        // H4 hardfork (coin-age holder-reward v3): fire on the FIRST block at or after the gate,
+        // not on an exact DAA match — a chain block's daa_score advances by its mergeset's DAA-added
+        // count and routinely skips the exact activation value at 10 BPS. `compare_exchange` keeps it
+        // to one print per process (the first post-gate block, whether reached live or during IBD).
+        if self.coin_age_activation.is_active(header.daa_score)
+            && COIN_AGE_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            // Header carries the GATE score (the fork's identity, always exact), not this block's —
+            // a node restarting long after the fork also prints this once, and `header.daa_score`
+            // would then read as if H4 had just fired. The observed block goes in the footer.
+            info!("════════════════ KERYX HARDFORK H4 · DAA {} ════════════════", self.coin_age_activation.daa_score());
+            info!("  Holder-reward — ratio numerator is now the coin-age effective balance, not the balance snapshot");
+            info!("  Coin age      — FIFO carry-over anchors per output; age resets on transfer, survives consolidation");
+            info!("  Maturity      — a coin ramps linearly to full weight over W = {} DAA", self.coin_age_maturity_w);
+            info!("  UTXO muhash   — per-coin effective_daa now committed in the multiset");
+            info!("  Rotation      — moving a pot to a fresh address no longer buys the top bracket");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() {
@@ -540,9 +571,18 @@ impl VirtualStateProcessor {
                 for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
                     if let Some(reward) = mergeset_rewards.get(blue) {
                         let spk = &reward.script_public_key;
-                        let base = self.address_balance_store.get(spk).unwrap() as i128;
-                        let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
-                        let balance = (base + delta).max(0) as u64;
+                        // Resolve `balance` exactly as the numerator above does — at/after
+                        // `coin_age_activation` that is the coin-age effective balance, NOT the
+                        // instantaneous snapshot. Recomputing the snapshot here would print a value
+                        // the bracket never saw, so a post-H4 cross-node diff on this line would
+                        // compare the wrong quantity and hide the real disagreement.
+                        let balance = if coin_age_active {
+                            self.eff_balance_for_spk(spk, pov_daa_score, view_diffs)
+                        } else {
+                            let base = self.address_balance_store.get(spk).unwrap() as i128;
+                            let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
+                            (base + delta).max(0) as u64
+                        };
                         let prefix = self.windowed_production_with_ctx(spk, &window_ctx);
                         // Also emit the producer's script-public-key (version + script hex) so an
                         // external tailer can key `prod_prefix`/`balance` by address without a

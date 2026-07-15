@@ -1205,9 +1205,12 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoM possession: active from genesis (mainnet-state baseline).
     pom_activation: ForkActivation::new(0),
     very_light_activation: ForkActivation::new(0), // H2 5-tier lineup from genesis
-    // H3 block levels: active from genesis (mainnet-state baseline; the H3 transition was
-    // rehearsed on the previous testnet). MUST mirror the miner's testnet activation.
-    pom_level_activation: ForkActivation::new(0),
+    // H3 block levels: active from the first mined block (mainnet-state baseline; the H3
+    // transition was rehearsed on the previous testnet). `new(1)` and NOT `new(0)`/`always()`:
+    // this activation also drives the global header-hashing switch (`init_pom_level_activation`),
+    // and genesis (daa 0) must keep its pinned legacy hash, which does not commit
+    // `pom_final_state`. MUST mirror the miner's testnet activation.
+    pom_level_activation: ForkActivation::new(1),
     inference_min_h2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
 
