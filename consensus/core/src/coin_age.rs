@@ -32,21 +32,38 @@ pub type AgedInput<'a> = (&'a ScriptPublicKey, u64, u64);
 ///   (age resets to zero — age is not transferable across addresses).
 /// - `S` present in the inputs (change / consolidation) ⇒ FIFO: the spent value
 ///   `spent_v = max(0, in_v − out_v)` consumes the OLDEST inputs first (their age is destroyed);
-///   `e_out` is the value-weighted average anchor of the surviving (youngest) input value, plus
-///   any net-received value weighted at `current_daa`.
+///   `e_out` is the value-weighted average of the surviving (youngest) input value's anchors —
+///   each CAPPED at maturity `w` (see below) — plus any net-received value weighted at
+///   `current_daa`.
 ///
 /// FIFO is the only choice a holder cannot game in their favor (LIFO would let a churning shell
 /// shield an old core); consolidation to the same SPK spends nothing net, so the full weighted
 /// average survives — consolidating is free (spec §4①).
 ///
+/// # Why each carried anchor is capped at `w`
+///
+/// [`eff_balance_from_buckets`] is CONCAVE in age: a coin ramps to full weight over `w`, then
+/// stops — age beyond `w` is discarded, which is exactly what kills the maturity battery for
+/// coins that stay SEPARATE. Merging coins replaces them with one coin at their weighted-average
+/// age, so carrying RAW age mass (`Σ v·age`) would recover the over-mature coins' discarded
+/// surplus and spread it over the fresh ones — re-creating the battery through the merge and
+/// minting effective balance out of nothing (a long-running miner could erase its whole immature
+/// deficit with one self-consolidation, repeatedly). Capping each carried anchor at `w` first
+/// (`Σ v·min(age, w)`) makes the merged age `≤ w` by construction, so the merged coin is never
+/// over-mature and `eff_balance` is conserved across a consolidation (rounding aside):
+/// `V·ā/w = Σ vᵢ·min(ageᵢ/w, 1)`. Consolidating still costs nothing — it just no longer pays.
+///
 /// Returns one `effective_daa` per output, in output order. Every output of the same SPK gets the
 /// same anchor. Coinbase transactions have no inputs ⇒ every output anchors at `current_daa`.
 ///
 /// Ties on equal anchors keep the tx input order (stable sort) — canonical on every node.
+/// `w` is `params.coin_age_maturity_w`; callers MUST pass the same value the bucket arithmetic
+/// uses, or the stored anchors and the ratio numerator would disagree.
 pub fn assign_output_effective_daa(
     inputs: &[AgedInput<'_>],
     outputs: &[(&ScriptPublicKey, u64)],
     current_daa: u64,
+    w: u64,
 ) -> Vec<u64> {
     // Group input (amount, anchor) pairs by SPK, preserving tx input order within each group.
     let mut by_spk: HashMap<&ScriptPublicKey, Vec<(u64, u64)>> = HashMap::new();
@@ -63,7 +80,7 @@ pub fn assign_output_effective_daa(
     for (&spk, &total_out) in out_v.iter() {
         let anchor = match by_spk.get(spk) {
             None => current_daa, // pure recipient: reset
-            Some(group) => fifo_survivor_anchor(group, total_out, current_daa),
+            Some(group) => fifo_survivor_anchor(group, total_out, current_daa, w),
         };
         anchor_by_spk.insert(spk, anchor);
     }
@@ -76,28 +93,39 @@ pub fn assign_output_effective_daa(
 /// The spent value (`in_v − out_v`, when positive) consumes the oldest anchors first; what
 /// remains — the youngest `preserved = min(in_v, out_v)` of input value — carries its
 /// value-weighted average anchor into the outputs, diluted by any net-new value at `current_daa`.
-/// Floor division; the ≤ `current_daa` invariant holds since every anchor is a past DAA.
-fn fifo_survivor_anchor(group: &[(u64, u64)], out_v: u64, current_daa: u64) -> u64 {
+/// Each carried anchor is first floored at `current_daa − w` (age capped at maturity), so a merge
+/// can never mint effective balance — see [`assign_output_effective_daa`] for why.
+/// The ≤ `current_daa` invariant holds since every anchor is a past DAA.
+fn fifo_survivor_anchor(group: &[(u64, u64)], out_v: u64, current_daa: u64, w: u64) -> u64 {
     let in_v: u64 = group.iter().map(|(v, _)| v).sum();
     if in_v == 0 {
         return current_daa;
     }
-    // Oldest first; stable ⇒ equal anchors keep tx input order (canonical tie-break).
+    // Age beyond maturity carries no weight, so it must not carry across a merge either.
+    let carry_floor = current_daa.saturating_sub(w);
+    // Oldest first; stable ⇒ equal anchors keep tx input order (canonical tie-break). Ordering
+    // uses the RAW anchor: FIFO must spend the genuinely oldest value first. (Over-mature inputs
+    // all clamp to `carry_floor`, so their relative order cannot change the carried mass.)
     let mut sorted: Vec<(u64, u64)> = group.to_vec();
     sorted.sort_by_key(|&(_, anchor)| anchor);
     // Consume the spent value from the oldest end; a partially spent input keeps its remainder.
     let mut spent_v = in_v.saturating_sub(out_v);
-    let mut survivor_mass: u128 = 0; // Σ v·anchor over surviving value
+    let mut survivor_mass: u128 = 0; // Σ v·min(anchor capped at maturity) over surviving value
     for (v, anchor) in sorted {
         let consumed = spent_v.min(v);
         spent_v -= consumed;
         let surviving = v - consumed;
-        survivor_mass += (surviving as u128) * (anchor as u128);
+        survivor_mass += (surviving as u128) * (anchor.max(carry_floor) as u128);
     }
     let preserved = in_v.min(out_v); // surviving input value, > 0 here
     let new_v = out_v - preserved; // net-received value enters at age zero (anchor = now)
     let total_mass = survivor_mass + (new_v as u128) * (current_daa as u128);
-    (total_mass / (out_v as u128)) as u64
+    // Round the anchor UP: a lower anchor means MORE age, so flooring here would hand the merged
+    // value up to one extra DAA of age (≤ out_v/w sompi of effective balance minted per merge).
+    // Ceiling keeps the rule strictly non-minting. `out_v > 0`, and ceil(mass/out_v) ≤ max anchor
+    // ≤ current_daa, so the invariant holds.
+    let out_v = out_v as u128;
+    total_mass.div_ceil(out_v) as u64
 }
 
 /// Per-coin-capped effective balance (spec §2) from the three per-SPK bucket aggregates at the
@@ -130,29 +158,58 @@ mod tests {
     const W: u64 = 6_048_000; // 7 days at 10 BPS (COIN_AGE_MATURITY_W)
     const D: u64 = 50_000_000; // evaluation DAA for the tests
 
+    /// Anchor of a coin created `age` DAA before the evaluation point `D`.
+    fn aged(age: u64) -> u64 {
+        D - age
+    }
+
+    /// Most effective balance a merge of `total` value may lose to rounding: the anchor is
+    /// rounded up by < 1 DAA (worth `total/W` of ramp) and `eff_balance` floors once. The rule is
+    /// deliberately one-sided — it may under-credit by this much, never over-credit by anything.
+    fn rounding_slack(total: u64) -> u64 {
+        total / W + 2
+    }
+
+    /// `eff_balance` of a set of (amount, anchor) coins held by one SPK, evaluated at `D` —
+    /// the per-coin-capped sum the buckets aggregate. Used to assert what a merge does to the
+    /// only number that matters: the ratio numerator.
+    fn eff_of(coins: &[(u64, u64)]) -> u64 {
+        let (mut b_mat, mut b_imm, mut a_imm) = (0u64, 0u64, 0u128);
+        for &(v, anchor) in coins {
+            if D - anchor >= W {
+                b_mat += v;
+            } else {
+                b_imm += v;
+                a_imm += v as u128 * anchor as u128;
+            }
+        }
+        eff_balance_from_buckets(b_mat, b_imm, a_imm, D, W)
+    }
+
     #[test]
     fn consolidation_carries_full_weighted_average() {
         // Spec §4①: same-SPK consolidation spends nothing net ⇒ the full value-weighted
-        // average anchor survives. Age mass is conserved (up to the documented floor).
+        // average anchor survives. Both inputs are below maturity, so no capping applies here.
         let a = spk(1);
-        let inputs = [(&a, 10u64, 100u64), (&a, 20, 200)];
+        let inputs = [(&a, 10u64, aged(W / 2)), (&a, 20, aged(W / 4))];
         let outputs = [(&a, 30u64)];
-        let anchors = assign_output_effective_daa(&inputs, &outputs, D);
-        assert_eq!(anchors, vec![(10 * 100 + 20 * 200) / 30]); // = 166
+        let anchors = assign_output_effective_daa(&inputs, &outputs, D, W);
+        // Average age = (10·W/2 + 20·W/4)/30 = W/3.
+        assert_eq!(anchors, vec![aged(W / 3)]);
     }
 
     #[test]
     fn fifo_spends_oldest_first_on_partial_spend() {
-        // Spec §4②: mixed-age stock, partial spend. The oldest input (anchor 100) is consumed
-        // by the spent value; the change keeps the YOUNGEST anchor — FIFO destroys the most age,
-        // never less (a holder cannot shield an old core by churning young coins).
+        // Spec §4②: mixed-age stock, partial spend. The oldest input is consumed by the spent
+        // value; the change keeps the YOUNGEST anchor — FIFO destroys the most age, never less
+        // (a holder cannot shield an old core by churning young coins).
         let a = spk(1);
         let b = spk(2);
-        let inputs = [(&a, 100u64, 100u64), (&a, 100, 900)];
+        let inputs = [(&a, 100u64, aged(W / 2)), (&a, 100, aged(W / 4))];
         let outputs = [(&b, 100u64), (&a, 100)];
-        let anchors = assign_output_effective_daa(&inputs, &outputs, D);
+        let anchors = assign_output_effective_daa(&inputs, &outputs, D, W);
         assert_eq!(anchors[0], D); // recipient B: reset to now
-        assert_eq!(anchors[1], 900); // change at A: the young survivor, old age destroyed
+        assert_eq!(anchors[1], aged(W / 4)); // change at A: the young survivor, old age destroyed
     }
 
     #[test]
@@ -161,10 +218,11 @@ mod tests {
         // own anchor and blends with the younger input.
         let a = spk(1);
         let b = spk(2);
-        let inputs = [(&a, 100u64, 100u64), (&a, 100, 900)];
+        let inputs = [(&a, 100u64, aged(W / 2)), (&a, 100, aged(W / 4))];
         let outputs = [(&a, 150u64), (&b, 50)];
-        let anchors = assign_output_effective_daa(&inputs, &outputs, D);
-        assert_eq!(anchors[0], (50 * 100 + 100 * 900) / 150); // = 633
+        let anchors = assign_output_effective_daa(&inputs, &outputs, D, W);
+        // 50 spent off the oldest; survivors: 50 at age W/2 + 100 at age W/4 ⇒ mean age W/3.
+        assert_eq!(anchors[0], aged(W / 3));
         assert_eq!(anchors[1], D);
     }
 
@@ -176,7 +234,7 @@ mod tests {
         let b = spk(2);
         let inputs = [(&a, 1_000u64, 42u64)];
         let outputs = [(&b, 1_000u64)];
-        assert_eq!(assign_output_effective_daa(&inputs, &outputs, D), vec![D]);
+        assert_eq!(assign_output_effective_daa(&inputs, &outputs, D, W), vec![D]);
     }
 
     #[test]
@@ -185,11 +243,11 @@ mod tests {
         // dilutes the carried anchor toward `current_daa`.
         let a = spk(1);
         let b = spk(2);
-        let inputs = [(&a, 700u64, 1_000u64), (&b, 300, 5_000)];
+        let inputs = [(&a, 700u64, aged(W / 2)), (&b, 300, aged(W))];
         let outputs = [(&a, 1_000u64)];
-        let anchors = assign_output_effective_daa(&inputs, &outputs, D);
-        let expected = ((700u128 * 1_000 + 300u128 * D as u128) / 1_000) as u64;
-        assert_eq!(anchors, vec![expected]); // b's anchor is destroyed — only a's value carries age
+        let anchors = assign_output_effective_daa(&inputs, &outputs, D, W);
+        // b's anchor is destroyed — only a's value carries age: 700 at age W/2, 300 at age 0.
+        assert_eq!(anchors, vec![aged(700 * (W / 2) / 1_000)]);
     }
 
     #[test]
@@ -197,18 +255,18 @@ mod tests {
         // No inputs (coinbase): every output starts at the current DAA.
         let a = spk(1);
         let outputs = [(&a, 5_000u64)];
-        assert_eq!(assign_output_effective_daa(&[], &outputs, D), vec![D]);
+        assert_eq!(assign_output_effective_daa(&[], &outputs, D, W), vec![D]);
     }
 
     #[test]
     fn same_spk_outputs_share_one_anchor() {
         // All outputs of one SPK get the same anchor (the rule resolves per SPK, not per output).
         let a = spk(1);
-        let inputs = [(&a, 100u64, 400u64)];
+        let inputs = [(&a, 100u64, aged(W / 2))];
         let outputs = [(&a, 30u64), (&a, 70)];
-        let anchors = assign_output_effective_daa(&inputs, &outputs, D);
+        let anchors = assign_output_effective_daa(&inputs, &outputs, D, W);
         assert_eq!(anchors[0], anchors[1]);
-        assert_eq!(anchors[0], 400);
+        assert_eq!(anchors[0], aged(W / 2));
     }
 
     #[test]
@@ -216,9 +274,63 @@ mod tests {
         let a = spk(1);
         let inputs = [(&a, u64::MAX / 2, D - 1)];
         let outputs = [(&a, u64::MAX / 2), (&spk(2), 1u64)];
-        for anchor in assign_output_effective_daa(&inputs, &outputs, D) {
+        for anchor in assign_output_effective_daa(&inputs, &outputs, D, W) {
             assert!(anchor <= D);
         }
+    }
+
+    #[test]
+    fn carried_age_is_capped_at_maturity() {
+        // An over-mature input carries `w` of age into a merge, never its raw age: the surplus
+        // the per-coin cap discards must not survive the consolidation either.
+        let a = spk(1);
+        let inputs = [(&a, 100u64, aged(3 * W)), (&a, 100, D)];
+        let outputs = [(&a, 200u64)];
+        // Raw-age carry would give mean age 1.5·W ⇒ instantly mature. Capped: mean age W/2.
+        assert_eq!(assign_output_effective_daa(&inputs, &outputs, D, W), vec![aged(W / 2)]);
+    }
+
+    #[test]
+    fn maturity_battery_dies_through_consolidation() {
+        // Spec §4④, the case `maturity_battery_is_dead` misses: the battery and the fresh pot
+        // are CONSOLIDATED into one coin instead of being left separate. Merging must not let
+        // the old holding's discarded surplus pre-charge the fresh pot — the exploit found on
+        // testnet, where a merge minted +8.34e9 of effective balance in one block.
+        let a = spk(1);
+        let (mature, fresh) = (1_000_000u64, 40_000_000u64);
+        let before = eff_of(&[(mature, aged(3 * W)), (fresh, D)]);
+        assert_eq!(before, mature); // separate: the fresh pot weighs nothing
+
+        let inputs = [(&a, mature, aged(3 * W)), (&a, fresh, D)];
+        let outputs = [(&a, mature + fresh)];
+        let merged = assign_output_effective_daa(&inputs, &outputs, D, W)[0];
+        let after = eff_of(&[(mature + fresh, merged)]);
+
+        // Before the cap this merge returned an instantly-mature 41M coin ⇒ `after` was 41M.
+        assert!(after <= before, "consolidation minted effective balance: {before} -> {after}");
+        assert!(after + rounding_slack(mature + fresh) >= before, "consolidation destroyed real age: {before} -> {after}");
+    }
+
+    #[test]
+    fn consolidation_never_mints_effective_balance() {
+        // The general invariant behind the fix, over a miner-shaped stock: a long tail of
+        // over-mature coins plus a fresh ramp still climbing. Sweeping the whole stock into one
+        // coin must leave the ratio numerator where it was (bar the conservative rounding) —
+        // never raise it. This is the shape that minted +38.28e9 on testnet at daa 8568.
+        let a = spk(1);
+        let coins: Vec<(u64, u64)> = (0..40u64)
+            .map(|i| (1_000_000 + i * 7, aged(if i < 20 { 3 * W + i * 1_000 } else { (i - 19) * (W / 40) })))
+            .collect();
+        let before = eff_of(&coins);
+        let total: u64 = coins.iter().map(|(v, _)| v).sum();
+
+        let inputs: Vec<AgedInput<'_>> = coins.iter().map(|&(v, anchor)| (&a, v, anchor)).collect();
+        let outputs = [(&a, total)];
+        let merged = assign_output_effective_daa(&inputs, &outputs, D, W)[0];
+        let after = eff_of(&[(total, merged)]);
+
+        assert!(after <= before, "consolidation minted effective balance: {before} -> {after}");
+        assert!(after + rounding_slack(total) >= before, "consolidation destroyed real age: {before} -> {after}");
     }
 
     #[test]
@@ -226,6 +338,8 @@ mod tests {
         // Spec §4④: 1M KRX held ≥ W (mature) + a fresh 40M pot (age 0 ⇒ a_imm = b_imm·d).
         // Under the per-coin cap the fresh pot contributes ZERO — the old holding cannot
         // "pre-charge" maturity for incoming coins (the aggregate-cap exploit).
+        // NOTE: this only covers coins left SEPARATE. Merging them is the carry-over rule's job:
+        // see `maturity_battery_dies_through_consolidation`.
         let mature = 1_000_000u64;
         let fresh = 40_000_000u64;
         assert_eq!(eff_balance_from_buckets(mature, fresh, fresh as u128 * D as u128, D, W), mature);

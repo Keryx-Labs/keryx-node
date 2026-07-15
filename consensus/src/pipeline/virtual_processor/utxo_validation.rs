@@ -156,8 +156,8 @@ impl VirtualStateProcessor {
         // same gating discipline as every other fork so IBD re-validation stays canonical.
         let coin_age_active = self.coin_age_activation.is_active(pov_daa_score);
 
-        ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score, coin_age_active).unwrap();
-        ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score, self.coin_age_activation);
+        ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score, coin_age_active, self.coin_age_maturity_w).unwrap();
+        ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score, self.coin_age_activation, self.coin_age_maturity_w);
         let validated_coinbase_id = validated_coinbase.id();
         ctx.accepted_tx_ids.push(validated_coinbase_id);
 
@@ -185,7 +185,7 @@ impl VirtualStateProcessor {
 
             let mut block_fee = 0u64;
             for (validated_tx, _) in validated_transactions.iter() {
-                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score, coin_age_active).unwrap();
+                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score, coin_age_active, self.coin_age_maturity_w).unwrap();
                 ctx.accepted_tx_ids.push(validated_tx.id());
                 block_fee += validated_tx.calculated_fee;
             }
@@ -1110,7 +1110,7 @@ impl VirtualStateProcessor {
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
                 .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags).ok().map(|vtx| {
-                    let mh = MuHash::from_transaction(&vtx, pov_daa_score, self.coin_age_activation);
+                    let mh = MuHash::from_transaction(&vtx, pov_daa_score, self.coin_age_activation, self.coin_age_maturity_w);
                     (smallvec![(vtx, i as u32)], mh)
                 }
                 ))

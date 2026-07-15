@@ -14,16 +14,35 @@ use keryx_muhash::MuHash;
 /// the addition that put the coin in — a POV-era gate would break the commitment on the first
 /// post-fork spend of a pre-fork coin. Pre-fork coins carry `effective_daa == block_daa_score`
 /// by invariant, so excluding the field loses nothing; post-fork coins pin their FIFO anchors
-/// into the header `utxo_commitment`. Callers pass `params.coin_age_activation` verbatim.
+/// into the header `utxo_commitment`. Callers pass `params.coin_age_activation` verbatim, and
+/// `coin_age_maturity_w` from the same params — the anchors hashed here must be the ones
+/// `UtxoDiff::add_transaction` stores, and the maturity cap is an input to that rule.
 pub trait MuHashExtensions {
-    fn add_transaction(&mut self, tx: &impl VerifiableTransaction, block_daa_score: u64, coin_age_activation: ForkActivation);
+    fn add_transaction(
+        &mut self,
+        tx: &impl VerifiableTransaction,
+        block_daa_score: u64,
+        coin_age_activation: ForkActivation,
+        coin_age_maturity_w: u64,
+    );
     fn add_utxo(&mut self, outpoint: &TransactionOutpoint, entry: &UtxoEntry, coin_age_activation: ForkActivation);
-    fn from_transaction(tx: &impl VerifiableTransaction, block_daa_score: u64, coin_age_activation: ForkActivation) -> Self;
+    fn from_transaction(
+        tx: &impl VerifiableTransaction,
+        block_daa_score: u64,
+        coin_age_activation: ForkActivation,
+        coin_age_maturity_w: u64,
+    ) -> Self;
     fn from_utxo(outpoint: &TransactionOutpoint, entry: &UtxoEntry, coin_age_activation: ForkActivation) -> Self;
 }
 
 impl MuHashExtensions for MuHash {
-    fn add_transaction(&mut self, tx: &impl VerifiableTransaction, block_daa_score: u64, coin_age_activation: ForkActivation) {
+    fn add_transaction(
+        &mut self,
+        tx: &impl VerifiableTransaction,
+        block_daa_score: u64,
+        coin_age_activation: ForkActivation,
+        coin_age_maturity_w: u64,
+    ) {
         // Coin-age era of the NEW outputs (created at `block_daa_score`): the hashed entries must
         // carry the SAME FIFO-inherited anchors as the stored ones (`UtxoDiff::add_transaction`),
         // otherwise the commitment and the UTXO set would disagree. Same rule, same inputs, same
@@ -34,7 +53,7 @@ impl MuHashExtensions for MuHash {
                 .map(|(_, entry)| (&entry.script_public_key, entry.amount, entry.effective_daa))
                 .collect();
             let outputs: Vec<_> = tx.outputs().iter().map(|output| (&output.script_public_key, output.value)).collect();
-            Some(assign_output_effective_daa(&inputs, &outputs, block_daa_score))
+            Some(assign_output_effective_daa(&inputs, &outputs, block_daa_score, coin_age_maturity_w))
         } else {
             None
         };
@@ -63,9 +82,14 @@ impl MuHashExtensions for MuHash {
         writer.finalize();
     }
 
-    fn from_transaction(tx: &impl VerifiableTransaction, block_daa_score: u64, coin_age_activation: ForkActivation) -> Self {
+    fn from_transaction(
+        tx: &impl VerifiableTransaction,
+        block_daa_score: u64,
+        coin_age_activation: ForkActivation,
+        coin_age_maturity_w: u64,
+    ) -> Self {
         let mut mh = Self::new();
-        mh.add_transaction(tx, block_daa_score, coin_age_activation);
+        mh.add_transaction(tx, block_daa_score, coin_age_activation, coin_age_maturity_w);
         mh
     }
 
