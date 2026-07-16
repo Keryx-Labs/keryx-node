@@ -315,13 +315,13 @@ pub const RATIO_REWARD_WINDOW: u64 = 864_000;
 /// selected-chain depth than the legacy window (~190k chain blocks), comfortably inside pruning.
 pub const RATIO_REWARD_WINDOW_DAA: u64 = 864_000;
 
-/// Coin-age (holder-reward v3) maturity period, in DAA score: 7 days at 10 BPS. A coin younger
+/// Coin-age (holder-reward v3) maturity period, in DAA score: 24h at 10 BPS. A coin younger
 /// than this counts toward the ratio numerator at the linear prorata of its age (`v·age/W`);
-/// at/after it, at its full face value. Deliberately LONGER than the 24h production window and
-/// decoupled from it: the anti-rotation cost is holding the pot in place for a full week per
-/// address, making bracket-farming by address hopping unprofitable. See
+/// at/after it, at its full face value. Set equal to the production window: 24h of holding is
+/// enough to break bracket-farming by address hopping, while keeping the maturity ramp short so
+/// normal holders are not over-penalised. See
 /// KERYX-KRX/coin_age_holder_reward_spec.md §2/§9. Used at/after `coin_age_activation`.
-pub const COIN_AGE_MATURITY_W: u64 = 6_048_000;
+pub const COIN_AGE_MATURITY_W: u64 = 864_000; // 24h at 10 BPS
 
 /// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
 /// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
@@ -776,7 +776,7 @@ pub struct Params {
     /// cross-node determinism. `never()` until H4 is scheduled.
     pub coin_age_verification_activation: ForkActivation,
 
-    /// Coin-age maturity period in DAA score. Defaults to `COIN_AGE_MATURITY_W` (7 days); a
+    /// Coin-age maturity period in DAA score. Defaults to `COIN_AGE_MATURITY_W` (24h); a
     /// Params field (not the const) so tests can shrink it to exercise the maturity ramp and
     /// the immature→mature bucket promotion.
     pub coin_age_maturity_w: u64,
