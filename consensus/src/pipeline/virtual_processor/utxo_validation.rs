@@ -356,7 +356,7 @@ impl VirtualStateProcessor {
             info!("  Maturity      — a coin ramps linearly to full weight over W = {} DAA", self.coin_age_maturity_w);
             info!("  UTXO muhash   — per-coin effective_daa now committed in the multiset");
             info!("  Rotation      — moving a pot to a fresh address no longer buys the top bracket");
-            info!("  Bracket table — floor 50% (was 40%), ramp to 100% now spans 60 days (was 30)");
+            info!("  Bracket table — floor 50% (was 40%), ramp to 100% now spans 90 days (was 30)");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }

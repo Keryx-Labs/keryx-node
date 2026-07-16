@@ -298,17 +298,17 @@ pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
 
 /// Ratio-reward v2 — recalibrated bracket table, gated by `coin_age_activation` (bundled into H4,
 /// one hardfork instead of two): higher floor (50 % instead of 40 %, less burn overall) and a
-/// slightly slower ramp to 100 % (60 days instead of 30). Deliberately stays within 0-100 % — a
-/// bracket above 100 % would let the ratio bonus compensate the tier-reward penalty, which was
-/// rejected: it would let a miner with the hardware for a big tier deliberately run a small one
-/// and, given enough patience, still reach full reward — undermining the tier-reward's entire
-/// purpose (rewarding real model capacity). See KERYX-KRX/ratio_reward_spec.md (v2 addendum).
-pub const RATIO_REWARD_BPS_V2: [u64; 7] = [5_000, 6_000, 7_000, 8_000, 9_000, 9_500, 10_000];
+/// gentler 9-step ramp to 100 % over 90 days. Deliberately stays within 0-100 % — a bracket above
+/// 100 % would let the ratio bonus compensate the tier-reward penalty, which was rejected: it
+/// would let a miner with the hardware for a big tier deliberately run a small one and, given
+/// enough patience, still reach full reward — undermining the tier-reward's entire purpose
+/// (rewarding real model capacity). See KERYX-KRX/ratio_reward_spec.md (v2 addendum).
+pub const RATIO_REWARD_BPS_V2: [u64; 9] = [5_000, 5_500, 6_000, 6_500, 7_500, 8_000, 8_500, 9_000, 10_000];
 
 /// Bracket entry thresholds for `RATIO_REWARD_BPS_V2`, same semantics as `RATIO_REWARD_THRESHOLDS`
 /// (integer multiples of windowed production; 1 window = 24h at 10 BPS today). Reading:
-/// 0/3/7/15/30/45/60 days held.
-pub const RATIO_REWARD_THRESHOLDS_V2: [u64; 7] = [0, 3, 7, 15, 30, 45, 60];
+/// 0/3/7/15/30/45/60/75/90 days held.
+pub const RATIO_REWARD_THRESHOLDS_V2: [u64; 9] = [0, 3, 7, 15, 30, 45, 60, 75, 90];
 
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
@@ -1416,12 +1416,14 @@ mod ratio_reward_bps_tests {
     #[test]
     fn v2_brackets_exact_boundaries() {
         assert_eq!(ratio_reward_bps_v2(0, P), 5_000);
-        assert_eq!(ratio_reward_bps_v2(3 * P, P), 6_000);
-        assert_eq!(ratio_reward_bps_v2(7 * P, P), 7_000);
-        assert_eq!(ratio_reward_bps_v2(15 * P, P), 8_000);
-        assert_eq!(ratio_reward_bps_v2(30 * P, P), 9_000);
-        assert_eq!(ratio_reward_bps_v2(45 * P, P), 9_500);
-        assert_eq!(ratio_reward_bps_v2(60 * P, P), 10_000);
+        assert_eq!(ratio_reward_bps_v2(3 * P, P), 5_500);
+        assert_eq!(ratio_reward_bps_v2(7 * P, P), 6_000);
+        assert_eq!(ratio_reward_bps_v2(15 * P, P), 6_500);
+        assert_eq!(ratio_reward_bps_v2(30 * P, P), 7_500); // note: 70% bracket deliberately skipped
+        assert_eq!(ratio_reward_bps_v2(45 * P, P), 8_000);
+        assert_eq!(ratio_reward_bps_v2(60 * P, P), 8_500);
+        assert_eq!(ratio_reward_bps_v2(75 * P, P), 9_000);
+        assert_eq!(ratio_reward_bps_v2(90 * P, P), 10_000);
     }
 
     #[test]
@@ -1435,6 +1437,6 @@ mod ratio_reward_bps_tests {
     fn v2_one_below_each_threshold_stays_in_lower_bracket() {
         // Off-by-one just under each threshold must NOT round up to the next bracket.
         assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
-        assert_eq!(ratio_reward_bps_v2(60 * P - 1, P), 9_500);
+        assert_eq!(ratio_reward_bps_v2(90 * P - 1, P), 9_000);
     }
 }
