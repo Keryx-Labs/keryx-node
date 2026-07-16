@@ -303,7 +303,7 @@ pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
 /// would let a miner with the hardware for a big tier deliberately run a small one and, given
 /// enough patience, still reach full reward — undermining the tier-reward's entire purpose
 /// (rewarding real model capacity). See KERYX-KRX/ratio_reward_spec.md (v2 addendum).
-pub const RATIO_REWARD_BPS_V2: [u64; 9] = [5_000, 5_500, 6_000, 6_500, 7_500, 8_000, 8_500, 9_000, 10_000];
+pub const RATIO_REWARD_BPS_V2: [u64; 9] = [5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 9_000, 10_000];
 
 /// Bracket entry thresholds for `RATIO_REWARD_BPS_V2`, same semantics as `RATIO_REWARD_THRESHOLDS`
 /// (integer multiples of windowed production; 1 window = 24h at 10 BPS today). Reading:
@@ -1419,10 +1419,10 @@ mod ratio_reward_bps_tests {
         assert_eq!(ratio_reward_bps_v2(3 * P, P), 5_500);
         assert_eq!(ratio_reward_bps_v2(7 * P, P), 6_000);
         assert_eq!(ratio_reward_bps_v2(15 * P, P), 6_500);
-        assert_eq!(ratio_reward_bps_v2(30 * P, P), 7_500); // note: 70% bracket deliberately skipped
-        assert_eq!(ratio_reward_bps_v2(45 * P, P), 8_000);
-        assert_eq!(ratio_reward_bps_v2(60 * P, P), 8_500);
-        assert_eq!(ratio_reward_bps_v2(75 * P, P), 9_000);
+        assert_eq!(ratio_reward_bps_v2(30 * P, P), 7_000);
+        assert_eq!(ratio_reward_bps_v2(45 * P, P), 7_500);
+        assert_eq!(ratio_reward_bps_v2(60 * P, P), 8_000);
+        assert_eq!(ratio_reward_bps_v2(75 * P, P), 9_000); // note: 85% bracket deliberately skipped
         assert_eq!(ratio_reward_bps_v2(90 * P, P), 10_000);
     }
 
