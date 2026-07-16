@@ -32,7 +32,7 @@ use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, tier_reward_bps};
+use keryx_consensus_core::config::params::{TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -356,6 +356,7 @@ impl VirtualStateProcessor {
             info!("  Maturity      — a coin ramps linearly to full weight over W = {} DAA", self.coin_age_maturity_w);
             info!("  UTXO muhash   — per-coin effective_daa now committed in the multiset");
             info!("  Rotation      — moving a pot to a fresh address no longer buys the top bracket");
+            info!("  Bracket table — floor 50% (was 40%), ramp to 100% now spans 60 days (was 30)");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
@@ -553,7 +554,13 @@ impl VirtualStateProcessor {
                     (base + delta).max(0) as u64
                 };
                 let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
-                map.insert(*blue, ratio_reward_bps(balance, production));
+                // Recalibrated bracket table ships bundled with H4 (one hardfork, one gate).
+                let bps = if self.coin_age_activation.is_active(pov_daa_score) {
+                    ratio_reward_bps_v2(balance, production)
+                } else {
+                    ratio_reward_bps(balance, production)
+                };
+                map.insert(*blue, bps);
             }
         }
 

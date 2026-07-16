@@ -296,6 +296,20 @@ pub const RATIO_REWARD_BPS_DIVISOR: u64 = 10_000;
 /// ascending and start at 0 (bracket 0 always reachable). Reading: 0/1/3/7/15/30 windows held.
 pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
 
+/// Ratio-reward v2 — recalibrated bracket table, gated by `coin_age_activation` (bundled into H4,
+/// one hardfork instead of two): higher floor (50 % instead of 40 %, less burn overall) and a
+/// slightly slower ramp to 100 % (60 days instead of 30). Deliberately stays within 0-100 % — a
+/// bracket above 100 % would let the ratio bonus compensate the tier-reward penalty, which was
+/// rejected: it would let a miner with the hardware for a big tier deliberately run a small one
+/// and, given enough patience, still reach full reward — undermining the tier-reward's entire
+/// purpose (rewarding real model capacity). See KERYX-KRX/ratio_reward_spec.md (v2 addendum).
+pub const RATIO_REWARD_BPS_V2: [u64; 7] = [5_000, 6_000, 7_000, 8_000, 9_000, 9_500, 10_000];
+
+/// Bracket entry thresholds for `RATIO_REWARD_BPS_V2`, same semantics as `RATIO_REWARD_THRESHOLDS`
+/// (integer multiples of windowed production; 1 window = 24h at 10 BPS today). Reading:
+/// 0/3/7/15/30/45/60 days held.
+pub const RATIO_REWARD_THRESHOLDS_V2: [u64; 7] = [0, 3, 7, 15, 30, 45, 60];
+
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
 /// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
@@ -326,15 +340,25 @@ pub const COIN_AGE_MATURITY_W: u64 = 864_000; // 24h at 10 BPS
 /// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
 /// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
 /// (a zero-history / freshly-rotated address would otherwise hit the top bracket for free).
-///
-/// Division-free: bracket `i` is reached iff `balance >= THRESHOLDS[i] * production`. Thresholds
-/// are ascending, so the first failing bracket ends the scan. `u128` math avoids overflow on the
-/// `threshold * production` product.
 pub fn ratio_reward_bps(balance: u64, production: u64) -> u64 {
-    let mut bps = RATIO_REWARD_BPS[0];
-    for i in 0..RATIO_REWARD_THRESHOLDS.len() {
-        if (balance as u128) >= (RATIO_REWARD_THRESHOLDS[i] as u128) * (production as u128) {
-            bps = RATIO_REWARD_BPS[i];
+    ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS, &RATIO_REWARD_BPS)
+}
+
+/// Same as `ratio_reward_bps`, against the recalibrated `RATIO_REWARD_BPS_V2` table. Gated by
+/// `coin_age_activation` (bundled into H4).
+pub fn ratio_reward_bps_v2(balance: u64, production: u64) -> u64 {
+    ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS_V2, &RATIO_REWARD_BPS_V2)
+}
+
+/// Division-free bracket scan shared by `ratio_reward_bps`/`ratio_reward_bps_v2`: bracket `i` is
+/// reached iff `balance >= thresholds[i] * production`. Thresholds are ascending, so the first
+/// failing bracket ends the scan. `u128` math avoids overflow on the `threshold * production`
+/// product. `thresholds` and `bps_table` MUST be the same length.
+fn ratio_bracket_bps(balance: u64, production: u64, thresholds: &[u64], bps_table: &[u64]) -> u64 {
+    let mut bps = bps_table[0];
+    for i in 0..thresholds.len() {
+        if (balance as u128) >= (thresholds[i] as u128) * (production as u128) {
+            bps = bps_table[i];
         } else {
             break;
         }
@@ -1142,7 +1166,8 @@ pub const MAINNET_PARAMS: Params = Params {
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
     // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
-    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue) gates here.
+    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue), plus the
+    // recalibrated ratio-reward v2 bracket table, gates here — one hardfork, one gate.
     coin_age_activation: ForkActivation::never(),
     coin_age_verification_activation: ForkActivation::never(),
     coin_age_maturity_w: COIN_AGE_MATURITY_W,
@@ -1236,8 +1261,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // Coin-age holder-reward (v3): the ONLY mid-chain transition on this testnet — from genesis
     // the chain is in the current-mainnet state (everything above at 0), then at DAA 3_000 the H4
     // boundary fires: FIFO anchors start, the per-coin muhash field appears, the ratio numerator
-    // switches to the effective balance, and the shrunk maturity ramp (W=2_000) + queue
-    // promotions kick in. Rehearses the mainnet H4 gate end-to-end.
+    // switches to the effective balance, the recalibrated ratio-reward v2 bracket table takes
+    // over, and the shrunk maturity ramp (W=2_000) + queue promotions kick in. Rehearses the
+    // mainnet H4 gate end-to-end.
     coin_age_activation: ForkActivation::new(3_000),
     coin_age_verification_activation: ForkActivation::new(3_000),
     coin_age_maturity_w: 2_000,
@@ -1368,3 +1394,47 @@ pub const DEVNET_PARAMS: Params = Params {
     coin_age_verification_activation: ForkActivation::never(),
     coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
+
+#[cfg(test)]
+mod ratio_reward_bps_tests {
+    use super::*;
+
+    const P: u64 = 1_000_000; // arbitrary windowed production
+
+    #[test]
+    fn v1_brackets_unchanged() {
+        // Regression lock for the pre-existing table after factoring out `ratio_bracket_bps`.
+        assert_eq!(ratio_reward_bps(0, P), 4_000);
+        assert_eq!(ratio_reward_bps(1 * P, P), 5_200);
+        assert_eq!(ratio_reward_bps(3 * P, P), 6_400);
+        assert_eq!(ratio_reward_bps(7 * P, P), 7_600);
+        assert_eq!(ratio_reward_bps(15 * P, P), 8_800);
+        assert_eq!(ratio_reward_bps(30 * P, P), 10_000);
+        assert_eq!(ratio_reward_bps(1_000 * P, P), 10_000); // holding far beyond top bracket stays capped
+    }
+
+    #[test]
+    fn v2_brackets_exact_boundaries() {
+        assert_eq!(ratio_reward_bps_v2(0, P), 5_000);
+        assert_eq!(ratio_reward_bps_v2(3 * P, P), 6_000);
+        assert_eq!(ratio_reward_bps_v2(7 * P, P), 7_000);
+        assert_eq!(ratio_reward_bps_v2(15 * P, P), 8_000);
+        assert_eq!(ratio_reward_bps_v2(30 * P, P), 9_000);
+        assert_eq!(ratio_reward_bps_v2(45 * P, P), 9_500);
+        assert_eq!(ratio_reward_bps_v2(60 * P, P), 10_000);
+    }
+
+    #[test]
+    fn v2_never_exceeds_100_percent() {
+        // No bracket above 100%, unlike a tier-compensation table would need — by design.
+        assert!(RATIO_REWARD_BPS_V2.iter().all(|&bps| bps <= RATIO_REWARD_BPS_DIVISOR));
+        assert_eq!(ratio_reward_bps_v2(u64::MAX / 2, P), 10_000); // extreme holding still capped at 100%
+    }
+
+    #[test]
+    fn v2_one_below_each_threshold_stays_in_lower_bracket() {
+        // Off-by-one just under each threshold must NOT round up to the next bracket.
+        assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
+        assert_eq!(ratio_reward_bps_v2(60 * P - 1, P), 9_500);
+    }
+}
