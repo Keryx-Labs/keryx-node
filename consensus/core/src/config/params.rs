@@ -130,6 +130,63 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
     (LLAMA_3_3_70B_Q2_MODEL_ID,   400_000_000),   // 4.0 KRX  (--very-high, Q2_K_L)
 ];
 
+// --- H4 lineup refresh (gated by `coin_age_activation`, bundled into H4). Fully candle-independent:
+// every model is UNTIED (llama.cpp hosts the walk + inference in one resident copy). MUST mirror the
+// miner's `models.rs`. Each `model_id` = CIDv0[2..34] of the pinned GGUF; each `root` from the offline
+// builder (`WeightIndex::build_from_gguf`), spike-verified byte-identical. Dormant on mainnet until
+// `coin_age_activation` is scheduled. ---
+
+/// EXAONE-4.0-1.2B-abliterated Q4_K_M (LG). H4 tier 0 (--very-light), replaces Qwen3-1.7B.
+pub const EXAONE_4_0_1_2B_MODEL_ID: [u8; 32] = [
+    0x30, 0x0a, 0x99, 0xb3, 0xa8, 0x5b, 0x0a, 0xb4,
+    0x5d, 0x1d, 0x93, 0x0b, 0xb7, 0xb1, 0xd4, 0xb0,
+    0xf3, 0x59, 0x83, 0xd5, 0x21, 0xe7, 0x9f, 0xf2,
+    0x11, 0x93, 0xa6, 0x90, 0x8d, 0xc4, 0xb8, 0x10,
+];
+
+/// Mistral-7B-Instruct-v0.3-abliterated Q6_K (Mistral). H4 tier 1 (--light), replaces Gemma-3-4B.
+pub const MISTRAL_7B_V03_MODEL_ID: [u8; 32] = [
+    0x8c, 0x2f, 0xea, 0x60, 0x0f, 0x0e, 0xef, 0xe7,
+    0x04, 0x87, 0x41, 0xa5, 0x11, 0x9c, 0xb7, 0xbe,
+    0x30, 0x30, 0x37, 0xf5, 0x9f, 0xc0, 0x26, 0xe4,
+    0x83, 0x82, 0x65, 0x8f, 0x23, 0x58, 0x1e, 0x0a,
+];
+
+/// GLM-4-9B-0414-abliterated Q6_K (Zhipu). H4 tier 2 (default), replaces Dolphin-8B.
+pub const GLM_4_9B_0414_MODEL_ID: [u8; 32] = [
+    0xfa, 0x2f, 0x13, 0xbe, 0x08, 0x50, 0xe2, 0x6c,
+    0x5c, 0xe8, 0x6c, 0x7a, 0xc7, 0x9d, 0xa8, 0x5e,
+    0x30, 0x0c, 0x1d, 0xa8, 0xb3, 0x29, 0x0f, 0x9a,
+    0x18, 0xd4, 0x71, 0x05, 0xf1, 0xf2, 0x14, 0x0a,
+];
+
+/// Qwen3.6-27B-abliterated Q4_K_M (Alibaba, arch qwen35 hybrid-SSM). H4 tier 3 (--high), replaces Qwen3-32B.
+pub const QWEN3_6_27B_MODEL_ID: [u8; 32] = [
+    0xb8, 0xbd, 0xc0, 0x1f, 0xa4, 0x07, 0xea, 0xb9,
+    0x43, 0xe4, 0xfe, 0xfc, 0x80, 0x74, 0x83, 0xb3,
+    0x9f, 0x81, 0x42, 0x78, 0x52, 0x56, 0x04, 0x9e,
+    0x1f, 0x55, 0x96, 0x98, 0xa5, 0x28, 0x47, 0x46,
+];
+
+/// Kimi-Linear-48B-A3B-abliterated Q4_K_M (Moonshot, MoE). H4 tier 4 (--very-high), replaces Llama-70B-Q2.
+pub const KIMI_LINEAR_48B_MODEL_ID: [u8; 32] = [
+    0x3d, 0xc0, 0x93, 0x58, 0xad, 0x75, 0xc6, 0xef,
+    0x0c, 0x9c, 0x86, 0xee, 0x4f, 0x47, 0xc4, 0xd6,
+    0xac, 0xda, 0x96, 0x1f, 0xec, 0xbd, 0x0e, 0x4f,
+    0x9c, 0xf5, 0x5e, 0x8f, 0x0f, 0xdf, 0xfd, 0xdb,
+];
+
+/// Per-model minimum inference_reward in sompi. H4 (candle-free) lineup, enforced from
+/// `coin_age_activation`. New bareme 0.5/1/1.5/2.5/4 KRX. Node-only enforcement (no miner lockstep).
+/// Gated at the H4 boundary (never applied to historical blocks — see the H2 table's rationale).
+pub const INFERENCE_REWARD_MINIMUMS_V2_H4: &[([u8; 32], u64)] = &[
+    (EXAONE_4_0_1_2B_MODEL_ID,     50_000_000),   // 0.5 KRX  (--very-light)
+    (MISTRAL_7B_V03_MODEL_ID,     100_000_000),   // 1.0 KRX  (--light)
+    (GLM_4_9B_0414_MODEL_ID,      150_000_000),   // 1.5 KRX  (default)
+    (QWEN3_6_27B_MODEL_ID,        250_000_000),   // 2.5 KRX  (--high)
+    (KIMI_LINEAR_48B_MODEL_ID,    400_000_000),   // 4.0 KRX  (--very-high)
+];
+
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
 
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
@@ -220,12 +277,61 @@ pub const POM_TIERS_H2: &[crate::pom::PomTier] = &[
     },
 ];
 
+/// H4 (candle-free) possession anchors, gated by `coin_age_activation`. Same 5-tier ORDER as H2
+/// (tier index → reward position unchanged), swapping every model for an UNTIED one so llama.cpp
+/// hosts walk + inference with no candle: EXAONE-1.2B=0, Mistral-7B=1, GLM-4-9B=2, Qwen3.6-27B=3,
+/// Kimi-Linear-48B=4. MUST mirror the miner's `pom_tier_index` H4 ordering. Roots spike-verified.
+pub const POM_TIERS_H4: &[crate::pom::PomTier] = &[
+    crate::pom::PomTier {
+        model_id: EXAONE_4_0_1_2B_MODEL_ID,
+        root: [
+            0xcc, 0x8b, 0x25, 0xc4, 0xe1, 0xaa, 0x7a, 0xb9, 0xbb, 0x99, 0x41, 0xda, 0x16, 0x18, 0xf9, 0xab,
+            0x29, 0x38, 0xea, 0x85, 0x07, 0x7b, 0x88, 0x79, 0xeb, 0xd7, 0xd4, 0x91, 0x6a, 0xc3, 0x8d, 0xdd,
+        ],
+        chunks: 28_943_588,
+    },
+    crate::pom::PomTier {
+        model_id: MISTRAL_7B_V03_MODEL_ID,
+        root: [
+            0xd7, 0x6a, 0xcb, 0xbe, 0x8c, 0x24, 0x29, 0x81, 0x6c, 0x02, 0xa4, 0xdb, 0xd9, 0xf2, 0x09, 0xa0,
+            0x87, 0x85, 0xef, 0x97, 0x5c, 0xd1, 0x38, 0xf5, 0x18, 0x22, 0x76, 0x12, 0x0b, 0xa2, 0x0e, 0xc5,
+        ],
+        chunks: 185_827_840,
+    },
+    crate::pom::PomTier {
+        model_id: GLM_4_9B_0414_MODEL_ID,
+        root: [
+            0x1b, 0xa8, 0xb8, 0xb1, 0x34, 0x41, 0x03, 0xfa, 0xa0, 0xa7, 0x47, 0x89, 0xd9, 0x39, 0xc3, 0x3c,
+            0x23, 0xba, 0x5c, 0x3c, 0x41, 0xbb, 0x1a, 0x89, 0x5a, 0xb6, 0xe8, 0xbf, 0xec, 0xb0, 0x78, 0x7d,
+        ],
+        chunks: 258_040_832,
+    },
+    crate::pom::PomTier {
+        model_id: QWEN3_6_27B_MODEL_ID,
+        root: [
+            0x85, 0x23, 0xf4, 0x14, 0x8d, 0x22, 0xc7, 0x71, 0x3b, 0xfc, 0x11, 0x32, 0xb4, 0xaf, 0x3d, 0x4b,
+            0x97, 0x61, 0xa2, 0x03, 0xfb, 0x33, 0xf1, 0x8e, 0xe7, 0x55, 0x67, 0xbd, 0xee, 0x51, 0x2b, 0x0a,
+        ],
+        chunks: 516_762_688,
+    },
+    crate::pom::PomTier {
+        model_id: KIMI_LINEAR_48B_MODEL_ID,
+        root: [
+            0x95, 0x74, 0x71, 0x0f, 0xfa, 0xb6, 0x78, 0xf0, 0x68, 0xb4, 0xe6, 0x5a, 0xbe, 0x72, 0x40, 0x86,
+            0x2d, 0xa1, 0x5b, 0xb1, 0x6e, 0xa8, 0x2f, 0xd1, 0x62, 0xa9, 0x35, 0x1a, 0x10, 0x51, 0x99, 0x59,
+        ],
+        chunks: 927_994_064,
+    },
+];
+
 /// Possession anchors for a block at `daa_score`: the 5-tier H2 set once `very_light_activation`
 /// is live, the legacy 4-tier set before. The choice MUST be made per block from that block's own
 /// DAA (never frozen) — an archival/IBD node recomputing a pre-H2 block under the 5-tier scheme
 /// would validate against the wrong anchors and reject the chain.
-pub fn pom_tiers(very_light_active: bool) -> &'static [crate::pom::PomTier] {
-    if very_light_active {
+pub fn pom_tiers(coin_age_active: bool, very_light_active: bool) -> &'static [crate::pom::PomTier] {
+    if coin_age_active {
+        POM_TIERS_H4
+    } else if very_light_active {
         POM_TIERS_H2
     } else {
         POM_TIERS

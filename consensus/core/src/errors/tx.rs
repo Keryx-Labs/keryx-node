@@ -51,6 +51,9 @@ pub enum TxRuleError {
     )]
     ImmatureCoinbaseSpend(usize, TransactionOutpoint, u64, u64, u64),
 
+    #[error("transaction input #{0} violates consensus rule 0x22 {1}")]
+    SpkRuleViolation(usize, TransactionOutpoint),
+
     #[error("transaction total inputs spending amount overflowed u64")]
     InputAmountOverflow,
 

@@ -25,6 +25,7 @@ pub mod config;
 pub mod constants;
 pub mod daa_score_timestamp;
 pub mod errors;
+pub mod spk_rule;
 pub mod hashing;
 pub mod header;
 pub mod mass;

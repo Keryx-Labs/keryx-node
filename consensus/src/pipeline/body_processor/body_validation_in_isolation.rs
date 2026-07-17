@@ -179,9 +179,14 @@ impl BlockBodyProcessor {
         if h3 && proof.final_state != header.pom_final_state {
             return Err(RuleError::PomFinalStateMismatch(header.pom_final_state, proof.final_state));
         }
-        // Tier set is gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
-        // chosen from this block's own daa_score so archival/IBD recomputation stays canonical.
-        let tiers = pom_tiers(self.very_light_activation.is_active(header.daa_score));
+        // Tier set is gated per block by DAA: H4 (candle-free, coin_age_verification) > H2 (5-tier,
+        // very_light) > legacy 4-tier. Chosen from this block's own daa_score so archival/IBD
+        // recomputation stays canonical. H4 co-activates with the recompute-from-chunks verifier
+        // (same `coin_age_verification_activation` DAA), so the new roots are checked by v2.
+        let tiers = pom_tiers(
+            self.coin_age_verification_activation.is_active(header.daa_score),
+            self.very_light_activation.is_active(header.daa_score),
+        );
         let tier = tiers.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
 
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
