@@ -26,7 +26,7 @@ impl From<&Block> for RpcRawBlock {
         Self {
             header: item.header.as_ref().into(),
             transactions: item.transactions.iter().map(RpcTransaction::from).collect(),
-            pom_proof: item.pom_proof.as_ref().map(|p| borsh::to_vec(p.as_ref()).expect("PomProof borsh serialize")),
+            pom_proof: item.pom_proof.as_ref().map(|p| p.to_wire_bytes()),
         }
     }
 }
@@ -87,9 +87,9 @@ impl TryFrom<RpcRawBlock> for Block {
     type Error = RpcError;
     fn try_from(item: RpcRawBlock) -> RpcResult<Self> {
         let pom_proof = match &item.pom_proof {
-            Some(bytes) => Some(Arc::new(
-                borsh::from_slice::<PomProof>(bytes).map_err(|e| RpcError::PomProofDecodeError(e.to_string()))?,
-            )),
+            Some(bytes) => {
+                Some(Arc::new(PomProof::from_wire_bytes(bytes).map_err(|e| RpcError::PomProofDecodeError(e.to_string()))?))
+            }
             None => None,
         };
         Ok(Self {

@@ -104,10 +104,10 @@ pub struct PomProof {
     /// transitions itself (`verify_pom_proof_v2`) and derives `final_state` — no trace
     /// tree, no spot-check, nothing taken on the prover's word (the 32/256 spot-check this
     /// replaces accepted a forged `final_state` ~88% of the time). `None` on every pre-H4
-    /// proof. Trailing field: a `None` proof MUST encode byte-identically to the pre-H4
-    /// layout (see `to_wire_bytes`/`from_wire_bytes`), and bincode omits it via
-    /// `skip_serializing_if` so DB records stay era-exact too.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// proof. Trailing field: on the borsh wire a `None` proof is re-encoded through the
+    /// `PomProofPreH4` layout (`to_wire_bytes`) so it stays byte-identical for not-yet-updated
+    /// peers; in the node-local bincode DB, old records (written before this field existed)
+    /// decode via the `PomProofPreH4` fallback in `DbPomProofStore`.
     pub steps_v2: Option<Vec<PomStep>>,
 }
 
@@ -759,5 +759,32 @@ mod verify_tests {
 
         // A truncated / garbage stream fails both decodes.
         assert!(PomProof::from_wire_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// Bincode decode fallback the `DbPomProofStore` relies on: a record written by a pre-H4 binary
+    /// is the `PomProofPreH4` positional layout; the grown `PomProof` under-flows on it, so decode
+    /// must fall back to the old layout and backfill `steps_v2 = None` — never a silent mis-decode.
+    #[test]
+    fn bincode_pre_h4_record_decodes_via_fallback() {
+        let (n, k, t) = (4096u64, 256u32, 32usize);
+        let pph = blake(b"db-pph");
+        let (v1, _, _) = build(n, k, t, &pph, 0xabc);
+
+        // Old binary wrote the 7-field layout.
+        let old_bytes = bincode::serialize(&PomProofPreH4::from(&v1)).unwrap();
+        // New `PomProof` (8 fields) under-flows on it...
+        assert!(bincode::deserialize::<PomProof>(&old_bytes).is_err());
+        // ...so the store's fallback kicks in and backfills steps_v2 = None.
+        let recovered: PomProof = bincode::deserialize::<PomProofPreH4>(&old_bytes).unwrap().into();
+        assert!(recovered.steps_v2.is_none());
+        assert_eq!(recovered.final_state, v1.final_state);
+        assert_eq!(recovered.openings.len(), v1.openings.len());
+
+        // A v2 record decodes as PomProof directly (primary path, no fallback).
+        let seed = pom_seed_state(0xabc);
+        let (v2, _) = build_v2(n, k, seed);
+        let v2_bytes = bincode::serialize(&v2).unwrap();
+        let back = bincode::deserialize::<PomProof>(&v2_bytes).unwrap();
+        assert_eq!(back.steps_v2.as_ref().unwrap().len(), k as usize);
     }
 }

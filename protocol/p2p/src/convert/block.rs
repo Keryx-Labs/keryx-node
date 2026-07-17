@@ -13,8 +13,9 @@ impl From<(HeaderFormat, &Block)> for protowire::BlockMessage {
         Self {
             header: Some((header_format, block.header.as_ref()).into()),
             transactions: block.transactions.iter().map(|tx| tx.into()).collect(),
-            // borsh is infallible for in-memory PomProof (plain data).
-            pom_proof: block.pom_proof.as_ref().map(|p| borsh::to_vec(p.as_ref()).expect("PomProof borsh serialize")),
+            // `to_wire_bytes` keeps a pre-H4 proof (steps_v2 == None) byte-identical to the legacy
+            // layout, so not-yet-updated peers still decode re-served pre-H4 blocks.
+            pom_proof: block.pom_proof.as_ref().map(|p| p.to_wire_bytes()),
             // Carry the tier explicitly (falls back to the proof's tier) so it survives IBD even
             // when the full proof is absent (legacy blocks).
             pom_tier: block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier)).map(|t| t as u32),
@@ -42,7 +43,7 @@ impl TryFrom<Versioned<protowire::BlockMessage>> for Block {
         let txs = block.transactions.into_iter().map(|i| i.try_into()).collect::<Result<Vec<Transaction>, Self::Error>>()?;
         let mut blk = Block::new(Versioned(header_format, header).try_into()?, txs);
         if let Some(bytes) = block.pom_proof {
-            let proof: PomProof = borsh::from_slice(&bytes).map_err(|_| ConversionError::PomProofDecode)?;
+            let proof = PomProof::from_wire_bytes(&bytes).map_err(|_| ConversionError::PomProofDecode)?;
             blk = blk.with_pom_proof(proof);
         }
         blk = blk.with_pom_tier(block.pom_tier.map(|t| t as u8));
@@ -80,6 +81,24 @@ mod tests {
                 trace_path_before: vec![[8u8; 32]],
                 trace_path_after: vec![[9u8; 32]],
             }],
+            steps_v2: None,
+        }
+    }
+
+    fn dummy_proof_v2() -> PomProof {
+        use keryx_consensus_core::pom::PomStep;
+        PomProof {
+            tier: 4,
+            trace_root: [0u8; 32],
+            pow_value: [3u8; 32],
+            final_state: 0xbeef,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: Some(vec![
+                PomStep { chunk: [1u8; 32], weight_path: vec![[2u8; 32]] },
+                PomStep { chunk: [3u8; 32], weight_path: vec![[4u8; 32], [5u8; 32]] },
+            ]),
         }
     }
 
@@ -111,11 +130,11 @@ mod tests {
         let mut body: protowire::BlockBodyMessage = (&BlockBody::new()).into();
         assert!(body.pom_proof.is_none() && body.pom_tier.is_none());
         body.pom_tier = Some(proof.tier as u32);
-        body.pom_proof = Some(borsh::to_vec(&proof).expect("PomProof borsh serialize"));
+        body.pom_proof = Some(proof.to_wire_bytes());
 
         // Receive side (ibd::flow): decode tier + proof back out.
         assert_eq!(body.pom_tier.map(|t| t as u8), Some(1));
-        let decoded: PomProof = borsh::from_slice(body.pom_proof.as_deref().unwrap()).expect("proof preserved over the body wire");
+        let decoded = PomProof::from_wire_bytes(body.pom_proof.as_deref().unwrap()).expect("proof preserved over the body wire");
         assert_eq!(decoded.tier, proof.tier);
         assert_eq!(decoded.trace_root, proof.trace_root);
         assert_eq!(decoded.final_state, proof.final_state);
@@ -131,5 +150,27 @@ mod tests {
         assert!(msg.pom_proof.is_none());
         let back: Block = Versioned(HeaderFormat::Legacy, msg).try_into().unwrap();
         assert!(back.pom_proof.is_none());
+    }
+
+    #[test]
+    fn v2_proof_survives_p2p_roundtrip() {
+        let block = Block::from_precomputed_hash(Hash::from_bytes([3u8; 32]), vec![]).with_pom_proof(dummy_proof_v2());
+        let msg: protowire::BlockMessage = (HeaderFormat::Legacy, &block).into();
+        let back: Block = Versioned(HeaderFormat::Legacy, msg).try_into().unwrap();
+        let p = back.pom_proof.expect("v2 proof preserved over the wire");
+        assert_eq!(p.tier, 4);
+        let steps = p.steps_v2.as_ref().expect("steps_v2 preserved");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[1].weight_path.len(), 2);
+        assert!(p.openings.is_empty());
+    }
+
+    /// A pre-H4 proof must serialize to the EXACT bytes the legacy `PomProofPreH4` layout emits —
+    /// the invariant that lets a not-yet-updated peer keep decoding re-served pre-H4 blocks.
+    #[test]
+    fn pre_h4_proof_wire_bytes_are_legacy_exact() {
+        use keryx_consensus_core::pom::PomProofPreH4;
+        let p = dummy_proof();
+        assert_eq!(p.to_wire_bytes(), borsh::to_vec(&PomProofPreH4::from(&p)).unwrap());
     }
 }

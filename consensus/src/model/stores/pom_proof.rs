@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use keryx_consensus_core::BlockHasher;
-use keryx_consensus_core::pom::PomProof;
+use keryx_consensus_core::pom::{PomProof, PomProofPreH4};
 use keryx_database::prelude::CachePolicy;
 use keryx_database::prelude::DB;
 use keryx_database::prelude::StoreError;
@@ -52,7 +52,10 @@ impl DbPomProofStore {
 
 impl PomProofStoreReader for DbPomProofStore {
     fn get(&self, hash: Hash) -> Result<PomProof, StoreError> {
-        self.access.read(hash)
+        // Records written before the H4 `steps_v2` field existed are the pre-H4 positional layout
+        // (`PomProofPreH4`); the grown `PomProof` under-flows on their bytes, so decode falls back
+        // to the old layout and backfills `steps_v2 = None`. Same mechanism as the utxoset store.
+        self.access.read_with_decode_fallback::<PomProofPreH4>(hash)
     }
 
     fn has(&self, hash: Hash) -> Result<bool, StoreError> {
