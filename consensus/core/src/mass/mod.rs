@@ -727,6 +727,7 @@ mod tests {
                 amount: in_amount,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             })
             .collect();

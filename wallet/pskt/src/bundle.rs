@@ -253,7 +253,7 @@ pub fn unlock_utxo_outputs_as_batch_transaction_pskb(
 ) -> Result<Bundle, Error> {
     let origin_spk = pay_to_address_script(start_address);
 
-    let utxo_entry = UtxoEntry { amount, script_public_key: origin_spk, block_daa_score: UNACCEPTED_DAA_SCORE, is_coinbase: false };
+    let utxo_entry = UtxoEntry { amount, script_public_key: origin_spk, block_daa_score: UNACCEPTED_DAA_SCORE, effective_daa: UNACCEPTED_DAA_SCORE, is_coinbase: false };
 
     let input =
         InputBuilder::default().utxo_entry(utxo_entry.to_owned()).sig_op_count(1).redeem_script(script_sig.to_vec()).build()?;
@@ -304,6 +304,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: pay_to_script_hash_script(redeem_script),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             })
             .previous_outpoint(TransactionOutpoint {

@@ -54,11 +54,30 @@ pub struct UtxoEntry {
     pub block_daa_score: u64,
     #[wasm_bindgen(js_name = isCoinbase)]
     pub is_coinbase: bool,
+    /// Coin-age (holder-reward v3) anchor: the DAA score this UTXO's value is aged from. Before
+    /// `coin_age_activation` the invariant `effective_daa == block_daa_score` holds everywhere
+    /// (both are the creation score); at/after it, outputs whose SPK also appears in the spending
+    /// tx's inputs inherit the FIFO-surviving anchor instead (see `coin_age`), letting same-address
+    /// consolidation keep its age while cross-address transfers reset. Kept at the struct tail so
+    /// the positional bincode DB layout grows by a trailing field (legacy decode fallback).
+    /// Excluded from the muhash commitment until `coin_age_activation` (H4).
+    #[wasm_bindgen(js_name = effectiveDaaScore)]
+    pub effective_daa: u64,
 }
 
 impl UtxoEntry {
+    /// Standard constructor: anchors the age at the creation score (`effective_daa =
+    /// block_daa_score`), which is the correct value everywhere the FIFO carry-over does not
+    /// apply — the pre-H4 invariant, coinbase outputs, and mempool/test placeholders.
     pub fn new(amount: u64, script_public_key: ScriptPublicKey, block_daa_score: u64, is_coinbase: bool) -> Self {
-        Self { amount, script_public_key, block_daa_score, is_coinbase }
+        Self { amount, script_public_key, block_daa_score, is_coinbase, effective_daa: block_daa_score }
+    }
+
+    /// Coin-age constructor: like [`UtxoEntry::new`] but with an explicit inherited age anchor —
+    /// the post-`coin_age_activation` utxo-diff population path, where same-SPK outputs carry the
+    /// FIFO-surviving anchor of their inputs (`coin_age::assign_output_effective_daa`).
+    pub fn new_aged(amount: u64, script_public_key: ScriptPublicKey, block_daa_score: u64, is_coinbase: bool, effective_daa: u64) -> Self {
+        Self { amount, script_public_key, block_daa_score, is_coinbase, effective_daa }
     }
 }
 

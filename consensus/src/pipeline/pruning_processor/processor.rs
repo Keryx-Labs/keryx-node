@@ -398,10 +398,12 @@ impl PruningProcessor {
     fn assert_utxo_commitment(&self, pruning_point: Hash) {
         info!("Verifying the new pruning point UTXO commitment (sanity test)");
         let commitment = self.headers_store.get_header(pruning_point).unwrap().utxo_commitment;
+        // Coin-age muhash gate is PER COIN (each entry's own creation era) — see `MuHashExtensions`.
+        let coin_age_activation = self.config.params.coin_age_activation;
         let mut multiset = MuHash::new();
         let pruning_meta_read = self.pruning_meta_stores.read();
         for (outpoint, entry) in pruning_meta_read.utxo_set.iterator().map(|r| r.unwrap()) {
-            multiset.add_utxo(&outpoint, &entry);
+            multiset.add_utxo(&outpoint, &entry, coin_age_activation);
         }
         assert_eq!(multiset.finalize(), commitment, "Updated pruning point utxo set does not match the header utxo commitment");
         info!("Pruning point UTXO commitment was verified correctly (sanity test)");

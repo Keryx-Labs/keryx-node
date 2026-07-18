@@ -44,7 +44,7 @@ impl HandleBlockBodyRequests {
                 self.ctx.warn_if_serving_naked_pom_block(&block);
                 let mut body_msg: keryx_p2p_lib::pb::BlockBodyMessage = block.transactions.as_ref().into();
                 body_msg.pom_tier = block.pom_tier.map(|t| t as u32);
-                body_msg.pom_proof = block.pom_proof.as_ref().map(|p| borsh::to_vec(p.as_ref()).expect("PomProof borsh serialize"));
+                body_msg.pom_proof = block.pom_proof.as_ref().map(|p| p.to_wire_bytes());
                 self.router.enqueue(make_response!(Payload::BlockBody, body_msg, request_id)).await?;
             }
         }

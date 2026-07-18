@@ -9,6 +9,8 @@ use keryx_database::registry::DatabaseStorePrefixes;
 use keryx_hashes::Hash;
 use rocksdb::WriteBatch;
 
+use super::utxo_set::UtxoDiffPreH4;
+
 /// Store for holding the UTXO difference (delta) of a block relative to its selected parent.
 /// Note that this data is lazy-computed only for blocks which are candidates to being chain
 /// blocks. However, once the diff is computed, it is permanent. This store has a relation to
@@ -54,7 +56,8 @@ impl DbUtxoDiffsStore {
 
 impl UtxoDiffsStoreReader for DbUtxoDiffsStore {
     fn get(&self, hash: Hash) -> Result<Arc<UtxoDiff>, StoreError> {
-        self.access.read(hash)
+        // Diffs written by a pre-coin-age binary lack the trailing `effective_daa` field.
+        self.access.read_with_decode_fallback::<UtxoDiffPreH4>(hash)
     }
 }
 

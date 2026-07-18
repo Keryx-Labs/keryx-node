@@ -130,6 +130,71 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
     (LLAMA_3_3_70B_Q2_MODEL_ID,   400_000_000),   // 4.0 KRX  (--very-high, Q2_K_L)
 ];
 
+/// SINGLE flip point for the H4 hard fork on mainnet. `u64::MAX` = dormant (every H4 gate reads as
+/// `never()`). Set this to the chosen H4 DAA score at release — it drives BOTH mainnet coin-age
+/// gates (`coin_age_activation` + `coin_age_verification_activation`) in one edit. The miner's
+/// `COIN_AGE_VERIFICATION_ACTIVATION_DAA` MUST be set to the exact same value (node↔miner lockstep).
+/// NOTE: the H4 difficulty reset is a SEPARATE entry (see `difficulty_reset_activations`), because
+/// the existing H2 reset at 38_951_445 is load-bearing history that must not move.
+pub const H4_ACTIVATION_DAA: u64 = 54_766_000;
+
+// --- H4 lineup refresh (gated by `coin_age_activation`, bundled into H4). Fully candle-independent:
+// every model is UNTIED (llama.cpp hosts the walk + inference in one resident copy). MUST mirror the
+// miner's `models.rs`. Each `model_id` = CIDv0[2..34] of the pinned GGUF; each `root` from the offline
+// builder (`WeightIndex::build_from_gguf`), spike-verified byte-identical. Dormant on mainnet until
+// `coin_age_activation` is scheduled. ---
+
+/// EXAONE-4.0-1.2B-abliterated Q4_K_M (LG). H4 tier 0 (--very-light), replaces Qwen3-1.7B.
+pub const EXAONE_4_0_1_2B_MODEL_ID: [u8; 32] = [
+    0x30, 0x0a, 0x99, 0xb3, 0xa8, 0x5b, 0x0a, 0xb4,
+    0x5d, 0x1d, 0x93, 0x0b, 0xb7, 0xb1, 0xd4, 0xb0,
+    0xf3, 0x59, 0x83, 0xd5, 0x21, 0xe7, 0x9f, 0xf2,
+    0x11, 0x93, 0xa6, 0x90, 0x8d, 0xc4, 0xb8, 0x10,
+];
+
+/// Mistral-7B-Instruct-v0.3-abliterated Q6_K (Mistral). H4 tier 1 (--light), replaces Gemma-3-4B.
+pub const MISTRAL_7B_V03_MODEL_ID: [u8; 32] = [
+    0x8c, 0x2f, 0xea, 0x60, 0x0f, 0x0e, 0xef, 0xe7,
+    0x04, 0x87, 0x41, 0xa5, 0x11, 0x9c, 0xb7, 0xbe,
+    0x30, 0x30, 0x37, 0xf5, 0x9f, 0xc0, 0x26, 0xe4,
+    0x83, 0x82, 0x65, 0x8f, 0x23, 0x58, 0x1e, 0x0a,
+];
+
+/// GLM-4-9B-0414-abliterated Q6_K (Zhipu). H4 tier 2 (default), replaces Dolphin-8B.
+pub const GLM_4_9B_0414_MODEL_ID: [u8; 32] = [
+    0xfa, 0x2f, 0x13, 0xbe, 0x08, 0x50, 0xe2, 0x6c,
+    0x5c, 0xe8, 0x6c, 0x7a, 0xc7, 0x9d, 0xa8, 0x5e,
+    0x30, 0x0c, 0x1d, 0xa8, 0xb3, 0x29, 0x0f, 0x9a,
+    0x18, 0xd4, 0x71, 0x05, 0xf1, 0xf2, 0x14, 0x0a,
+];
+
+/// Qwen3.6-27B-abliterated Q4_K_M (Alibaba, arch qwen35 hybrid-SSM). H4 tier 3 (--high), replaces Qwen3-32B.
+pub const QWEN3_6_27B_MODEL_ID: [u8; 32] = [
+    0xb8, 0xbd, 0xc0, 0x1f, 0xa4, 0x07, 0xea, 0xb9,
+    0x43, 0xe4, 0xfe, 0xfc, 0x80, 0x74, 0x83, 0xb3,
+    0x9f, 0x81, 0x42, 0x78, 0x52, 0x56, 0x04, 0x9e,
+    0x1f, 0x55, 0x96, 0x98, 0xa5, 0x28, 0x47, 0x46,
+];
+
+/// Kimi-Linear-48B-A3B-abliterated Q4_K_M (Moonshot, MoE). H4 tier 4 (--very-high), replaces Llama-70B-Q2.
+pub const KIMI_LINEAR_48B_MODEL_ID: [u8; 32] = [
+    0x3d, 0xc0, 0x93, 0x58, 0xad, 0x75, 0xc6, 0xef,
+    0x0c, 0x9c, 0x86, 0xee, 0x4f, 0x47, 0xc4, 0xd6,
+    0xac, 0xda, 0x96, 0x1f, 0xec, 0xbd, 0x0e, 0x4f,
+    0x9c, 0xf5, 0x5e, 0x8f, 0x0f, 0xdf, 0xfd, 0xdb,
+];
+
+/// Per-model minimum inference_reward in sompi. H4 (candle-free) lineup, enforced from
+/// `coin_age_activation`. New bareme 0.5/1/1.5/2.5/4 KRX. Node-only enforcement (no miner lockstep).
+/// Gated at the H4 boundary (never applied to historical blocks — see the H2 table's rationale).
+pub const INFERENCE_REWARD_MINIMUMS_V2_H4: &[([u8; 32], u64)] = &[
+    (EXAONE_4_0_1_2B_MODEL_ID,     50_000_000),   // 0.5 KRX  (--very-light)
+    (MISTRAL_7B_V03_MODEL_ID,     100_000_000),   // 1.0 KRX  (--light)
+    (GLM_4_9B_0414_MODEL_ID,      150_000_000),   // 1.5 KRX  (default)
+    (QWEN3_6_27B_MODEL_ID,        250_000_000),   // 2.5 KRX  (--high)
+    (KIMI_LINEAR_48B_MODEL_ID,    400_000_000),   // 4.0 KRX  (--very-high)
+];
+
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
 
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
@@ -139,16 +204,19 @@ pub const POM_WALK_STEPS: u32 = 256;
 pub const POM_OPENINGS: usize = 32;
 
 /// Selected-chain depth, in chain blocks, behind which a block's persisted `PomProof` may be
-/// garbage-collected. Each proof is ~48 KB; persisting one per block over the full body window
-/// (`pruning_depth`, days of blocks) is what doubled pruned datadirs after the PoM hardfork. A
-/// proof is only ever needed to (re-)serve a *recent* block to peers via relay; far older blocks
-/// are only ever requested through IBD, which does not verify the proof (`skip_pom_proof`). So
-/// keeping proofs for the last `POM_PROOF_RETENTION_DEPTH` chain blocks (~83 min at 10 BPS) is far
-/// more than the relay horizon (a few hundred blocks) and lets the rest be reclaimed. Deleting a
+/// garbage-collected. A proof is only ever needed to (re-)serve a *recent* block to peers via relay;
+/// far older blocks are only ever requested through IBD, which does not verify the proof
+/// (`skip_pom_proof`). So keeping proofs for the last `POM_PROOF_RETENTION_DEPTH` DAA-score depth is
+/// far more than the relay horizon (a few hundred blocks) and lets the rest be reclaimed. Deleting a
 /// proof can never corrupt consensus state: the proof is not part of the UTXO set / state, and the
 /// header `utxo_commitment` already pins the state. The GC pass runs unconditionally on every node
 /// (see the pruning processor) — no flag, transparent — so pruned datadirs stay bounded by design.
-pub const POM_PROOF_RETENTION_DEPTH: u64 = 50_000;
+///
+/// Lowered 50_000 → 25_000 for the H4 verifier-v2 proofs: v2 records the full K=256-step walk
+/// (256 Merkle paths) instead of the v1 32/256 spot-check, so each proof is ~2.7× bigger (~228 KB
+/// vs ~48 KB). At 25_000 the pruned proof store stays ~6 GB (vs ~12 GB at 50_000), keeping the
+/// bootstrap datadir near its H3 size. Still far above the relay horizon; not consensus (per above).
+pub const POM_PROOF_RETENTION_DEPTH: u64 = 25_000;
 
 /// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
 /// produced offline by `pom-rt-builder` (canonical: name-sorted GGUF tensors). Tier index =
@@ -220,12 +288,61 @@ pub const POM_TIERS_H2: &[crate::pom::PomTier] = &[
     },
 ];
 
+/// H4 (candle-free) possession anchors, gated by `coin_age_activation`. Same 5-tier ORDER as H2
+/// (tier index → reward position unchanged), swapping every model for an UNTIED one so llama.cpp
+/// hosts walk + inference with no candle: EXAONE-1.2B=0, Mistral-7B=1, GLM-4-9B=2, Qwen3.6-27B=3,
+/// Kimi-Linear-48B=4. MUST mirror the miner's `pom_tier_index` H4 ordering. Roots spike-verified.
+pub const POM_TIERS_H4: &[crate::pom::PomTier] = &[
+    crate::pom::PomTier {
+        model_id: EXAONE_4_0_1_2B_MODEL_ID,
+        root: [
+            0xcc, 0x8b, 0x25, 0xc4, 0xe1, 0xaa, 0x7a, 0xb9, 0xbb, 0x99, 0x41, 0xda, 0x16, 0x18, 0xf9, 0xab,
+            0x29, 0x38, 0xea, 0x85, 0x07, 0x7b, 0x88, 0x79, 0xeb, 0xd7, 0xd4, 0x91, 0x6a, 0xc3, 0x8d, 0xdd,
+        ],
+        chunks: 28_943_588,
+    },
+    crate::pom::PomTier {
+        model_id: MISTRAL_7B_V03_MODEL_ID,
+        root: [
+            0xd7, 0x6a, 0xcb, 0xbe, 0x8c, 0x24, 0x29, 0x81, 0x6c, 0x02, 0xa4, 0xdb, 0xd9, 0xf2, 0x09, 0xa0,
+            0x87, 0x85, 0xef, 0x97, 0x5c, 0xd1, 0x38, 0xf5, 0x18, 0x22, 0x76, 0x12, 0x0b, 0xa2, 0x0e, 0xc5,
+        ],
+        chunks: 185_827_840,
+    },
+    crate::pom::PomTier {
+        model_id: GLM_4_9B_0414_MODEL_ID,
+        root: [
+            0x1b, 0xa8, 0xb8, 0xb1, 0x34, 0x41, 0x03, 0xfa, 0xa0, 0xa7, 0x47, 0x89, 0xd9, 0x39, 0xc3, 0x3c,
+            0x23, 0xba, 0x5c, 0x3c, 0x41, 0xbb, 0x1a, 0x89, 0x5a, 0xb6, 0xe8, 0xbf, 0xec, 0xb0, 0x78, 0x7d,
+        ],
+        chunks: 258_040_832,
+    },
+    crate::pom::PomTier {
+        model_id: QWEN3_6_27B_MODEL_ID,
+        root: [
+            0x85, 0x23, 0xf4, 0x14, 0x8d, 0x22, 0xc7, 0x71, 0x3b, 0xfc, 0x11, 0x32, 0xb4, 0xaf, 0x3d, 0x4b,
+            0x97, 0x61, 0xa2, 0x03, 0xfb, 0x33, 0xf1, 0x8e, 0xe7, 0x55, 0x67, 0xbd, 0xee, 0x51, 0x2b, 0x0a,
+        ],
+        chunks: 516_762_688,
+    },
+    crate::pom::PomTier {
+        model_id: KIMI_LINEAR_48B_MODEL_ID,
+        root: [
+            0x95, 0x74, 0x71, 0x0f, 0xfa, 0xb6, 0x78, 0xf0, 0x68, 0xb4, 0xe6, 0x5a, 0xbe, 0x72, 0x40, 0x86,
+            0x2d, 0xa1, 0x5b, 0xb1, 0x6e, 0xa8, 0x2f, 0xd1, 0x62, 0xa9, 0x35, 0x1a, 0x10, 0x51, 0x99, 0x59,
+        ],
+        chunks: 927_994_064,
+    },
+];
+
 /// Possession anchors for a block at `daa_score`: the 5-tier H2 set once `very_light_activation`
 /// is live, the legacy 4-tier set before. The choice MUST be made per block from that block's own
 /// DAA (never frozen) — an archival/IBD node recomputing a pre-H2 block under the 5-tier scheme
 /// would validate against the wrong anchors and reject the chain.
-pub fn pom_tiers(very_light_active: bool) -> &'static [crate::pom::PomTier] {
-    if very_light_active {
+pub fn pom_tiers(coin_age_active: bool, very_light_active: bool) -> &'static [crate::pom::PomTier] {
+    if coin_age_active {
+        POM_TIERS_H4
+    } else if very_light_active {
         POM_TIERS_H2
     } else {
         POM_TIERS
@@ -296,6 +413,20 @@ pub const RATIO_REWARD_BPS_DIVISOR: u64 = 10_000;
 /// ascending and start at 0 (bracket 0 always reachable). Reading: 0/1/3/7/15/30 windows held.
 pub const RATIO_REWARD_THRESHOLDS: [u64; 6] = [0, 1, 3, 7, 15, 30];
 
+/// Ratio-reward v2 — recalibrated bracket table, gated by `coin_age_activation` (bundled into H4,
+/// one hardfork instead of two): higher floor (50 % instead of 40 %, less burn overall) and a
+/// gentler 9-step ramp to 100 % over 90 days. Deliberately stays within 0-100 % — a bracket above
+/// 100 % would let the ratio bonus compensate the tier-reward penalty, which was rejected: it
+/// would let a miner with the hardware for a big tier deliberately run a small one and, given
+/// enough patience, still reach full reward — undermining the tier-reward's entire purpose
+/// (rewarding real model capacity). See KERYX-KRX/ratio_reward_spec.md (v2 addendum).
+pub const RATIO_REWARD_BPS_V2: [u64; 9] = [5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 9_000, 10_000];
+
+/// Bracket entry thresholds for `RATIO_REWARD_BPS_V2`, same semantics as `RATIO_REWARD_THRESHOLDS`
+/// (integer multiples of windowed production; 1 window = 24h at 10 BPS today). Reading:
+/// 0/3/7/15/30/45/60/75/90 days held.
+pub const RATIO_REWARD_THRESHOLDS_V2: [u64; 9] = [0, 3, 7, 15, 30, 45, 60, 75, 90];
+
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
 /// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
@@ -315,18 +446,36 @@ pub const RATIO_REWARD_WINDOW: u64 = 864_000;
 /// selected-chain depth than the legacy window (~190k chain blocks), comfortably inside pruning.
 pub const RATIO_REWARD_WINDOW_DAA: u64 = 864_000;
 
+/// Coin-age (holder-reward v3) maturity period, in DAA score: 24h at 10 BPS. A coin younger
+/// than this counts toward the ratio numerator at the linear prorata of its age (`v·age/W`);
+/// at/after it, at its full face value. Set equal to the production window: 24h of holding is
+/// enough to break bracket-farming by address hopping, while keeping the maturity ramp short so
+/// normal holders are not over-penalised. See
+/// KERYX-KRX/coin_age_holder_reward_spec.md §2/§9. Used at/after `coin_age_activation`.
+pub const COIN_AGE_MATURITY_W: u64 = 864_000; // 24h at 10 BPS
+
 /// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
 /// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
 /// (a zero-history / freshly-rotated address would otherwise hit the top bracket for free).
-///
-/// Division-free: bracket `i` is reached iff `balance >= THRESHOLDS[i] * production`. Thresholds
-/// are ascending, so the first failing bracket ends the scan. `u128` math avoids overflow on the
-/// `threshold * production` product.
 pub fn ratio_reward_bps(balance: u64, production: u64) -> u64 {
-    let mut bps = RATIO_REWARD_BPS[0];
-    for i in 0..RATIO_REWARD_THRESHOLDS.len() {
-        if (balance as u128) >= (RATIO_REWARD_THRESHOLDS[i] as u128) * (production as u128) {
-            bps = RATIO_REWARD_BPS[i];
+    ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS, &RATIO_REWARD_BPS)
+}
+
+/// Same as `ratio_reward_bps`, against the recalibrated `RATIO_REWARD_BPS_V2` table. Gated by
+/// `coin_age_activation` (bundled into H4).
+pub fn ratio_reward_bps_v2(balance: u64, production: u64) -> u64 {
+    ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS_V2, &RATIO_REWARD_BPS_V2)
+}
+
+/// Division-free bracket scan shared by `ratio_reward_bps`/`ratio_reward_bps_v2`: bracket `i` is
+/// reached iff `balance >= thresholds[i] * production`. Thresholds are ascending, so the first
+/// failing bracket ends the scan. `u128` math avoids overflow on the `threshold * production`
+/// product. `thresholds` and `bps_table` MUST be the same length.
+fn ratio_bracket_bps(balance: u64, production: u64, thresholds: &[u64], bps_table: &[u64]) -> u64 {
+    let mut bps = bps_table[0];
+    for i in 0..thresholds.len() {
+        if (balance as u128) >= (thresholds[i] as u128) * (production as u128) {
+            bps = bps_table[i];
         } else {
             break;
         }
@@ -744,6 +893,14 @@ pub struct Params {
     /// Forward-only: blocks below this score keep their original bits (no re-org). `never()` to disable.
     pub difficulty_reset_activation: ForkActivation,
 
+    /// SECOND difficulty-reset window, for the H4 relaunch. Additive to `difficulty_reset_activation`:
+    /// each reset is a self-contained window `[activation, activation + full_window)` that forces
+    /// `genesis.bits`. A dedicated field (rather than moving the existing one) because the H2 reset at
+    /// `difficulty_reset_activation` is load-bearing consensus history — an archival node re-derives
+    /// those blocks, so its window must never shift. Driven by `H4_ACTIVATION_DAA`. `never()` while H4
+    /// is unscheduled.
+    pub difficulty_reset_activation_h4: ForkActivation,
+
     /// Length (in blocks) of the trailing selected-chain window over which a payout address's
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
@@ -754,6 +911,24 @@ pub struct Params {
     /// H3 ratio-reward window in DAA score (fixed real-time duration, per-blue accounting era).
     /// Defaults to `RATIO_REWARD_WINDOW_DAA`; a Params field so tests can shrink it.
     pub ratio_reward_window_daa: u64,
+
+    /// Coin-age holder-reward (v3, H4) activation DAA score. At/after this score the ratio-reward
+    /// numerator switches from the instantaneous balance to the per-coin-capped effective balance
+    /// (`coin_age::eff_balance_from_buckets`), closing the "rotation" exploit (bracket-farming by
+    /// hopping the pot across fresh addresses). Requires the `effective_daa` UtxoEntry field
+    /// (hard fork: UTXO commitment changes at this boundary). `never()` until H4 is scheduled.
+    pub coin_age_activation: ForkActivation,
+
+    /// Coin-age VERIFICATION boundary (mirrors `ratio_verification_activation`): coinbase outputs
+    /// are re-derived with the coin-age numerator and enforced only at/after this score, covering
+    /// the post-activation migration window where trusted transition blocks may precede full
+    /// cross-node determinism. `never()` until H4 is scheduled.
+    pub coin_age_verification_activation: ForkActivation,
+
+    /// Coin-age maturity period in DAA score. Defaults to `COIN_AGE_MATURITY_W` (24h); a
+    /// Params field (not the const) so tests can shrink it to exercise the maturity ramp and
+    /// the immature→mature bucket promotion.
+    pub coin_age_maturity_w: u64,
 }
 
 impl Params {
@@ -951,9 +1126,14 @@ impl Params {
             ratio_reward_activation: self.ratio_reward_activation,
             ratio_verification_activation: self.ratio_verification_activation,
             difficulty_reset_activation: self.difficulty_reset_activation,
+            difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
 
             ratio_reward_window: self.ratio_reward_window,
             ratio_reward_window_daa: self.ratio_reward_window_daa,
+
+            coin_age_activation: self.coin_age_activation,
+            coin_age_verification_activation: self.coin_age_verification_activation,
+            coin_age_maturity_w: self.coin_age_maturity_w,
         }
     }
 }
@@ -1108,8 +1288,18 @@ pub const MAINNET_PARAMS: Params = Params {
     // genesis.bits. The chain relaunches at the launch target and the DAA re-converges upward to
     // the real PoM hashrate within one window. MUST match across all honest nodes.
     difficulty_reset_activation: ForkActivation::new(38_951_445),
+    // H4 relaunch difficulty reset — additive, driven by the single H4 flip point.
+    difficulty_reset_activation_h4: ForkActivation::new(H4_ACTIVATION_DAA),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
+
+    // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
+    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue), plus the
+    // recalibrated ratio-reward v2 bracket table, gates here — one hardfork, one gate.
+    // Both driven by the single `H4_ACTIVATION_DAA` flip point (set it at release).
+    coin_age_activation: ForkActivation::new(H4_ACTIVATION_DAA),
+    coin_age_verification_activation: ForkActivation::new(H4_ACTIVATION_DAA),
+    coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
 
 pub const TESTNET_PARAMS: Params = Params {
@@ -1159,20 +1349,22 @@ pub const TESTNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // Testnet mirrors the current mainnet state from genesis: every pre-H3 fork
-    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward) is active at
-    // DAA 0, so the only transition exercised on this testnet is H3 below.
+    // Testnet mirrors the current mainnet state from genesis: every shipped fork
+    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels)
+    // is active at DAA 0, so the only transition exercised on this testnet is the
+    // coin-age H4 rehearsal below.
     opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
     // PoM possession: active from genesis (mainnet-state baseline).
     pom_activation: ForkActivation::new(0),
     very_light_activation: ForkActivation::new(0), // H2 5-tier lineup from genesis
-    // PoM block-level hardfork (H3): testnet DAA 2_000 to exercise the header-format
-    // transition (pre-H3 PoM blocks at level 0, post-H3 real levels + pom_final_state
-    // hashed) and the pruning-proof re-boundedness. MUST mirror the miner's testnet
-    // activation.
-    pom_level_activation: ForkActivation::new(2_000),
+    // H3 block levels: active from the first mined block (mainnet-state baseline; the H3
+    // transition was rehearsed on the previous testnet). `new(1)` and NOT `new(0)`/`always()`:
+    // this activation also drives the global header-hashing switch (`init_pom_level_activation`),
+    // and genesis (daa 0) must keep its pinned legacy hash, which does not commit
+    // `pom_final_state`. MUST mirror the miner's testnet activation.
+    pom_level_activation: ForkActivation::new(1),
     inference_min_h2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
 
@@ -1187,13 +1379,26 @@ pub const TESTNET_PARAMS: Params = Params {
     // Ratio-reward: active from genesis (mainnet-state baseline).
     ratio_reward_activation: ForkActivation::new(0),
     ratio_verification_activation: ForkActivation::new(0), // no corrupted history on testnet — verify all
-    // Testnet has no frozen-chain history to relaunch from; difficulty reset stays disabled.
+    // Testnet has no frozen-chain history to relaunch from; the H2 difficulty reset stays disabled.
     difficulty_reset_activation: ForkActivation::never(),
+    // H4 reset ENABLED on testnet (mirrors the coin-age gates at 3_000) so the additive-reset path
+    // is exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
+    difficulty_reset_activation_h4: ForkActivation::new(3_000),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
     // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
     ratio_reward_window: 1_000,
     ratio_reward_window_daa: 1_000,
+
+    // Coin-age holder-reward (v3): the ONLY mid-chain transition on this testnet — from genesis
+    // the chain is in the current-mainnet state (everything above at 0), then at DAA 3_000 the H4
+    // boundary fires: FIFO anchors start, the per-coin muhash field appears, the ratio numerator
+    // switches to the effective balance, the recalibrated ratio-reward v2 bracket table takes
+    // over, and the shrunk maturity ramp (W=2_000) + queue promotions kick in. Rehearses the
+    // mainnet H4 gate end-to-end.
+    coin_age_activation: ForkActivation::new(3_000),
+    coin_age_verification_activation: ForkActivation::new(3_000),
+    coin_age_maturity_w: 2_000,
 };
 
 pub const SIMNET_PARAMS: Params = Params {
@@ -1250,8 +1455,15 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
+    difficulty_reset_activation_h4: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
+
+    // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
+    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue) gates here.
+    coin_age_activation: ForkActivation::never(),
+    coin_age_verification_activation: ForkActivation::never(),
+    coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
 
 pub const DEVNET_PARAMS: Params = Params {
@@ -1306,6 +1518,59 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
+    difficulty_reset_activation_h4: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
+
+    // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
+    // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue) gates here.
+    coin_age_activation: ForkActivation::never(),
+    coin_age_verification_activation: ForkActivation::never(),
+    coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
+
+#[cfg(test)]
+mod ratio_reward_bps_tests {
+    use super::*;
+
+    const P: u64 = 1_000_000; // arbitrary windowed production
+
+    #[test]
+    fn v1_brackets_unchanged() {
+        // Regression lock for the pre-existing table after factoring out `ratio_bracket_bps`.
+        assert_eq!(ratio_reward_bps(0, P), 4_000);
+        assert_eq!(ratio_reward_bps(1 * P, P), 5_200);
+        assert_eq!(ratio_reward_bps(3 * P, P), 6_400);
+        assert_eq!(ratio_reward_bps(7 * P, P), 7_600);
+        assert_eq!(ratio_reward_bps(15 * P, P), 8_800);
+        assert_eq!(ratio_reward_bps(30 * P, P), 10_000);
+        assert_eq!(ratio_reward_bps(1_000 * P, P), 10_000); // holding far beyond top bracket stays capped
+    }
+
+    #[test]
+    fn v2_brackets_exact_boundaries() {
+        assert_eq!(ratio_reward_bps_v2(0, P), 5_000);
+        assert_eq!(ratio_reward_bps_v2(3 * P, P), 5_500);
+        assert_eq!(ratio_reward_bps_v2(7 * P, P), 6_000);
+        assert_eq!(ratio_reward_bps_v2(15 * P, P), 6_500);
+        assert_eq!(ratio_reward_bps_v2(30 * P, P), 7_000);
+        assert_eq!(ratio_reward_bps_v2(45 * P, P), 7_500);
+        assert_eq!(ratio_reward_bps_v2(60 * P, P), 8_000);
+        assert_eq!(ratio_reward_bps_v2(75 * P, P), 9_000); // note: 85% bracket deliberately skipped
+        assert_eq!(ratio_reward_bps_v2(90 * P, P), 10_000);
+    }
+
+    #[test]
+    fn v2_never_exceeds_100_percent() {
+        // No bracket above 100%, unlike a tier-compensation table would need — by design.
+        assert!(RATIO_REWARD_BPS_V2.iter().all(|&bps| bps <= RATIO_REWARD_BPS_DIVISOR));
+        assert_eq!(ratio_reward_bps_v2(u64::MAX / 2, P), 10_000); // extreme holding still capped at 100%
+    }
+
+    #[test]
+    fn v2_one_below_each_threshold_stays_in_lower_bracket() {
+        // Off-by-one just under each threshold must NOT round up to the next bracket.
+        assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
+        assert_eq!(ratio_reward_bps_v2(90 * P - 1, P), 9_000);
+    }
+}

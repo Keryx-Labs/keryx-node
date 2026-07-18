@@ -2,6 +2,7 @@ use super::{
     utxo_collection::*,
     utxo_error::{UtxoAlgebraError, UtxoResult},
 };
+use crate::coin_age::assign_output_effective_daa;
 use crate::tx::{TransactionOutpoint, UtxoEntry, VerifiableTransaction};
 use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
@@ -221,7 +222,28 @@ impl UtxoDiff {
         Ok(result)
     }
 
-    pub fn add_transaction(&mut self, transaction: &impl VerifiableTransaction, block_daa_score: u64) -> UtxoResult<()> {
+    /// Applies a validated transaction to the diff. `coin_age_active` selects the coin-age era
+    /// (holder-reward v3, at/after `coin_age_activation`): when active, outputs whose SPK also
+    /// appears among the spent inputs inherit the FIFO-surviving age anchor (same-address
+    /// consolidation keeps its age, cross-address transfers reset — see
+    /// `coin_age::assign_output_effective_daa`); when inactive, every output anchors at its
+    /// creation score (`effective_daa == block_daa_score`, the pre-H4 invariant). The caller
+    /// derives the flag from the POV block's own daa score so IBD re-validation of pre-fork
+    /// history stays canonical.
+    pub fn add_transaction(&mut self, transaction: &impl VerifiableTransaction, block_daa_score: u64, coin_age_active: bool) -> UtxoResult<()> {
+        // Anchors are resolved BEFORE entries are consumed: the FIFO rule reads the spent inputs'
+        // (spk, amount, effective_daa) in tx input order — the consensus-canonical tie-break.
+        let anchors: Option<Vec<u64>> = if coin_age_active {
+            let inputs: Vec<_> = transaction
+                .populated_inputs()
+                .map(|(_, entry)| (&entry.script_public_key, entry.amount, entry.effective_daa))
+                .collect();
+            let outputs: Vec<_> = transaction.outputs().iter().map(|output| (&output.script_public_key, output.value)).collect();
+            Some(assign_output_effective_daa(&inputs, &outputs, block_daa_score))
+        } else {
+            None
+        };
+
         for (input, entry) in transaction.populated_inputs() {
             self.remove_entry(&input.previous_outpoint, entry)?;
         }
@@ -231,7 +253,10 @@ impl UtxoDiff {
 
         for (i, output) in transaction.outputs().iter().enumerate() {
             let outpoint = TransactionOutpoint::new(tx_id, i as u32);
-            let entry = UtxoEntry::new(output.value, output.script_public_key.clone(), block_daa_score, is_coinbase);
+            let entry = match &anchors {
+                Some(anchors) => UtxoEntry::new_aged(output.value, output.script_public_key.clone(), block_daa_score, is_coinbase, anchors[i]),
+                None => UtxoEntry::new(output.value, output.script_public_key.clone(), block_daa_score, is_coinbase),
+            };
             self.add_entry(outpoint, entry)?;
         }
         Ok(())
@@ -263,8 +288,69 @@ impl UtxoDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tx::{ScriptPublicKey, TransactionId};
+    use crate::subnets::SubnetworkId;
+    use crate::tx::{MutableTransaction, ScriptPublicKey, ScriptVec, Transaction, TransactionId, TransactionInput, TransactionOutput};
     use std::str::FromStr;
+
+    /// End-to-end check of the coin-age era switch in `add_transaction`: with `coin_age_active`,
+    /// the change output (same SPK as the inputs) inherits the FIFO-surviving anchor while the
+    /// transfer output resets to the POV score; without it, every output anchors at its creation
+    /// score (the pre-H4 invariant).
+    #[test]
+    fn add_transaction_assigns_coin_age_anchors() {
+        const D: u64 = 5_000_000; // POV daa score
+        let spk_a = ScriptPublicKey::new(0, ScriptVec::from_slice(&[1u8; 3]));
+        let spk_b = ScriptPublicKey::new(0, ScriptVec::from_slice(&[2u8; 3]));
+        let prev: TransactionId = 7.into();
+
+        let make_tx = || {
+            Transaction::new(
+                0,
+                (0..2u32)
+                    .map(|index| TransactionInput {
+                        previous_outpoint: TransactionOutpoint { transaction_id: prev, index },
+                        signature_script: vec![],
+                        sequence: index as u64,
+                        sig_op_count: 0,
+                    })
+                    .collect(),
+                vec![
+                    TransactionOutput { value: 100, script_public_key: spk_a.clone() }, // change (same SPK)
+                    TransactionOutput { value: 100, script_public_key: spk_b.clone() }, // transfer
+                ],
+                0,
+                SubnetworkId::from_bytes([0; 20]),
+                0,
+                vec![],
+            )
+        };
+        // Two spent inputs @ A with distinct anchors: FIFO must destroy the oldest (100) and
+        // carry the youngest (900) into the change.
+        let entries = || {
+            vec![
+                UtxoEntry::new_aged(100, spk_a.clone(), 50, false, 100),
+                UtxoEntry::new_aged(100, spk_a.clone(), 60, false, 900),
+            ]
+        };
+
+        // Coin-age era: change keeps the FIFO survivor, transfer resets to D.
+        let mtx = MutableTransaction::with_entries(make_tx(), entries());
+        let mut diff = UtxoDiff::default();
+        diff.add_transaction(&mtx.as_verifiable(), D, true).unwrap();
+        let tx_id = mtx.tx.id();
+        let change = &diff.add[&TransactionOutpoint::new(tx_id, 0)];
+        let transfer = &diff.add[&TransactionOutpoint::new(tx_id, 1)];
+        assert_eq!(change.effective_daa, 900);
+        assert_eq!(transfer.effective_daa, D);
+        assert_eq!((change.block_daa_score, transfer.block_daa_score), (D, D));
+
+        // Pre-H4: every output anchors at its creation score.
+        let mtx = MutableTransaction::with_entries(make_tx(), entries());
+        let mut diff = UtxoDiff::default();
+        diff.add_transaction(&mtx.as_verifiable(), D, false).unwrap();
+        assert_eq!(diff.add[&TransactionOutpoint::new(tx_id, 0)].effective_daa, D);
+        assert_eq!(diff.add[&TransactionOutpoint::new(tx_id, 1)].effective_daa, D);
+    }
 
     #[test]
     fn test_utxo_diff_rules() {

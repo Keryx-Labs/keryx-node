@@ -391,6 +391,7 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
             initial_trace_path: vec![],
             final_trace_path: vec![],
             openings: vec![],
+            steps_v2: None,
         }
     }
 

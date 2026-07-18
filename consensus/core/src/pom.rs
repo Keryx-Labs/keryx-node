@@ -67,6 +67,19 @@ pub struct PomOpening {
     pub trace_path_after: Vec<[u8; 32]>,
 }
 
+/// One step of the H4 recompute-from-chunks walk record: the 32 B weight chunk the walk
+/// read at this step, plus its inclusion path under the tier root `R_T`. The chunk index
+/// is NOT carried — the verifier derives it (`state % N`) while re-walking, so a prover
+/// cannot open a chunk at an index the walk never visited.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PomStep {
+    /// The 32-byte weight chunk read at this step (candle's exact quantized bytes).
+    pub chunk: [u8; 32],
+    /// Merkle path proving `leaf(chunk)` is at the derived index `state % N` under `R_T`.
+    pub weight_path: Vec<[u8; 32]>,
+}
+
 /// Post-PoW possession witness, carried at the `Block` level (outside `pre_pow_hash`).
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +99,61 @@ pub struct PomProof {
     pub final_trace_path: Vec<[u8; 32]>,
     /// The `t` Fiat-Shamir openings, in challenge order.
     pub openings: Vec<PomOpening>,
+    /// H4 recompute-from-chunks walk record: the K chunks the winning walk read, in step
+    /// order, each Merkle-proven under `R_T`. When present the verifier re-walks all K
+    /// transitions itself (`verify_pom_proof_v2`) and derives `final_state` — no trace
+    /// tree, no spot-check, nothing taken on the prover's word (the 32/256 spot-check this
+    /// replaces accepted a forged `final_state` ~88% of the time). `None` on every pre-H4
+    /// proof. Trailing field: on the borsh wire a `None` proof is re-encoded through the
+    /// `PomProofPreH4` layout (`to_wire_bytes`) so it stays byte-identical for not-yet-updated
+    /// peers; in the node-local bincode DB, old records (written before this field existed)
+    /// decode via the `PomProofPreH4` fallback in `DbPomProofStore`.
+    pub steps_v2: Option<Vec<PomStep>>,
+}
+
+/// Exact pre-H4 layout of `PomProof` (no `steps_v2`). Decode-fallback target for legacy
+/// wire/DB bytes and byte-identical encode source for proofs without the v2 extension —
+/// an updated node re-serving a pre-H4 block must emit the exact bytes a not-yet-updated
+/// peer expects. Same mechanism as `UtxoEntryPreH4` / `HeaderWithBlockLevelPreH3`.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PomProofPreH4 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+}
+
+impl From<PomProofPreH4> for PomProof {
+    fn from(p: PomProofPreH4) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: None,
+        }
+    }
+}
+
+impl From<&PomProof> for PomProofPreH4 {
+    fn from(p: &PomProof) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path.clone(),
+            final_trace_path: p.final_trace_path.clone(),
+            openings: p.openings.clone(),
+        }
+    }
 }
 
 impl PomProof {
@@ -102,7 +170,28 @@ impl PomProof {
             .iter()
             .map(|o| 32 + 8 + path_bytes(&o.weight_path) + path_bytes(&o.trace_path_before) + path_bytes(&o.trace_path_after))
             .sum();
-        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings
+        let steps: usize =
+            self.steps_v2.as_ref().map_or(0, |steps| steps.iter().map(|s| 32 + path_bytes(&s.weight_path)).sum());
+        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps
+    }
+
+    /// Canonical wire (borsh) encoding, era-exact: a proof without the v2 extension encodes
+    /// byte-identically to the pre-H4 layout, so re-served pre-H4 blocks stay readable by
+    /// not-yet-updated peers. ALL borsh encode sites MUST use this instead of `borsh::to_vec`.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        if self.steps_v2.is_none() {
+            borsh::to_vec(&PomProofPreH4::from(self)).expect("PomProof borsh serialize")
+        } else {
+            borsh::to_vec(self).expect("PomProof borsh serialize")
+        }
+    }
+
+    /// Decode the canonical wire (borsh) encoding, either era. A pre-H4 stream ends exactly
+    /// where the `steps_v2` option tag would sit, so the full decode fails cleanly and the
+    /// legacy fallback applies; a v2 stream fails the legacy decode (trailing bytes), so the
+    /// two layouts can never be confused. ALL borsh decode sites MUST use this.
+    pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        borsh::from_slice::<PomProof>(bytes).or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
 }
 
@@ -133,6 +222,15 @@ pub enum PomVerifyError {
     BadStateBeforePath,
     BadWeightPath,
     BadStateAfterPath,
+    // --- H4 recompute-from-chunks (verify_pom_proof_v2) ---
+    /// Post-H4 proof without the `steps_v2` walk record.
+    MissingSteps,
+    /// `steps_v2` length differs from the walk length `K`.
+    WrongStepCount,
+    /// Post-H4 proof still carries legacy trace-tree fields (must be canonically empty).
+    NonCanonicalLegacyFields,
+    /// The claimed `final_state` differs from the state derived by re-walking the chunks.
+    FinalStateMismatch,
 }
 
 #[inline]
@@ -352,6 +450,58 @@ pub fn verify_pom_proof<Hf: Fn(u64) -> [u8; 32]>(
     Ok(())
 }
 
+/// H4 verifier — recompute-from-chunks. The prover supplies the K chunks its winning walk
+/// read (in step order), each Merkle-proven under the tier root `r_t`; the verifier re-walks
+/// every transition itself, deriving each chunk index (`state % N`) and the `final_state`.
+/// No transition is taken on the prover's word — this closes the soundness hole of the 32/256
+/// spot-check (`verify_pom_proof`), where the 224 unopened transitions let a single honest
+/// walk back a hash-grinded `final_state` with ~88% acceptance.
+///
+/// Legacy trace-tree fields must be canonically empty (`trace_root == 0`, empty paths and
+/// openings): one canonical encoding per post-H4 proof, no dead 47 KB payload. `final_state`
+/// and `pow_value` stay meaningful but are CHECKED against the derived walk, never trusted.
+/// The caller still cross-checks `final_state` against `Header::pom_final_state` (H3 rule).
+pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
+    seed: u64,
+    proof: &PomProof,
+    n_chunks: u64,
+    k: u32,
+    r_t: &[u8; 32],
+    target: &[u8; 32],
+    final_hash: Hf,
+) -> Result<(), PomVerifyError> {
+    let steps = proof.steps_v2.as_ref().ok_or(PomVerifyError::MissingSteps)?;
+    if steps.len() != k as usize {
+        return Err(PomVerifyError::WrongStepCount);
+    }
+    if proof.trace_root != [0u8; 32]
+        || !proof.initial_trace_path.is_empty()
+        || !proof.final_trace_path.is_empty()
+        || !proof.openings.is_empty()
+    {
+        return Err(PomVerifyError::NonCanonicalLegacyFields);
+    }
+    let mut state = seed;
+    for step in steps.iter() {
+        let off = state % n_chunks;
+        if !verify_merkle(blake(&step.chunk), off, &step.weight_path, r_t) {
+            return Err(PomVerifyError::BadWeightPath);
+        }
+        state = transition(state, &chunk_to_words(&step.chunk));
+    }
+    if state != proof.final_state {
+        return Err(PomVerifyError::FinalStateMismatch);
+    }
+    let pow_value = final_hash(state);
+    if pow_value != proof.pow_value {
+        return Err(PomVerifyError::PowValueMismatch);
+    }
+    if !le_leq(&pow_value, target) {
+        return Err(PomVerifyError::TargetNotMet);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod verify_tests {
     use super::*;
@@ -451,8 +601,35 @@ mod verify_tests {
             initial_trace_path: merkle_proof(&trace_leaves, 0),
             final_trace_path: merkle_proof(&trace_leaves, k as usize),
             openings,
+            steps_v2: None,
         };
         (proof, r_t, seed)
+    }
+
+    // Inline v2 prover (test-only): walk once recording the chunks, open every step under R_T.
+    fn build_v2(n_chunks: u64, k: u32, seed: u64) -> (PomProof, [u8; 32]) {
+        let weight_leaves: Vec<[u8; 32]> = (0..n_chunks).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
+        let r_t = merkle_root(&weight_leaves);
+
+        let mut steps = Vec::with_capacity(k as usize);
+        let mut state = seed;
+        for _ in 0..k {
+            let off = state % n_chunks;
+            steps.push(PomStep { chunk: words_to_bytes(&synth_chunk(off)), weight_path: merkle_proof(&weight_leaves, off as usize) });
+            state = transition(state, &synth_chunk(off));
+        }
+        let final_state = state;
+        let proof = PomProof {
+            tier: 0,
+            trace_root: [0u8; 32],
+            pow_value: trace_leaf(final_state), // stand-in final_hash for tests
+            final_state,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: Some(steps),
+        };
+        (proof, r_t)
     }
 
     fn fh(s: u64) -> [u8; 32] {
@@ -483,5 +660,131 @@ mod verify_tests {
         assert_eq!(verify_pom_proof(&pph, nonce, seed, &p2, n, k, t, &r_t, &pass, fh), Err(PomVerifyError::BadWeightPath));
         // target not met
         assert_eq!(verify_pom_proof(&pph, nonce, seed, &proof, n, k, t, &r_t, &[0u8; 32], fh), Err(PomVerifyError::TargetNotMet));
+    }
+
+    #[test]
+    fn v2_verify_roundtrip_and_tamper() {
+        let (n, k) = (4096u64, 256u32);
+        let seed = pom_seed_state(0xabc);
+        let (proof, r_t) = build_v2(n, k, seed);
+        let pass = [0xffu8; 32];
+
+        // honest
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh), Ok(()));
+        // wrong tier root
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &blake(b"wrong"), &pass, fh), Err(PomVerifyError::BadWeightPath));
+        // wrong seed: the very first derived index no longer matches the opened path
+        assert_eq!(verify_pom_proof_v2(seed ^ 1, &proof, n, k, &r_t, &pass, fh), Err(PomVerifyError::BadWeightPath));
+        // tampered chunk
+        let mut p2 = proof.clone();
+        p2.steps_v2.as_mut().unwrap()[100].chunk[0] ^= 0xff;
+        assert_eq!(verify_pom_proof_v2(seed, &p2, n, k, &r_t, &pass, fh), Err(PomVerifyError::BadWeightPath));
+        // truncated walk
+        let mut p3 = proof.clone();
+        p3.steps_v2.as_mut().unwrap().pop();
+        assert_eq!(verify_pom_proof_v2(seed, &p3, n, k, &r_t, &pass, fh), Err(PomVerifyError::WrongStepCount));
+        // missing steps entirely
+        let mut p4 = proof.clone();
+        p4.steps_v2 = None;
+        assert_eq!(verify_pom_proof_v2(seed, &p4, n, k, &r_t, &pass, fh), Err(PomVerifyError::MissingSteps));
+        // legacy trace-tree fields must stay canonically empty
+        let mut p5 = proof.clone();
+        p5.trace_root = [1u8; 32];
+        assert_eq!(verify_pom_proof_v2(seed, &p5, n, k, &r_t, &pass, fh), Err(PomVerifyError::NonCanonicalLegacyFields));
+        let mut p6 = proof.clone();
+        p6.openings.push(PomOpening {
+            state_before: 0,
+            chunk: [0u8; 32],
+            weight_path: vec![],
+            trace_path_before: vec![],
+            trace_path_after: vec![],
+        });
+        assert_eq!(verify_pom_proof_v2(seed, &p6, n, k, &r_t, &pass, fh), Err(PomVerifyError::NonCanonicalLegacyFields));
+        // target not met
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &[0u8; 32], fh), Err(PomVerifyError::TargetNotMet));
+    }
+
+    /// The spot-check exploit scenario, replayed against v2: keep one honest walk record but
+    /// grind `final_state`/`pow_value` in pure hashing. Under the 32/256 spot-check this was
+    /// accepted ~88% of the time; under v2 the verifier derives `final_state` from the chunks
+    /// itself, so EVERY forged value is rejected — no probabilistic escape hatch.
+    #[test]
+    fn v2_forged_final_state_always_rejected() {
+        let (n, k) = (4096u64, 256u32);
+        let seed = pom_seed_state(0xdead);
+        let (proof, r_t) = build_v2(n, k, seed);
+        let pass = [0xffu8; 32];
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh), Ok(()));
+
+        for grind in 0..1000u64 {
+            let forged_state = mix64(proof.final_state ^ grind.wrapping_add(1));
+            let mut forged = proof.clone();
+            forged.final_state = forged_state;
+            forged.pow_value = fh(forged_state); // self-consistent fold, exactly like the exploit
+            assert_eq!(
+                verify_pom_proof_v2(seed, &forged, n, k, &r_t, &pass, fh),
+                Err(PomVerifyError::FinalStateMismatch),
+                "forged final_state accepted at grind {grind}"
+            );
+        }
+    }
+
+    /// Era-exact wire encoding: a proof without `steps_v2` MUST encode byte-identically to
+    /// the pre-H4 layout (not-yet-updated peers must keep decoding re-served pre-H4 blocks),
+    /// and both eras must round-trip through the canonical decode helper.
+    #[test]
+    fn wire_bytes_era_exact_and_roundtrip() {
+        let (n, k, t) = (4096u64, 256u32, 32usize);
+        let pph = blake(b"wire-pph");
+        let (v1, _, _) = build(n, k, t, &pph, 0xabc);
+        assert!(v1.steps_v2.is_none());
+
+        // v1 wire bytes == exact legacy encoding (what a pre-H4 binary emits and expects).
+        let legacy = borsh::to_vec(&PomProofPreH4::from(&v1)).unwrap();
+        assert_eq!(v1.to_wire_bytes(), legacy, "pre-H4 proof must stay byte-identical on the wire");
+
+        // Legacy bytes decode back with steps_v2 == None.
+        let back = PomProof::from_wire_bytes(&legacy).unwrap();
+        assert!(back.steps_v2.is_none());
+        assert_eq!(back.final_state, v1.final_state);
+        assert_eq!(back.openings.len(), v1.openings.len());
+
+        // v2 round-trips through the same helpers.
+        let seed = pom_seed_state(0xabc);
+        let (v2, r_t) = build_v2(n, k, seed);
+        let bytes = v2.to_wire_bytes();
+        let back2 = PomProof::from_wire_bytes(&bytes).unwrap();
+        assert_eq!(back2.steps_v2.as_ref().unwrap().len(), k as usize);
+        assert_eq!(verify_pom_proof_v2(seed, &back2, n, k, &r_t, &[0xffu8; 32], fh), Ok(()));
+
+        // A truncated / garbage stream fails both decodes.
+        assert!(PomProof::from_wire_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// Bincode decode fallback the `DbPomProofStore` relies on: a record written by a pre-H4 binary
+    /// is the `PomProofPreH4` positional layout; the grown `PomProof` under-flows on it, so decode
+    /// must fall back to the old layout and backfill `steps_v2 = None` — never a silent mis-decode.
+    #[test]
+    fn bincode_pre_h4_record_decodes_via_fallback() {
+        let (n, k, t) = (4096u64, 256u32, 32usize);
+        let pph = blake(b"db-pph");
+        let (v1, _, _) = build(n, k, t, &pph, 0xabc);
+
+        // Old binary wrote the 7-field layout.
+        let old_bytes = bincode::serialize(&PomProofPreH4::from(&v1)).unwrap();
+        // New `PomProof` (8 fields) under-flows on it...
+        assert!(bincode::deserialize::<PomProof>(&old_bytes).is_err());
+        // ...so the store's fallback kicks in and backfills steps_v2 = None.
+        let recovered: PomProof = bincode::deserialize::<PomProofPreH4>(&old_bytes).unwrap().into();
+        assert!(recovered.steps_v2.is_none());
+        assert_eq!(recovered.final_state, v1.final_state);
+        assert_eq!(recovered.openings.len(), v1.openings.len());
+
+        // A v2 record decodes as PomProof directly (primary path, no fallback).
+        let seed = pom_seed_state(0xabc);
+        let (v2, _) = build_v2(n, k, seed);
+        let v2_bytes = bincode::serialize(&v2).unwrap();
+        let back = bincode::deserialize::<PomProof>(&v2_bytes).unwrap();
+        assert_eq!(back.steps_v2.as_ref().unwrap().len(), k as usize);
     }
 }

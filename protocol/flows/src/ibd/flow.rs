@@ -796,7 +796,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 let pom_proof = msg
                     .pom_proof
                     .as_deref()
-                    .map(borsh::from_slice::<PomProof>)
+                    .map(PomProof::from_wire_bytes)
                     .transpose()
                     .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for trusted block {}", hash)))?
                     .map(Arc::new);
@@ -980,7 +980,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             let pom_proof = msg
                 .pom_proof
                 .as_deref()
-                .map(borsh::from_slice::<PomProof>)
+                .map(PomProof::from_wire_bytes)
                 .transpose()
                 .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for block {}", expected_hash)))?
                 .map(Arc::new);

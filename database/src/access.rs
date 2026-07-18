@@ -136,6 +136,59 @@ where
         }
     }
 
+    /// Like `read`, with an in-place decode fallback (no prefix fallback): if the bytes fail to
+    /// decode as `TData`, the SAME bytes are re-tried as `TDecodeFallback` (a previous layout of
+    /// `TData`) and converted. See `read_with_fallbacks` for the safety argument (a grown
+    /// positional layout under-flows on old bytes — hard error, never a silent mis-decode).
+    pub fn read_with_decode_fallback<TDecodeFallback>(&self, key: TKey) -> Result<TData, StoreError>
+    where
+        TKey: Clone + AsRef<[u8]> + ToString,
+        TData: DeserializeOwned,
+        TDecodeFallback: DeserializeOwned + Into<TData>,
+    {
+        if let Some(data) = self.cache.get(&key) {
+            Ok(data)
+        } else {
+            let db_key = DbKey::new(&self.prefix, key.clone());
+            if let Some(slice) = self.db.get_pinned(&db_key)? {
+                let data: TData = match bincode::deserialize(&slice) {
+                    Ok(data) => data,
+                    Err(_) => bincode::deserialize::<TDecodeFallback>(&slice)?.into(),
+                };
+                self.cache.insert(key, data.clone());
+                Ok(data)
+            } else {
+                Err(StoreError::KeyNotFound(db_key))
+            }
+        }
+    }
+
+    /// Like `iterator`, with the same in-place decode fallback as `read_with_decode_fallback` —
+    /// needed by stores whose whole keyspace may hold mixed layouts (e.g. a utxoset written by an
+    /// older binary and appended to by this one) and which are scanned wholesale at startup.
+    pub fn iterator_with_decode_fallback<TDecodeFallback>(&self) -> impl Iterator<Item = KeyDataResult<TData>> + '_
+    where
+        TKey: Clone + AsRef<[u8]>,
+        TData: DeserializeOwned,
+        TDecodeFallback: DeserializeOwned + Into<TData>,
+    {
+        let prefix_key = DbKey::prefix_only(&self.prefix);
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_range(rocksdb::PrefixRange(prefix_key.as_ref()));
+        self.db.iterator_opt(IteratorMode::From(prefix_key.as_ref(), Direction::Forward), read_opts).map(move |iter_result| {
+            match iter_result {
+                Ok((key, data_bytes)) => match bincode::deserialize(&data_bytes) {
+                    Ok(data) => Ok((key[prefix_key.prefix_len()..].into(), data)),
+                    Err(e) => match bincode::deserialize::<TDecodeFallback>(&data_bytes) {
+                        Ok(data) => Ok((key[prefix_key.prefix_len()..].into(), data.into())),
+                        Err(_) => Err(e.into()),
+                    },
+                },
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
     pub fn iterator(&self) -> impl Iterator<Item = KeyDataResult<TData>> + '_
     where
         TKey: Clone + AsRef<[u8]>,
@@ -276,6 +329,55 @@ where
             Ok((key_bytes, value_bytes)) => match bincode::deserialize::<TData>(value_bytes.as_ref()) {
                 Ok(value) => Ok((key_bytes[db_key.prefix_len()..].into(), value)),
                 Err(err) => Err(err.into()),
+            },
+            Err(err) => Err(err.into()),
+        })
+    }
+
+    /// `seek_iterator` with the same in-place decode fallback as `read_with_decode_fallback`
+    /// (mixed-layout keyspaces, e.g. pruning-point utxoset chunk streaming over an old datadir).
+    pub fn seek_iterator_with_decode_fallback<TDecodeFallback>(
+        &self,
+        bucket: Option<&[u8]>,
+        seek_from: Option<TKey>,
+        limit: usize,
+        skip_first: bool,
+    ) -> impl Iterator<Item = KeyDataResult<TData>> + '_
+    where
+        TKey: Clone + AsRef<[u8]>,
+        TData: DeserializeOwned,
+        TDecodeFallback: DeserializeOwned + Into<TData>,
+    {
+        let db_key = bucket.map_or_else(
+            move || DbKey::prefix_only(&self.prefix),
+            move |bucket| {
+                let mut key = DbKey::prefix_only(&self.prefix);
+                key.add_bucket(bucket);
+                key
+            },
+        );
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_range(rocksdb::PrefixRange(db_key.as_ref()));
+
+        let mut db_iterator = match seek_from {
+            Some(seek_key) => {
+                self.db.iterator_opt(IteratorMode::From(DbKey::new(&self.prefix, seek_key).as_ref(), Direction::Forward), read_opts)
+            }
+            None => self.db.iterator_opt(IteratorMode::Start, read_opts),
+        };
+
+        if skip_first {
+            db_iterator.next();
+        }
+
+        db_iterator.take(limit).map(move |item| match item {
+            Ok((key_bytes, value_bytes)) => match bincode::deserialize::<TData>(value_bytes.as_ref()) {
+                Ok(value) => Ok((key_bytes[db_key.prefix_len()..].into(), value)),
+                Err(err) => match bincode::deserialize::<TDecodeFallback>(value_bytes.as_ref()) {
+                    Ok(value) => Ok((key_bytes[db_key.prefix_len()..].into(), value.into())),
+                    Err(_) => Err(err.into()),
+                },
             },
             Err(err) => Err(err.into()),
         })

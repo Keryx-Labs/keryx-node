@@ -14,7 +14,7 @@ mod utxo_set_override_inner {
     pub fn set_genesis_utxo_commitment_from_config(config: &mut Config) {
         let mut genesis_multiset = MuHash::new();
         for (outpoint, entry) in config.initial_utxo_set.iter() {
-            genesis_multiset.add_utxo(outpoint, entry);
+            genesis_multiset.add_utxo(outpoint, entry, config.params.coin_age_activation);
         }
 
         config.params.genesis.utxo_commitment = genesis_multiset.finalize();

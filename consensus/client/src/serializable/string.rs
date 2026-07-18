@@ -70,6 +70,9 @@ impl TryFrom<&SerializableUtxoEntry> for cctx::UtxoEntry {
             script_public_key: utxo.script_public_key.clone(),
             block_daa_score: utxo.block_daa_score.parse()?,
             is_coinbase: utxo.is_coinbase,
+            // The serializable type does not carry the coin-age anchor; anchor at the creation
+            // score (pre-H4 invariant). Client-built entries never enter consensus state.
+            effective_daa: utxo.block_daa_score.parse()?,
         })
     }
 }

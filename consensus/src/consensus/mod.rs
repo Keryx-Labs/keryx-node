@@ -350,6 +350,11 @@ impl Consensus {
         // Authoritative (Σ UTXO); incremental maintenance carries it forward from here. See its doc.
         this.virtual_processor.rebuild_address_balance_index();
 
+        // Coin-age (v3) bucket index: recompute from the UTXO set (each entry carries its
+        // `effective_daa` anchor). Also re-classifies coins that matured in place since the last
+        // run — the startup-time counterpart of the maturation-queue promotions.
+        this.virtual_processor.rebuild_age_buckets_index();
+
         this
     }
 
@@ -1113,9 +1118,11 @@ impl ConsensusApi for Consensus {
         let mut pruning_meta_write = self.pruning_meta_stores.write();
         pruning_meta_write.utxo_set.write_many(utxoset_chunk).unwrap();
 
+        // Coin-age muhash gate is PER COIN (each entry's own creation era) — see `MuHashExtensions`.
+        let coin_age_activation = self.config.params.coin_age_activation;
         // Parallelize processing using the context of an existing thread pool.
         let inner_multiset = self.virtual_processor.install(|| {
-            utxoset_chunk.par_iter().map(|(outpoint, entry)| MuHash::from_utxo(outpoint, entry)).reduce(MuHash::new, |mut a, b| {
+            utxoset_chunk.par_iter().map(|(outpoint, entry)| MuHash::from_utxo(outpoint, entry, coin_age_activation)).reduce(MuHash::new, |mut a, b| {
                 a.combine(&b);
                 a
             })

@@ -20,6 +20,7 @@ use keryx_consensus::pipeline::ProcessingCounters;
 use keryx_consensus::pipeline::monitor::ConsensusMonitor;
 use keryx_consensus::processes::reachability::tests::{DagBlock, DagBuilder, StoreValidationExtensions};
 use keryx_consensus::processes::window::{WindowManager, WindowType};
+use keryx_consensus_core::config::params::ForkActivation;
 use keryx_consensus_core::api::args::TransactionValidationArgs;
 use keryx_consensus_core::api::{BlockValidationFutures, ConsensusApi};
 use keryx_consensus_core::block::Block;
@@ -1432,7 +1433,7 @@ async fn kip10_test() {
     // Set up initial UTXO with our test script
     let initial_utxo_collection = [(
         TransactionOutpoint::new(1.into(), 0),
-        UtxoEntry { amount: SOMPI_PER_KASPA, script_public_key: spk.clone(), block_daa_score: 0, is_coinbase: false },
+        UtxoEntry { amount: SOMPI_PER_KASPA, script_public_key: spk.clone(), block_daa_score: 0, effective_daa: 0, is_coinbase: false },
     )];
 
     // Initialize consensus with KIP-10 activation point
@@ -1441,7 +1442,7 @@ async fn kip10_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();
@@ -1554,6 +1555,7 @@ async fn payload_for_native_tx_test() {
             amount: SOMPI_PER_KASPA,
             script_public_key: ScriptPublicKey::from_vec(0, vec![OpTrue]),
             block_daa_score: 0,
+            effective_daa: 0,
             is_coinbase: false,
         },
     )];
@@ -1564,7 +1566,7 @@ async fn payload_for_native_tx_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();
@@ -1659,7 +1661,7 @@ async fn runtime_sig_op_counting_test() {
     // Set up initial UTXO with P2SH script
     let initial_utxo_collection = [(
         TransactionOutpoint::new(1.into(), 0),
-        UtxoEntry { amount: SOMPI_PER_KASPA, script_public_key: script_pub_key.clone(), block_daa_score: 0, is_coinbase: false },
+        UtxoEntry { amount: SOMPI_PER_KASPA, script_public_key: script_pub_key.clone(), block_daa_score: 0, effective_daa: 0, is_coinbase: false },
     )];
 
     let config = ConfigBuilder::new(DEVNET_PARAMS)
@@ -1667,7 +1669,7 @@ async fn runtime_sig_op_counting_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();
@@ -1761,13 +1763,13 @@ async fn sighash_type_commitment_test() {
     for i in 0..6 {
         initial_utxo_collection.push((
             TransactionOutpoint::new((i + 1).into(), 0),
-            UtxoEntry { amount: SOMPI_PER_KASPA / 10, script_public_key: p2sh_script.clone(), block_daa_score: 0, is_coinbase: false },
+            UtxoEntry { amount: SOMPI_PER_KASPA / 10, script_public_key: p2sh_script.clone(), block_daa_score: 0, effective_daa: 0, is_coinbase: false },
         ));
     }
     for i in 0..3 {
         initial_utxo_collection.push((
             TransactionOutpoint::new((i + 7).into(), 0),
-            UtxoEntry { amount: SOMPI_PER_KASPA / 20, script_public_key: op_true_spk.clone(), block_daa_score: 0, is_coinbase: false },
+            UtxoEntry { amount: SOMPI_PER_KASPA / 20, script_public_key: op_true_spk.clone(), block_daa_score: 0, effective_daa: 0, is_coinbase: false },
         ));
     }
 
@@ -1776,7 +1778,7 @@ async fn sighash_type_commitment_test() {
         .apply_args(|cfg| {
             let mut genesis_multiset = MuHash::new();
             initial_utxo_collection.iter().for_each(|(outpoint, utxo)| {
-                genesis_multiset.add_utxo(outpoint, utxo);
+                genesis_multiset.add_utxo(outpoint, utxo, ForkActivation::never());
             });
             cfg.params.genesis.utxo_commitment = genesis_multiset.finalize();
             let genesis_header: Header = (&cfg.params.genesis).into();

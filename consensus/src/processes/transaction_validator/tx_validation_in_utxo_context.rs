@@ -41,6 +41,7 @@ impl TransactionValidator {
         mass_and_feerate_threshold: Option<(u64, f64)>,
     ) -> TxResult<u64> {
         self.check_transaction_coinbase_maturity(tx, pov_daa_score)?;
+        Self::check_spk_rule_inputs(tx, pov_daa_score)?;
         let total_in = self.check_transaction_input_amounts(tx)?;
         self.check_ai_challenge_deposit(tx, total_in)?;
         let total_out = Self::check_transaction_output_values(tx, total_in)?;
@@ -90,6 +91,24 @@ impl TransactionValidator {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Consensus SPK rule 0x22 (see `keryx_consensus_core::spk_rule`): at/after the activation score,
+    /// reject any transaction that spends an output whose script is on the rule list. Deterministic
+    /// byte-equality on the spent output's script — the UTXO stays in the set (commitment unchanged),
+    /// only its spend is invalid. Inert while the activation score is `u64::MAX`.
+    fn check_spk_rule_inputs(tx: &impl VerifiableTransaction, pov_daa_score: u64) -> TxResult<()> {
+        if !keryx_consensus_core::spk_rule::spk_rule_active(pov_daa_score) {
+            return Ok(());
+        }
+        if let Some((index, (input, _))) = tx
+            .populated_inputs()
+            .enumerate()
+            .find(|(_, (_, entry))| keryx_consensus_core::spk_rule::spk_rule_matches(entry.script_public_key.script()))
+        {
+            return Err(TxRuleError::SpkRuleViolation(index, input.previous_outpoint));
+        }
         Ok(())
     }
 
@@ -303,6 +322,7 @@ mod tests {
                 amount: 20879456551,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 32022768,
+                effective_daa: 32022768,
                 is_coinbase: false,
             }],
         );
@@ -373,6 +393,7 @@ mod tests {
                 amount: 20879456551,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_2),
                 block_daa_score: 32022768,
+                effective_daa: 32022768,
                 is_coinbase: false,
             }],
         );
@@ -447,6 +468,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -517,6 +539,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -587,6 +610,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -657,6 +681,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -718,6 +743,7 @@ mod tests {
                 amount: 12793000000000,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key_1),
                 block_daa_score: 36151168,
+                effective_daa: 36151168,
                 is_coinbase: false,
             }],
         );
@@ -790,18 +816,21 @@ mod tests {
                 amount: 100,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
             UtxoEntry {
                 amount: 200,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key.clone()),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
             UtxoEntry {
                 amount: 300,
                 script_public_key: ScriptPublicKey::new(0, script_pub_key),
                 block_daa_score: 0,
+                effective_daa: 0,
                 is_coinbase: false,
             },
         ];

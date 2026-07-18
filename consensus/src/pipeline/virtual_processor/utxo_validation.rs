@@ -25,11 +25,14 @@ use crate::{
     },
 };
 use crate::model::stores::address_amount::AddressAmountStoreReader;
+use crate::model::stores::age_buckets::{AgeBuckets, AgeBucketsStoreReader};
+use crate::model::stores::maturation_queue::{DbMaturationQueueStore, MaturationEntry};
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
-use keryx_consensus_core::config::params::{TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, tier_reward_bps};
+use keryx_consensus_core::coin_age::eff_balance_from_buckets;
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -54,7 +57,18 @@ use keryx_utils::refs::Refs;
 
 use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};
-use std::{iter::once, ops::Deref};
+use std::{
+    iter::once,
+    ops::Deref,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+/// One-shot guard for the H4 banner below. Unlike the other hardfork banners — which match the
+/// activation DAA score exactly — H4 fires on the FIRST block seen at or after the gate. A chain
+/// block's `daa_score` advances by its mergeset's DAA-added count, so at 10 BPS it routinely
+/// SKIPS the exact activation value and an equality-matched banner never prints. Logging only, so
+/// a process-global guard is fine: it has no bearing on consensus.
+static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Pre-resolved production-window context of a single validated block (its selected parent
 /// `m_sp`), shared by every rewarded blue of that block — see [`VirtualStateProcessor::production_window_ctx`].
@@ -138,8 +152,12 @@ impl VirtualStateProcessor {
         let selected_parent_transactions = self.block_transactions_store.get(ctx.selected_parent()).unwrap();
         let validated_coinbase = ValidatedTransaction::new_coinbase(&selected_parent_transactions[0]);
 
-        ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score).unwrap();
-        ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score);
+        // Coin-age era flag (holder-reward v3), derived from the POV block's own daa score —
+        // same gating discipline as every other fork so IBD re-validation stays canonical.
+        let coin_age_active = self.coin_age_activation.is_active(pov_daa_score);
+
+        ctx.mergeset_diff.add_transaction(&validated_coinbase, pov_daa_score, coin_age_active).unwrap();
+        ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score, self.coin_age_activation);
         let validated_coinbase_id = validated_coinbase.id();
         ctx.accepted_tx_ids.push(validated_coinbase_id);
 
@@ -167,7 +185,7 @@ impl VirtualStateProcessor {
 
             let mut block_fee = 0u64;
             for (validated_tx, _) in validated_transactions.iter() {
-                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score).unwrap();
+                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score, coin_age_active).unwrap();
                 ctx.accepted_tx_ids.push(validated_tx.id());
                 block_fee += validated_tx.calculated_fee;
             }
@@ -322,6 +340,27 @@ impl VirtualStateProcessor {
             }
         }
 
+        // H4 hardfork (coin-age holder-reward v3): fire on the FIRST block at or after the gate,
+        // not on an exact DAA match — a chain block's daa_score advances by its mergeset's DAA-added
+        // count and routinely skips the exact activation value at 10 BPS. `compare_exchange` keeps it
+        // to one print per process (the first post-gate block, whether reached live or during IBD).
+        if self.coin_age_activation.is_active(header.daa_score)
+            && COIN_AGE_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            // Header carries the GATE score (the fork's identity, always exact), not this block's —
+            // a node restarting long after the fork also prints this once, and `header.daa_score`
+            // would then read as if H4 had just fired. The observed block goes in the footer.
+            info!("════════════════ KERYX HARDFORK H4 · DAA {} ════════════════", self.coin_age_activation.daa_score());
+            info!("  Holder-reward — ratio numerator is now the coin-age effective balance, not the balance snapshot");
+            info!("  Coin age      — FIFO carry-over anchors per output; age resets on transfer, survives consolidation");
+            info!("  Maturity      — a coin ramps linearly to full weight over W = {} DAA", self.coin_age_maturity_w);
+            info!("  UTXO muhash   — per-coin effective_daa now committed in the multiset");
+            info!("  Rotation      — moving a pot to a fresh address no longer buys the top bracket");
+            info!("  Bracket table — floor 50% (was 40%), ramp to 100% now spans 90 days (was 30)");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() {
@@ -347,7 +386,11 @@ impl VirtualStateProcessor {
             // OPoI v2 hardfork: swap to the uncensored lineup at/after activation. DAA-gated so
             // IBD re-validates historical (pre-v2) blocks against the legacy lineup unchanged.
             // (Activation is announced by the consolidated KERYX HARDFORK banner above.)
-            let minimums = if self.inference_min_h2_activation.is_active(header.daa_score) {
+            let minimums = if self.coin_age_activation.is_active(header.daa_score) {
+                // H4 candle-free lineup floors (new bareme 0.5/1/1.5/2.5/4 KRX). New model_ids, so
+                // the H2 table no longer matches any served model post-H4.
+                INFERENCE_REWARD_MINIMUMS_V2_H4
+            } else if self.inference_min_h2_activation.is_active(header.daa_score) {
                 // H2 (5-tier) floors: adds Qwen3-1.7B + 70B-Q2, absent from the v2 table.
                 self.inference_reward_minimums_v2_h2
             } else if self.opoi_v2_activation.is_active(header.daa_score) {
@@ -495,6 +538,10 @@ impl VirtualStateProcessor {
         // so a newcomer with no recent production divides by one block. The balance numerator keeps its
         // own committed-index + `view_diffs` correction (that index is exact and not the divergence source).
         let prod_floor = self.coinbase_manager.base_miner_cut(pov_daa_score).max(1);
+        // Coin-age era (v3): the numerator switches from the instantaneous balance to the
+        // per-coin-capped effective balance — rotation-resistant (a fresh address's coins carry
+        // age 0 and contribute nothing until they ripen over W).
+        let coin_age_active = self.coin_age_activation.is_active(pov_daa_score);
         let w = self.ratio_reward_window;
         // Window context depends only on the block's selected parent — resolve it ONCE and share it
         // across every rewarded blue (it embeds the full side-chain aggregation in the Case B shape).
@@ -503,11 +550,21 @@ impl VirtualStateProcessor {
             // Payout SPK = the blue's own miner cut, already resolved into the reward data.
             if let Some(reward) = mergeset_rewards.get(blue) {
                 let spk = &reward.script_public_key;
-                let base = self.address_balance_store.get(spk).unwrap() as i128;
-                let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
-                let balance = (base + delta).max(0) as u64;
+                let balance = if coin_age_active {
+                    self.eff_balance_for_spk(spk, pov_daa_score, view_diffs)
+                } else {
+                    let base = self.address_balance_store.get(spk).unwrap() as i128;
+                    let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
+                    (base + delta).max(0) as u64
+                };
                 let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
-                map.insert(*blue, ratio_reward_bps(balance, production));
+                // Recalibrated bracket table ships bundled with H4 (one hardfork, one gate).
+                let bps = if self.coin_age_activation.is_active(pov_daa_score) {
+                    ratio_reward_bps_v2(balance, production)
+                } else {
+                    ratio_reward_bps(balance, production)
+                };
+                map.insert(*blue, bps);
             }
         }
 
@@ -525,9 +582,18 @@ impl VirtualStateProcessor {
                 for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
                     if let Some(reward) = mergeset_rewards.get(blue) {
                         let spk = &reward.script_public_key;
-                        let base = self.address_balance_store.get(spk).unwrap() as i128;
-                        let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
-                        let balance = (base + delta).max(0) as u64;
+                        // Resolve `balance` exactly as the numerator above does — at/after
+                        // `coin_age_activation` that is the coin-age effective balance, NOT the
+                        // instantaneous snapshot. Recomputing the snapshot here would print a value
+                        // the bracket never saw, so a post-H4 cross-node diff on this line would
+                        // compare the wrong quantity and hide the real disagreement.
+                        let balance = if coin_age_active {
+                            self.eff_balance_for_spk(spk, pov_daa_score, view_diffs)
+                        } else {
+                            let base = self.address_balance_store.get(spk).unwrap() as i128;
+                            let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
+                            (base + delta).max(0) as u64
+                        };
                         let prefix = self.windowed_production_with_ctx(spk, &window_ctx);
                         // Also emit the producer's script-public-key (version + script hex) so an
                         // external tailer can key `prod_prefix`/`balance` by address without a
@@ -872,6 +938,149 @@ impl VirtualStateProcessor {
         }
     }
 
+    /// Coin-age (holder-reward v3) — advances the bucket index by `diff`, in lockstep with the
+    /// virtual UTXO set (same batch as `apply_balance_diff`). Each entry is classified at the new
+    /// virtual score: MATURE (`effective_daa <= d − W`) contributes its face value to `b_mat`,
+    /// IMMATURE contributes `(amount, amount·effective_daa)` to `(b_imm, a_imm)`. Deltas are
+    /// folded per SPK first, then each touched address is read-modify-written once; all-zero
+    /// aggregates delete their entry. Maintained ungated (passive aggregate, same discipline as
+    /// the balance index); nothing reads it before `coin_age_activation`, and the startup rebuild
+    /// re-derives it exactly from the UTXO set — which also re-classifies any coin that matured
+    /// in place until the maturation-queue promotions land.
+    pub(super) fn apply_age_diff(&self, batch: &mut rocksdb::WriteBatch, diff: &UtxoDiff, pov_daa_score: u64) {
+        // (b_mat delta, b_imm delta, a_imm delta) per SPK. i128 accommodates sompi × DAA products.
+        let mut deltas: std::collections::HashMap<ScriptPublicKey, (i128, i128, i128)> = std::collections::HashMap::new();
+        let mature_bound = pov_daa_score.saturating_sub(self.coin_age_maturity_w);
+        for (outpoint, entry) in diff.add.iter() {
+            let d = deltas.entry(entry.script_public_key.clone()).or_default();
+            if entry.effective_daa <= mature_bound {
+                d.0 += entry.amount as i128;
+            } else {
+                d.1 += entry.amount as i128;
+                d.2 += (entry.amount as i128) * (entry.effective_daa as i128);
+                // Immature coin: enqueue at its maturity score so the sweep promotes it in time.
+                let queued = MaturationEntry {
+                    script_public_key: entry.script_public_key.clone(),
+                    amount: entry.amount,
+                    anchor: entry.effective_daa,
+                };
+                self.maturation_queue_store.insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued).unwrap();
+            }
+        }
+        for (outpoint, entry) in diff.remove.iter() {
+            let d = deltas.entry(entry.script_public_key.clone()).or_default();
+            if entry.effective_daa <= mature_bound {
+                d.0 -= entry.amount as i128;
+            } else {
+                d.1 -= entry.amount as i128;
+                d.2 -= (entry.amount as i128) * (entry.effective_daa as i128);
+                // Spent while immature: drop its pending promotion.
+                self.maturation_queue_store.delete_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint).unwrap();
+            }
+        }
+        for (spk, (dm, div, dia)) in deltas {
+            if (dm, div, dia) == (0, 0, 0) {
+                continue;
+            }
+            let b = self.age_buckets_store.get(&spk).unwrap();
+            let next = AgeBuckets {
+                b_mat: (b.b_mat as i128 + dm).max(0) as u64,
+                b_imm: (b.b_imm as i128 + div).max(0) as u64,
+                a_imm: (b.a_imm as i128 + dia).max(0) as u128,
+            };
+            self.age_buckets_store.set_batch(batch, &spk, next).unwrap();
+        }
+    }
+
+    /// Coin-age maturation sweep — the time-driven bucket transition. Promotes every queued coin
+    /// whose maturity score (`anchor + W`) fell at/below the NEW virtual score: `b_imm/a_imm →
+    /// b_mat`, queue entry deleted, watermark advanced. Runs BEFORE `apply_age_diff` in the same
+    /// commit so a coin that is both due and spent is first promoted, then removed as mature —
+    /// mirroring the remove-path classification (which sees it at/below `d − W`).
+    ///
+    /// Returns `true` when the virtual score moved BELOW the watermark (deep reorg past a
+    /// maturity boundary): incremental promotions can't be unwound, so the caller must run a full
+    /// `rebuild_age_buckets_index` after the commit instead (exact from the UTXO set).
+    pub(super) fn sweep_maturation_queue(&self, batch: &mut rocksdb::WriteBatch, new_daa_score: u64) -> bool {
+        let watermark = self.maturation_queue_store.get_watermark().unwrap().unwrap_or(new_daa_score);
+        if new_daa_score < watermark {
+            return true;
+        }
+        for (_, due) in self.maturation_queue_store.due_range(watermark, new_daa_score) {
+            // Consecutive read-modify-writes on the same SPK stay coherent through the store's
+            // write-through cache (set_batch inserts the cache before the batch lands).
+            let b = self.age_buckets_store.get(&due.script_public_key).unwrap();
+            let next = AgeBuckets {
+                b_mat: b.b_mat.saturating_add(due.amount),
+                b_imm: b.b_imm.saturating_sub(due.amount),
+                a_imm: b.a_imm.saturating_sub(due.amount as u128 * due.anchor as u128),
+            };
+            self.age_buckets_store.set_batch(batch, &due.script_public_key, next).unwrap();
+            // NOTE: the promoted entry is NOT deleted — it is retained for `coin_age_retention`
+            // scores so the read path can DEMOTE when a POV falls below the watermark (side
+            // chains, see `eff_balance_for_spk`). Retention pruning below reclaims it.
+        }
+        self.maturation_queue_store.prune_below(batch, new_daa_score.saturating_sub(self.coin_age_retention)).unwrap();
+        self.maturation_queue_store.set_watermark_batch(batch, new_daa_score).unwrap();
+        false
+    }
+
+    /// Coin-age numerator (holder-reward v3): the per-coin-capped effective balance of `spk` at
+    /// the POV block's view — the consensus replacement for the raw balance at/after
+    /// `coin_age_activation`. Cross-node determinism requires reconciling two node-local anchors
+    /// onto the POV's:
+    ///
+    /// 1. **Split reconciliation** — the committed buckets are split at the node-local WATERMARK,
+    ///    not at the POV score. Retained queue entries bridge the gap: maturities in
+    ///    `(watermark, pov]` are promotions the POV already sees (add to `b_mat`), maturities in
+    ///    `(pov, watermark]` are promotions the POV does NOT yet see (demote back). A demotion
+    ///    entry whose outpoint is re-added by `view_diffs` is skipped — the coin is absent from
+    ///    the committed store (spent after maturing), and the content correction below re-adds it
+    ///    on the right side of the POV split.
+    /// 2. **Content correction** — `view_diffs` (committed virtual → POV view) entries are folded
+    ///    at the POV split (`effective_daa <= pov − W`), mirroring `balance_delta_for_spk`.
+    ///
+    /// Both adjustments are bounded: the split scan by `|pov − watermark|` (mergeset depth in
+    /// practice, capped by the retention horizon), the content fold by the diff size.
+    pub(super) fn eff_balance_for_spk(&self, spk: &ScriptPublicKey, pov_daa_score: u64, view_diffs: &[&UtxoDiff]) -> u64 {
+        let b = self.age_buckets_store.get(spk).unwrap();
+        let (mut mat, mut imm_v, mut imm_a) = (b.b_mat as i128, b.b_imm as i128, b.a_imm as i128);
+        let watermark = self.maturation_queue_store.get_watermark().unwrap().unwrap_or(pov_daa_score);
+        if pov_daa_score >= watermark {
+            // Promotions the POV sees but the committed split does not yet.
+            for (_, e) in self.maturation_queue_store.due_range(watermark, pov_daa_score) {
+                if &e.script_public_key == spk {
+                    mat += e.amount as i128;
+                    imm_v -= e.amount as i128;
+                    imm_a -= (e.amount as i128) * (e.anchor as i128);
+                }
+            }
+        } else {
+            // Promotions the committed split holds but the POV does not see yet: demote, unless
+            // the coin is absent from the committed store (re-added by the view diffs).
+            for (raw, e) in self.maturation_queue_store.due_range(pov_daa_score, watermark) {
+                if &e.script_public_key == spk {
+                    let outpoint = DbMaturationQueueStore::outpoint_of(&raw);
+                    if view_diffs.iter().any(|d| d.add.contains_key(&outpoint)) {
+                        continue;
+                    }
+                    mat -= e.amount as i128;
+                    imm_v += e.amount as i128;
+                    imm_a += (e.amount as i128) * (e.anchor as i128);
+                }
+            }
+        }
+        // Content correction at the POV split.
+        let mature_bound = pov_daa_score.saturating_sub(self.coin_age_maturity_w);
+        for diff in view_diffs {
+            let (dm, div, dia) = age_delta_for_spk(diff, spk, mature_bound);
+            mat += dm;
+            imm_v += div;
+            imm_a += dia;
+        }
+        eff_balance_from_buckets(mat.max(0) as u64, imm_v.max(0) as u64, imm_a.max(0) as u128, pov_daa_score, self.coin_age_maturity_w)
+    }
+
     fn check_ai_response_model_caps(&self, txs: &[Transaction]) -> BlockProcessResult<()> {
         check_ai_response_model_caps(txs)
     }
@@ -912,7 +1121,7 @@ impl VirtualStateProcessor {
                 .enumerate()
                 .skip(1) // Skip the coinbase tx.
                 .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags).ok().map(|vtx| {
-                    let mh = MuHash::from_transaction(&vtx, pov_daa_score);
+                    let mh = MuHash::from_transaction(&vtx, pov_daa_score, self.coin_age_activation);
                     (smallvec![(vtx, i as u32)], mh)
                 }
                 ))
@@ -1161,6 +1370,28 @@ fn check_ai_request_inference_rewards(
 /// diff. Used to translate the virtual-anchored balance index to a rewarding block's own view in
 /// `ratio_bps_by_block`. `i128` carries the signed intermediate; the caller floors the corrected
 /// balance at 0.
+/// Coin-age view-diff correction for one SPK: (b_mat, b_imm, a_imm) deltas with every entry
+/// classified at the POV split (`effective_daa <= mature_bound`). The bucket-space mirror of
+/// `balance_delta_for_spk`.
+fn age_delta_for_spk(diff: &UtxoDiff, spk: &ScriptPublicKey, mature_bound: u64) -> (i128, i128, i128) {
+    let (mut dm, mut div, mut dia) = (0i128, 0i128, 0i128);
+    let mut fold = |entry: &keryx_consensus_core::tx::UtxoEntry, sign: i128| {
+        if entry.effective_daa <= mature_bound {
+            dm += sign * entry.amount as i128;
+        } else {
+            div += sign * entry.amount as i128;
+            dia += sign * (entry.amount as i128) * (entry.effective_daa as i128);
+        }
+    };
+    for entry in diff.add.values().filter(|e| &e.script_public_key == spk) {
+        fold(entry, 1);
+    }
+    for entry in diff.remove.values().filter(|e| &e.script_public_key == spk) {
+        fold(entry, -1);
+    }
+    (dm, div, dia)
+}
+
 fn balance_delta_for_spk(diff: &UtxoDiff, spk: &ScriptPublicKey) -> i128 {
     let added: i128 = diff.add.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();
     let removed: i128 = diff.remove.values().filter(|e| &e.script_public_key == spk).map(|e| e.amount as i128).sum();

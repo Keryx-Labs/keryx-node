@@ -155,6 +155,7 @@ pub struct SampledDifficultyManager<T: HeaderStoreReader, U: GhostdagStoreReader
     difficulty_sample_rate: u64,
     target_time_per_block: u64,
     difficulty_reset_activation: ForkActivation,
+    difficulty_reset_activation_h4: ForkActivation,
 }
 
 impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U> {
@@ -170,6 +171,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         difficulty_sample_rate: u64,
         target_time_per_block: u64,
         difficulty_reset_activation: ForkActivation,
+        difficulty_reset_activation_h4: ForkActivation,
     ) -> Self {
         Self::check_min_difficulty_window_size(difficulty_window_size, min_difficulty_window_size);
         Self {
@@ -183,7 +185,18 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
             difficulty_sample_rate,
             target_time_per_block,
             difficulty_reset_activation,
+            difficulty_reset_activation_h4,
         }
+    }
+
+    /// True while `daa_score` is inside ANY difficulty-reset window (H2 relaunch OR H4 relaunch).
+    /// Each reset is a self-contained window `[activation, activation + full_window)` forcing
+    /// `genesis_bits`; the two windows never overlap (H4 ≫ H2 + full_window), so checking both is a
+    /// plain OR. See `difficulty_reset_activation_h4` in params for why H4 is a separate field.
+    fn in_any_reset_window(&self, daa_score: u64) -> bool {
+        let range = self.difficulty_full_window_size();
+        self.difficulty_reset_activation.is_within_range_from_activation(daa_score, range)
+            || self.difficulty_reset_activation_h4.is_within_range_from_activation(daa_score, range)
     }
 
     /// Returns `Some(genesis_bits)` while the difficulty-reset hardfork window is active for
@@ -193,7 +206,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
     /// the template to genesis lets the first block be mined; it validates against the same reset rule
     /// in `calculate_difficulty_bits`, and its insertion re-resolves the virtual normally afterwards.
     pub fn reset_bits(&self, daa_score: u64) -> Option<u32> {
-        self.difficulty_reset_activation.is_within_range_from_activation(daa_score, self.difficulty_full_window_size()).then_some(self.genesis_bits)
+        self.in_any_reset_window(daa_score).then_some(self.genesis_bits)
     }
 
     #[inline]
@@ -228,8 +241,9 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
     }
 
     pub fn calculate_difficulty_bits(&self, window: &BlockWindowHeap, ghostdag_data: &GhostdagData, daa_score: u64) -> u32 {
-        // Difficulty-reset hardfork: for the first full window after `difficulty_reset_activation`,
-        // force `genesis_bits` outright, ignoring the inherited window. The pre-fork window is
+        // Difficulty-reset hardfork: for the first full window after ANY reset activation (H2 or H4,
+        // see `in_any_reset_window`), force `genesis_bits` outright, ignoring the inherited window.
+        // The pre-fork window is
         // calibrated to the old (mostly non-PoM) hashrate; once the fork sheds it the chain freezes,
         // and the frozen tip shares its daa_score with the new blocks — so daa-based filtering can't
         // separate old high-difficulty samples from new ones. Forcing genesis across the whole
@@ -238,7 +252,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         // which point the DAA re-converges to the real PoM hashrate. Forward-only: blocks below the
         // activation score are never in range here. Checked before the window fetch so the genesis
         // burst doesn't pay 661 store reads per block.
-        if self.difficulty_reset_activation.is_within_range_from_activation(daa_score, self.difficulty_full_window_size()) {
+        if self.in_any_reset_window(daa_score) {
             return self.genesis_bits;
         }
 

@@ -17,7 +17,7 @@ use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 
 use super::ghostdag::GhostdagData;
-use super::utxo_set::DbUtxoSetStore;
+use super::utxo_set::{DbUtxoSetStore, UtxoDiffPreH4};
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct VirtualState {
@@ -160,11 +160,46 @@ pub struct DbVirtualStateStore {
     lkg_virtual_state: LkgVirtualState,
 }
 
+/// Pre-H4 layout of the serialized virtual state: identical field order, with the embedded
+/// `utxo_diff` holding pre-`effective_daa` utxo entries. A datadir written by an older binary
+/// stores this layout under the same key; reads fall back to it and backfill the coin-age
+/// anchor with the pre-H4 invariant (`effective_daa = block_daa_score`), like the utxoset store.
+#[derive(Deserialize)]
+struct VirtualStatePreH4 {
+    parents: Vec<Hash>,
+    ghostdag_data: GhostdagData,
+    daa_score: u64,
+    bits: u32,
+    past_median_time: u64,
+    multiset: MuHash,
+    utxo_diff: UtxoDiffPreH4,
+    accepted_tx_ids: Vec<TransactionId>,
+    mergeset_rewards: BlockHashMap<BlockRewardData>,
+    mergeset_non_daa: BlockHashSet,
+}
+
+impl From<VirtualStatePreH4> for Arc<VirtualState> {
+    fn from(s: VirtualStatePreH4) -> Self {
+        Arc::new(VirtualState {
+            parents: s.parents,
+            ghostdag_data: s.ghostdag_data,
+            daa_score: s.daa_score,
+            bits: s.bits,
+            past_median_time: s.past_median_time,
+            multiset: s.multiset,
+            utxo_diff: s.utxo_diff.into(),
+            accepted_tx_ids: s.accepted_tx_ids,
+            mergeset_rewards: s.mergeset_rewards,
+            mergeset_non_daa: s.mergeset_non_daa,
+        })
+    }
+}
+
 impl DbVirtualStateStore {
     pub fn new(db: Arc<DB>, lkg_virtual_state: LkgVirtualState) -> Self {
         let access = CachedDbItem::new(db.clone(), DatabaseStorePrefixes::VirtualState.into());
         // Init the LKG cache from DB store data
-        lkg_virtual_state.store(access.read().optional().unwrap().unwrap_or_default());
+        lkg_virtual_state.store(access.read_with_decode_fallback::<VirtualStatePreH4>().optional().unwrap().unwrap_or_default());
         Self { db, access, lkg_virtual_state }
     }
 
@@ -188,7 +223,7 @@ impl DbVirtualStateStore {
 
 impl VirtualStateStoreReader for DbVirtualStateStore {
     fn get(&self) -> StoreResult<Arc<VirtualState>> {
-        self.access.read()
+        self.access.read_with_decode_fallback::<VirtualStatePreH4>()
     }
 }
 

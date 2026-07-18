@@ -52,6 +52,9 @@ impl From<RpcUtxoEntry> for UtxoEntry {
             script_public_key: entry.script_public_key,
             block_daa_score: entry.block_daa_score,
             is_coinbase: entry.is_coinbase,
+            // The RPC type does not carry the coin-age anchor; anchor at the creation score
+            // (pre-H4 invariant). RPC-sourced entries never enter consensus state.
+            effective_daa: entry.block_daa_score,
         }
     }
 }

@@ -26,6 +26,7 @@ fn main() {
             amount: 12793000000000,
             script_public_key: pay_to_script_hash_script(&redeem_script),
             block_daa_score: 36151168,
+            effective_daa: 36151168,
             is_coinbase: false,
         })
         .previous_outpoint(TransactionOutpoint {

@@ -9,7 +9,7 @@ use keryx_consensus_core::{
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
-    pom::{pom_block_seed, pom_block_seed_h3, pom_pow_value, pom_pow_value_h3, verify_pom_proof},
+    pom::{pom_block_seed, pom_block_seed_h3, pom_pow_value, pom_pow_value_h3, verify_pom_proof, verify_pom_proof_v2},
     tx::TransactionOutpoint,
 };
 use keryx_math::Uint256;
@@ -179,9 +179,14 @@ impl BlockBodyProcessor {
         if h3 && proof.final_state != header.pom_final_state {
             return Err(RuleError::PomFinalStateMismatch(header.pom_final_state, proof.final_state));
         }
-        // Tier set is gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
-        // chosen from this block's own daa_score so archival/IBD recomputation stays canonical.
-        let tiers = pom_tiers(self.very_light_activation.is_active(header.daa_score));
+        // Tier set is gated per block by DAA: H4 (candle-free, coin_age_verification) > H2 (5-tier,
+        // very_light) > legacy 4-tier. Chosen from this block's own daa_score so archival/IBD
+        // recomputation stays canonical. H4 co-activates with the recompute-from-chunks verifier
+        // (same `coin_age_verification_activation` DAA), so the new roots are checked by v2.
+        let tiers = pom_tiers(
+            self.coin_age_verification_activation.is_active(header.daa_score),
+            self.very_light_activation.is_active(header.daa_score),
+        );
         let tier = tiers.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
 
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
@@ -192,6 +197,17 @@ impl BlockBodyProcessor {
             pom_block_seed(&pre_pow_hash, header.timestamp, header.nonce)
         };
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
+        let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
+
+        // H4: recompute-from-chunks verifier (all K transitions re-walked, `final_state` derived).
+        // Replaces the 32/256 spot-check, which accepted a forged `final_state` ~88% of the time.
+        // The seed/target/final_hash inputs are identical to the spot-check path — only the proof
+        // structure and verification differ. H3 is a prerequisite of H4 (H4 gates strictly later),
+        // so `final_state` is still pinned to the header above.
+        if self.coin_age_verification_activation.is_active(header.daa_score) {
+            return verify_pom_proof_v2(seed, proof, tier.chunks, POM_WALK_STEPS, &tier.root, &target, final_hash)
+                .map_err(RuleError::BadPomProof);
+        }
 
         verify_pom_proof(
             &pre_pow_hash,
@@ -203,7 +219,7 @@ impl BlockBodyProcessor {
             POM_OPENINGS,
             &tier.root,
             &target,
-            |s| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) },
+            final_hash,
         )
         .map_err(RuleError::BadPomProof)
     }

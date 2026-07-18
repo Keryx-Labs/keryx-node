@@ -194,6 +194,9 @@ message UtxoEntry {
   ScriptPublicKey scriptPublicKey = 2;
   uint64 blockDaaScore = 3;
   bool isCoinbase = 4;
+  // Coin-age (holder-reward v3) anchor. Presence-tracked: absent (old peer) falls back to
+  // blockDaaScore — the pre-H4 invariant; present is taken verbatim (a genuine 0 stays 0).
+  optional uint64 effectiveDaaScore = 5;
 }
 
 message RequestNextPruningPointUtxoSetChunkMessage {
