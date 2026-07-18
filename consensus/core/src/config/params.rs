@@ -204,16 +204,19 @@ pub const POM_WALK_STEPS: u32 = 256;
 pub const POM_OPENINGS: usize = 32;
 
 /// Selected-chain depth, in chain blocks, behind which a block's persisted `PomProof` may be
-/// garbage-collected. Each proof is ~48 KB; persisting one per block over the full body window
-/// (`pruning_depth`, days of blocks) is what doubled pruned datadirs after the PoM hardfork. A
-/// proof is only ever needed to (re-)serve a *recent* block to peers via relay; far older blocks
-/// are only ever requested through IBD, which does not verify the proof (`skip_pom_proof`). So
-/// keeping proofs for the last `POM_PROOF_RETENTION_DEPTH` chain blocks (~83 min at 10 BPS) is far
-/// more than the relay horizon (a few hundred blocks) and lets the rest be reclaimed. Deleting a
+/// garbage-collected. A proof is only ever needed to (re-)serve a *recent* block to peers via relay;
+/// far older blocks are only ever requested through IBD, which does not verify the proof
+/// (`skip_pom_proof`). So keeping proofs for the last `POM_PROOF_RETENTION_DEPTH` DAA-score depth is
+/// far more than the relay horizon (a few hundred blocks) and lets the rest be reclaimed. Deleting a
 /// proof can never corrupt consensus state: the proof is not part of the UTXO set / state, and the
 /// header `utxo_commitment` already pins the state. The GC pass runs unconditionally on every node
 /// (see the pruning processor) — no flag, transparent — so pruned datadirs stay bounded by design.
-pub const POM_PROOF_RETENTION_DEPTH: u64 = 50_000;
+///
+/// Lowered 50_000 → 25_000 for the H4 verifier-v2 proofs: v2 records the full K=256-step walk
+/// (256 Merkle paths) instead of the v1 32/256 spot-check, so each proof is ~2.7× bigger (~228 KB
+/// vs ~48 KB). At 25_000 the pruned proof store stays ~6 GB (vs ~12 GB at 50_000), keeping the
+/// bootstrap datadir near its H3 size. Still far above the relay horizon; not consensus (per above).
+pub const POM_PROOF_RETENTION_DEPTH: u64 = 25_000;
 
 /// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
 /// produced offline by `pom-rt-builder` (canonical: name-sorted GGUF tensors). Tier index =
