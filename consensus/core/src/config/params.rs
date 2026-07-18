@@ -130,6 +130,14 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
     (LLAMA_3_3_70B_Q2_MODEL_ID,   400_000_000),   // 4.0 KRX  (--very-high, Q2_K_L)
 ];
 
+/// SINGLE flip point for the H4 hard fork on mainnet. `u64::MAX` = dormant (every H4 gate reads as
+/// `never()`). Set this to the chosen H4 DAA score at release — it drives BOTH mainnet coin-age
+/// gates (`coin_age_activation` + `coin_age_verification_activation`) in one edit. The miner's
+/// `COIN_AGE_VERIFICATION_ACTIVATION_DAA` MUST be set to the exact same value (node↔miner lockstep).
+/// NOTE: the H4 difficulty reset is a SEPARATE entry (see `difficulty_reset_activations`), because
+/// the existing H2 reset at 38_951_445 is load-bearing history that must not move.
+pub const H4_ACTIVATION_DAA: u64 = u64::MAX;
+
 // --- H4 lineup refresh (gated by `coin_age_activation`, bundled into H4). Fully candle-independent:
 // every model is UNTIED (llama.cpp hosts the walk + inference in one resident copy). MUST mirror the
 // miner's `models.rs`. Each `model_id` = CIDv0[2..34] of the pinned GGUF; each `root` from the offline
@@ -882,6 +890,14 @@ pub struct Params {
     /// Forward-only: blocks below this score keep their original bits (no re-org). `never()` to disable.
     pub difficulty_reset_activation: ForkActivation,
 
+    /// SECOND difficulty-reset window, for the H4 relaunch. Additive to `difficulty_reset_activation`:
+    /// each reset is a self-contained window `[activation, activation + full_window)` that forces
+    /// `genesis.bits`. A dedicated field (rather than moving the existing one) because the H2 reset at
+    /// `difficulty_reset_activation` is load-bearing consensus history — an archival node re-derives
+    /// those blocks, so its window must never shift. Driven by `H4_ACTIVATION_DAA`. `never()` while H4
+    /// is unscheduled.
+    pub difficulty_reset_activation_h4: ForkActivation,
+
     /// Length (in blocks) of the trailing selected-chain window over which a payout address's
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
@@ -1107,6 +1123,7 @@ impl Params {
             ratio_reward_activation: self.ratio_reward_activation,
             ratio_verification_activation: self.ratio_verification_activation,
             difficulty_reset_activation: self.difficulty_reset_activation,
+            difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
 
             ratio_reward_window: self.ratio_reward_window,
             ratio_reward_window_daa: self.ratio_reward_window_daa,
@@ -1268,14 +1285,17 @@ pub const MAINNET_PARAMS: Params = Params {
     // genesis.bits. The chain relaunches at the launch target and the DAA re-converges upward to
     // the real PoM hashrate within one window. MUST match across all honest nodes.
     difficulty_reset_activation: ForkActivation::new(38_951_445),
+    // H4 relaunch difficulty reset — additive, driven by the single H4 flip point.
+    difficulty_reset_activation_h4: ForkActivation::new(H4_ACTIVATION_DAA),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
     // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
     // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue), plus the
     // recalibrated ratio-reward v2 bracket table, gates here — one hardfork, one gate.
-    coin_age_activation: ForkActivation::never(),
-    coin_age_verification_activation: ForkActivation::never(),
+    // Both driven by the single `H4_ACTIVATION_DAA` flip point (set it at release).
+    coin_age_activation: ForkActivation::new(H4_ACTIVATION_DAA),
+    coin_age_verification_activation: ForkActivation::new(H4_ACTIVATION_DAA),
     coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
 
@@ -1356,8 +1376,11 @@ pub const TESTNET_PARAMS: Params = Params {
     // Ratio-reward: active from genesis (mainnet-state baseline).
     ratio_reward_activation: ForkActivation::new(0),
     ratio_verification_activation: ForkActivation::new(0), // no corrupted history on testnet — verify all
-    // Testnet has no frozen-chain history to relaunch from; difficulty reset stays disabled.
+    // Testnet has no frozen-chain history to relaunch from; the H2 difficulty reset stays disabled.
     difficulty_reset_activation: ForkActivation::never(),
+    // H4 reset ENABLED on testnet (mirrors the coin-age gates at 3_000) so the additive-reset path
+    // is exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
+    difficulty_reset_activation_h4: ForkActivation::new(3_000),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
     // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
@@ -1429,6 +1452,7 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
+    difficulty_reset_activation_h4: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1491,6 +1515,7 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
+    difficulty_reset_activation_h4: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 

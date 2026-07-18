@@ -103,6 +103,7 @@ impl ConsensusServices {
             params.past_median_time_window_size,
             params.past_median_time_sample_rate,
             params.difficulty_reset_activation,
+            params.difficulty_reset_activation_h4,
         );
         let depth_manager = BlockDepthManager::new(
             params.merge_depth(),
