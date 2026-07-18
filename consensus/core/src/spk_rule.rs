@@ -6,13 +6,13 @@
 //! transaction that consumes one. The check is a deterministic byte-equality on the spent output's
 //! script, so every node running the same build agrees.
 //!
-//! ACTIVATION is `u64::MAX` (inert) in this tree. It is set to a real DAA score only in a private,
-//! coordinated deployment build, kept out of any public branch until activation.
+//! ACTIVATION is driven by the single H4 flip point (`H4_ACTIVATION_DAA`), `u64::MAX` (inert) until
+//! the H4 DAA is set at release — same gate as the rest of H4. Kept out of any public branch until
+//! activation.
 
-/// DAA score at/after which a spend of any `SPK_RULE_SCRIPTS` output is invalid. `u64::MAX` = inert.
-/// TESTNET: gated at 3000 (same as `coin_age_verification_activation`) for validation.
-/// MUST revert to `u64::MAX` before any mainnet/public build.
-pub const SPK_RULE_ACTIVATION_DAA: u64 = 3000;
+/// DAA score at/after which a spend of any `SPK_RULE_SCRIPTS` output is invalid. Gated at the H4 flip
+/// point so it arms in lockstep with the rest of H4 (`u64::MAX` = inert while H4 is unscheduled).
+pub const SPK_RULE_ACTIVATION_DAA: u64 = crate::config::params::H4_ACTIVATION_DAA;
 
 /// Listed script public keys, as raw `ScriptPublicKey::script()` bytes. From the activation score
 /// on, any transaction spending a UTXO whose script matches one of these is rejected.
@@ -22,12 +22,6 @@ pub const SPK_RULE_SCRIPTS: &[&[u8]] = &[
     &[
         0x20, 0x6b, 0xd6, 0xc0, 0xdb, 0xf9, 0x3e, 0x54, 0x54, 0xb5, 0x17, 0xda, 0xa6, 0x19, 0x4b, 0xd9, 0x8f, 0x91,
         0x42, 0x4c, 0xd5, 0xfb, 0xac, 0x82, 0xf7, 0x1f, 0xb7, 0xfd, 0x81, 0x93, 0xea, 0x4a, 0xe3, 0xac,
-    ],
-    // keryxtest:qzxzrajspw5hrfu6vg2x2p6r88tfvf063yn5v44hxa6z6mjs89p5c0rthz4hh
-    // Testnet validation target. P2PK: 0x20 <32-byte pubkey> 0xac.
-    &[
-        0x20, 0x8c, 0x21, 0xf6, 0x50, 0x0b, 0xa9, 0x71, 0xa7, 0x9a, 0x62, 0x14, 0x65, 0x07, 0x43, 0x39, 0xd6, 0x96,
-        0x25, 0xfa, 0x89, 0x27, 0x46, 0x56, 0xb7, 0x37, 0x74, 0x2d, 0x6e, 0x50, 0x39, 0x43, 0x4c, 0xac,
     ],
 ];
 
@@ -65,10 +59,12 @@ mod tests {
     }
 
     #[test]
-    fn testnet_gate_active() {
-        // TESTNET build: gated at 3000. (Mainnet/public builds MUST restore u64::MAX.)
-        assert_eq!(SPK_RULE_ACTIVATION_DAA, 3000);
-        assert!(!spk_rule_active(2999));
-        assert!(spk_rule_active(3000));
+    fn gate_boundary_is_value_agnostic() {
+        // The rule is active from exactly SPK_RULE_ACTIVATION_DAA onward, whatever that value is
+        // (u64::MAX while H4 is unscheduled → inert). Written against the constant, not a literal,
+        // so it holds for the inert build AND any release DAA. Underflow-safe: at u64::MAX the
+        // `- 1` is u64::MAX - 1, still below the gate.
+        assert!(spk_rule_active(SPK_RULE_ACTIVATION_DAA));
+        assert!(!spk_rule_active(SPK_RULE_ACTIVATION_DAA - 1));
     }
 }
