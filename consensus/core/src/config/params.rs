@@ -136,7 +136,7 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
 /// `COIN_AGE_VERIFICATION_ACTIVATION_DAA` MUST be set to the exact same value (node↔miner lockstep).
 /// NOTE: the H4 difficulty reset is a SEPARATE entry (see `difficulty_reset_activations`), because
 /// the existing H2 reset at 38_951_445 is load-bearing history that must not move.
-pub const H4_ACTIVATION_DAA: u64 = 54_668_000;
+pub const H4_ACTIVATION_DAA: u64 = 54_726_000;
 
 // --- H4 lineup refresh (gated by `coin_age_activation`, bundled into H4). Fully candle-independent:
 // every model is UNTIED (llama.cpp hosts the walk + inference in one resident copy). MUST mirror the

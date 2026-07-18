@@ -42,6 +42,31 @@ impl<T> CachedDbItem<T> {
         }
     }
 
+    /// Like `read`, with an in-place decode fallback: if the bytes fail to decode as `T`, the
+    /// SAME bytes are re-tried as `TDecodeFallback` (a previous layout of `T`) and converted.
+    /// Item-store counterpart of `CachedDbAccess::read_with_decode_fallback` — needed by
+    /// singleton items whose payload embeds a grown positional layout (e.g. the virtual state's
+    /// utxo diff embedding pre-H4 `UtxoEntry` values).
+    pub fn read_with_decode_fallback<TDecodeFallback>(&self) -> Result<T, StoreError>
+    where
+        T: Clone + DeserializeOwned,
+        TDecodeFallback: DeserializeOwned + Into<T>,
+    {
+        if let Some(item) = self.cached_item.read().clone() {
+            return Ok(item);
+        }
+        if let Some(slice) = self.db.get_pinned(&self.key)? {
+            let item: T = match bincode::deserialize(&slice) {
+                Ok(item) => item,
+                Err(_) => bincode::deserialize::<TDecodeFallback>(&slice)?.into(),
+            };
+            *self.cached_item.write() = Some(item.clone());
+            Ok(item)
+        } else {
+            Err(StoreError::KeyNotFound(DbKey::prefix_only(&self.key)))
+        }
+    }
+
     pub fn write(&mut self, mut writer: impl DbWriter, item: &T) -> Result<(), StoreError>
     where
         T: Clone + Serialize,

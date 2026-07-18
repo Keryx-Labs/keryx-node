@@ -12,7 +12,7 @@ use keryx_database::prelude::{BatchDbWriter, CachedDbAccess, DirectDbWriter};
 use keryx_database::prelude::{CachePolicy, StoreError};
 use keryx_hashes::Hash;
 use rocksdb::WriteBatch;
-use std::{error::Error, fmt::Display, sync::Arc};
+use std::{collections::HashMap, error::Error, fmt::Display, sync::Arc};
 
 type UtxoCollectionIterator<'a> = Box<dyn Iterator<Item = Result<(TransactionOutpoint, UtxoEntry), Box<dyn Error>>> + 'a>;
 
@@ -94,17 +94,44 @@ impl From<UtxoKey> for TransactionOutpoint {
 /// exactly the pre-H4 invariant, so lazy migration is deterministic regardless of when a node
 /// upgrades. Same mechanism as the H3 `HeaderWithBlockLevelPreH3` header-store fallback.
 #[derive(Deserialize)]
-struct UtxoEntryPreH4 {
+pub(crate) struct UtxoEntryPreH4 {
     amount: u64,
     script_public_key: ScriptPublicKey,
     block_daa_score: u64,
     is_coinbase: bool,
 }
 
-impl From<UtxoEntryPreH4> for Arc<UtxoEntry> {
+impl From<UtxoEntryPreH4> for UtxoEntry {
     fn from(e: UtxoEntryPreH4) -> Self {
         // Pre-H4 invariant: the age anchor is the creation score.
-        Arc::new(UtxoEntry::new(e.amount, e.script_public_key, e.block_daa_score, e.is_coinbase))
+        UtxoEntry::new(e.amount, e.script_public_key, e.block_daa_score, e.is_coinbase)
+    }
+}
+
+impl From<UtxoEntryPreH4> for Arc<UtxoEntry> {
+    fn from(e: UtxoEntryPreH4) -> Self {
+        Arc::new(e.into())
+    }
+}
+
+/// Pre-H4 layout of a serialized `UtxoDiff` — same mechanism as `UtxoEntryPreH4`, for stores
+/// whose payload embeds utxo entries inside a diff (per-block utxo diffs, virtual state).
+#[derive(Deserialize)]
+pub(crate) struct UtxoDiffPreH4 {
+    add: HashMap<TransactionOutpoint, UtxoEntryPreH4>,
+    remove: HashMap<TransactionOutpoint, UtxoEntryPreH4>,
+}
+
+impl From<UtxoDiffPreH4> for UtxoDiff {
+    fn from(d: UtxoDiffPreH4) -> Self {
+        let convert = |c: HashMap<TransactionOutpoint, UtxoEntryPreH4>| c.into_iter().map(|(k, v)| (k, v.into())).collect();
+        UtxoDiff { add: convert(d.add), remove: convert(d.remove) }
+    }
+}
+
+impl From<UtxoDiffPreH4> for Arc<UtxoDiff> {
+    fn from(d: UtxoDiffPreH4) -> Self {
+        Arc::new(d.into())
     }
 }
 
