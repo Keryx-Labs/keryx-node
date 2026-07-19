@@ -815,7 +815,14 @@ impl VirtualStateProcessor {
     /// in place since the last run (until the maturation-queue promotions maintain that in-flight).
     pub(crate) fn rebuild_age_buckets_index(&self) {
         let virtual_read = self.virtual_stores.read();
-        let daa_score = virtual_read.state.get().unwrap().daa_score;
+        // A freshly-created (staging) consensus has no virtual state yet — skip, like the
+        // windowed-production rebuild does. The index is seeded once the state exists: at
+        // pruning-point import for fast sync (`import_pruning_point_utxo_set`) or next startup.
+        let Some(state) = virtual_read.state.get().optional().unwrap() else {
+            warn!("age-buckets rebuild: virtual state is not initialized yet; skipping");
+            return;
+        };
+        let daa_score = state.daa_score;
         let mature_bound = daa_score.saturating_sub(self.coin_age_maturity_w);
         let mut buckets: HashMap<ScriptPublicKey, AgeBuckets> = HashMap::new();
         for item in virtual_read.utxo_set.iterator() {
@@ -1608,6 +1615,13 @@ impl VirtualStateProcessor {
             &mut UtxoDiff::default(),
             &ChainPath::default(),
         )?;
+
+        // Coin-age (v3): seed the age-bucket index from the just-imported UTXO set (every entry
+        // carries its `effective_daa`). The startup rebuild was skipped on this consensus while it
+        // had no virtual state; the state exists now, and the imported set is the exact baseline —
+        // without this, a fast-synced node validates holder-reward with empty buckets once the
+        // post-import trust window expires.
+        self.rebuild_age_buckets_index();
 
         Ok(())
     }

@@ -232,7 +232,11 @@ impl PruningProcessor {
         }
 
         // Lower bound: nothing below the pruning point exists anymore, so never walk past it.
-        let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
+        // Tolerate a virgin (staging) consensus that has no pruning point yet — the GC thread now
+        // starts before the first pruning message instead of inside the message loop.
+        let Some(pruning_point) = self.pruning_point_store.read().pruning_point().optional().unwrap() else {
+            return false;
+        };
         let floor = self.selected_chain_store.read().get_by_hash(pruning_point).optional().unwrap().unwrap_or(0);
         let from = self.pom_gc_cursor.load(Ordering::Relaxed).max(floor);
         if from >= target {
