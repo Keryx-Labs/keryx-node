@@ -641,8 +641,9 @@ impl ConsensusApi for Consensus {
     }
 
     fn validate_and_insert_block_ibd(&self, block: Block) -> BlockValidationFutures {
-        // IBD body sync: skip the PoM possession proof (not transmitted in IBD; legacy blocks have
-        // none persisted). The synced chain is trusted by accumulated work.
+        // IBD body sync: skip PoM possession proof *verification*. The synced chain is trusted by
+        // accumulated work. A proof may still travel with the block (v8 body serving) so recent
+        // blocks can be re-relayed; the IBD flow strips it for blocks beyond the retention window.
         let (block_task, virtual_state_task) =
             self.validate_and_insert_block_impl(BlockTask::Ordinary { block, skip_pom_proof: true });
         BlockValidationFutures { block_task: Box::pin(block_task), virtual_state_task: Box::pin(virtual_state_task) }

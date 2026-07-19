@@ -9,6 +9,7 @@ use keryx_consensus_core::{
     BlockHashSet,
     api::BlockValidationFuture,
     block::Block,
+    config::params::POM_PROOF_RETENTION_DEPTH,
     header::Header,
     pom::PomProof,
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
@@ -810,6 +811,10 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 if blk_body.is_empty() {
                     return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", hash)));
                 }
+                // Pruning-anticone blocks sit at pruning depth, far beyond the proof retention
+                // window — keep the proven tier for the coinbase split, never persist the proof.
+                let pom_tier = pom_tier.or_else(|| pom_proof.as_ref().map(|p| p.tier));
+                let pom_proof = None;
                 let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof, pom_tier };
                 // TODO (relaxed): sending ghostdag data may be redundant, especially when the headers were already verified.
                 // Consider sending empty ghostdag data, simplifying a great deal. The result should be the same -
@@ -842,13 +847,17 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             for &hash in chunk.iter() {
                 // TODO: change to BodyOnly requests when incorporated
                 let msg = dequeue_with_timeout!(self.incoming_route, Payload::IbdBlock)?;
-                let block: Block = Versioned(self.header_format, msg).try_into()?;
+                let mut block: Block = Versioned(self.header_format, msg).try_into()?;
                 if block.hash() != hash {
                     return Err(ProtocolError::OtherOwned(format!("expected block {} but got {}", hash, block.hash())));
                 }
                 if block.is_header_only() {
                     return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
                 }
+                // Pruning-anticone blocks sit at pruning depth, far beyond the proof retention
+                // window — keep the proven tier for the coinbase split, never persist the proof.
+                block.pom_tier = block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier));
+                block.pom_proof = None;
                 // TODO (relaxed): sending ghostdag data may be redundant, especially when the headers were already verified.
                 // Consider sending empty ghostdag data, simplifying a great deal. The result should be the same -
                 // a trusted task is sent, however the header is already verified, and hence only the block body will be verified.
@@ -888,14 +897,18 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         let low_header = consensus.async_get_header(*hashes.first().expect("hashes was non empty")).await?;
         let high_header = consensus.async_get_header(*hashes.last().expect("hashes was non empty")).await?;
         let mut progress_reporter = ProgressReporter::new(low_header.daa_score, high_header.daa_score, "blocks");
+        // Sync target used to decide whether a block's possession proof is worth persisting: blocks
+        // deeper than the proof retention window below the target can never be relayed as recent,
+        // so their proof would only be a doomed 200+ KB write that the GC deletes later.
+        let high_daa = high_header.daa_score;
 
         let mut iter = hashes.chunks(IBD_BATCH_SIZE);
         let QueueChunkOutput { jobs: mut prev_jobs, daa_score: mut prev_daa_score, timestamp: mut prev_timestamp } =
-            self.queue_block_processing_chunk(consensus, iter.next().expect("hashes was non empty")).await?;
+            self.queue_block_processing_chunk(consensus, iter.next().expect("hashes was non empty"), high_daa).await?;
 
         for chunk in iter {
             let QueueChunkOutput { jobs: current_jobs, daa_score: current_daa_score, timestamp: current_timestamp } =
-                self.queue_block_processing_chunk(consensus, chunk).await?;
+                self.queue_block_processing_chunk(consensus, chunk, high_daa).await?;
             let prev_chunk_len = prev_jobs.len();
             // Join the previous chunk so that we always concurrently process a chunk and receive another
             try_join_all(prev_jobs).await?;
@@ -917,11 +930,12 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         &mut self,
         consensus: &ConsensusProxy,
         chunk: &[Hash],
+        high_daa: u64,
     ) -> Result<QueueChunkOutput, ProtocolError> {
         if self.body_only_ibd_permitted {
-            self.queue_block_processing_chunk_body_only(consensus, chunk).await
+            self.queue_block_processing_chunk_body_only(consensus, chunk, high_daa).await
         } else {
-            self.queue_block_processing_chunk_full_block(consensus, chunk).await
+            self.queue_block_processing_chunk_full_block(consensus, chunk, high_daa).await
         }
     }
 
@@ -929,6 +943,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         &mut self,
         consensus: &ConsensusProxy,
         chunk: &[Hash],
+        high_daa: u64,
     ) -> Result<QueueChunkOutput, ProtocolError> {
         let mut jobs = Vec::with_capacity(chunk.len());
         let mut current_daa_score = 0;
@@ -941,12 +956,16 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             .await?;
         for &expected_hash in chunk {
             let msg = dequeue_with_timeout!(self.incoming_route, Payload::IbdBlock)?;
-            let block: Block = Versioned(self.header_format, msg).try_into()?;
+            let mut block: Block = Versioned(self.header_format, msg).try_into()?;
             if block.hash() != expected_hash {
                 return Err(ProtocolError::OtherOwned(format!("expected block {} but got {}", expected_hash, block.hash())));
             }
             if block.is_header_only() {
                 return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
+            }
+            if high_daa.saturating_sub(block.header.daa_score) > POM_PROOF_RETENTION_DEPTH {
+                block.pom_tier = block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier));
+                block.pom_proof = None;
             }
             current_daa_score = block.header.daa_score;
             current_timestamp = block.header.timestamp;
@@ -959,6 +978,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         &mut self,
         consensus: &ConsensusProxy,
         chunk: &[Hash],
+        high_daa: u64,
     ) -> Result<QueueChunkOutput, ProtocolError> {
         let mut jobs = Vec::with_capacity(chunk.len());
         let mut current_daa_score = 0;
@@ -994,6 +1014,11 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             if blk_body.is_empty() {
                 return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", expected_hash)));
             }
+            let (pom_proof, pom_tier) = if high_daa.saturating_sub(blk_header.daa_score) > POM_PROOF_RETENTION_DEPTH {
+                (None, pom_tier.or_else(|| pom_proof.as_ref().map(|p| p.tier)))
+            } else {
+                (pom_proof, pom_tier)
+            };
             let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof, pom_tier };
             current_daa_score = block.header.daa_score;
             current_timestamp = block.header.timestamp;

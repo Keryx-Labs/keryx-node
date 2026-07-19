@@ -86,7 +86,7 @@ pub struct PruningProcessor {
     is_consensus_exiting: Arc<AtomicBool>,
 
     // Highest selected-chain index whose mergeset PoM proofs have already been garbage-collected
-    // (see `gc_pom_proofs_if_enabled`). In-memory only — on restart the sweep simply re-walks from
+    // (see `gc_old_pom_proofs`). In-memory only — on restart the sweep simply re-walks from
     // the pruning point, issuing harmless no-op deletes for proofs that are already gone.
     pom_gc_cursor: AtomicU64,
 }
@@ -125,6 +125,26 @@ impl PruningProcessor {
     }
 
     pub fn worker(self: &Arc<Self>) {
+        // The proof GC gets its own thread: it used to run inline in the message loop below, where a
+        // single long pruning pass (hours under IBD load, waiting on consensus write permissions)
+        // froze it entirely while proofs kept flooding in — 54 GB of stale proofs observed on a
+        // bootstrap datadir. The sweep is cursor-based and idempotent, so running it concurrently
+        // with pruning (which deletes proofs too) is safe: deletes of the same key commute.
+        let gc = self.clone();
+        std::thread::Builder::new()
+            .name("pom-proof-gc".to_string())
+            .spawn(move || {
+                while !gc.is_consensus_exiting.load(Ordering::Relaxed) {
+                    // Drain the whole backlog batch by batch, pausing briefly between batches to
+                    // stay gentle on the DB, then idle until new chain blocks exit the window.
+                    while gc.gc_old_pom_proofs() && !gc.is_consensus_exiting.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            })
+            .expect("spawning the PoM proof GC thread");
+
         // On start-up, check if any pruning workflows require recovery. We wait for the first processing message to arrive
         // in order to make sure the node is already connected and receiving blocks before we start background recovery operations
         let mut recovered = false;
@@ -143,7 +163,6 @@ impl PruningProcessor {
                 recovered = true;
             }
             self.advance_pruning_point_if_possible(sink_ghostdag_data);
-            self.gc_old_pom_proofs();
             self.gc_collapse_ratio_prefix();
         }
     }
@@ -186,8 +205,9 @@ impl PruningProcessor {
     }
 
     /// Garbage-collect PoM possession proofs older than `POM_PROOF_RETENTION_DEPTH` chain blocks.
+    /// Returns whether a batch was swept (i.e. there may be more backlog to drain).
     ///
-    /// Runs unconditionally on every pruning message — no flag, transparent on every node. It is a
+    /// Runs on a dedicated thread — no flag, transparent on every node. It is a
     /// self-contained cache reclaim: it deletes only from the `pom_proof` store and touches no
     /// consensus state (UTXO, statuses, rewards, relations). The worst case if it ever over-deletes
     /// is a recent block being served "naked" — which IBD tolerates (it skips proof verification,
@@ -200,15 +220,15 @@ impl PruningProcessor {
     /// in-memory cursor advances from the pruning point up to `tip - retention`, processing at most
     /// `GC_BATCH` chain blocks per pruning message so a large backlog drains gradually without ever
     /// blocking consensus.
-    fn gc_old_pom_proofs(&self) {
+    fn gc_old_pom_proofs(&self) -> bool {
         const GC_BATCH: u64 = 2_000;
 
         let Ok((tip_index, _)) = self.selected_chain_store.read().get_tip() else {
-            return;
+            return false;
         };
         let target = tip_index.saturating_sub(POM_PROOF_RETENTION_DEPTH);
         if target == 0 {
-            return;
+            return false;
         }
 
         // Lower bound: nothing below the pruning point exists anymore, so never walk past it.
@@ -216,7 +236,7 @@ impl PruningProcessor {
         let floor = self.selected_chain_store.read().get_by_hash(pruning_point).optional().unwrap().unwrap_or(0);
         let from = self.pom_gc_cursor.load(Ordering::Relaxed).max(floor);
         if from >= target {
-            return; // caught up — nothing newly exited the retention window
+            return false; // caught up — nothing newly exited the retention window
         }
         let to = target.min(from + GC_BATCH);
 
@@ -253,6 +273,7 @@ impl PruningProcessor {
             deleted,
             POM_PROOF_RETENTION_DEPTH
         );
+        true
     }
 
     fn recover_pruning_workflows_if_needed(&self) -> bool {
