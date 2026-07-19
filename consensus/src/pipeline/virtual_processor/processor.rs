@@ -744,12 +744,12 @@ impl VirtualStateProcessor {
         // for from-genesis nodes (fast-sync reconstruction from the pruning-point snapshot is 2b-3).
         self.apply_balance_diff(&mut batch, accumulated_diff);
 
-        // Coin-age (v3): sweep the maturation queue FIRST (promote coins whose age crossed W by
-        // the new virtual score), then advance the bucket index by the SAME diff, in the SAME
+        // Coin-age (v3): sweep the maturation queue FIRST (promote — or, on a score drop, demote —
+        // coins across the W boundary), then advance the bucket index by the SAME diff, in the SAME
         // batch (lockstep, like the balance index above). Ungated passive aggregates — read only
-        // at/after `coin_age_activation`. A `true` sweep result = the virtual score moved below
-        // the promotion watermark (deep reorg): rebuild everything from the UTXO set post-commit.
-        let coin_age_needs_rebuild = self.sweep_maturation_queue(&mut batch, new_virtual_state.daa_score);
+        // at/after `coin_age_activation`. A `true` sweep result = the score dropped past the
+        // retention horizon (never in practice): rebuild from the UTXO set post-commit.
+        let coin_age_needs_rebuild = self.sweep_maturation_queue(&mut batch, new_virtual_state.daa_score, accumulated_diff);
         self.apply_age_diff(&mut batch, accumulated_diff, new_virtual_state.daa_score);
 
         // Ratio-reward (Stage 2b-2b): advance the prefix-sum production index along the SAME chain
@@ -771,9 +771,10 @@ impl VirtualStateProcessor {
         drop(virtual_write);
         drop(selected_chain_write);
 
-        // Deep-reorg guard (see `sweep_maturation_queue`): re-derive the coin-age state exactly
-        // from the just-committed UTXO set. Rare to nonexistent in practice (the virtual daa
-        // score is effectively monotone); correctness beats incremental demotion here.
+        // Deep-reorg guard (see `sweep_maturation_queue`): only a score drop deeper than the
+        // retention horizon lands here — the retained promotions were pruned and can't be
+        // unwound, so re-derive the coin-age state exactly from the just-committed UTXO set.
+        // Shallow drops (routine during IBD catch-up) are demoted in place by the sweep.
         if coin_age_needs_rebuild {
             self.rebuild_age_buckets_index();
         }

@@ -998,13 +998,43 @@ impl VirtualStateProcessor {
     /// commit so a coin that is both due and spent is first promoted, then removed as mature —
     /// mirroring the remove-path classification (which sees it at/below `d − W`).
     ///
-    /// Returns `true` when the virtual score moved BELOW the watermark (deep reorg past a
-    /// maturity boundary): incremental promotions can't be unwound, so the caller must run a full
-    /// `rebuild_age_buckets_index` after the commit instead (exact from the UTXO set).
-    pub(super) fn sweep_maturation_queue(&self, batch: &mut rocksdb::WriteBatch, new_daa_score: u64) -> bool {
+    /// When the virtual score moves BELOW the watermark (side-chain re-anchor — routine during
+    /// IBD catch-up, where virtual commits alternate between the syncer chain and the local
+    /// near-tip sink), the promotions in `(new, watermark]` are unwound in place by demoting
+    /// their retained queue entries — the write-path mirror of the read-path demotion in
+    /// `eff_balance_for_spk`, with the same spent-after-maturing guard (`diff` here plays the
+    /// role of `view_diffs`: a spend at score ≥ due > new score cannot be in the new virtual's
+    /// past, so the reorg diff re-adds such a coin and `apply_age_diff` re-classifies it).
+    ///
+    /// Returns `true` only when the drop exceeds `coin_age_retention` — the retained promotions
+    /// needed to unwind were pruned (never in practice: retention = finality depth) — and the
+    /// caller must run a full `rebuild_age_buckets_index` after the commit instead.
+    pub(super) fn sweep_maturation_queue(&self, batch: &mut rocksdb::WriteBatch, new_daa_score: u64, diff: &UtxoDiff) -> bool {
         let watermark = self.maturation_queue_store.get_watermark().unwrap().unwrap_or(new_daa_score);
         if new_daa_score < watermark {
-            return true;
+            if watermark - new_daa_score > self.coin_age_retention {
+                return true;
+            }
+            for (raw, due) in self.maturation_queue_store.due_range(new_daa_score, watermark) {
+                // Pure re-add (spent-after-maturing restore) — skip, `apply_age_diff` re-adds the
+                // coin on the immature side. In add AND remove (same outpoint re-anchored with a
+                // different `effective_daa`) — demote: the remove folds on the immature side and
+                // must land on the demoted value.
+                let outpoint = DbMaturationQueueStore::outpoint_of(&raw);
+                if diff.add.contains_key(&outpoint) && !diff.remove.contains_key(&outpoint) {
+                    continue;
+                }
+                let b = self.age_buckets_store.get(&due.script_public_key).unwrap();
+                let next = AgeBuckets {
+                    b_mat: b.b_mat.saturating_sub(due.amount),
+                    b_imm: b.b_imm.saturating_add(due.amount),
+                    a_imm: b.a_imm.saturating_add(due.amount as u128 * due.anchor as u128),
+                };
+                self.age_buckets_store.set_batch(batch, &due.script_public_key, next).unwrap();
+                // The entry stays queued: the next forward sweep past its due re-promotes it.
+            }
+            self.maturation_queue_store.set_watermark_batch(batch, new_daa_score).unwrap();
+            return false;
         }
         for (_, due) in self.maturation_queue_store.due_range(watermark, new_daa_score) {
             // Consecutive read-modify-writes on the same SPK stay coherent through the store's
