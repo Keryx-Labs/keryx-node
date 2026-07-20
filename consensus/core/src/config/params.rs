@@ -1179,7 +1179,10 @@ impl From<NetworkId> for Params {
 }
 
 pub const MAINNET_PARAMS: Params = Params {
-    dns_seeders: &["seed.keryx-labs.com"],
+    // A literal IP is valid here: the seeder string is resolved through
+    // `(seeder, default_port).to_socket_addrs()`, which parses an IP address before
+    // falling back to a DNS lookup. It acts as a fixed bootstrap peer on port 22111.
+    dns_seeders: &["seed.keryx-labs.com", "141.95.35.181"],
     net: NetworkId::new(NetworkType::Mainnet),
     genesis: GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
