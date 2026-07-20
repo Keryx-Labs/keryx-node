@@ -131,16 +131,16 @@ impl PruningProcessor {
         // bootstrap datadir. The sweep is cursor-based and idempotent, so running it concurrently
         // with pruning (which deletes proofs too) is safe: deletes of the same key commute.
         let gc = self.clone();
-        std::thread::Builder::new()
+        let gc_handle = std::thread::Builder::new()
             .name("pom-proof-gc".to_string())
             .spawn(move || {
                 while !gc.is_consensus_exiting.load(Ordering::Relaxed) {
                     // Drain the whole backlog batch by batch, pausing briefly between batches to
                     // stay gentle on the DB, then idle until new chain blocks exit the window.
                     while gc.gc_old_pom_proofs() && !gc.is_consensus_exiting.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(50));
+                        std::thread::park_timeout(Duration::from_millis(50));
                     }
-                    std::thread::sleep(Duration::from_secs(5));
+                    std::thread::park_timeout(Duration::from_secs(5));
                 }
             })
             .expect("spawning the PoM proof GC thread");
@@ -165,6 +165,12 @@ impl PruningProcessor {
             self.advance_pruning_point_if_possible(sink_ghostdag_data);
             self.gc_collapse_ratio_prefix();
         }
+
+        // The GC thread owns an Arc<PruningProcessor>, which indirectly keeps
+        // the RocksDB connection alive. Join it before the staging consensus
+        // is dropped so cleanup can close the DB and release its FD budget.
+        gc_handle.thread().unpark();
+        gc_handle.join().expect("joining the PoM proof GC thread");
     }
 
     /// Collapse ratio-reward prefix-index entries the consensus can no longer read into the per-SPK
