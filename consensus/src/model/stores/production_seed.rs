@@ -48,6 +48,13 @@ impl DbProductionIndexSeedStore {
     pub fn get_optional(&self) -> Option<u64> {
         self.access.read().optional().unwrap()
     }
+
+    /// Clears the fast-sync catch-up marker when a selected-chain rewind rebuilds the prefix
+    /// index from its retained chain. Keeping the old marker would unnecessarily trust coinbases
+    /// after recovery, even though the rebuilt index is already authoritative.
+    pub fn clear_batch(&mut self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.delete_all(BatchDbWriter::new(batch))
+    }
 }
 
 impl ProductionIndexSeedStoreReader for DbProductionIndexSeedStore {

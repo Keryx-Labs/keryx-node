@@ -2,7 +2,7 @@ use crate::{
     consensus::test_consensus::TestConsensus,
     model::{
         services::reachability::ReachabilityService,
-        stores::ai_slash::AiResponseStoreReader,
+        stores::{ai_slash::AiResponseStoreReader, headers::HeaderStoreReader, selected_chain::SelectedChainStoreReader},
     },
 };
 use keryx_inference::{self, AiResponsePayload, compute_ai_commitment};
@@ -176,6 +176,83 @@ async fn template_mining_sanity_test() {
             .assert_virtual_parents_subset()
             .assert_valid_utxo_tip();
     }
+}
+
+#[tokio::test]
+async fn stash_blocks_rewinds_selected_chain_and_quarantines_discarded_descendants() {
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    for _ in 0..5 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let target = ctx.consensus.get_sink();
+    let target_index = ctx.consensus.virtual_processor().selected_chain_store.read().get_tip().unwrap().0;
+
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let vp = ctx.consensus.virtual_processor().clone();
+    let (tip_index, _) = vp.selected_chain_store.read().get_tip().unwrap();
+    let discarded = {
+        let selected_chain = vp.selected_chain_store.read();
+        ((target_index + 1)..=tip_index).map(|index| selected_chain.get_by_index(index).unwrap()).collect::<Vec<_>>()
+    };
+
+    ctx.consensus.shutdown(std::mem::take(&mut ctx.join_handles));
+    let outcome = vp.stash_selected_chain_blocks(3).unwrap();
+
+    assert_eq!(outcome.target, target);
+    assert_eq!(outcome.target_index, target_index);
+    assert_eq!(outcome.removed_selected_chain_blocks, 3);
+    assert_eq!(ctx.consensus.get_sink(), target);
+    assert_eq!(ctx.consensus.body_tips(), BlockHashSet::from_iter([target]));
+    for hash in discarded {
+        assert_eq!(ctx.consensus.block_status(hash), BlockStatus::StatusInvalid);
+    }
+    assert!(vp.stash_selected_chain_blocks(0).is_err());
+}
+
+#[tokio::test]
+async fn h4_stash_quarantines_active_side_branch_that_forks_before_target() {
+    let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+
+    for _ in 0..2 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let vp = ctx.consensus.virtual_processor().clone();
+    let (target_index, target) = vp.selected_chain_store.read().get_tip().unwrap();
+
+    for _ in 0..3 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+    }
+    let selected_tip = ctx.consensus.get_sink();
+    let h4_boundary = {
+        let selected_chain = vp.selected_chain_store.read();
+        let first_h4_block = selected_chain.get_by_index(target_index + 1).unwrap();
+        vp.headers_store.get_daa_score(first_h4_block).unwrap()
+    };
+
+    // Build a separate body branch from genesis. It has active H4 blocks but is not a descendant
+    // of `target`, so a selected-chain-only rewind would otherwise leave it usable as a parent.
+    let mut side_parents = vec![ctx.consensus.params().genesis.hash];
+    for _ in 0..6 {
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+        let block = ctx.build_block_with_parents(side_parents, 0, ctx.simulated_time);
+        side_parents = vec![block.header.hash];
+        ctx.validate_and_insert_block(block.to_immutable()).await;
+    }
+    let side_tip = side_parents[0];
+    assert_eq!(ctx.consensus.get_sink(), selected_tip);
+    assert!(vp.headers_store.get_daa_score(side_tip).unwrap() >= h4_boundary);
+
+    ctx.consensus.shutdown(std::mem::take(&mut ctx.join_handles));
+    let outcome = vp.stash_selected_chain_to_before_daa(h4_boundary).unwrap();
+
+    assert_eq!(outcome.target, target);
+    assert_eq!(ctx.consensus.get_sink(), target);
+    assert_eq!(ctx.consensus.block_status(side_tip), BlockStatus::StatusInvalid);
 }
 
 #[tokio::test]

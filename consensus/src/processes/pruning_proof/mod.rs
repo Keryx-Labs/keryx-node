@@ -18,7 +18,9 @@ use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, BlockLevel, HashMapCustomHasher, KType,
     blockhash::{self, BlockHashExtensions},
     config::params::ForkActivation,
+    constants::block_version_for_h4_relaunch,
     errors::{
+        block::RuleError,
         consensus::{ConsensusError, ConsensusResult},
         pruning::{PruningImportError, PruningImportResult},
     },
@@ -122,8 +124,10 @@ pub struct PruningProofManager {
     // per-level PoW check must skip them — mirror `pre_ghostdag_validation::check_pow_and_calc_block_level`.
     pom_activation: ForkActivation,
     // H3: from this score headers commit to `pom_final_state` and the PoW value / block level
-    // are header-only derivable again — see `pom_aware_block_level`.
+    // are header-only derivable again - see `pom_aware_block_level`.
     pom_level_activation: ForkActivation,
+    // H4 relaunch changes both the PoM fold and the required header version.
+    h4_relaunch_activation: ForkActivation,
 
     is_consensus_exiting: Arc<AtomicBool>,
 }
@@ -146,6 +150,7 @@ impl PruningProofManager {
         skip_proof_of_work: bool,
         pom_activation: ForkActivation,
         pom_level_activation: ForkActivation,
+        h4_relaunch_activation: ForkActivation,
         is_consensus_exiting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -182,9 +187,18 @@ impl PruningProofManager {
             skip_proof_of_work,
             pom_activation,
             pom_level_activation,
+            h4_relaunch_activation,
 
             is_consensus_exiting,
         }
+    }
+
+    fn validate_h4_header_version(&self, header: &Header) -> PruningImportResult<()> {
+        let expected = block_version_for_h4_relaunch(header.daa_score, self.h4_relaunch_activation.daa_score());
+        if header.version != expected {
+            return Err(RuleError::WrongBlockVersion { actual: header.version, expected }.into());
+        }
+        Ok(())
     }
 
     pub fn import_pruning_points(&self, pruning_points: &[Arc<Header>]) -> PruningImportResult<()> {
@@ -193,6 +207,7 @@ impl PruningProofManager {
             return Err(PruningImportError::DuplicatedPastPruningPoints(pruning_points.len() - unique_count));
         }
         for (i, header) in pruning_points.iter().enumerate() {
+            self.validate_h4_header_version(header)?;
             self.past_pruning_points_store.set(i as u64, header.hash).unwrap();
 
             if i > 0 {

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Display};
 
 use crate::{
-    BlueWorkType, constants,
+    BlueWorkType,
     errors::{coinbase::CoinbaseError, tx::TxRuleError},
     tx::{TransactionId, TransactionOutpoint},
 };
@@ -27,8 +27,8 @@ impl<T: Display + Clone> Display for TwoDimVecDisplay<T> {
 
 #[derive(Error, Debug, Clone)]
 pub enum RuleError {
-    #[error("wrong block version: got {0} but expected {}", constants::BLOCK_VERSION)]
-    WrongBlockVersion(u16),
+    #[error("wrong block version: got {actual} but expected {expected}")]
+    WrongBlockVersion { actual: u16, expected: u16 },
 
     #[error("the block timestamp is too far into the future: block timestamp is {0} but maximum timestamp allowed is {1}")]
     TimeTooFarIntoTheFuture(u64, u64),

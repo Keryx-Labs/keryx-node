@@ -45,6 +45,13 @@ impl PruningProofManager {
     pub fn apply_proof(&self, proof: PruningPointProof, trusted_set: &[TrustedBlock]) -> PruningImportResult<()> {
         // Following validation of a pruning proof, various consensus storages must be updated
 
+        for header in proof.iter().flatten() {
+            self.validate_h4_header_version(header)?;
+        }
+        for trusted in trusted_set {
+            self.validate_h4_header_version(&trusted.block.header)?;
+        }
+
         let pruning_point_header = proof[0].last().unwrap().clone();
         let pruning_point = pruning_point_header.hash;
 

@@ -54,6 +54,8 @@ pub struct Args {
     pub user_agent_comments: Vec<String>,
     pub utxoindex: bool,
     pub reset_db: bool,
+    pub stash_blocks: Option<u64>,
+    pub rollback_h4: bool,
     #[serde(rename = "outpeers")]
     pub outbound_target: usize,
     #[serde(rename = "maxinpeers")]
@@ -110,6 +112,8 @@ impl Default for Args {
             async_threads: num_cpus::get(),
             utxoindex: false,
             reset_db: false,
+            stash_blocks: None,
+            rollback_h4: false,
             outbound_target: 8,
             inbound_limit: 128,
             rpc_max_clients: 128,
@@ -201,6 +205,22 @@ impl Args {
             (false, false, true) => NetworkId::new(NetworkType::Simnet),
             _ => panic!("only a single net should be activated"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+
+    #[test]
+    fn parses_stash_blocks_with_underscore_alias() {
+        let args = Args::parse(["keryxd", "--stash_blocks", "7"]).unwrap();
+        assert_eq!(args.stash_blocks, Some(7));
+    }
+
+    #[test]
+    fn rejects_zero_stash_blocks() {
+        assert!(Args::parse(["keryxd", "--stash-blocks", "0"]).is_err());
     }
 }
 
@@ -330,6 +350,26 @@ pub fn cli() -> Command {
                 .help("Max number of RPC clients for standard connections (default: 128)."),
         )
         .arg(arg!(--"reset-db" "Reset database before starting node. It's needed when switching between subnetworks.").env("KERYXD_RESET_DB"))
+        .arg(
+            Arg::new("stash-blocks")
+                .long("stash-blocks")
+                .visible_alias("stash_blocks")
+                .env("KERYXD_STASH_BLOCKS")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u64).range(1..))
+                .conflicts_with("reset-db")
+                .conflicts_with("rollback-h4")
+                .help("Atomically rewind N selected-chain blocks and quarantine their descendants before the node starts."),
+        )
+        .arg(
+            Arg::new("rollback-h4")
+                .long("rollback-h4")
+                .env("KERYXD_ROLLBACK_H4")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("reset-db")
+                .conflicts_with("stash-blocks")
+                .help("Atomically rewind to the last selected-chain block before the configured H4 DAA boundary."),
+        )
         .arg(arg!(--"enable-unsynced-mining" "Allow the node to accept blocks from RPC while not synced (this flag is mainly used for testing)").env("KERYXD_ENABLE_UNSYNCED_MINING"))
         .arg(
             Arg::new("enable-mainnet-mining")
@@ -504,6 +544,8 @@ impl Args {
             rpc_max_clients: arg_match_unwrap_or::<usize>(&m, "rpcmaxclients", defaults.rpc_max_clients),
             max_tracked_addresses: arg_match_unwrap_or::<usize>(&m, "max-tracked-addresses", defaults.max_tracked_addresses),
             reset_db: arg_match_unwrap_or::<bool>(&m, "reset-db", defaults.reset_db),
+            stash_blocks: m.get_one::<u64>("stash-blocks").copied().or(defaults.stash_blocks),
+            rollback_h4: arg_match_unwrap_or::<bool>(&m, "rollback-h4", defaults.rollback_h4),
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
             utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),

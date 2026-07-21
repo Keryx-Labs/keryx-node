@@ -134,6 +134,8 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
 /// `never()`). Set this to the chosen H4 DAA score at release — it drives BOTH mainnet coin-age
 /// gates (`coin_age_activation` + `coin_age_verification_activation`) in one edit. The miner's
 /// `COIN_AGE_VERIFICATION_ACTIVATION_DAA` MUST be set to the exact same value (node↔miner lockstep).
+/// At this score miners and pools MUST also switch to header version 2 and the
+/// `POM_H4_RELAUNCH_PPH_SALT` fold; version-1 H4 headers are intentionally invalid.
 /// NOTE: the H4 difficulty reset is a SEPARATE entry (see `difficulty_reset_activations`), because
 /// the existing H2 reset at 38_951_445 is load-bearing history that must not move.
 pub const H4_ACTIVATION_DAA: u64 = 54_766_000;

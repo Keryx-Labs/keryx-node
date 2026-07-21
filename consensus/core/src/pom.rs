@@ -270,10 +270,25 @@ fn pph_words(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
 /// Derivation: sha256("keryx-h3-pom-pph-salt") read as 4 little-endian u64 words.
 pub const POM_H3_PPH_SALT: [u64; 4] = [0x7C99D381176D4EC4, 0xC2E28E3E28118C36, 0xD496CE1B129B76CA, 0x47CF0979FA580BCE];
 
+/// H4 relaunch domain salt, layered on top of the H3 fold. It is a consensus
+/// separator rather than a model change: a block built on the aborted H4 branch
+/// must not remain valid after nodes return to the H4 boundary and re-mine it.
+/// Derivation: sha256("keryx-h4-relaunch-pom-pph-salt-v1") as little-endian u64 words.
+pub const POM_H4_RELAUNCH_PPH_SALT: [u64; 4] = [0x841889637DD00109, 0x2C462821E692095A, 0xB686260E241D9F3E, 0x7F5848D211D48879];
+
 #[inline]
 fn pph_words_h3(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
     let mut w = pph_words(pre_pow_hash);
     for (wi, si) in w.iter_mut().zip(POM_H3_PPH_SALT.iter()) {
+        *wi ^= si;
+    }
+    w
+}
+
+#[inline]
+fn pph_words_h4_relaunch(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = pph_words_h3(pre_pow_hash);
+    for (wi, si) in w.iter_mut().zip(POM_H4_RELAUNCH_PPH_SALT.iter()) {
         *wi ^= si;
     }
     w
@@ -302,6 +317,11 @@ pub fn pom_block_seed_h3(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) ->
     pom_block_seed_from_words(&pph_words_h3(pre_pow_hash), timestamp, nonce)
 }
 
+/// H4-relaunch seed: H3's fold with an additional forced-update domain separator.
+pub fn pom_block_seed_h4_relaunch(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words_h4_relaunch(pre_pow_hash), timestamp, nonce)
+}
+
 #[inline]
 fn pom_pow_value_from_words(final_state: u64, p: &[u64; 4]) -> [u8; 32] {
     let o0 = mix64(final_state ^ p[0] ^ 0x9E3779B97F4A7C15);
@@ -326,6 +346,11 @@ pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
 /// H3-era pow value: same fold over the salted pre_pow_hash words.
 pub fn pom_pow_value_h3(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
     pom_pow_value_from_words(final_state, &pph_words_h3(pre_pow_hash))
+}
+
+/// H4-relaunch PoM value: H3's fold with the relaunch domain separator.
+pub fn pom_pow_value_h4_relaunch(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    pom_pow_value_from_words(final_state, &pph_words_h4_relaunch(pre_pow_hash))
 }
 
 #[inline]
@@ -634,6 +659,25 @@ mod verify_tests {
 
     fn fh(s: u64) -> [u8; 32] {
         trace_leaf(s)
+    }
+
+    #[test]
+    fn h4_relaunch_fold_is_distinct_from_h3() {
+        let pre_pow_hash = blake(b"h4-relaunch-pre-pow-hash");
+        let timestamp = 1_719_000_000_000;
+        let nonce = 0xfeed_cafe;
+        let final_state = 0x0123_4567_89ab_cdef;
+
+        assert_ne!(
+            pom_block_seed_h3(&pre_pow_hash, timestamp, nonce),
+            pom_block_seed_h4_relaunch(&pre_pow_hash, timestamp, nonce),
+            "the relaunch must produce a new possession-walk trajectory"
+        );
+        assert_ne!(
+            pom_pow_value_h3(final_state, &pre_pow_hash),
+            pom_pow_value_h4_relaunch(final_state, &pre_pow_hash),
+            "the relaunch must make aborted-H4 header PoW invalid"
+        );
     }
 
     #[test]

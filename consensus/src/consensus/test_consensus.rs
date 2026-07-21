@@ -20,7 +20,7 @@ use crate::pipeline::virtual_processor::test_block_builder::TestBlockBuilder;
 use crate::processes::window::WindowManager;
 use crate::{
     config::Config,
-    constants::TX_VERSION,
+    constants::{TX_VERSION, block_version_for_h4_relaunch},
     errors::BlockProcessResult,
     model::{
         services::reachability::MTReachabilityService,
@@ -59,7 +59,9 @@ impl TestConsensus {
             tx_script_cache_counters,
             0,
             Arc::new(MiningRules::default()),
-        ));
+            None,
+        )
+        .expect("test consensus initialization must succeed"));
         let block_builder = TestBlockBuilder::new(consensus.virtual_processor.clone());
 
         Self { params: config.params.clone(), consensus, block_builder, _db_lifetime: Default::default() }
@@ -80,7 +82,9 @@ impl TestConsensus {
             tx_script_cache_counters,
             0,
             Arc::new(MiningRules::default()),
-        ));
+            None,
+        )
+        .expect("test consensus initialization must succeed"));
         let block_builder = TestBlockBuilder::new(consensus.virtual_processor.clone());
 
         Self { consensus, block_builder, params: config.params.clone(), _db_lifetime: db_lifetime }
@@ -102,7 +106,9 @@ impl TestConsensus {
             tx_script_cache_counters,
             0,
             Arc::new(MiningRules::default()),
-        ));
+            None,
+        )
+        .expect("test consensus initialization must succeed"));
         let block_builder = TestBlockBuilder::new(consensus.virtual_processor.clone());
 
         Self { consensus, block_builder, params: config.params.clone(), _db_lifetime: db_lifetime }
@@ -125,6 +131,10 @@ impl TestConsensus {
         let daa_window = self.consensus.services.window_manager.block_daa_window(&ghostdag_data).unwrap();
         header.bits = self.consensus.services.window_manager.calculate_difficulty_bits(&ghostdag_data, &daa_window);
         header.daa_score = daa_window.daa_score;
+        header.version = block_version_for_h4_relaunch(
+            header.daa_score,
+            self.params.coin_age_verification_activation.daa_score(),
+        );
         header.timestamp = self.consensus.services.window_manager.calc_past_median_time(&ghostdag_data).unwrap().0 + 1;
         header.blue_score = ghostdag_data.blue_score;
         header.blue_work = ghostdag_data.blue_work;

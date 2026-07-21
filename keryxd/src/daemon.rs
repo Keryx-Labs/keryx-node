@@ -27,7 +27,8 @@ use keryx_utils_tower::counters::TowerConnectionCounters;
 
 use keryx_addressmanager::AddressManager;
 use keryx_consensus::{
-    consensus::factory::MultiConsensusManagementStore, model::stores::headers::DbHeadersStore, pipeline::monitor::ConsensusMonitor,
+    consensus::{StartupRecovery, factory::MultiConsensusManagementStore}, model::stores::headers::DbHeadersStore,
+    pipeline::monitor::ConsensusMonitor,
 };
 use keryx_consensus::{
     consensus::factory::{Factory as ConsensusFactory, LATEST_DB_VERSION},
@@ -112,6 +113,13 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
     }
     if args.max_tracked_addresses > Tracker::MAX_ADDRESS_UPPER_BOUND {
         return Err(ConfigError::MaxTrackedAddressesTooHigh(Tracker::MAX_ADDRESS_UPPER_BOUND));
+    }
+    if args.stash_blocks == Some(0) {
+        return Err(ConfigError::StashBlocksZero);
+    }
+    let recovery_options = args.stash_blocks.is_some() as u8 + args.rollback_h4 as u8 + args.reset_db as u8;
+    if recovery_options > 1 {
+        return Err(ConfigError::ConflictingRecoveryOptions);
     }
     Ok(())
 }
@@ -540,6 +548,30 @@ Do you confirm? (y/n)";
         );
     }
 
+    let startup_recovery = match (args.stash_blocks, args.rollback_h4) {
+        (Some(blocks), false) => {
+            get_user_approval_or_exit(
+                &format!(
+                    "--stash-blocks={blocks} will atomically rewind the selected chain, quarantine every discarded DAG descendant, and rebuild derived indexes. Do you confirm? (y/n)"
+                ),
+                args.yes,
+            );
+            Some(StartupRecovery::StashBlocks(blocks))
+        }
+        (None, true) => {
+            let h4_daa = config.params.coin_age_verification_activation.daa_score();
+            get_user_approval_or_exit(
+                &format!(
+                    "--rollback-h4 will atomically rewind to the last selected-chain block before H4 DAA {h4_daa}, quarantine every discarded DAG descendant, and rebuild derived indexes. Do you confirm? (y/n)"
+                ),
+                args.yes,
+            );
+            Some(StartupRecovery::RollbackH4)
+        }
+        (None, false) => None,
+        (Some(_), true) => unreachable!("argument validation rejects conflicting recovery flags"),
+    };
+
     let connect_peers = args.connect_peers.iter().map(|x| x.normalize(config.default_p2p_port())).collect::<Vec<_>>();
     let add_peers = args.add_peers.iter().map(|x| x.normalize(config.default_p2p_port())).collect();
     let p2p_server_addr = args.listen.unwrap_or(ContextualNetAddress::unspecified()).normalize(config.default_p2p_port());
@@ -589,6 +621,7 @@ Do you confirm? (y/n)";
         rocksdb_preset,
         wal_dir.clone(),
         cache_budget,
+        startup_recovery,
     ));
     let consensus_manager = Arc::new(ConsensusManager::new(consensus_factory));
     let consensus_monitor = Arc::new(ConsensusMonitor::new(processing_counters.clone(), tick_service.clone()));

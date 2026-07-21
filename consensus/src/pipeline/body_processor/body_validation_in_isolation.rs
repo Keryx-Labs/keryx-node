@@ -9,7 +9,10 @@ use keryx_consensus_core::{
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
-    pom::{pom_block_seed, pom_block_seed_h3, pom_pow_value, pom_pow_value_h3, verify_pom_proof, verify_pom_proof_v2},
+    pom::{
+        pom_block_seed, pom_block_seed_h3, pom_block_seed_h4_relaunch, pom_pow_value, pom_pow_value_h3,
+        pom_pow_value_h4_relaunch, verify_pom_proof, verify_pom_proof_v2,
+    },
     tx::TransactionOutpoint,
 };
 use keryx_math::Uint256;
@@ -176,6 +179,7 @@ impl BlockBodyProcessor {
         // derive from it) — pin it to the proof so a miner cannot claim a level it did not earn.
         // H3 also salts the pph words feeding both folds (forced update — see POM_H3_PPH_SALT).
         let h3 = self.pom_level_activation.is_active(header.daa_score);
+        let h4_relaunch = self.coin_age_verification_activation.is_active(header.daa_score);
         if h3 && proof.final_state != header.pom_final_state {
             return Err(RuleError::PomFinalStateMismatch(header.pom_final_state, proof.final_state));
         }
@@ -191,13 +195,23 @@ impl BlockBodyProcessor {
 
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
         let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
-        let seed = if h3 {
+        let seed = if h4_relaunch {
+            pom_block_seed_h4_relaunch(&pre_pow_hash, header.timestamp, header.nonce)
+        } else if h3 {
             pom_block_seed_h3(&pre_pow_hash, header.timestamp, header.nonce)
         } else {
             pom_block_seed(&pre_pow_hash, header.timestamp, header.nonce)
         };
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
-        let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
+        let final_hash = |s: u64| {
+            if h4_relaunch {
+                pom_pow_value_h4_relaunch(s, &pre_pow_hash)
+            } else if h3 {
+                pom_pow_value_h3(s, &pre_pow_hash)
+            } else {
+                pom_pow_value(s, &pre_pow_hash)
+            }
+        };
 
         // H4: recompute-from-chunks verifier (all K transitions re-walked, `final_state` derived).
         // Replaces the 32/256 spot-check, which accepted a forged `final_state` ~88% of the time.

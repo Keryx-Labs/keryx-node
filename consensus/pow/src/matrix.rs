@@ -391,7 +391,7 @@ mod tests {
     /// This is the key property guaranteeing Kaspa ↔ Keryx network isolation.
     #[test]
     fn test_keryx_salt_isolates_from_kaspa() {
-        use super::{KERYX_MATRIX_SALT, Matrix};
+        use super::{KERYX_MATRIX_SALT_V1, Matrix};
         use crate::xoshiro::XoShiRo256PlusPlus;
 
         let seed = Hash::from_bytes([42; 32]);
@@ -418,7 +418,7 @@ mod tests {
             Hash::from_bytes(bytes)
         };
         assert_eq!(zero_salt_seed, seed, "XOR with zero must be identity");
-        let _ = KERYX_MATRIX_SALT; // referenced to confirm salt is accessible from tests
+        let _ = KERYX_MATRIX_SALT_V1; // referenced to confirm salt is accessible from tests
     }
 
     /// Helper: prints the Keryx PoW vectors (keryx_hash and generate) so that

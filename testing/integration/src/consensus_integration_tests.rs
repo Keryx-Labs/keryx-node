@@ -27,7 +27,7 @@ use keryx_consensus_core::block::Block;
 use keryx_consensus_core::blockhash::{self, new_unique};
 use keryx_consensus_core::blockstatus::BlockStatus;
 use keryx_consensus_core::coinbase::MinerData;
-use keryx_consensus_core::constants::{BLOCK_VERSION, SOMPI_PER_KASPA, TRANSIENT_BYTE_TO_MASS_FACTOR};
+use keryx_consensus_core::constants::{BLOCK_VERSION, H4_RELAUNCH_BLOCK_VERSION, SOMPI_PER_KASPA, TRANSIENT_BYTE_TO_MASS_FACTOR};
 use keryx_consensus_core::errors::block::{BlockProcessResult, RuleError};
 use keryx_consensus_core::hashing;
 use keryx_consensus_core::header::Header;
@@ -415,11 +415,27 @@ async fn header_in_isolation_validation_test() {
         let block_version = BLOCK_VERSION - 1;
         block.header.version = block_version;
         match consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await {
-            Err(RuleError::WrongBlockVersion(wrong_version)) => {
-                assert_eq!(wrong_version, block_version)
+            Err(RuleError::WrongBlockVersion { actual, expected }) => {
+                assert_eq!(actual, block_version);
+                assert_eq!(expected, BLOCK_VERSION)
             }
             res => {
                 panic!("Unexpected result: {res:?}")
+            }
+        }
+    }
+
+    {
+        let mut block = consensus.build_header_only_block_with_parents(2.into(), vec![config.genesis.hash]);
+        block.header.daa_score = config.params.coin_age_verification_activation.daa_score();
+        block.header.version = BLOCK_VERSION;
+        match consensus.validate_and_insert_block(block.to_immutable()).virtual_state_task.await {
+            Err(RuleError::WrongBlockVersion { actual, expected }) => {
+                assert_eq!(actual, BLOCK_VERSION);
+                assert_eq!(expected, H4_RELAUNCH_BLOCK_VERSION)
+            }
+            res => {
+                panic!("Unexpected H4 version result: {res:?}")
             }
         }
     }
@@ -1391,6 +1407,7 @@ async fn staging_consensus_test() {
         200,
         Arc::new(MiningRules::default()),
         keryx_database::prelude::RocksDbPreset::Default,
+        None,
         None,
         None,
     ));

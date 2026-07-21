@@ -165,6 +165,7 @@ impl ProofContext {
         }
 
         let proof_pp_header = proof[0].last().expect("checked if empty").clone();
+        ppm.validate_h4_header_version(&proof_pp_header)?;
         // Must mirror the builder's `pp_header.block_level` (headers_store, PoM-aware): the
         // level anchoring checks below compare against the level the builder actually used.
         let proof_pp_level =
@@ -189,6 +190,7 @@ impl ProofContext {
             let mut selected_tip =
                 proof[level as usize].first().map(|header| header.hash).ok_or(PruningImportError::PruningProofNotEnoughHeaders)?;
             for (i, header) in proof[level as usize].iter().enumerate() {
+                ppm.validate_h4_header_version(header)?;
                 // `header_level` keeps the PoW-derived level so it stays consistent with the
                 // builder's per-level placement (`pom_aware_block_level`), across the three eras:
                 // - H3 (`pom_level_activation`): the header commits to the walk's final state, so

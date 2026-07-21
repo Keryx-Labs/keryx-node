@@ -1,6 +1,6 @@
 #[cfg(feature = "devnet-prealloc")]
 use super::utxo_set_override::{set_genesis_utxo_commitment_from_config, set_initial_utxo_set};
-use super::{Consensus, ctl::Ctl};
+use super::{Consensus, StartupRecovery, ctl::Ctl};
 use crate::{model::stores::U64Key, pipeline::ProcessingCounters};
 use itertools::Itertools;
 use keryx_consensus_core::{api::ConsensusApi, config::Config, mining_rules::MiningRules};
@@ -17,7 +17,7 @@ use keryx_database::{
 
 use keryx_txscript::caches::TxScriptCacheCounters;
 use keryx_utils::mem_size::MemSizeEstimator;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, error::Error, fs, path::PathBuf, sync::Arc};
@@ -259,6 +259,7 @@ pub struct Factory {
     rocksdb_preset: RocksDbPreset,
     wal_dir: Option<PathBuf>,
     cache_budget: Option<usize>,
+    startup_recovery: Mutex<Option<StartupRecovery>>,
 }
 
 impl Factory {
@@ -276,6 +277,7 @@ impl Factory {
         rocksdb_preset: RocksDbPreset,
         wal_dir: Option<PathBuf>,
         cache_budget: Option<usize>,
+        startup_recovery: Option<StartupRecovery>,
     ) -> Self {
         assert!(fd_budget > 0, "fd_budget has to be positive");
         let mut config = config.clone();
@@ -297,6 +299,7 @@ impl Factory {
             rocksdb_preset,
             wal_dir,
             cache_budget,
+            startup_recovery: Mutex::new(startup_recovery),
         };
         factory.delete_inactive_consensus_entries();
         factory
@@ -333,6 +336,7 @@ impl ConsensusFactory for Factory {
             .build()
             .unwrap();
 
+        let startup_recovery = self.startup_recovery.lock().take();
         let session_lock = SessionLock::new();
         let consensus = Arc::new(Consensus::new(
             db.clone(),
@@ -343,7 +347,9 @@ impl ConsensusFactory for Factory {
             self.tx_script_cache_counters.clone(),
             entry.creation_timestamp,
             self.mining_rules.clone(),
-        ));
+            startup_recovery,
+        )
+        .unwrap_or_else(|err| panic!("startup recovery failed before consensus processors began: {err}")));
 
         // We write the new active entry only once the instance was created successfully.
         // This way we can safely avoid processing genesis in future process runs
@@ -381,7 +387,9 @@ impl ConsensusFactory for Factory {
             self.tx_script_cache_counters.clone(),
             entry.creation_timestamp,
             self.mining_rules.clone(),
-        ));
+            None,
+        )
+        .expect("staging consensus initialization must not require recovery"));
 
         // The default for the body_missing_anticone_set is an empty vector, which corresponds precisely to the state before a consensus commit
         // But The default value for the pruning_utxoset_stable_flag is true, but a staging consensus does not have a utxo and hence the flag is dropped explicitly

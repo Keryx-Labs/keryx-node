@@ -17,6 +17,12 @@ pub enum ConfigError {
     #[error("Configuration: --max-tracked-addresses cannot be set above {0}")]
     MaxTrackedAddressesTooHigh(usize),
 
+    #[error("Configuration: --stash-blocks must be greater than zero")]
+    StashBlocksZero,
+
+    #[error("Configuration: only one of --stash-blocks, --rollback-h4, and --reset-db may be used")]
+    ConflictingRecoveryOptions,
+
     #[cfg(feature = "devnet-prealloc")]
     #[error("Cannot preallocate UTXOs on any network except devnet")]
     PreallocUtxosOnNonDevnet,

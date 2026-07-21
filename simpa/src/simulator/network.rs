@@ -88,7 +88,9 @@ impl KaspaNetworkSimulator {
                 Default::default(),
                 unix_now(),
                 Arc::new(MiningRules::default()),
-            ));
+                None,
+            )
+            .expect("simulator consensus initialization must succeed"));
             let handles = consensus.run_processors();
             let (sk, pk) = secp.generate_keypair(&mut rng);
             let miner_process = Box::new(Miner::new(

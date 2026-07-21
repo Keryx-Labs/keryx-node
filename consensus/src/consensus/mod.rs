@@ -152,6 +152,17 @@ pub struct Consensus {
     is_consensus_exiting: Arc<AtomicBool>,
 }
 
+/// A destructive local recovery requested before consensus workers start.
+///
+/// `StashBlocks` is intentionally measured in selected-chain blocks. `RollbackH4` derives that
+/// count from the local selected chain so operators can recover exactly to the H4 boundary without
+/// treating a DAG DAA score as a linear block height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRecovery {
+    StashBlocks(u64),
+    RollbackH4,
+}
+
 impl Deref for Consensus {
     type Target = ConsensusStorage;
 
@@ -170,7 +181,8 @@ impl Consensus {
         tx_script_cache_counters: Arc<TxScriptCacheCounters>,
         creation_timestamp: u64,
         mining_rules: Arc<MiningRules>,
-    ) -> Self {
+        startup_recovery: Option<StartupRecovery>,
+    ) -> Result<Self, String> {
         let params = &config.params;
         let perf_params = &config.perf;
         let is_consensus_exiting: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -181,7 +193,6 @@ impl Consensus {
         // Same pattern for the PoM block-level fork (H3): header hashing commits to
         // `pom_final_state` from this score on and has no access to Params.
         keryx_consensus_core::pom::init_pom_level_activation(params.pom_level_activation.daa_score());
-
         //
         // Storage layer
         //
@@ -327,6 +338,14 @@ impl Consensus {
         // Run database upgrades if any
         this.run_database_upgrades();
 
+        if let Some(recovery) = startup_recovery {
+            this.apply_startup_recovery(recovery)?;
+        }
+        // A generic --stash-blocks recovery must not become a way to bypass the forced H4
+        // relaunch. It either rewinds past the bad branch or this check stops startup and asks
+        // the operator to use a larger stash (or --rollback-h4).
+        this.ensure_h4_relaunch_compatible_chain()?;
+
         // Invariant the prefix-sum production index depends on for determinism: the ratio-reward
         // window never reaches below the pruning point, so every in-window block AND the `cum(b−W)`
         // floor baseline are always on disk for every node (archival or pruned). If a future param
@@ -355,7 +374,7 @@ impl Consensus {
         // run — the startup-time counterpart of the maturation-queue promotions.
         this.virtual_processor.rebuild_age_buckets_index();
 
-        this
+        Ok(this)
     }
 
     /// A procedure for calling database upgrades which are self-contained (i.e., do not require knowing the DB version)
@@ -363,6 +382,116 @@ impl Consensus {
         // Upgrade to initialize the new retention root field correctly
         self.retention_root_database_upgrade();
         self.consensus_transitional_flags_upgrade();
+    }
+
+    fn apply_startup_recovery(&self, recovery: StartupRecovery) -> Result<(), String> {
+        let outcome = match recovery {
+            StartupRecovery::StashBlocks(blocks) => self.virtual_processor.stash_selected_chain_blocks(blocks)?,
+            StartupRecovery::RollbackH4 => {
+                let h4_daa = self.config.params.coin_age_verification_activation.daa_score();
+                if h4_daa == u64::MAX {
+                    return Err("H4 is not scheduled for this network, so --rollback-h4 cannot be used".to_string());
+                }
+                self.virtual_processor.stash_selected_chain_to_before_daa(h4_daa)?
+            }
+        };
+        info!(
+            "stash-blocks recovery committed: removed {} selected-chain blocks, target {} at index {}, quarantined {} descendants",
+            outcome.removed_selected_chain_blocks,
+            outcome.target,
+            outcome.target_index,
+            outcome.invalidated_descendants,
+        );
+        Ok(())
+    }
+
+    /// A stored header is normally not revalidated when a node starts. That is unsafe at a
+    /// forced-update boundary: an old H4 branch can otherwise remain selected forever even though
+    /// a newly received copy of the same header would fail the replacement PoM fold. Locate the
+    /// first retained H4 block before workers start and require an explicit local rewind when it
+    /// contains a pre-relaunch solution.
+    fn ensure_h4_relaunch_compatible_chain(&self) -> Result<(), String> {
+        if self.config.params.skip_proof_of_work {
+            return Ok(());
+        }
+        let h4_daa = self.config.params.coin_age_verification_activation.daa_score();
+        if h4_daa == u64::MAX {
+            return Ok(());
+        }
+
+        let selected_chain = self.selected_chain_store.read();
+        let Ok((tip_index, _)) = selected_chain.get_tip() else {
+            return Ok(());
+        };
+
+        let retained_floor = self
+            .pruning_point_store
+            .read()
+            .pruning_point()
+            .map_err(|err| format!("cannot read pruning point for H4 relaunch check: {err}"))?;
+        let mut low = selected_chain
+            .get_by_hash(retained_floor)
+            .map_err(|err| format!("cannot locate retained selected-chain floor {retained_floor} for H4 relaunch: {err}"))?;
+        let tip = selected_chain
+            .get_by_index(tip_index)
+            .map_err(|err| format!("cannot inspect selected-chain tip {tip_index} for H4 relaunch: {err}"))?;
+        let tip_daa = self
+            .headers_store
+            .get_daa_score(tip)
+            .map_err(|err| format!("cannot read selected-chain tip {tip} for H4 relaunch: {err}"))?;
+        if tip_daa < h4_daa {
+            return Ok(());
+        }
+
+        let floor = selected_chain
+            .get_by_index(low)
+            .map_err(|err| format!("cannot inspect retained selected-chain floor {low} for H4 relaunch: {err}"))?;
+        let floor_daa = self
+            .headers_store
+            .get_daa_score(floor)
+            .map_err(|err| format!("cannot read retained selected-chain floor {floor} for H4 relaunch: {err}"))?;
+        if floor_daa < h4_daa {
+            let mut high = tip_index;
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let hash = selected_chain
+                    .get_by_index(mid)
+                    .map_err(|err| format!("cannot inspect selected-chain block {mid} for H4 relaunch: {err}"))?;
+                let daa = self
+                    .headers_store
+                    .get_daa_score(hash)
+                    .map_err(|err| format!("cannot read selected-chain header {hash} for H4 relaunch: {err}"))?;
+                if daa < h4_daa {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+        }
+
+        let hash = selected_chain
+            .get_by_index(low)
+            .map_err(|err| format!("cannot inspect first retained H4 block {low}: {err}"))?;
+        let header = self
+            .headers_store
+            .get_header(hash)
+            .map_err(|err| format!("cannot read first retained H4 header {hash}: {err}"))?;
+        let expected_version = keryx_consensus_core::constants::block_version_for_h4_relaunch(header.daa_score, h4_daa);
+        if header.version != expected_version {
+            return Err(format!(
+                "detected pre-relaunch H4 block {hash} at DAA {} with header version {}; run keryxd --rollback-h4 --yes before connecting to peers",
+                header.daa_score, header.version
+            ));
+        }
+        let (_, passes) = keryx_pow::calc_pom_block_level_check_pow(&header, self.config.params.max_block_level);
+        if !passes {
+            return Err(format!(
+                "detected pre-relaunch H4 block {hash} at DAA {}; run keryxd --rollback-h4 --yes before connecting to peers",
+                header.daa_score
+            ));
+        }
+
+        Ok(())
     }
 
     fn retention_root_database_upgrade(&self) {

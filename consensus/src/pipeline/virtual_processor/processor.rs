@@ -6,7 +6,7 @@ use crate::{
         },
         storage::ConsensusStorage,
     },
-    constants::BLOCK_VERSION,
+    constants::block_version_for_h4_relaunch,
     errors::RuleError,
     model::{
         services::{
@@ -22,6 +22,7 @@ use crate::{
             depth::{DbDepthStore, DepthStoreReader},
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStoreReader},
+            headers_selected_tip::DbHeadersSelectedTipStore,
             address_amount::DbAddressAmountStore,
             age_buckets::{AgeBuckets, DbAgeBucketsStore},
             maturation_queue::{DbMaturationQueueStore, MaturationEntry},
@@ -36,7 +37,7 @@ use crate::{
             relations::{DbRelationsStore, RelationsStoreReader},
             selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
-            tips::{DbTipsStore, TipsStoreReader},
+            tips::{DbTipsStore, TipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
             utxo_multisets::{DbUtxoMultisetsStore, UtxoMultisetsStoreReader},
             virtual_state::{LkgVirtualState, VirtualState, VirtualStateStoreReader, VirtualStores},
@@ -59,7 +60,7 @@ use keryx_consensus_core::{
     acceptance_data::AcceptanceData,
     api::args::{TransactionValidationArgs, TransactionValidationBatchArgs},
     block::{BlockTemplate, MutableBlock, TemplateBuildMode, TemplateTransactionSelector},
-    blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusUTXOValid},
+    blockstatus::BlockStatus::{StatusDisqualifiedFromChain, StatusInvalid, StatusUTXOValid},
     coinbase::MinerData,
     config::{genesis::GenesisBlock, params::ForkActivation},
     header::Header,
@@ -106,6 +107,15 @@ use std::{
     sync::{Arc, atomic::Ordering},
 };
 
+/// Outcome of a startup-only selected-chain rewind.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StashBlocksResult {
+    pub target: Hash,
+    pub target_index: u64,
+    pub removed_selected_chain_blocks: u64,
+    pub invalidated_descendants: usize,
+}
+
 pub struct VirtualStateProcessor {
     // Channels
     receiver: CrossbeamReceiver<VirtualStateProcessingMessage>,
@@ -125,8 +135,10 @@ pub struct VirtualStateProcessor {
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
+    pub(super) relations_store: Arc<RwLock<DbRelationsStore>>,
     pub(super) ghostdag_store: Arc<DbGhostdagStore>,
     pub(super) headers_store: Arc<DbHeadersStore>,
+    pub(super) headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
     pub(super) daa_excluded_store: Arc<DbDaaStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, read to scale the tier-reward coinbase split.
@@ -238,6 +250,9 @@ pub struct VirtualStateProcessor {
     // FIFO-inherited `effective_daa` anchors (see `UtxoDiff::add_transaction`) and the ratio
     // numerator switches to the per-coin-capped effective balance. Dormant (`never()`) until H4.
     pub(super) coin_age_activation: ForkActivation,
+    // H4 relaunch marker for block templates. This is deliberately the verification gate: it
+    // must remain in lockstep with the PoM v2 salt and header validation.
+    pub(super) h4_relaunch_activation: ForkActivation,
     // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
     pub(super) coin_age_maturity_w: u64,
     // Retention horizon (DAA score) for PROMOTED maturation-queue entries, enabling read-path
@@ -309,7 +324,9 @@ impl VirtualStateProcessor {
 
             db,
             statuses_store: storage.statuses_store.clone(),
+            relations_store: storage.relations_store.clone(),
             headers_store: storage.headers_store.clone(),
+            headers_selected_tip_store: storage.headers_selected_tip_store.clone(),
             ghostdag_store: storage.ghostdag_store.clone(),
             daa_excluded_store: storage.daa_excluded_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
@@ -372,6 +389,7 @@ impl VirtualStateProcessor {
             ratio_reward_window: params.ratio_reward_window,
             ratio_reward_window_daa: params.ratio_reward_window_daa,
             coin_age_activation: params.coin_age_activation,
+            h4_relaunch_activation: params.coin_age_verification_activation,
             coin_age_maturity_w: params.coin_age_maturity_w,
             coin_age_retention: params.finality_depth(),
             is_archival,
@@ -385,6 +403,284 @@ impl VirtualStateProcessor {
     /// construction, so the fast-sync catch-up relaxation auto-expires once the window refills.
     pub(super) fn trust_coinbase(&self) -> bool {
         self.is_archival || self.trust_coinbase_env || self.in_production_catchup_window()
+    }
+
+    /// Atomically rewinds the selected chain by `blocks` and quarantines every DAG descendant of
+    /// the new tip. This is deliberately startup-only: callers must invoke it before processor
+    /// workers or P2P begin using the consensus stores.
+    ///
+    /// Retaining the discarded records lets RocksDB avoid a huge destructive rewrite, while
+    /// `StatusInvalid` prevents an old side branch from ever becoming a parent or a virtual tip.
+    pub(crate) fn stash_selected_chain_blocks(&self, blocks: u64) -> Result<StashBlocksResult, String> {
+        self.stash_selected_chain_blocks_with_quarantine(blocks, BlockHashSet::default())
+    }
+
+    fn stash_selected_chain_blocks_with_quarantine(
+        &self,
+        blocks: u64,
+        additional_invalidated: BlockHashSet,
+    ) -> Result<StashBlocksResult, String> {
+        if blocks == 0 {
+            return Err("--stash-blocks must be greater than zero".to_string());
+        }
+
+        let (tip_index, selected_tip) = self
+            .selected_chain_store
+            .read()
+            .get_tip()
+            .map_err(|err| format!("cannot read selected-chain tip for stash: {err}"))?;
+        if blocks > tip_index {
+            return Err(format!(
+                "cannot stash {blocks} selected-chain blocks from index {tip_index}; refusing to cross the available chain boundary"
+            ));
+        }
+
+        let target_index = tip_index - blocks;
+        let retained_floor = self
+            .pruning_point_store
+            .read()
+            .pruning_point()
+            .map_err(|err| format!("cannot read pruning point for stash: {err}"))?;
+        let retained_floor_index = self
+            .selected_chain_store
+            .read()
+            .get_by_hash(retained_floor)
+            .map_err(|err| format!("cannot locate pruning point {retained_floor} on the selected chain for stash: {err}"))?;
+        if target_index < retained_floor_index {
+            return Err(format!(
+                "cannot stash to selected-chain index {target_index}: it is below retained pruning point {retained_floor} at index {retained_floor_index}; reset and resync is required"
+            ));
+        }
+        let (target, removed) = {
+            let selected_chain = self.selected_chain_store.read();
+            let target = selected_chain
+                .get_by_index(target_index)
+                .map_err(|err| format!("cannot read selected-chain rollback target at index {target_index}: {err}"))?;
+            let removed = ((target_index + 1)..=tip_index)
+                .map(|index| {
+                    selected_chain
+                        .get_by_index(index)
+                        .map_err(|err| format!("cannot read selected-chain block at index {index}: {err}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (target, removed)
+        };
+
+        let mut invalidated = self.collect_descendants(target)?;
+        invalidated.extend(additional_invalidated);
+        let virtual_read = self.virtual_stores.upgradable_read();
+        let previous_state = virtual_read
+            .state
+            .get()
+            .map_err(|err| format!("cannot read virtual state for stash: {err}"))?;
+        let previous_sink = previous_state.ghostdag_data.selected_parent;
+        if previous_sink != selected_tip {
+            return Err(format!(
+                "selected-chain tip {selected_tip} differs from virtual selected parent {previous_sink}; refusing unsafe stash"
+            ));
+        }
+        if !self.reachability_service.is_chain_ancestor_of(target, previous_sink) {
+            return Err(format!("rollback target {target} is not an ancestor of virtual selected parent {previous_sink}"));
+        }
+
+        // Reconstruct the target's UTXO state relative to the current virtual UTXO set, then
+        // construct the next virtual state with the target as its only parent. Do this directly
+        // over the selected-chain suffix rather than through the normal reorg helper: recovery
+        // must never repair a missing diff by writing intermediate state before its one atomic
+        // rollback batch is ready.
+        let mut accumulated_diff = previous_state.utxo_diff.clone().to_reversed();
+        for current in removed.iter().rev().copied() {
+            let mergeset_diff = self
+                .utxo_diffs_store
+                .get(current)
+                .map_err(|err| format!("cannot read UTXO diff for discarded selected-chain block {current}: {err}"))?;
+            accumulated_diff
+                .with_diff_in_place(&mergeset_diff.as_reversed())
+                .map_err(|err| format!("cannot reverse UTXO diff for discarded selected-chain block {current}: {err}"))?;
+        }
+        let target_multiset = self
+            .utxo_multisets_store
+            .get(target)
+            .map_err(|err| format!("cannot read UTXO multiset for rollback target {target}: {err}"))?;
+        let virtual_parents = vec![target];
+        let virtual_ghostdag_data = self.ghostdag_manager.ghostdag(&virtual_parents);
+        let new_virtual_state = self
+            .calculate_virtual_state(
+                &virtual_read,
+                virtual_parents,
+                virtual_ghostdag_data,
+                target_multiset,
+                &mut accumulated_diff,
+            )
+            .map_err(|err| format!("cannot calculate virtual state for rollback target {target}: {err}"))?;
+
+        let mut batch = WriteBatch::default();
+        let mut virtual_write = RwLockUpgradableReadGuard::upgrade(virtual_read);
+        let mut selected_chain_write = self.selected_chain_store.write();
+
+        virtual_write
+            .utxo_set
+            .write_diff_batch(&mut batch, &accumulated_diff)
+            .map_err(|err| format!("cannot stage virtual UTXO rollback: {err}"))?;
+        virtual_write
+            .state
+            .set_batch(&mut batch, new_virtual_state)
+            .map_err(|err| format!("cannot stage virtual-state rollback: {err}"))?;
+        selected_chain_write
+            .apply_changes(&mut batch, &ChainPath { added: vec![], removed })
+            .map_err(|err| format!("cannot stage selected-chain rollback: {err}"))?;
+
+        {
+            let mut body_tips = self.body_tips_store.write();
+            body_tips.delete_all_tips(&mut batch).map_err(|err| format!("cannot clear body tips for stash: {err}"))?;
+            body_tips.init_batch(&mut batch, &[target]).map_err(|err| format!("cannot set rollback body tip: {err}"))?;
+        }
+        let target_blue_work = self
+            .ghostdag_store
+            .get_blue_work(target)
+            .map_err(|err| format!("cannot read blue work for rollback target {target}: {err}"))?;
+        self.headers_selected_tip_store
+            .write()
+            .set_batch(&mut batch, SortableBlock::new(target, target_blue_work))
+            .map_err(|err| format!("cannot stage headers selected-tip rollback: {err}"))?;
+
+        {
+            let mut statuses = self.statuses_store.write();
+            for hash in invalidated.iter().copied() {
+                statuses
+                    .set_batch(&mut batch, hash, StatusInvalid)
+                    .map_err(|err| format!("cannot quarantine discarded block {hash}: {err}"))?;
+            }
+        }
+
+        // These aggregates are derived solely from the virtual UTXO set and selected chain. Clear
+        // them in the same batch so the normal startup rebuild cannot observe stale H4-era values.
+        self.address_balance_store.clear(&mut batch).map_err(|err| format!("cannot clear balance index for stash: {err}"))?;
+        self.age_buckets_store.clear(&mut batch).map_err(|err| format!("cannot clear age buckets for stash: {err}"))?;
+        self.maturation_queue_store.clear(&mut batch).map_err(|err| format!("cannot clear maturation queue for stash: {err}"))?;
+        self.windowed_production_prefix_store.clear(&mut batch);
+        self.production_index_seed_store
+            .write()
+            .clear_batch(&mut batch)
+            .map_err(|err| format!("cannot clear production-index seed for stash: {err}"))?;
+
+        self.db.write(batch).map_err(|err| format!("cannot commit atomic stash: {err}"))?;
+        drop(selected_chain_write);
+        drop(virtual_write);
+        self.block_production_cache.write().clear();
+
+        Ok(StashBlocksResult {
+            target,
+            target_index,
+            removed_selected_chain_blocks: blocks,
+            invalidated_descendants: invalidated.len(),
+        })
+    }
+
+    /// Finds the last selected-chain block strictly before `daa_score` and stashes everything
+    /// above it. This is used by the H4 recovery command so operators never need to guess a chain
+    /// index from a DAA score in a DAG.
+    pub(crate) fn stash_selected_chain_to_before_daa(&self, daa_score: u64) -> Result<StashBlocksResult, String> {
+        let (tip_index, _) = self
+            .selected_chain_store
+            .read()
+            .get_tip()
+            .map_err(|err| format!("cannot read selected-chain tip for DAA rollback: {err}"))?;
+        let selected_chain = self.selected_chain_store.read();
+        let retained_floor = self
+            .pruning_point_store
+            .read()
+            .pruning_point()
+            .map_err(|err| format!("cannot read pruning point for DAA rollback: {err}"))?;
+        let retained_floor_index = selected_chain
+            .get_by_hash(retained_floor)
+            .map_err(|err| format!("cannot locate pruning point {retained_floor} on selected chain for DAA rollback: {err}"))?;
+        let mut target_index = None;
+        for index in (retained_floor_index..=tip_index).rev() {
+            let hash = selected_chain
+                .get_by_index(index)
+                .map_err(|err| format!("cannot read selected-chain block at index {index}: {err}"))?;
+            let block_daa = self
+                .headers_store
+                .get_daa_score(hash)
+                .map_err(|err| format!("cannot read DAA score for selected-chain block {hash}: {err}"))?;
+            if block_daa < daa_score {
+                target_index = Some(index);
+                break;
+            }
+        }
+        drop(selected_chain);
+
+        let target_index = target_index.ok_or_else(|| {
+            format!("cannot roll back to DAA {daa_score}: the retained selected chain has no earlier block; reset and resync is required")
+        })?;
+        if target_index == tip_index {
+            return Err(format!("selected chain has not reached DAA {daa_score}; no blocks were stashed"));
+        }
+        // Body tips include every active body branch. Walk them backwards through the H4 region so
+        // an old branch that forked before `target` cannot remain a valid parent after the forced
+        // relaunch. Header-only remnants are harmless: their body is still checked against the new
+        // H4 PoM fold before they can enter the body DAG.
+        let legacy_h4_blocks = self.collect_active_blocks_at_or_after_daa(daa_score)?;
+        self.stash_selected_chain_blocks_with_quarantine(tip_index - target_index, legacy_h4_blocks)
+    }
+
+    fn collect_active_blocks_at_or_after_daa(&self, daa_score: u64) -> Result<BlockHashSet, String> {
+        let tips = {
+            let body_tips = self.body_tips_store.read();
+            let tips = body_tips.get().map_err(|err| format!("cannot read body tips for H4 rollback: {err}"))?;
+            tips.read().iter().copied().collect_vec()
+        };
+
+        let mut visited = BlockHashSet::default();
+        let mut matched = BlockHashSet::default();
+        let mut queue = VecDeque::from_iter(tips);
+        while let Some(current) = queue.pop_front() {
+            if !visited.insert(current) {
+                continue;
+            }
+
+            let current_daa = self
+                .headers_store
+                .get_daa_score(current)
+                .map_err(|err| format!("cannot read DAA score for active block {current} during H4 rollback: {err}"))?;
+            if current_daa < daa_score {
+                continue;
+            }
+            matched.insert(current);
+
+            let parents = {
+                let relations = self.relations_store.read();
+                relations
+                    .get_parents(current)
+                    .map_err(|err| format!("cannot traverse active H4 branch at {current}: {err}"))?
+            };
+            queue.extend(parents.iter().copied());
+        }
+        Ok(matched)
+    }
+
+    fn collect_descendants(&self, root: Hash) -> Result<BlockHashSet, String> {
+        let mut descendants = BlockHashSet::default();
+        let mut queue = VecDeque::from([root]);
+        while let Some(current) = queue.pop_front() {
+            let children = {
+                let relations = self.relations_store.read();
+                relations
+                    .get_children(current)
+                    .map_err(|err| format!("cannot traverse descendants of {current} for stash: {err}"))?
+                    .read()
+                    .iter()
+                    .copied()
+                    .collect_vec()
+            };
+            for child in children {
+                if descendants.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+        Ok(descendants)
     }
 
     /// True while we're still inside our own post-import catch-up window: fewer than
@@ -1411,7 +1707,10 @@ impl VirtualStateProcessor {
             )
             .unwrap();
         txs.insert(0, coinbase.tx);
-        let version = BLOCK_VERSION;
+        let version = block_version_for_h4_relaunch(
+            virtual_state.daa_score,
+            self.h4_relaunch_activation.daa_score(),
+        );
         let parents_by_level = self.parents_manager.calc_block_parents(pruning_point, &virtual_state.parents);
         let hash_merkle_root = calc_hash_merkle_root(txs.iter());
 

@@ -118,7 +118,15 @@ pub fn calc_level_from_pow(pow: Uint256, max_block_level: BlockLevel) -> BlockLe
 /// `proof.final_state == header.pom_final_state`.
 pub fn calc_pom_pow(header: &Header) -> Uint256 {
     let pre_pow_hash = hashing::header::hash_override_nonce_time(header, 0, 0);
-    Uint256::from_le_bytes(keryx_consensus_core::pom::pom_pow_value_h3(header.pom_final_state, &pre_pow_hash.as_bytes()))
+    // The H4 relaunch marker is part of the header and therefore needs no global
+    // network state here. Header validation enforces that version 2 starts at
+    // the configured H4 DAA boundary before this PoW check runs.
+    let pow = if header.version == keryx_consensus_core::constants::H4_RELAUNCH_BLOCK_VERSION {
+        keryx_consensus_core::pom::pom_pow_value_h4_relaunch(header.pom_final_state, &pre_pow_hash.as_bytes())
+    } else {
+        keryx_consensus_core::pom::pom_pow_value_h3(header.pom_final_state, &pre_pow_hash.as_bytes())
+    };
+    Uint256::from_le_bytes(pow)
 }
 
 /// H3 block level + target check from the header alone. The exact PoM-era mirror of
@@ -131,4 +139,24 @@ pub fn calc_pom_block_level_check_pow(header: &Header, max_block_level: BlockLev
     let pow = calc_pom_pow(header);
     let passed = pow <= Uint256::from_compact_target_bits(header.bits);
     (calc_level_from_pow(pow, max_block_level), passed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_consensus_core::constants::{BLOCK_VERSION, H4_RELAUNCH_BLOCK_VERSION};
+    use keryx_hashes::Hash;
+
+    #[test]
+    fn h4_relaunch_marker_selects_a_distinct_pom_pow_fold() {
+        let mut header = Header::from_precomputed_hash(Hash::from_bytes([1; 32]), vec![Hash::from_bytes([2; 32])]);
+        header.pom_final_state = 0x0123_4567_89ab_cdef;
+
+        header.version = BLOCK_VERSION;
+        let h3_pow = calc_pom_pow(&header);
+        header.version = H4_RELAUNCH_BLOCK_VERSION;
+        let h4_pow = calc_pom_pow(&header);
+
+        assert_ne!(h3_pow, h4_pow);
+    }
 }

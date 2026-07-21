@@ -255,7 +255,9 @@ fn main_impl(mut args: Args) {
             Default::default(),
             unix_now(),
             Arc::new(MiningRules::default()),
-        ));
+            None,
+        )
+        .expect("simulator consensus initialization must succeed"));
         (consensus, lifetime)
     } else {
         let until = if args.target_blocks.is_none() { config.genesis.timestamp + args.sim_time * 1000 } else { u64::MAX }; // milliseconds
@@ -337,7 +339,9 @@ fn main_impl(mut args: Args) {
         Default::default(),
         unix_now(),
         Arc::new(MiningRules::default()),
-    ));
+        None,
+    )
+    .expect("simulator consensus initialization must succeed"));
     let handles2 = consensus2.run_processors();
     if args.headers_first {
         rt.block_on(validate(&consensus, &consensus2, &config, args.delay, args.bps, true));
