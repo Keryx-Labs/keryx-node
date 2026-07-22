@@ -205,7 +205,10 @@ impl BlockBodyProcessor {
         // structure and verification differ. H3 is a prerequisite of H4 (H4 gates strictly later),
         // so `final_state` is still pinned to the header above.
         if self.coin_age_verification_activation.is_active(header.daa_score) {
-            return verify_pom_proof_v2(seed, proof, tier.chunks, POM_WALK_STEPS, &tier.root, &target, final_hash)
+            // H5: re-walk with the non-foldable mix64-chained transition at/after the H5 gate;
+            // pre-H5 blocks re-walk with the frozen v1 fold, so historical blocks stay valid.
+            let walk_v2 = self.h5_activation.is_active(header.daa_score);
+            return verify_pom_proof_v2(seed, proof, tier.chunks, POM_WALK_STEPS, &tier.root, &target, final_hash, walk_v2)
                 .map_err(RuleError::BadPomProof);
         }
 

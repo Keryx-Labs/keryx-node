@@ -328,13 +328,30 @@ pub fn pom_pow_value_h3(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
     pom_pow_value_from_words(final_state, &pph_words_h3(pre_pow_hash))
 }
 
+/// Pre-H5 possession transition (FROZEN — validates all blocks below `h5_activation`). The 4 chunk
+/// words are XOR-folded into a single 64-bit accumulator before one `mix64`, so only their XOR
+/// (8 bytes) is load-bearing — a miner could hold a 4×-smaller possession table. Kept verbatim for
+/// historical re-derivation; never change it.
 #[inline]
-fn transition(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
+fn transition_v1(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
     let mut h = state;
     for &w in chunk.iter() {
         h ^= w;
     }
     mix64(h)
+}
+
+/// H5 possession transition (active at/after `h5_activation`). `mix64` is chained through each of
+/// the 4 chunk words, so all 32 bytes are load-bearing and order-dependent — the v1 XOR-fold
+/// shortcut is closed and a miner must hold the full chunk. Same weights, same `R_T` (the change is
+/// in the walk, not the weight commitment); only the walk output `final_state` differs per era.
+#[inline]
+fn transition_v2(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
+    let mut h = state;
+    for &w in chunk.iter() {
+        h = mix64(h ^ w);
+    }
+    h
 }
 
 #[inline]
@@ -372,6 +389,13 @@ fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
+    // Bound the path to the u64 index bit-width: any Merkle tree addressable by a u64 index has at
+    // most 64 levels, so every honest inclusion path is <= 64 siblings. Rejecting longer paths early
+    // caps verification work — a malicious proof cannot force an unbounded hashing loop — and changes
+    // no accept decision, since an over-length path never hashes to the correct root below anyway.
+    if path.len() > 64 {
+        return false;
+    }
     let mut acc = leaf;
     let mut idx = index;
     for sib in path {
@@ -442,7 +466,8 @@ pub fn verify_pom_proof<Hf: Fn(u64) -> [u8; 32]>(
         if !verify_merkle(blake(&op.chunk), off, &op.weight_path, r_t) {
             return Err(PomVerifyError::BadWeightPath);
         }
-        let state_after = transition(op.state_before, &chunk_to_words(&op.chunk));
+        // Pre-H4 spot-check path — only ever runs for pre-H4 (hence pre-H5) blocks, always walk v1.
+        let state_after = transition_v1(op.state_before, &chunk_to_words(&op.chunk));
         if !verify_merkle(trace_leaf(state_after), i + 1, &op.trace_path_after, &proof.trace_root) {
             return Err(PomVerifyError::BadStateAfterPath);
         }
@@ -469,6 +494,7 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
     r_t: &[u8; 32],
     target: &[u8; 32],
     final_hash: Hf,
+    walk_v2: bool,
 ) -> Result<(), PomVerifyError> {
     let steps = proof.steps_v2.as_ref().ok_or(PomVerifyError::MissingSteps)?;
     if steps.len() != k as usize {
@@ -481,6 +507,9 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
     {
         return Err(PomVerifyError::NonCanonicalLegacyFields);
     }
+    // H5 era selection: `walk_v2` (from `h5_activation` on the block's daa_score) picks the
+    // non-foldable mix64-chained transition; pre-H5 blocks re-walk with the frozen v1 fold.
+    let transition = if walk_v2 { transition_v2 } else { transition_v1 };
     let mut state = seed;
     for step in steps.iter() {
         let off = state % n_chunks;
@@ -569,7 +598,7 @@ mod verify_tests {
         trace.push(state);
         let mut off = state % n_chunks;
         for _ in 0..k {
-            state = transition(state, &synth_chunk(off));
+            state = transition_v1(state, &synth_chunk(off));
             trace.push(state);
             off = state % n_chunks;
         }
@@ -607,10 +636,13 @@ mod verify_tests {
     }
 
     // Inline v2 prover (test-only): walk once recording the chunks, open every step under R_T.
-    fn build_v2(n_chunks: u64, k: u32, seed: u64) -> (PomProof, [u8; 32]) {
+    // `walk_v2` selects the era transition so both the frozen v1 fold and the H5 mix64 chain are
+    // exercised end-to-end against the verifier.
+    fn build_v2(n_chunks: u64, k: u32, seed: u64, walk_v2: bool) -> (PomProof, [u8; 32]) {
         let weight_leaves: Vec<[u8; 32]> = (0..n_chunks).map(|o| blake(&words_to_bytes(&synth_chunk(o)))).collect();
         let r_t = merkle_root(&weight_leaves);
 
+        let transition = if walk_v2 { transition_v2 } else { transition_v1 };
         let mut steps = Vec::with_capacity(k as usize);
         let mut state = seed;
         for _ in 0..k {
@@ -666,31 +698,31 @@ mod verify_tests {
     fn v2_verify_roundtrip_and_tamper() {
         let (n, k) = (4096u64, 256u32);
         let seed = pom_seed_state(0xabc);
-        let (proof, r_t) = build_v2(n, k, seed);
+        let (proof, r_t) = build_v2(n, k, seed, false);
         let pass = [0xffu8; 32];
 
         // honest
-        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh), Ok(()));
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh, false), Ok(()));
         // wrong tier root
-        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &blake(b"wrong"), &pass, fh), Err(PomVerifyError::BadWeightPath));
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &blake(b"wrong"), &pass, fh, false), Err(PomVerifyError::BadWeightPath));
         // wrong seed: the very first derived index no longer matches the opened path
-        assert_eq!(verify_pom_proof_v2(seed ^ 1, &proof, n, k, &r_t, &pass, fh), Err(PomVerifyError::BadWeightPath));
+        assert_eq!(verify_pom_proof_v2(seed ^ 1, &proof, n, k, &r_t, &pass, fh, false), Err(PomVerifyError::BadWeightPath));
         // tampered chunk
         let mut p2 = proof.clone();
         p2.steps_v2.as_mut().unwrap()[100].chunk[0] ^= 0xff;
-        assert_eq!(verify_pom_proof_v2(seed, &p2, n, k, &r_t, &pass, fh), Err(PomVerifyError::BadWeightPath));
+        assert_eq!(verify_pom_proof_v2(seed, &p2, n, k, &r_t, &pass, fh, false), Err(PomVerifyError::BadWeightPath));
         // truncated walk
         let mut p3 = proof.clone();
         p3.steps_v2.as_mut().unwrap().pop();
-        assert_eq!(verify_pom_proof_v2(seed, &p3, n, k, &r_t, &pass, fh), Err(PomVerifyError::WrongStepCount));
+        assert_eq!(verify_pom_proof_v2(seed, &p3, n, k, &r_t, &pass, fh, false), Err(PomVerifyError::WrongStepCount));
         // missing steps entirely
         let mut p4 = proof.clone();
         p4.steps_v2 = None;
-        assert_eq!(verify_pom_proof_v2(seed, &p4, n, k, &r_t, &pass, fh), Err(PomVerifyError::MissingSteps));
+        assert_eq!(verify_pom_proof_v2(seed, &p4, n, k, &r_t, &pass, fh, false), Err(PomVerifyError::MissingSteps));
         // legacy trace-tree fields must stay canonically empty
         let mut p5 = proof.clone();
         p5.trace_root = [1u8; 32];
-        assert_eq!(verify_pom_proof_v2(seed, &p5, n, k, &r_t, &pass, fh), Err(PomVerifyError::NonCanonicalLegacyFields));
+        assert_eq!(verify_pom_proof_v2(seed, &p5, n, k, &r_t, &pass, fh, false), Err(PomVerifyError::NonCanonicalLegacyFields));
         let mut p6 = proof.clone();
         p6.openings.push(PomOpening {
             state_before: 0,
@@ -699,9 +731,9 @@ mod verify_tests {
             trace_path_before: vec![],
             trace_path_after: vec![],
         });
-        assert_eq!(verify_pom_proof_v2(seed, &p6, n, k, &r_t, &pass, fh), Err(PomVerifyError::NonCanonicalLegacyFields));
+        assert_eq!(verify_pom_proof_v2(seed, &p6, n, k, &r_t, &pass, fh, false), Err(PomVerifyError::NonCanonicalLegacyFields));
         // target not met
-        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &[0u8; 32], fh), Err(PomVerifyError::TargetNotMet));
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &[0u8; 32], fh, false), Err(PomVerifyError::TargetNotMet));
     }
 
     /// The spot-check exploit scenario, replayed against v2: keep one honest walk record but
@@ -712,9 +744,9 @@ mod verify_tests {
     fn v2_forged_final_state_always_rejected() {
         let (n, k) = (4096u64, 256u32);
         let seed = pom_seed_state(0xdead);
-        let (proof, r_t) = build_v2(n, k, seed);
+        let (proof, r_t) = build_v2(n, k, seed, false);
         let pass = [0xffu8; 32];
-        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh), Ok(()));
+        assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh, false), Ok(()));
 
         for grind in 0..1000u64 {
             let forged_state = mix64(proof.final_state ^ grind.wrapping_add(1));
@@ -722,11 +754,36 @@ mod verify_tests {
             forged.final_state = forged_state;
             forged.pow_value = fh(forged_state); // self-consistent fold, exactly like the exploit
             assert_eq!(
-                verify_pom_proof_v2(seed, &forged, n, k, &r_t, &pass, fh),
+                verify_pom_proof_v2(seed, &forged, n, k, &r_t, &pass, fh, false),
                 Err(PomVerifyError::FinalStateMismatch),
                 "forged final_state accepted at grind {grind}"
             );
         }
+    }
+
+    /// H5 era-gating of the walk: the frozen v1 fold and the mix64-chained v2 walk produce
+    /// different `final_state`s from the same weights/seed, and a proof built for one era is
+    /// rejected when re-walked under the other (the derived chunk indices diverge). This is exactly
+    /// how a block validated on the wrong side of `h5_activation` fails.
+    #[test]
+    fn v2_walk_era_gating() {
+        let (n, k) = (4096u64, 256u32);
+        let seed = pom_seed_state(0xf00d);
+        let pass = [0xffu8; 32];
+
+        let (v1_proof, r_t) = build_v2(n, k, seed, false);
+        let (v2_proof, _) = build_v2(n, k, seed, true);
+
+        // Same weights + seed, different walk → different derived final_state.
+        assert_ne!(v1_proof.final_state, v2_proof.final_state);
+
+        // Each proof verifies only under its own era.
+        assert_eq!(verify_pom_proof_v2(seed, &v1_proof, n, k, &r_t, &pass, fh, false), Ok(()));
+        assert_eq!(verify_pom_proof_v2(seed, &v2_proof, n, k, &r_t, &pass, fh, true), Ok(()));
+
+        // Cross-era: re-walking with the wrong transition diverges → rejected.
+        assert!(verify_pom_proof_v2(seed, &v2_proof, n, k, &r_t, &pass, fh, false).is_err());
+        assert!(verify_pom_proof_v2(seed, &v1_proof, n, k, &r_t, &pass, fh, true).is_err());
     }
 
     /// Era-exact wire encoding: a proof without `steps_v2` MUST encode byte-identically to
@@ -751,11 +808,11 @@ mod verify_tests {
 
         // v2 round-trips through the same helpers.
         let seed = pom_seed_state(0xabc);
-        let (v2, r_t) = build_v2(n, k, seed);
+        let (v2, r_t) = build_v2(n, k, seed, false);
         let bytes = v2.to_wire_bytes();
         let back2 = PomProof::from_wire_bytes(&bytes).unwrap();
         assert_eq!(back2.steps_v2.as_ref().unwrap().len(), k as usize);
-        assert_eq!(verify_pom_proof_v2(seed, &back2, n, k, &r_t, &[0xffu8; 32], fh), Ok(()));
+        assert_eq!(verify_pom_proof_v2(seed, &back2, n, k, &r_t, &[0xffu8; 32], fh, false), Ok(()));
 
         // A truncated / garbage stream fails both decodes.
         assert!(PomProof::from_wire_bytes(&bytes[..bytes.len() - 1]).is_err());
@@ -782,7 +839,7 @@ mod verify_tests {
 
         // A v2 record decodes as PomProof directly (primary path, no fallback).
         let seed = pom_seed_state(0xabc);
-        let (v2, _) = build_v2(n, k, seed);
+        let (v2, _) = build_v2(n, k, seed, false);
         let v2_bytes = bincode::serialize(&v2).unwrap();
         let back = bincode::deserialize::<PomProof>(&v2_bytes).unwrap();
         assert_eq!(back.steps_v2.as_ref().unwrap().len(), k as usize);

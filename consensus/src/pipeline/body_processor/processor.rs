@@ -74,6 +74,10 @@ pub struct BlockBodyProcessor {
     /// verifier (`verify_pom_proof_v2`, all K transitions re-walked) instead of the 32/256 spot-check.
     /// Bundled into H4 alongside coin-age (same `coin_age_verification_activation` DAA).
     pub(super) coin_age_verification_activation: ForkActivation,
+    /// H5 gate — when active at a block's daa_score, `check_pom_proof` re-walks with the
+    /// non-foldable mix64-chained transition (`verify_pom_proof_v2(.., walk_v2= true)`); pre-H5
+    /// blocks re-walk with the frozen v1 fold. Single H5 bundle gate (`Params::h5_activation`).
+    pub(super) h5_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -136,6 +140,7 @@ impl BlockBodyProcessor {
             very_light_activation: params.very_light_activation,
             pom_level_activation: params.pom_level_activation,
             coin_age_verification_activation: params.coin_age_verification_activation,
+            h5_activation: params.h5_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
