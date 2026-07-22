@@ -8,9 +8,12 @@ use crate::{
     processes::ghostdag::ordering::SortableBlock,
 };
 use keryx_consensus_core::{
-    BlockHashSet, BlueWorkType, HashMapCustomHasher,
+    BlockHashMap, BlockHashSet, BlueWorkType, HashMapCustomHasher,
     blockhash::{BlockHashExtensions, ORIGIN},
-    config::{genesis::GenesisBlock, params::ForkActivation},
+    config::{
+        genesis::GenesisBlock,
+        params::{ForkActivation, PARALLEL_BLOCK_CAP_N},
+    },
     errors::{block::RuleError, difficulty::DifficultyResult},
 };
 use keryx_hashes::Hash;
@@ -85,6 +88,7 @@ pub struct SampledWindowManager<
     past_median_time_sample_rate: u64,
     difficulty_manager: SampledDifficultyManager<V, T>,
     past_median_time_manager: SampledPastMedianTimeManager<V>,
+    h5_activation: ForkActivation,
 }
 
 impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter, V: HeaderStoreReader, W: DaaStoreReader>
@@ -107,6 +111,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
         past_median_time_sample_rate: u64,
         difficulty_reset_activation: ForkActivation,
         difficulty_reset_activation_h4: ForkActivation,
+        h5_activation: ForkActivation,
     ) -> Self {
         let difficulty_manager = SampledDifficultyManager::new(
             headers_store.clone(),
@@ -136,6 +141,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
             past_median_time_sample_rate,
             difficulty_manager,
             past_median_time_manager,
+            h5_activation,
         }
     }
 
@@ -144,6 +150,36 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
     /// template build time so a frozen chain can be relaunched.
     pub fn reset_difficulty_bits(&self, daa_score: u64) -> Option<u32> {
         self.difficulty_manager.reset_bits(daa_score)
+    }
+
+    /// H5 parallel-block cap: force any surplus beyond `PARALLEL_BLOCK_CAP_N` blocks that share the
+    /// same selected-parent within this mergeset into `mergeset_non_daa`, so they count neither in
+    /// the DAA score nor in the coinbase payment. Gated on the selected parent's DAA score — a pure
+    /// header-level value, so the classification is deterministic and IBD re-derives it identically.
+    /// Blocks already excluded (too old) do not consume a cap slot. Enforcement is force-non-DAA,
+    /// never block rejection: a header carrying an over-cap DAA score fails the standard recomputation
+    /// and is rejected deterministically through the existing path.
+    fn apply_parallel_block_cap(&self, ghostdag_data: &GhostdagData, mergeset_non_daa: &mut BlockHashSet) {
+        let sp_daa_score = self.headers_store.get_daa_score(ghostdag_data.selected_parent).unwrap();
+        if !self.h5_activation.is_active(sp_daa_score) {
+            return;
+        }
+        let mut by_parent: BlockHashMap<Vec<Hash>> = BlockHashMap::new();
+        for hash in ghostdag_data.unordered_mergeset_without_selected_parent() {
+            if mergeset_non_daa.contains(&hash) {
+                continue;
+            }
+            let parent = self.ghostdag_store.get_selected_parent(hash).unwrap();
+            by_parent.entry(parent).or_default().push(hash);
+        }
+        for (_parent, mut group) in by_parent {
+            if group.len() > PARALLEL_BLOCK_CAP_N {
+                group.sort_unstable();
+                for hash in group.drain(PARALLEL_BLOCK_CAP_N..) {
+                    mergeset_non_daa.insert(hash);
+                }
+            }
+        }
     }
 
     fn build_block_window(
@@ -351,6 +387,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
         let window = self.build_block_window(ghostdag_data, WindowType::DifficultyWindow, |hash| {
             mergeset_non_daa.insert(hash);
         })?;
+        self.apply_parallel_block_cap(ghostdag_data, &mut mergeset_non_daa);
         let daa_score = self.difficulty_manager.calc_daa_score(ghostdag_data, &mergeset_non_daa);
         Ok(DaaWindow::new(window, daa_score, mergeset_non_daa))
     }

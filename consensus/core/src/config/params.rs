@@ -138,6 +138,21 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
 /// the existing H2 reset at 38_951_445 is load-bearing history that must not move.
 pub const H4_ACTIVATION_DAA: u64 = 54_766_000;
 
+/// Single activation gate for the ENTIRE H5 bundle — parallel-block cap, non-foldable `transition()`
+/// walk + `verify_merkle` bound, and the tier-0 model swap. `u64::MAX` = dormant; set this to the
+/// real DAA at H5 release and every H5 feature flips together in one edit. MUST be mirrored on the
+/// miner side (walk + lineup). See KERYX-KRX/H5_hardfork_plan.
+pub const H5_ACTIVATION_DAA: u64 = u64::MAX;
+
+/// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
+/// The surplus is forced into `mergeset_non_daa` — excluded from both the DAA increment and the
+/// coinbase payment — never rejected (rejection at admission is non-deterministic → split).
+/// N=20 is the lowest bound that never clips an honest producer: the measured honest ceiling is
+/// ~15 blocks/selected-parent, so 20 leaves margin while neutralizing sibling floods (observed up
+/// to 44/DAA). Gated by `h5_activation` on the selected parent's DAA score, a pure header-level
+/// function so IBD re-derives it identically. See KERYX-KRX/H5_hardfork_plan.
+pub const PARALLEL_BLOCK_CAP_N: usize = 20;
+
 // --- H4 lineup refresh (gated by `coin_age_activation`, bundled into H4). Fully candle-independent:
 // every model is UNTIED (llama.cpp hosts the walk + inference in one resident copy). MUST mirror the
 // miner's `models.rs`. Each `model_id` = CIDv0[2..34] of the pinned GGUF; each `root` from the offline
@@ -901,6 +916,11 @@ pub struct Params {
     /// is unscheduled.
     pub difficulty_reset_activation_h4: ForkActivation,
 
+    /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
+    /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
+    /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
+    pub h5_activation: ForkActivation,
+
     /// Length (in blocks) of the trailing selected-chain window over which a payout address's
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
@@ -1127,6 +1147,7 @@ impl Params {
             ratio_verification_activation: self.ratio_verification_activation,
             difficulty_reset_activation: self.difficulty_reset_activation,
             difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
+            h5_activation: self.h5_activation,
 
             ratio_reward_window: self.ratio_reward_window,
             ratio_reward_window_daa: self.ratio_reward_window_daa,
@@ -1293,6 +1314,8 @@ pub const MAINNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::new(38_951_445),
     // H4 relaunch difficulty reset — additive, driven by the single H4 flip point.
     difficulty_reset_activation_h4: ForkActivation::new(H4_ACTIVATION_DAA),
+    // H5 bundle gate — DORMANT (H5_ACTIVATION_DAA = u64::MAX) until scheduled; set the const at release.
+    h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1387,6 +1410,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // H4 reset ENABLED on testnet (mirrors the coin-age gates at 3_000) so the additive-reset path
     // is exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
     difficulty_reset_activation_h4: ForkActivation::new(3_000),
+    // H5 bundle gate active early on testnet for validation.
+    h5_activation: ForkActivation::new(3_000),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
     // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
@@ -1459,6 +1484,7 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
+    h5_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1522,6 +1548,7 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
+    h5_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
