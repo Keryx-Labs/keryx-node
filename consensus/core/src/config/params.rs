@@ -350,12 +350,30 @@ pub const POM_TIERS_H4: &[crate::pom::PomTier] = &[
     },
 ];
 
-/// Possession anchors for a block at `daa_score`: the 5-tier H2 set once `very_light_activation`
-/// is live, the legacy 4-tier set before. The choice MUST be made per block from that block's own
-/// DAA (never frozen) — an archival/IBD node recomputing a pre-H2 block under the 5-tier scheme
-/// would validate against the wrong anchors and reject the chain.
-pub fn pom_tiers(coin_age_active: bool, very_light_active: bool) -> &'static [crate::pom::PomTier] {
-    if coin_age_active {
+/// H5 possession anchors — same 5-tier ORDER as H4, swapping ONLY tier 0's model (raising the
+/// tier-0 VRAM floor to ~6 GB). Tiers 1-4 are unchanged from H4 (same models → same R_T). Gated by
+/// `h5_activation`.
+pub const POM_TIERS_H5: &[crate::pom::PomTier] = &[
+    // ⚠️ TIER 0 PLACEHOLDER — currently == H4 tier 0 (EXAONE), a safe no-op while H5 is dormant
+    // (`H5_ACTIVATION_DAA` = u64::MAX). At H5 release, REPLACE this single entry with the
+    // Qwen3-8B-abliterated anchor: { model_id = CIDv0[2..34] of its published GGUF, root =
+    // pom-rt-builder R_T over that GGUF's 32 B chunks, chunks = N }. Nothing else in H5 changes R_T.
+    POM_TIERS_H4[0],
+    POM_TIERS_H4[1],
+    POM_TIERS_H4[2],
+    POM_TIERS_H4[3],
+    POM_TIERS_H4[4],
+];
+
+/// Possession anchors for a block at `daa_score`: the H5 set once `h5_activation` is live (tier-0
+/// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
+/// else the legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
+/// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
+/// against the wrong anchors and reject the chain.
+pub fn pom_tiers(h5_active: bool, coin_age_active: bool, very_light_active: bool) -> &'static [crate::pom::PomTier] {
+    if h5_active {
+        POM_TIERS_H5
+    } else if coin_age_active {
         POM_TIERS_H4
     } else if very_light_active {
         POM_TIERS_H2
