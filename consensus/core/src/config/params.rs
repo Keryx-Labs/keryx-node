@@ -350,15 +350,29 @@ pub const POM_TIERS_H4: &[crate::pom::PomTier] = &[
     },
 ];
 
+/// Qwen3-8B-abliterated Q4_K_S (huihui-ai, mradermacher GGUF). H5 tier 0 (--very-light), replaces
+/// EXAONE. `model_id` = CIDv0[2..34] of the pinned GGUF (IPFS Qm...ccwHVeZYVzEq6A5ofk76MxrnwzMnSjAVt9PaUQ7zfLXm).
+pub const QWEN3_8B_ABLITERATED_MODEL_ID: [u8; 32] = [
+    0xd4, 0x2f, 0xa6, 0xee, 0x00, 0xe0, 0x7d, 0x49,
+    0xb0, 0x46, 0x09, 0x0a, 0x56, 0xaf, 0x0e, 0x7b,
+    0xd6, 0x10, 0x25, 0x93, 0x7c, 0x50, 0x2e, 0x2c,
+    0x57, 0x4a, 0x72, 0x87, 0x4c, 0x35, 0x0d, 0x24,
+];
+
 /// H5 possession anchors — same 5-tier ORDER as H4, swapping ONLY tier 0's model (raising the
 /// tier-0 VRAM floor to ~6 GB). Tiers 1-4 are unchanged from H4 (same models → same R_T). Gated by
 /// `h5_activation`.
 pub const POM_TIERS_H5: &[crate::pom::PomTier] = &[
-    // ⚠️ TIER 0 PLACEHOLDER — currently == H4 tier 0 (EXAONE), a safe no-op while H5 is dormant
-    // (`H5_ACTIVATION_DAA` = u64::MAX). At H5 release, REPLACE this single entry with the
-    // Qwen3-8B-abliterated anchor: { model_id = CIDv0[2..34] of its published GGUF, root =
-    // pom-rt-builder R_T over that GGUF's 32 B chunks, chunks = N }. Nothing else in H5 changes R_T.
-    POM_TIERS_H4[0],
+    // Tier 0: Qwen3-8B-abliterated Q4_K_S. root = pom-rt-builder R_T over the pinned GGUF's 32 B
+    // chunks (name-sorted tensors | blake3 leaf | blake3 tree); chunks = N reported by the builder.
+    crate::pom::PomTier {
+        model_id: QWEN3_8B_ABLITERATED_MODEL_ID,
+        root: [
+            0xa1, 0xcb, 0xff, 0xfa, 0xae, 0xb9, 0x71, 0xcb, 0x29, 0x7b, 0x7e, 0x01, 0xff, 0x41, 0x09, 0x72,
+            0x3e, 0x43, 0x97, 0x41, 0xcd, 0x42, 0x68, 0x22, 0x5f, 0x0c, 0x30, 0xa3, 0x33, 0xe6, 0x9a, 0x68,
+        ],
+        chunks: 149_876_736,
+    },
     POM_TIERS_H4[1],
     POM_TIERS_H4[2],
     POM_TIERS_H4[3],
