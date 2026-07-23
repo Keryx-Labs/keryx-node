@@ -184,9 +184,9 @@ pub struct CoinbaseManager {
     emission_schedule: Vec<u64>,
     /// Per-block subsidy applied indefinitely once `emission_schedule` is exhausted.
     tail_emission_per_block: u64,
-    /// Script public key for the protocol R&D allocation output (2% of every block reward).
+    /// Script public key for the protocol R&D allocation output (5% of every block reward).
     rd_allocation_script_public_key: ScriptPublicKey,
-    /// Provably-unspendable burn SPK — receives the 10% escrow cut of standard miners.
+    /// Provably-unspendable burn SPK — receives the 20% escrow cut of standard miners.
     burn_script_public_key: ScriptPublicKey,
 }
 
@@ -337,7 +337,7 @@ impl CoinbaseManager {
             outputs.push(TransactionOutput::new(red_subsidy - rd_cut, miner_data.script_public_key.clone()));
         }
 
-        // Single R&D allocation output — 2% of the total block reward, sent to the protocol treasury.
+        // Single R&D allocation output — 5% of the total block reward, sent to the protocol treasury.
         if rd_total > 0 {
             outputs.push(TransactionOutput::new(rd_total, self.rd_allocation_script_public_key.clone()));
         }

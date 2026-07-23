@@ -220,22 +220,31 @@ impl PruningProcessor {
     /// `skip_pom_proof`) and the serving guard-rail flags loudly; it can never cause a UTXO /
     /// consensus divergence, since the header `utxo_commitment` is what pins state, not the proof.
     ///
-    /// Walk strategy (bounded, never a full-store scan): every block belongs to the mergeset of
-    /// exactly one selected-chain block, so iterating chain blocks and deleting each one's mergeset
-    /// proofs (blues + reds + the chain block itself) covers the whole DAG without overlap. An
-    /// in-memory cursor advances from the pruning point up to `tip - retention`, processing at most
-    /// `GC_BATCH` chain blocks per pruning message so a large backlog drains gradually without ever
-    /// blocking consensus.
+    /// Walk strategy (bounded, never a full-store scan): every block is a reachability-tree
+    /// descendant of exactly one selected-chain block (its nearest chain ancestor). For each chain
+    /// block we delete (a) its mergeset proofs (blues + reds + itself) and (b) — from `h5_activation`
+    /// on — the proofs of the non-chain reachability-tree subtree rooted at it. (b) closes the
+    /// pre-H5 leak: a permanently-unmerged block is in no mergeset, so the mergeset-only walk never
+    /// reclaimed it and it survived until the far deeper main pruning pass (`pruning_depth`) instead
+    /// of the `POM_PROOF_RETENTION_DEPTH` window — unbounded-looking growth on pruned nodes, worst
+    /// during sibling floods. An in-memory cursor advances from the pruning point up to
+    /// `tip - retention`, processing at most `GC_BATCH` chain blocks per pruning message so a large
+    /// backlog drains gradually without ever blocking consensus.
     fn gc_old_pom_proofs(&self) -> bool {
         const GC_BATCH: u64 = 2_000;
 
-        let Ok((tip_index, _)) = self.selected_chain_store.read().get_tip() else {
+        let Ok((tip_index, tip_hash)) = self.selected_chain_store.read().get_tip() else {
             return false;
         };
         let target = tip_index.saturating_sub(POM_PROOF_RETENTION_DEPTH);
         if target == 0 {
             return false;
         }
+
+        // The full-coverage sweep (mergeset + never-merged subtree) activates at `h5_activation`;
+        // before it, keep the legacy mergeset-only sweep so field nodes are unchanged until the
+        // coordinated H5 crossing.
+        let h5 = self.config.params.h5_activation.is_active(self.headers_store.get_daa_score(tip_hash).unwrap_or(0));
 
         // Lower bound: nothing below the pruning point exists anymore, so never walk past it.
         // Tolerate a virgin (staging) consensus that has no pruning point yet — the GC thread now
@@ -273,17 +282,46 @@ impl PruningProcessor {
                 self.pom_proof_store.delete_batch(&mut batch, hash).unwrap();
                 deleted += 1;
             }
+
+            // H5: reclaim the permanently-unmerged blocks the mergeset walk cannot see. They form
+            // the non-chain reachability-tree subtree rooted at `chain_hash` — a chain block's
+            // selected parent is always the previous chain block, so descending only through
+            // non-chain nodes (stopping at any selected-chain block, which roots its own segment)
+            // enumerates exactly this segment's unmerged blocks, each visited once (the reachability
+            // tree has no shared nodes). Idempotent with the mergeset walk and with main pruning —
+            // deletes of the same key commute.
+            if h5 {
+                let mut subtree: VecDeque<Hash> = self.tree_children(chain_hash).into();
+                while let Some(b) = subtree.pop_front() {
+                    if self.selected_chain_store.read().get_by_hash(b).optional().unwrap().is_some() {
+                        continue;
+                    }
+                    if self.pom_proof_store.has(b).unwrap_or(false) {
+                        self.pom_proof_store.delete_batch(&mut batch, b).unwrap();
+                        deleted += 1;
+                    }
+                    subtree.extend(self.tree_children(b));
+                }
+            }
         }
         self.db.write(batch).unwrap();
         self.pom_gc_cursor.store(to, Ordering::Relaxed);
         debug!(
-            "PoM proof GC: swept chain indices {}..={} ({} block proofs deleted; retention depth {})",
+            "PoM proof GC: swept chain indices {}..={} ({} block proofs deleted; retention depth {}; unmerged sweep {})",
             from + 1,
             to,
             deleted,
-            POM_PROOF_RETENTION_DEPTH
+            POM_PROOF_RETENTION_DEPTH,
+            if h5 { "on" } else { "off" },
         );
         true
+    }
+
+    /// Reachability-tree children of `hash` (blocks whose selected parent is `hash`), tolerant of a
+    /// concurrent main-pruning delete: a missing reachability node yields no children instead of
+    /// panicking, since the PoM proof GC thread runs alongside pruning.
+    fn tree_children(&self, hash: Hash) -> Vec<Hash> {
+        self.reachability_store.read().get_children(hash).map(|c| c.iter().copied().collect()).unwrap_or_default()
     }
 
     fn recover_pruning_workflows_if_needed(&self) -> bool {
