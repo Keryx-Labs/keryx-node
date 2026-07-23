@@ -111,6 +111,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
         past_median_time_sample_rate: u64,
         difficulty_reset_activation: ForkActivation,
         difficulty_reset_activation_h4: ForkActivation,
+        difficulty_reset_activation_h5: ForkActivation,
         h5_activation: ForkActivation,
     ) -> Self {
         let difficulty_manager = SampledDifficultyManager::new(
@@ -125,6 +126,7 @@ impl<T: GhostdagStoreReader, U: BlockWindowCacheReader + BlockWindowCacheWriter,
             target_time_per_block,
             difficulty_reset_activation,
             difficulty_reset_activation_h4,
+            difficulty_reset_activation_h5,
         );
         let past_median_time_manager = SampledPastMedianTimeManager::new(headers_store.clone(), genesis.timestamp);
         Self {

@@ -142,7 +142,7 @@ pub const H4_ACTIVATION_DAA: u64 = 54_766_000;
 /// walk + `verify_merkle` bound, and the tier-0 model swap. `u64::MAX` = dormant; set this to the
 /// real DAA at H5 release and every H5 feature flips together in one edit. MUST be mirrored on the
 /// miner side (walk + lineup). See KERYX-KRX/H5_hardfork_plan.
-pub const H5_ACTIVATION_DAA: u64 = u64::MAX;
+pub const H5_ACTIVATION_DAA: u64 = 59_009_012;
 
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
 /// The surplus is forced into `mergeset_non_daa` — excluded from both the DAA increment and the
@@ -934,6 +934,13 @@ pub struct Params {
     /// is unscheduled.
     pub difficulty_reset_activation_h4: ForkActivation,
 
+    /// THIRD difficulty-reset window, for the H5 relaunch. Additive to the previous two (same
+    /// self-contained `[activation, activation + full_window)` → `genesis.bits` semantics); a
+    /// dedicated field so the H2/H4 resets stay load-bearing consensus history that archival nodes
+    /// re-derive unshifted. Driven by `H5_ACTIVATION_DAA` (H5 sheds the ~92% dominant hashrate at
+    /// relaunch, so stock difficulty is far too high). `never()` while H5 is unscheduled.
+    pub difficulty_reset_activation_h5: ForkActivation,
+
     /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
     /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
     /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
@@ -1165,6 +1172,7 @@ impl Params {
             ratio_verification_activation: self.ratio_verification_activation,
             difficulty_reset_activation: self.difficulty_reset_activation,
             difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
+            difficulty_reset_activation_h5: self.difficulty_reset_activation_h5,
             h5_activation: self.h5_activation,
 
             ratio_reward_window: self.ratio_reward_window,
@@ -1332,7 +1340,11 @@ pub const MAINNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::new(38_951_445),
     // H4 relaunch difficulty reset — additive, driven by the single H4 flip point.
     difficulty_reset_activation_h4: ForkActivation::new(H4_ACTIVATION_DAA),
-    // H5 bundle gate — DORMANT (H5_ACTIVATION_DAA = u64::MAX) until scheduled; set the const at release.
+    // H5 relaunch difficulty reset — additive, gated at the same DAA as the H5 bundle. The relaunch
+    // base is the frozen datadir at the current tip (daa 59_009_012), so re-mining starts with
+    // virtual_daa_score >= H5 and the reset fires on the very first re-mined block, same as H4.
+    difficulty_reset_activation_h5: ForkActivation::new(H5_ACTIVATION_DAA),
+    // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1428,6 +1440,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // H4 reset ENABLED on testnet (mirrors the coin-age gates at 3_000) so the additive-reset path
     // is exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
     difficulty_reset_activation_h4: ForkActivation::new(3_000),
+    // H5 reset ENABLED on testnet at the same gate as the H5 bundle, so the additive-reset path is
+    // exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
+    difficulty_reset_activation_h5: ForkActivation::new(3_000),
     // H5 bundle gate active early on testnet for validation.
     h5_activation: ForkActivation::new(3_000),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
@@ -1502,6 +1517,7 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
+    difficulty_reset_activation_h5: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1566,6 +1582,7 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
+    difficulty_reset_activation_h5: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
