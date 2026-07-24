@@ -70,6 +70,15 @@ use std::{
 /// a process-global guard is fine: it has no bearing on consensus.
 static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Max DAA a block may sit past the H4 gate and still trigger the activation banner. The gate uses
+/// an at-or-after match (an exact-equality banner would be skipped at 10 BPS), which alone is true
+/// forever after the fork — so a node that boots already synced far beyond H4 re-prints the banner
+/// on every restart, its first validated chain block always being "at or after" the long-passed
+/// gate. Bounding to gate + this window keeps the print to the actual crossing (live, or during IBD
+/// where the first post-gate chain block sits a handful of DAA past the gate) and stays silent once
+/// the chain has moved on. ~1 day at 10 BPS — orders of magnitude above any crossing lag.
+const H4_BANNER_MAX_LAG: u64 = 864_000;
+
 /// Pre-resolved production-window context of a single validated block (its selected parent
 /// `m_sp`), shared by every rewarded blue of that block — see [`VirtualStateProcessor::production_window_ctx`].
 pub(super) enum ProductionWindowCtx {
@@ -342,9 +351,12 @@ impl VirtualStateProcessor {
 
         // H4 hardfork (coin-age holder-reward v3): fire on the FIRST block at or after the gate,
         // not on an exact DAA match — a chain block's daa_score advances by its mergeset's DAA-added
-        // count and routinely skips the exact activation value at 10 BPS. `compare_exchange` keeps it
-        // to one print per process (the first post-gate block, whether reached live or during IBD).
+        // count and routinely skips the exact activation value at 10 BPS. Bounded to a window past
+        // the gate (H4_BANNER_MAX_LAG) so a node booting already synced far beyond H4 no longer
+        // re-prints it on every restart. `compare_exchange` keeps it to one print per process (the
+        // first post-gate block within the window, whether reached live or during IBD).
         if self.coin_age_activation.is_active(header.daa_score)
+            && header.daa_score < self.coin_age_activation.daa_score() + H4_BANNER_MAX_LAG
             && COIN_AGE_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             // Header carries the GATE score (the fork's identity, always exact), not this block's —

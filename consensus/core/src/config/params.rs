@@ -142,7 +142,7 @@ pub const H4_ACTIVATION_DAA: u64 = 54_766_000;
 /// walk + `verify_merkle` bound, and the tier-0 model swap. `u64::MAX` = dormant; set this to the
 /// real DAA at H5 release and every H5 feature flips together in one edit. MUST be mirrored on the
 /// miner side (walk + lineup). See KERYX-KRX/H5_hardfork_plan.
-pub const H5_ACTIVATION_DAA: u64 = 59_009_013;
+pub const H5_ACTIVATION_DAA: u64 = 59_009_037;
 
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
 /// The surplus is forced into `mergeset_non_daa` — excluded from both the DAA increment and the
@@ -1355,9 +1355,11 @@ pub const MAINNET_PARAMS: Params = Params {
     // H4 relaunch difficulty reset — additive, driven by the single H4 flip point.
     difficulty_reset_activation_h4: ForkActivation::new(H4_ACTIVATION_DAA),
     // H5 relaunch difficulty reset — additive, gated at the same DAA as the H5 bundle. The relaunch
-    // base is the frozen datadir at the current tip (daa 59_009_012); the gate is tip+1 (59_009_013)
-    // so the frozen tip stays on the H4 side and the first re-mined block (daa >= H5) fires the
-    // reset, same as H4.
+    // base is the archival datadir synced to the live tip; the gate equals the frozen
+    // virtual_daa_score (59_009_037) — the daa_score every newly-mined block will carry (a template
+    // inherits the virtual's daa, NOT virtual+1) — so all stored H4/walk_v1 blocks (daa <=
+    // 59_009_036, plus f4ba3d20 at 59_009_012) stay pre-H5 and the very first re-mined block fires
+    // the reset, same as H4.
     difficulty_reset_activation_h5: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
