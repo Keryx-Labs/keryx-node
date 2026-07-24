@@ -179,11 +179,12 @@ impl BlockBodyProcessor {
         if h3 && proof.final_state != header.pom_final_state {
             return Err(RuleError::PomFinalStateMismatch(header.pom_final_state, proof.final_state));
         }
-        // Tier set is gated per block by DAA: H4 (candle-free, coin_age_verification) > H2 (5-tier,
-        // very_light) > legacy 4-tier. Chosen from this block's own daa_score so archival/IBD
-        // recomputation stays canonical. H4 co-activates with the recompute-from-chunks verifier
-        // (same `coin_age_verification_activation` DAA), so the new roots are checked by v2.
+        // Tier set is gated per block by DAA: H5 (tier-0 model swap) > H4 (candle-free,
+        // coin_age_verification) > H2 (5-tier, very_light) > legacy 4-tier. Chosen from this block's
+        // own daa_score so archival/IBD recomputation stays canonical. H4 co-activates with the
+        // recompute-from-chunks verifier; H5 rides the same v2 verifier with the non-foldable walk.
         let tiers = pom_tiers(
+            self.h5_activation.is_active(header.daa_score),
             self.coin_age_verification_activation.is_active(header.daa_score),
             self.very_light_activation.is_active(header.daa_score),
         );
@@ -205,7 +206,10 @@ impl BlockBodyProcessor {
         // structure and verification differ. H3 is a prerequisite of H4 (H4 gates strictly later),
         // so `final_state` is still pinned to the header above.
         if self.coin_age_verification_activation.is_active(header.daa_score) {
-            return verify_pom_proof_v2(seed, proof, tier.chunks, POM_WALK_STEPS, &tier.root, &target, final_hash)
+            // H5: re-walk with the non-foldable mix64-chained transition at/after the H5 gate;
+            // pre-H5 blocks re-walk with the frozen v1 fold, so historical blocks stay valid.
+            let walk_v2 = self.h5_activation.is_active(header.daa_score);
+            return verify_pom_proof_v2(seed, proof, tier.chunks, POM_WALK_STEPS, &tier.root, &target, final_hash, walk_v2)
                 .map_err(RuleError::BadPomProof);
         }
 

@@ -156,6 +156,7 @@ pub struct SampledDifficultyManager<T: HeaderStoreReader, U: GhostdagStoreReader
     target_time_per_block: u64,
     difficulty_reset_activation: ForkActivation,
     difficulty_reset_activation_h4: ForkActivation,
+    difficulty_reset_activation_h5: ForkActivation,
 }
 
 impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U> {
@@ -172,6 +173,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         target_time_per_block: u64,
         difficulty_reset_activation: ForkActivation,
         difficulty_reset_activation_h4: ForkActivation,
+        difficulty_reset_activation_h5: ForkActivation,
     ) -> Self {
         Self::check_min_difficulty_window_size(difficulty_window_size, min_difficulty_window_size);
         Self {
@@ -186,17 +188,20 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
             target_time_per_block,
             difficulty_reset_activation,
             difficulty_reset_activation_h4,
+            difficulty_reset_activation_h5,
         }
     }
 
-    /// True while `daa_score` is inside ANY difficulty-reset window (H2 relaunch OR H4 relaunch).
+    /// True while `daa_score` is inside ANY difficulty-reset window (H2 OR H4 OR H5 relaunch).
     /// Each reset is a self-contained window `[activation, activation + full_window)` forcing
-    /// `genesis_bits`; the two windows never overlap (H4 ≫ H2 + full_window), so checking both is a
-    /// plain OR. See `difficulty_reset_activation_h4` in params for why H4 is a separate field.
+    /// `genesis_bits`; the windows never overlap (each gate ≫ previous + full_window), so checking
+    /// all of them is a plain OR. See `difficulty_reset_activation_h4` in params for why each is a
+    /// separate field.
     fn in_any_reset_window(&self, daa_score: u64) -> bool {
         let range = self.difficulty_full_window_size();
         self.difficulty_reset_activation.is_within_range_from_activation(daa_score, range)
             || self.difficulty_reset_activation_h4.is_within_range_from_activation(daa_score, range)
+            || self.difficulty_reset_activation_h5.is_within_range_from_activation(daa_score, range)
     }
 
     /// Returns `Some(genesis_bits)` while the difficulty-reset hardfork window is active for

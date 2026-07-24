@@ -138,6 +138,21 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H2: &[([u8; 32], u64)] = &[
 /// the existing H2 reset at 38_951_445 is load-bearing history that must not move.
 pub const H4_ACTIVATION_DAA: u64 = 54_766_000;
 
+/// Single activation gate for the ENTIRE H5 bundle — parallel-block cap, non-foldable `transition()`
+/// walk + `verify_merkle` bound, and the tier-0 model swap. `u64::MAX` = dormant; set this to the
+/// real DAA at H5 release and every H5 feature flips together in one edit. MUST be mirrored on the
+/// miner side (walk + lineup). See KERYX-KRX/H5_hardfork_plan.
+pub const H5_ACTIVATION_DAA: u64 = 59_009_037;
+
+/// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
+/// The surplus is forced into `mergeset_non_daa` — excluded from both the DAA increment and the
+/// coinbase payment — never rejected (rejection at admission is non-deterministic → split).
+/// N=20 is the lowest bound that never clips an honest producer: the measured honest ceiling is
+/// ~15 blocks/selected-parent, so 20 leaves margin while neutralizing sibling floods (observed up
+/// to 44/DAA). Gated by `h5_activation` on the selected parent's DAA score, a pure header-level
+/// function so IBD re-derives it identically. See KERYX-KRX/H5_hardfork_plan.
+pub const PARALLEL_BLOCK_CAP_N: usize = 20;
+
 // --- H4 lineup refresh (gated by `coin_age_activation`, bundled into H4). Fully candle-independent:
 // every model is UNTIED (llama.cpp hosts the walk + inference in one resident copy). MUST mirror the
 // miner's `models.rs`. Each `model_id` = CIDv0[2..34] of the pinned GGUF; each `root` from the offline
@@ -335,12 +350,44 @@ pub const POM_TIERS_H4: &[crate::pom::PomTier] = &[
     },
 ];
 
-/// Possession anchors for a block at `daa_score`: the 5-tier H2 set once `very_light_activation`
-/// is live, the legacy 4-tier set before. The choice MUST be made per block from that block's own
-/// DAA (never frozen) — an archival/IBD node recomputing a pre-H2 block under the 5-tier scheme
-/// would validate against the wrong anchors and reject the chain.
-pub fn pom_tiers(coin_age_active: bool, very_light_active: bool) -> &'static [crate::pom::PomTier] {
-    if coin_age_active {
+/// Qwen3-8B-abliterated Q4_K_S (huihui-ai, mradermacher GGUF). H5 tier 0 (--very-light), replaces
+/// EXAONE. `model_id` = CIDv0[2..34] of the pinned GGUF (IPFS Qm...ccwHVeZYVzEq6A5ofk76MxrnwzMnSjAVt9PaUQ7zfLXm).
+pub const QWEN3_8B_ABLITERATED_MODEL_ID: [u8; 32] = [
+    0xd4, 0x2f, 0xa6, 0xee, 0x00, 0xe0, 0x7d, 0x49,
+    0xb0, 0x46, 0x09, 0x0a, 0x56, 0xaf, 0x0e, 0x7b,
+    0xd6, 0x10, 0x25, 0x93, 0x7c, 0x50, 0x2e, 0x2c,
+    0x57, 0x4a, 0x72, 0x87, 0x4c, 0x35, 0x0d, 0x24,
+];
+
+/// H5 possession anchors — same 5-tier ORDER as H4, swapping ONLY tier 0's model (raising the
+/// tier-0 VRAM floor to ~6 GB). Tiers 1-4 are unchanged from H4 (same models → same R_T). Gated by
+/// `h5_activation`.
+pub const POM_TIERS_H5: &[crate::pom::PomTier] = &[
+    // Tier 0: Qwen3-8B-abliterated Q4_K_S. root = pom-rt-builder R_T over the pinned GGUF's 32 B
+    // chunks (name-sorted tensors | blake3 leaf | blake3 tree); chunks = N reported by the builder.
+    crate::pom::PomTier {
+        model_id: QWEN3_8B_ABLITERATED_MODEL_ID,
+        root: [
+            0xa1, 0xcb, 0xff, 0xfa, 0xae, 0xb9, 0x71, 0xcb, 0x29, 0x7b, 0x7e, 0x01, 0xff, 0x41, 0x09, 0x72,
+            0x3e, 0x43, 0x97, 0x41, 0xcd, 0x42, 0x68, 0x22, 0x5f, 0x0c, 0x30, 0xa3, 0x33, 0xe6, 0x9a, 0x68,
+        ],
+        chunks: 149_876_736,
+    },
+    POM_TIERS_H4[1],
+    POM_TIERS_H4[2],
+    POM_TIERS_H4[3],
+    POM_TIERS_H4[4],
+];
+
+/// Possession anchors for a block at `daa_score`: the H5 set once `h5_activation` is live (tier-0
+/// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
+/// else the legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
+/// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
+/// against the wrong anchors and reject the chain.
+pub fn pom_tiers(h5_active: bool, coin_age_active: bool, very_light_active: bool) -> &'static [crate::pom::PomTier] {
+    if h5_active {
+        POM_TIERS_H5
+    } else if coin_age_active {
         POM_TIERS_H4
     } else if very_light_active {
         POM_TIERS_H2
@@ -901,6 +948,18 @@ pub struct Params {
     /// is unscheduled.
     pub difficulty_reset_activation_h4: ForkActivation,
 
+    /// THIRD difficulty-reset window, for the H5 relaunch. Additive to the previous two (same
+    /// self-contained `[activation, activation + full_window)` → `genesis.bits` semantics); a
+    /// dedicated field so the H2/H4 resets stay load-bearing consensus history that archival nodes
+    /// re-derive unshifted. Driven by `H5_ACTIVATION_DAA` (H5 sheds the ~92% dominant hashrate at
+    /// relaunch, so stock difficulty is far too high). `never()` while H5 is unscheduled.
+    pub difficulty_reset_activation_h5: ForkActivation,
+
+    /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
+    /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
+    /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
+    pub h5_activation: ForkActivation,
+
     /// Length (in blocks) of the trailing selected-chain window over which a payout address's
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
@@ -1127,6 +1186,8 @@ impl Params {
             ratio_verification_activation: self.ratio_verification_activation,
             difficulty_reset_activation: self.difficulty_reset_activation,
             difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
+            difficulty_reset_activation_h5: self.difficulty_reset_activation_h5,
+            h5_activation: self.h5_activation,
 
             ratio_reward_window: self.ratio_reward_window,
             ratio_reward_window_daa: self.ratio_reward_window_daa,
@@ -1293,6 +1354,15 @@ pub const MAINNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::new(38_951_445),
     // H4 relaunch difficulty reset — additive, driven by the single H4 flip point.
     difficulty_reset_activation_h4: ForkActivation::new(H4_ACTIVATION_DAA),
+    // H5 relaunch difficulty reset — additive, gated at the same DAA as the H5 bundle. The relaunch
+    // base is the archival datadir synced to the live tip; the gate equals the frozen
+    // virtual_daa_score (59_009_037) — the daa_score every newly-mined block will carry (a template
+    // inherits the virtual's daa, NOT virtual+1) — so all stored H4/walk_v1 blocks (daa <=
+    // 59_009_036, plus f4ba3d20 at 59_009_012) stay pre-H5 and the very first re-mined block fires
+    // the reset, same as H4.
+    difficulty_reset_activation_h5: ForkActivation::new(H5_ACTIVATION_DAA),
+    // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
+    h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1387,6 +1457,11 @@ pub const TESTNET_PARAMS: Params = Params {
     // H4 reset ENABLED on testnet (mirrors the coin-age gates at 3_000) so the additive-reset path
     // is exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
     difficulty_reset_activation_h4: ForkActivation::new(3_000),
+    // H5 reset ENABLED on testnet at the same gate as the H5 bundle, so the additive-reset path is
+    // exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
+    difficulty_reset_activation_h5: ForkActivation::new(3_000),
+    // H5 bundle gate active early on testnet for validation.
+    h5_activation: ForkActivation::new(3_000),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
     // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
@@ -1459,6 +1534,8 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
+    difficulty_reset_activation_h5: ForkActivation::never(),
+    h5_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1522,6 +1599,8 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
+    difficulty_reset_activation_h5: ForkActivation::never(),
+    h5_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 

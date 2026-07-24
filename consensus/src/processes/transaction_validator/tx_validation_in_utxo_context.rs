@@ -105,7 +105,7 @@ impl TransactionValidator {
         if let Some((index, (input, _))) = tx
             .populated_inputs()
             .enumerate()
-            .find(|(_, (_, entry))| keryx_consensus_core::spk_rule::spk_rule_matches(entry.script_public_key.script()))
+            .find(|(_, (_, entry))| keryx_consensus_core::spk_rule::spk_rule_matches(entry.script_public_key.script(), pov_daa_score))
         {
             return Err(TxRuleError::SpkRuleViolation(index, input.previous_outpoint));
         }
