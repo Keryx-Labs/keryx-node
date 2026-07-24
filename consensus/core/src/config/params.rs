@@ -144,6 +144,13 @@ pub const H4_ACTIVATION_DAA: u64 = 54_766_000;
 /// miner side (walk + lineup). See KERYX-KRX/H5_hardfork_plan.
 pub const H5_ACTIVATION_DAA: u64 = 59_009_037;
 
+/// H5.1 emergency-relaunch gate (2026-07-24). Set to the virtual daa of the isolated relaunch
+/// base (a template inherits the virtual's daa, so all stored blocks are <= gate-1 and every
+/// newly mined block is at/after the gate). At/after this score the walk seed derives from the
+/// H5.1-salted pph words (`POM_H5_1_PPH_SALT`) — blocks mined by pre-H5.1 binaries fail body
+/// validation, capping the abandoned outside branch at the gate. MUST be mirrored miner-side.
+pub const H5_1_ACTIVATION_DAA: u64 = 59_027_921;
+
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
 /// The surplus is forced into `mergeset_non_daa` — excluded from both the DAA increment and the
 /// coinbase payment — never rejected (rejection at admission is non-deterministic → split).
@@ -960,6 +967,12 @@ pub struct Params {
     /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
     pub h5_activation: ForkActivation,
 
+    /// H5.1 emergency-relaunch activation (walk-seed salt v2), keyed on the block's own DAA
+    /// score. Driven by `H5_1_ACTIVATION_DAA`. `never()` on nets where H5.1 does not apply.
+    /// No difficulty-reset companion: the relaunch base sits inside the H5 reset window
+    /// (genesis bits), so templates are already minable.
+    pub h5_1_activation: ForkActivation,
+
     /// Length (in blocks) of the trailing selected-chain window over which a payout address's
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
     /// Defaults to `RATIO_REWARD_WINDOW`; a Params field (not the const) so tests can shrink it to
@@ -1188,6 +1201,7 @@ impl Params {
             difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
             difficulty_reset_activation_h5: self.difficulty_reset_activation_h5,
             h5_activation: self.h5_activation,
+            h5_1_activation: self.h5_1_activation,
 
             ratio_reward_window: self.ratio_reward_window,
             ratio_reward_window_daa: self.ratio_reward_window_daa,
@@ -1363,6 +1377,8 @@ pub const MAINNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
+    // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
+    h5_1_activation: ForkActivation::new(H5_1_ACTIVATION_DAA),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1462,6 +1478,8 @@ pub const TESTNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5: ForkActivation::new(3_000),
     // H5 bundle gate active early on testnet for validation.
     h5_activation: ForkActivation::new(3_000),
+    // H5.1 mirrors the H5 testnet gate so both eras cross together in one E2E run.
+    h5_1_activation: ForkActivation::new(3_000),
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
     // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
@@ -1536,6 +1554,7 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation_h4: ForkActivation::never(),
     difficulty_reset_activation_h5: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
+    h5_1_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1601,6 +1620,7 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation_h4: ForkActivation::never(),
     difficulty_reset_activation_h5: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
+    h5_1_activation: ForkActivation::never(),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 

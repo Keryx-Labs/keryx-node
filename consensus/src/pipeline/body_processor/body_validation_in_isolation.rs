@@ -9,7 +9,7 @@ use keryx_consensus_core::{
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
-    pom::{pom_block_seed, pom_block_seed_h3, pom_pow_value, pom_pow_value_h3, verify_pom_proof, verify_pom_proof_v2},
+    pom::{pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_pow_value, pom_pow_value_h3, verify_pom_proof, verify_pom_proof_v2},
     tx::TransactionOutpoint,
 };
 use keryx_math::Uint256;
@@ -192,7 +192,13 @@ impl BlockBodyProcessor {
 
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
         let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
-        let seed = if h3 {
+        // H5.1 (emergency relaunch): the walk seed derives from the v2-salted pph words — blocks
+        // mined with the pre-H5.1 seed recompute to a different final_state and fail below. The
+        // pow fold (final_hash) keeps the H3 salt so header-only pow/levels are era-stable.
+        let h5_1 = self.h5_1_activation.is_active(header.daa_score);
+        let seed = if h5_1 {
+            pom_block_seed_h5_1(&pre_pow_hash, header.timestamp, header.nonce)
+        } else if h3 {
             pom_block_seed_h3(&pre_pow_hash, header.timestamp, header.nonce)
         } else {
             pom_block_seed(&pre_pow_hash, header.timestamp, header.nonce)

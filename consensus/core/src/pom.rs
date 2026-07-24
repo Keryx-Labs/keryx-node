@@ -279,6 +279,23 @@ fn pph_words_h3(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
     w
 }
 
+/// H5.1 domain salt applied to the pre_pow_hash words feeding the WALK SEED fold only, at/after
+/// `h5_1_activation`. Forced-update mechanism (2026-07-24 emergency relaunch): every walk
+/// trajectory changes at the gate, so blocks mined by pre-H5.1 binaries fail `check_pom_proof`
+/// (recomputed final_state no longer matches the header). The header-level pow fold keeps the
+/// H3 salt — block levels, pruning proofs and header-only validation are untouched.
+/// Derivation: sha256("keryx-h5.1-pom-pph-salt") read as 4 little-endian u64 words.
+pub const POM_H5_1_PPH_SALT: [u64; 4] = [0x0F86D1400D3F8664, 0xC296B67C7A7A6A5B, 0x5F89AD33D961FEAA, 0xAC6C9AFDFA053580];
+
+#[inline]
+fn pph_words_h5_1(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = pph_words(pre_pow_hash);
+    for (wi, si) in w.iter_mut().zip(POM_H5_1_PPH_SALT.iter()) {
+        *wi ^= si;
+    }
+    w
+}
+
 #[inline]
 fn pom_block_seed_from_words(p: &[u64; 4], timestamp: u64, nonce: u64) -> u64 {
     let mut s = mix64(nonce ^ 0x4B65727978531);
@@ -300,6 +317,12 @@ pub fn pom_block_seed(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u6
 /// unchanged — it folds whatever pph words the host feeds it (the host salts them post-gate).
 pub fn pom_block_seed_h3(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
     pom_block_seed_from_words(&pph_words_h3(pre_pow_hash), timestamp, nonce)
+}
+
+/// H5.1-era block seed: same fold over the H5.1-salted pre_pow_hash words. Seed fold only —
+/// `pom_pow_value_h3` (header pow / block levels) is NOT affected by this era.
+pub fn pom_block_seed_h5_1(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words_h5_1(pre_pow_hash), timestamp, nonce)
 }
 
 #[inline]

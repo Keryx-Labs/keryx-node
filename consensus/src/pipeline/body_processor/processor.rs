@@ -78,6 +78,9 @@ pub struct BlockBodyProcessor {
     /// non-foldable mix64-chained transition (`verify_pom_proof_v2(.., walk_v2= true)`); pre-H5
     /// blocks re-walk with the frozen v1 fold. Single H5 bundle gate (`Params::h5_activation`).
     pub(super) h5_activation: ForkActivation,
+    /// H5.1 emergency relaunch: walk seed derives from the v2-salted pph words at/after the gate
+    /// (`POM_H5_1_PPH_SALT`). Seed only — the header pow fold stays on the H3 salt.
+    pub(super) h5_1_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -141,6 +144,7 @@ impl BlockBodyProcessor {
             pom_level_activation: params.pom_level_activation,
             coin_age_verification_activation: params.coin_age_verification_activation,
             h5_activation: params.h5_activation,
+            h5_1_activation: params.h5_1_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
