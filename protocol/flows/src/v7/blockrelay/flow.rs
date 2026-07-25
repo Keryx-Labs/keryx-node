@@ -204,16 +204,31 @@ impl HandleRelayInvsFlow {
                 continue;
             }
 
-            let BlockValidationFutures { block_task, mut virtual_state_task } = session.validate_and_insert_block(block.clone());
+            // Orphan-root recovery is a mini-IBD: roots live arbitrarily deep below the network
+            // tip, so their possession proofs may be legitimately GC'ed or stripped (the serving
+            // side evaluates retention depth against ITS OWN virtual — a receiver that lags far
+            // behind would otherwise demand proofs nobody retains; that mismatch is what wedged
+            // the network on 2026-07-24/25). Apply the IBD trust model (accumulated work) to
+            // roots and skip possession-proof verification; direct tip relays keep full
+            // enforcement, so the possession teeth at the live tip are unchanged.
+            let BlockValidationFutures { block_task, mut virtual_state_task } = if inv.is_orphan_root {
+                session.validate_and_insert_block_ibd(block.clone())
+            } else {
+                session.validate_and_insert_block(block.clone())
+            };
 
             let ancestor_batch = match block_task.await {
                 Ok(_) => Default::default(),
                 Err(RuleError::MissingParents(missing_parents)) => {
                     debug!("Block {} is orphan and has missing parents: {:?}", block.hash(), missing_parents);
                     if let Some(mut ancestor_batch) = self.process_orphan(&session, block.clone(), inv.known_within_range).await? {
-                        // Block is not an orphan, retrying
+                        // Block is not an orphan, retrying (same proof policy as the first attempt)
                         let BlockValidationFutures { block_task: block_task_inner, virtual_state_task: virtual_state_task_inner } =
-                            session.validate_and_insert_block(block.clone());
+                            if inv.is_orphan_root {
+                                session.validate_and_insert_block_ibd(block.clone())
+                            } else {
+                                session.validate_and_insert_block(block.clone())
+                            };
                         virtual_state_task = virtual_state_task_inner;
                         for block_task in ancestor_batch.block_tasks.take().unwrap() {
                             match block_task.await {
