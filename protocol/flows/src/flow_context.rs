@@ -734,10 +734,11 @@ impl FlowContext {
 }
 
 /// Minimum keryxd peer version accepted at handshake (local peering policy): builds older than
-/// the H5.2 relaunch live on the abandoned branch and only generate IBD/relay noise. NOTE: the
-/// comparison is a numeric (major, minor, patch) tuple — patch numbering within 1.3.x must stay
-/// >= 42 for future releases.
-const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 3, 42);
+/// the v1.4.0 release either live on the abandoned branch or are unreleased internal builds.
+/// NOTE: the comparison is a numeric (major, minor, patch) tuple — keep future version numbers
+/// monotonically increasing under that ordering (e.g. a hypothetical 1.4.41 must not be followed
+/// by a "1.4.5", which compares lower).
+const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 0);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents

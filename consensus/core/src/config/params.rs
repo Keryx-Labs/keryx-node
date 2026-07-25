@@ -165,12 +165,13 @@ pub const H5_2_ACTIVATION_DAA: u64 = 59_170_000;
 /// DAG knows the block — or, after the anchor gets pruned, once the local pruning point sits
 /// at/above the anchor daa (only the anchored chain validates past the H5.2 gate, so a
 /// post-anchor pruning point witnesses it). Fresh-bootstrap nodes are never affected.
-/// Selected-chain block 95b037ef0fb666262e4c4ca1625b9a6368d1d99d21aff50e7f536f13121afb71,
-/// pinned 2026-07-25 while the network was stalled (post-H5.2 crossing, solo bubble chain).
-pub const CHAIN_ANCHOR_DAA: u64 = 59_176_510;
+/// Selected-chain block 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce,
+/// pinned 2026-07-25 while the network was stalled (frozen tip after the H5.2 naked-catch-up
+/// validation, ahead of the v1.4.0 release).
+pub const CHAIN_ANCHOR_DAA: u64 = 59_192_679;
 pub const CHAIN_ANCHOR_HASH: Hash = Hash::from_bytes([
-    0x95, 0xb0, 0x37, 0xef, 0x0f, 0xb6, 0x66, 0x26, 0x2e, 0x4c, 0x4c, 0xa1, 0x62, 0x5b, 0x9a, 0x63,
-    0x68, 0xd1, 0xd9, 0x9d, 0x21, 0xaf, 0xf5, 0x0e, 0x7f, 0x53, 0x6f, 0x13, 0x12, 0x1a, 0xfb, 0x71,
+    0x34, 0x61, 0xd9, 0x17, 0x80, 0x83, 0xb2, 0x4d, 0xad, 0xb1, 0x36, 0x18, 0x75, 0x8b, 0x5c, 0x4c,
+    0x92, 0xfa, 0xa7, 0xc3, 0xc5, 0xdc, 0x1a, 0xcd, 0xcd, 0x6a, 0x6a, 0xbe, 0x53, 0x00, 0xe2, 0xce,
 ]);
 
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
