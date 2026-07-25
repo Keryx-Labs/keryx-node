@@ -103,7 +103,7 @@ impl IbdFlow {
                         if e.is_ban_worthy() {
                             let peer_ip = self.router.net_address().ip();
                             self.ctx.address_manager.lock().ban(peer_ip.into());
-                            warn!("Banned peer {} for protocol violation (bad coinbase payload)", self.router);
+                            warn!("Banned peer {} for ban-worthy protocol violation: {}", self.router, e);
                         }
                         return Err(e);
                     }

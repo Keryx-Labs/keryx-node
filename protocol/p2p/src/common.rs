@@ -72,6 +72,9 @@ pub enum ProtocolError {
 
     #[error("got reject message: {0}")]
     IgnorableReject(String),
+
+    #[error("peer is on an incompatible chain: {0}")]
+    WrongChain(String),
 }
 
 /// String used as a P2P convention to signal connection is rejected because we are connecting to ourselves
@@ -85,10 +88,24 @@ impl ProtocolError {
         matches!(self, Self::ConnectionClosed)
     }
 
-    /// Returns true when the peer sent structurally invalid data that warrants a ban
-    /// (e.g. missing or invalid OPoI tag in coinbase), rather than a simple disconnect.
+    /// Returns true when the peer sent provably invalid data that warrants a ban rather than
+    /// a simple disconnect (which the abandoned-branch peers just answer with a reconnect):
+    /// - a structurally invalid coinbase (missing/invalid OPoI tag),
+    /// - a block failing difficulty validation or building on a known-invalid block
+    ///   (the exact signature of the pre-relaunch branch),
+    /// - a chain that excludes the configured chain anchor (see `Params::chain_anchor`).
+    ///
+    /// Ambiguous endings (timeouts, closed connections) are deliberately NOT ban-worthy.
     pub fn is_ban_worthy(&self) -> bool {
-        matches!(self, ProtocolError::RuleError(RuleError::BadCoinbasePayload(_)))
+        matches!(
+            self,
+            ProtocolError::RuleError(
+                RuleError::BadCoinbasePayload(_)
+                    | RuleError::UnexpectedDifficulty(..)
+                    | RuleError::InvalidParent(_)
+                    | RuleError::KnownInvalid
+            ) | ProtocolError::WrongChain(_)
+        )
     }
 
     pub fn can_send_outgoing_message(&self) -> bool {

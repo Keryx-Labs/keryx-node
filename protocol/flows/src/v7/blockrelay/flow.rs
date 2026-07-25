@@ -84,7 +84,15 @@ impl Flow for HandleRelayInvsFlow {
     }
 
     async fn start(&mut self) -> Result<(), ProtocolError> {
-        self.start_impl().await
+        match self.start_impl().await {
+            Err(e) if e.is_ban_worthy() => {
+                let peer_ip = self.router.net_address().ip();
+                self.ctx.address_manager.lock().ban(peer_ip.into());
+                warn!("Banned peer {} for ban-worthy protocol violation: {}", self.router, e);
+                Err(e)
+            }
+            res => res,
+        }
     }
 }
 
@@ -110,8 +118,9 @@ impl HandleRelayInvsFlow {
             match session.async_get_block_status(inv.hash).await {
                 None | Some(BlockStatus::StatusHeaderOnly) => {} // Continue processing this missing inv
                 Some(BlockStatus::StatusInvalid) => {
-                    // Report a protocol error
-                    return Err(ProtocolError::OtherOwned(format!("sent inv of an invalid block {}", inv.hash)));
+                    // The peer advertises as part of its chain a block we have proven invalid —
+                    // that is a validation verdict, not an ambiguous ending, hence ban-worthy.
+                    return Err(ProtocolError::WrongChain(format!("sent inv of an invalid block {}", inv.hash)));
                 }
                 _ => {
                     // Block is already known, skip to next inv

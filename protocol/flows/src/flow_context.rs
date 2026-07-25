@@ -733,6 +733,23 @@ impl FlowContext {
     }
 }
 
+/// Minimum keryxd peer version accepted at handshake (local peering policy): builds older than
+/// the H5.2 relaunch live on the abandoned branch and only generate IBD/relay noise. NOTE: the
+/// comparison is a numeric (major, minor, patch) tuple — patch numbering within 1.3.x must stay
+/// >= 42 for future releases.
+const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 3, 42);
+
+/// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
+/// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
+/// (dnsseeder crawlers etc.), which are let through — the chain anchor and the ban-worthy
+/// validation errors cover anything that lies here.
+fn parse_keryxd_user_agent_version(user_agent: &str) -> Option<(u32, u32, u32)> {
+    let rest = &user_agent[user_agent.find("keryxd:")? + "keryxd:".len()..];
+    let end = rest.find(|c: char| c != '.' && !c.is_ascii_digit()).unwrap_or(rest.len());
+    let mut parts = rest[..end].splitn(3, '.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
 #[async_trait]
 impl ConnectionInitializer for FlowContext {
     async fn initialize_connection(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
@@ -780,6 +797,17 @@ impl ConnectionInitializer for FlowContext {
 
         if peer_version.network != network_name {
             return Err(ProtocolError::WrongNetwork(network_name, peer_version.network));
+        }
+
+        // Handshake version gate (local peering policy): reject pre-H5.2 keryxd builds before
+        // registering any flow — they are on the abandoned branch and would only churn IBD noise.
+        if let Some((major, minor, patch)) = parse_keryxd_user_agent_version(&peer_version.user_agent)
+            && (major, minor, patch) < MINIMUM_KERYXD_PEER_VERSION
+        {
+            return Err(ProtocolError::OtherOwned(format!(
+                "obsolete keryxd version {}.{}.{} (minimum accepted: {}.{}.{})",
+                major, minor, patch, MINIMUM_KERYXD_PEER_VERSION.0, MINIMUM_KERYXD_PEER_VERSION.1, MINIMUM_KERYXD_PEER_VERSION.2
+            )));
         }
 
         debug!("protocol versions - self: {}, peer: {}", PROTOCOL_VERSION, peer_version.protocol_version);

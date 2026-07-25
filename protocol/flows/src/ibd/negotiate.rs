@@ -164,6 +164,42 @@ impl IbdFlow {
         }
 
         debug!("Found highest known syncer chain block {:?} from peer {}", highest_known_syncer_chain_hash, self.router);
+
+        // Chain-anchor enforcement (local peering policy, not a chain rule): once our own DAG
+        // contains the anchor block, any syncer whose selected chain excludes it is on an
+        // abandoned branch — refuse before downloading a single header. Containment is derived
+        // from the negotiation invariant: the anchor is a block both sides know, so if it were in
+        // the syncer's chain the highest shared chain block could not sit below its daa score.
+        // Skipped while we don't know the anchor yet (fresh bootstrap) so IBD-from-scratch is
+        // never affected.
+        // The anchor block itself is eventually pruned (headers and statuses are dropped below
+        // the pruning point), so its local status cannot witness the anchored chain forever.
+        // Fallback witness: once our own pruning point sits at/above the anchor daa, we
+        // necessarily validated through the anchor era on the anchored chain (no other chain
+        // passes body validation beyond the H5.2 gate), so enforcement stays armed.
+        let anchor_witnessed = if let Some((anchor_hash, anchor_daa)) = self.ctx.config.chain_anchor {
+            match consensus.async_get_block_status(anchor_hash).await {
+                Some(status) if status.is_valid() => true,
+                _ => consensus.async_get_header(consensus.async_pruning_point().await).await?.daa_score >= anchor_daa,
+            }
+        } else {
+            false
+        };
+        if let Some((anchor_hash, anchor_daa)) = self.ctx.config.chain_anchor
+            && anchor_witnessed
+        {
+            let syncer_chain_contains_anchor = match highest_known_syncer_chain_hash {
+                Some(hash) => consensus.async_get_header(hash).await?.daa_score >= anchor_daa,
+                None => false,
+            };
+            if !syncer_chain_contains_anchor {
+                return Err(ProtocolError::WrongChain(format!(
+                    "syncer chain (sink {}) does not contain the chain anchor {} (daa {})",
+                    syncer_virtual_selected_parent, anchor_hash, anchor_daa
+                )));
+            }
+        }
+
         Ok(ChainNegotiationOutput { syncer_virtual_selected_parent, highest_known_syncer_chain_hash, syncer_pruning_point })
     }
 
