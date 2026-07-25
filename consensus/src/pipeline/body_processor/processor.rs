@@ -81,6 +81,9 @@ pub struct BlockBodyProcessor {
     /// H5.1 emergency relaunch: walk seed derives from the v2-salted pph words at/after the gate
     /// (`POM_H5_1_PPH_SALT`). Seed only — the header pow fold stays on the H3 salt.
     pub(super) h5_1_activation: ForkActivation,
+    /// H5.2 chain anchoring: walk seed derives from the v3-salted pph words at/after the gate
+    /// (`POM_H5_2_PPH_SALT`). Seed only — the header pow fold stays on the H3 salt.
+    pub(super) h5_2_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -145,6 +148,7 @@ impl BlockBodyProcessor {
             coin_age_verification_activation: params.coin_age_verification_activation,
             h5_activation: params.h5_activation,
             h5_1_activation: params.h5_1_activation,
+            h5_2_activation: params.h5_2_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),

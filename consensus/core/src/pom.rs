@@ -325,6 +325,30 @@ pub fn pom_block_seed_h5_1(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) 
     pom_block_seed_from_words(&pph_words_h5_1(pre_pow_hash), timestamp, nonce)
 }
 
+/// H5.2 domain salt applied to the pre_pow_hash words feeding the WALK SEED fold only, at/after
+/// `h5_2_activation`. Anchoring mechanism (2026-07-25): the relaunched chain was mined solo at
+/// low difficulty, so its accumulated work is small — a private branch forked before this gate
+/// could outweigh it. Rotating the seed salt caps every pre-gate fork point for good: blocks
+/// mined with any earlier seed era fail `check_pom_proof` beyond the gate. The header-level pow
+/// fold keeps the H3 salt — block levels, pruning proofs and header-only validation are untouched.
+/// Derivation: sha256("keryx-h5.2-pom-pph-salt") read as 4 little-endian u64 words.
+pub const POM_H5_2_PPH_SALT: [u64; 4] = [0x584ADE0A598D896D, 0x8783631D81BC2695, 0x2917FCF883A0B862, 0x533CCCFAC88FD614];
+
+#[inline]
+fn pph_words_h5_2(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = pph_words(pre_pow_hash);
+    for (wi, si) in w.iter_mut().zip(POM_H5_2_PPH_SALT.iter()) {
+        *wi ^= si;
+    }
+    w
+}
+
+/// H5.2-era block seed: same fold over the H5.2-salted pre_pow_hash words. Seed fold only —
+/// `pom_pow_value_h3` (header pow / block levels) is NOT affected by this era.
+pub fn pom_block_seed_h5_2(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words_h5_2(pre_pow_hash), timestamp, nonce)
+}
+
 #[inline]
 fn pom_pow_value_from_words(final_state: u64, p: &[u64; 4]) -> [u8; 32] {
     let o0 = mix64(final_state ^ p[0] ^ 0x9E3779B97F4A7C15);
