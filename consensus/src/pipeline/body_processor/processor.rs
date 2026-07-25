@@ -233,7 +233,16 @@ impl BlockBodyProcessor {
                 // transactions that fits the merkle root.
                 // PrunedBlock - PrunedBlock is an error that rejects a block body and
                 // not the block as a whole, so we shouldn't mark it as invalid.
-                if !matches!(e, RuleError::BadMerkleRoot(_, _) | RuleError::MissingParents(_) | RuleError::PrunedBlock) {
+                // PomProofMissing - the proof is a transport-level attachment (stripped by IBD
+                // beyond the retention window, garbage-collected, or dropped by a lagging peer),
+                // so its absence only rejects this delivery; the same block can arrive later WITH
+                // its proof. Marking it invalid here poisons all descendants permanently
+                // ("parent is invalid") and wedges the node. A present-but-wrong proof still
+                // marks invalid below.
+                if !matches!(
+                    e,
+                    RuleError::BadMerkleRoot(_, _) | RuleError::MissingParents(_) | RuleError::PrunedBlock | RuleError::PomProofMissing
+                ) {
                     self.statuses_store.write().set(block.hash(), BlockStatus::StatusInvalid).unwrap();
                 }
                 return Err(e);
