@@ -1,4 +1,4 @@
-use super::rocksdb_preset::RocksDbPreset;
+use super::rocksdb_preset::{RocksDbPreset, RocksDbResources};
 use crate::db::DB;
 use rocksdb::{DBWithThreadMode, MultiThreaded};
 use std::{path::PathBuf, sync::Arc};
@@ -16,7 +16,7 @@ pub struct ConnBuilder<Path, const STATS_ENABLED: bool, StatsPeriod, FDLimit> {
     stats_period: StatsPeriod,
     preset: RocksDbPreset,
     wal_dir: Option<PathBuf>,
-    cache_budget: Option<usize>,
+    resources: Option<RocksDbResources>,
 }
 
 impl Default for ConnBuilder<Unspecified, false, Unspecified, Unspecified> {
@@ -30,7 +30,7 @@ impl Default for ConnBuilder<Unspecified, false, Unspecified, Unspecified> {
             files_limit: Unspecified,
             preset: RocksDbPreset::Default,
             wal_dir: None,
-            cache_budget: None,
+            resources: None,
         }
     }
 }
@@ -46,7 +46,7 @@ impl<Path, const STATS_ENABLED: bool, StatsPeriod, FDLimit> ConnBuilder<Path, ST
             stats_period: self.stats_period,
             preset: self.preset,
             wal_dir: self.wal_dir,
-            cache_budget: self.cache_budget,
+            resources: self.resources,
         }
     }
     pub fn with_create_if_missing(self, create_if_missing: bool) -> ConnBuilder<Path, STATS_ENABLED, StatsPeriod, FDLimit> {
@@ -68,7 +68,7 @@ impl<Path, const STATS_ENABLED: bool, StatsPeriod, FDLimit> ConnBuilder<Path, ST
             stats_period: self.stats_period,
             preset: self.preset,
             wal_dir: self.wal_dir,
-            cache_budget: self.cache_budget,
+            resources: self.resources,
         }
     }
     pub fn with_preset(self, preset: RocksDbPreset) -> ConnBuilder<Path, STATS_ENABLED, StatsPeriod, FDLimit> {
@@ -77,8 +77,10 @@ impl<Path, const STATS_ENABLED: bool, StatsPeriod, FDLimit> ConnBuilder<Path, ST
     pub fn with_wal_dir(self, wal_dir: Option<PathBuf>) -> ConnBuilder<Path, STATS_ENABLED, StatsPeriod, FDLimit> {
         ConnBuilder { wal_dir, ..self }
     }
-    pub fn with_cache_budget(self, cache_budget: Option<usize>) -> ConnBuilder<Path, STATS_ENABLED, StatsPeriod, FDLimit> {
-        ConnBuilder { cache_budget, ..self }
+    /// Attaches the process-wide RocksDB memory resources (shared block cache + memtable budget).
+    /// Every connection the node opens should be given the *same* instance — see [`RocksDbResources`].
+    pub fn with_resources(self, resources: Option<RocksDbResources>) -> ConnBuilder<Path, STATS_ENABLED, StatsPeriod, FDLimit> {
+        ConnBuilder { resources, ..self }
     }
 }
 
@@ -93,7 +95,7 @@ impl<Path, FDLimit> ConnBuilder<Path, false, Unspecified, FDLimit> {
             stats_period: self.stats_period,
             preset: self.preset,
             wal_dir: self.wal_dir,
-            cache_budget: self.cache_budget,
+            resources: self.resources,
         }
     }
 }
@@ -109,7 +111,7 @@ impl<Path, StatsPeriod, FDLimit> ConnBuilder<Path, true, StatsPeriod, FDLimit> {
             stats_period: Unspecified,
             preset: self.preset,
             wal_dir: self.wal_dir,
-            cache_budget: self.cache_budget,
+            resources: self.resources,
         }
     }
     pub fn with_stats_period(self, stats_period: impl Into<u32>) -> ConnBuilder<Path, true, u32, FDLimit> {
@@ -122,7 +124,7 @@ impl<Path, StatsPeriod, FDLimit> ConnBuilder<Path, true, StatsPeriod, FDLimit> {
             stats_period: stats_period.into(),
             preset: self.preset,
             wal_dir: self.wal_dir,
-            cache_budget: self.cache_budget,
+            resources: self.resources,
         }
     }
 }
@@ -132,7 +134,7 @@ macro_rules! default_opts {
         let mut opts = rocksdb::Options::default();
 
         // Apply the preset configuration (includes parallelism and compaction settings)
-        $self.preset.apply_to_options(&mut opts, $self.parallelism, $self.mem_budget, $self.cache_budget);
+        $self.preset.apply_to_options(&mut opts, $self.parallelism, $self.mem_budget, $self.resources.as_ref());
 
         // Configure WAL directory if specified (for RAM cache / tmpfs)
         // Auto-generate unique subdirectory from database path to avoid conflicts

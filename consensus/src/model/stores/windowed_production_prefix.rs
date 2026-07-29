@@ -34,11 +34,14 @@
 //!   floor only ever serves as the `cum(b−W)` baseline, never as an in-window term.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
+use keryx_consensus_core::api::counters::ProcessingCounters;
 use keryx_consensus_core::tx::ScriptPublicKey;
-use keryx_database::prelude::{StoreError, DB};
+use keryx_database::prelude::{Cache, CachePolicy, StoreError, DB};
 use keryx_database::registry::DatabaseStorePrefixes;
+use keryx_utils::mem_size::MemSizeEstimator;
 use rocksdb::{Direction, IteratorMode, ReadOptions, WriteBatch};
 
 use super::address_amount::ScriptPublicKeyBucket;
@@ -61,23 +64,77 @@ pub trait WindowedProductionPrefixStoreReader {
     }
 }
 
-/// A DB-backed prefix-sum production index. Reads hit committed state directly (no cache layer — the
-/// reverse seek is a single `SeekForPrev` and queries are ~one-per-reward-payout); writes go through
-/// the caller's consensus `WriteBatch` so they commit atomically with the selected-chain change.
+/// Cache key for a `cumulative_at(spk, index)` query. The value is the SeekForPrev result (or floor).
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct CumulativeQueryKey {
+    spk: ScriptPublicKeyBucket,
+    index: u64,
+}
+
+impl MemSizeEstimator for CumulativeQueryKey {
+    fn estimate_mem_units(&self) -> usize {
+        1
+    }
+}
+
+/// A DB-backed prefix-sum production index with an app-level LRU in front of `SeekForPrev`.
+///
+/// The cache is invalidated per-SPK on `extend` / collapse / `clear` so reorgs cannot serve stale
+/// cumulatives. Writes go through the caller's consensus `WriteBatch` so they commit atomically
+/// with the selected-chain change.
 #[derive(Clone)]
 pub struct DbWindowedProductionPrefixStore {
     db: Arc<DB>,
     entries_prefix: u8,
     floor_prefix: u8,
+    /// `(spk, query_index) → cumulative`. Bounded by `cache_budget_bytes` via ~48 B/entry units.
+    cache: Cache<CumulativeQueryKey, u64>,
+    counters: OnceLock<Arc<ProcessingCounters>>,
 }
 
 impl DbWindowedProductionPrefixStore {
-    pub fn new(db: Arc<DB>) -> Self {
+    /// `cache_budget_bytes` is the soft RAM budget for the SeekForPrev result cache (honours the
+    /// caller's `--ram-scale` via `scaled(...)` in `ConsensusStorage`).
+    pub fn new(db: Arc<DB>, cache_budget_bytes: usize) -> Self {
+        // ~48 B per entry: SPK bucket (~34) + u64 index + u64 value + IndexMap overhead.
+        let max_items = (cache_budget_bytes / 48).max(256);
         Self {
             db,
             entries_prefix: DatabaseStorePrefixes::WindowedProductionPrefix.into(),
             floor_prefix: DatabaseStorePrefixes::WindowedProductionFloor.into(),
+            cache: Cache::new(CachePolicy::Count(max_items)),
+            counters: OnceLock::new(),
         }
+    }
+
+    /// Wire process-wide processing counters (called once from `Consensus::new`).
+    pub fn attach_counters(&self, counters: Arc<ProcessingCounters>) {
+        let _ = self.counters.set(counters);
+    }
+
+    fn record_hit(&self) {
+        if let Some(c) = self.counters.get() {
+            c.windowed_prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_miss(&self) {
+        if let Some(c) = self.counters.get() {
+            c.windowed_prefix_cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn cache_insert(&self, spk: &ScriptPublicKey, index: u64, value: u64) {
+        let bucket = ScriptPublicKeyBucket::from(spk);
+        self.cache.insert(CumulativeQueryKey { spk: bucket, index }, value);
+    }
+
+    /// Any mutation that changes entries for ≥1 SPK can affect SeekForPrev results for that SPK at
+    /// every query index. Full clear is correct and cheap relative to a disk seek; validation still
+    /// benefits because many rewarded blues re-read the same tip indices *within* one block before
+    /// the next extend.
+    fn invalidate_cache(&self) {
+        self.cache.remove_all();
     }
 
     /// On-disk entry key: `entries_prefix || SPK_bucket || be(index)`.
@@ -156,6 +213,9 @@ impl DbWindowedProductionPrefixStore {
             self.put_cumulative(batch, spk, *index, new_cum);
             acc.insert(spk.clone(), new_cum);
         }
+        if !removals.is_empty() || !additions.is_empty() {
+            self.invalidate_cache();
+        }
         Ok(())
     }
 
@@ -176,6 +236,9 @@ impl DbWindowedProductionPrefixStore {
             // collapsed max supersedes it; still take the max for total order-independence.
             let merged = self.read_floor(&spk)?.max(cumulative);
             self.put_floor(batch, &spk, merged);
+        }
+        if !items.is_empty() {
+            self.invalidate_cache();
         }
         Ok(())
     }
@@ -226,6 +289,9 @@ impl DbWindowedProductionPrefixStore {
             let existing = self.db.get(&fk)?.map(decode_u64).unwrap_or(0);
             batch.put(fk, existing.max(cumulative).to_le_bytes());
         }
+        if deleted > 0 {
+            self.invalidate_cache();
+        }
         Ok(deleted)
     }
 
@@ -243,11 +309,19 @@ impl DbWindowedProductionPrefixStore {
             // delete_range covers [prefix, prefix+1) — the whole single-byte-prefixed keyspace.
             batch.delete_range(vec![prefix], vec![prefix + 1]);
         }
+        self.invalidate_cache();
     }
 }
 
 impl WindowedProductionPrefixStoreReader for DbWindowedProductionPrefixStore {
     fn cumulative_at(&self, spk: &ScriptPublicKey, index: u64) -> Result<u64, StoreError> {
+        let qkey = CumulativeQueryKey { spk: ScriptPublicKeyBucket::from(spk), index };
+        if let Some(v) = self.cache.get(&qkey) {
+            self.record_hit();
+            return Ok(v);
+        }
+        self.record_miss();
+
         let range = self.spk_range(spk);
         // Seek key = range || be(index). Reverse direction ⇒ SeekForPrev: the largest key ≤ seek.
         let mut seek = range.clone();
@@ -255,13 +329,16 @@ impl WindowedProductionPrefixStoreReader for DbWindowedProductionPrefixStore {
         let mut opts = ReadOptions::default();
         opts.set_iterate_range(rocksdb::PrefixRange(range.as_slice()));
         let mut it = self.db.iterator_opt(IteratorMode::From(seek.as_slice(), Direction::Reverse), opts);
-        if let Some(item) = it.next() {
+        let value = if let Some(item) = it.next() {
             let (_key, value) = item?;
             // PrefixRange bounds the iterator to this SPK, so any hit is a real entry ≤ index.
-            return Ok(decode_u64(value.as_ref().to_vec()));
-        }
-        // No retained entry ≤ index for this SPK ⇒ the floor baseline (0 if never pruned/seen).
-        self.read_floor(spk)
+            decode_u64(value.as_ref().to_vec())
+        } else {
+            // No retained entry ≤ index for this SPK ⇒ the floor baseline (0 if never pruned/seen).
+            self.read_floor(spk)?
+        };
+        self.cache_insert(spk, index, value);
+        Ok(value)
     }
 }
 
@@ -298,7 +375,7 @@ mod tests {
     #[test]
     fn forward_matches_brute_force() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let store = DbWindowedProductionPrefixStore::new(db.clone());
+        let store = DbWindowedProductionPrefixStore::new(db.clone(), 1_000_000);
         let w = 5u64;
         // A deliberately uneven production pattern across 3 SPKs over 20 blocks.
         let chain: Vec<(ScriptPublicKey, u64)> = (1..=20u64)
@@ -327,7 +404,7 @@ mod tests {
     #[test]
     fn reorg_matches_brute_force() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let store = DbWindowedProductionPrefixStore::new(db.clone());
+        let store = DbWindowedProductionPrefixStore::new(db.clone(), 1_000_000);
         let w = 4u64;
 
         // Original chain, indices 1..=10.
@@ -371,7 +448,7 @@ mod tests {
     #[test]
     fn floor_collapse_preserves_queries() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let store = DbWindowedProductionPrefixStore::new(db.clone());
+        let store = DbWindowedProductionPrefixStore::new(db.clone(), 1_000_000);
         let w = 6u64;
 
         // SPK 1 produces early then goes quiet; SPK 2 produces late — the exact case the floor exists
@@ -430,7 +507,7 @@ mod tests {
     #[test]
     fn collapse_below_preserves_queries() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let store = DbWindowedProductionPrefixStore::new(db.clone());
+        let store = DbWindowedProductionPrefixStore::new(db.clone(), 1_000_000);
         let w = 6u64;
         let chain: Vec<(ScriptPublicKey, u64)> = vec![
             (spk(1), 10), (spk(1), 20), (spk(2), 5), (spk(2), 5), (spk(1), 30),
@@ -472,7 +549,7 @@ mod tests {
     #[test]
     fn cross_spk_isolation() {
         let (_lt, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
-        let store = DbWindowedProductionPrefixStore::new(db.clone());
+        let store = DbWindowedProductionPrefixStore::new(db.clone(), 1_000_000);
         let mut batch = WriteBatch::default();
         // Two SPKs whose buckets are adjacent; only spk(2) has an entry at index 5.
         store.put_cumulative(&mut batch, &spk(2), 5, 999);

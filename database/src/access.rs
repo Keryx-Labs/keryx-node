@@ -34,11 +34,51 @@ where
         Self { db, cache: Cache::new(cache_policy), prefix }
     }
 
-    pub fn read_from_cache(&self, key: TKey) -> Option<TData>
+    pub fn read_from_cache(&self, key: &TKey) -> Option<TData> {
+        self.cache.get(key)
+    }
+
+    /// Batch read: serve hits from the app cache, then one RocksDB `multi_get` for the misses.
+    /// Returns one `Option` per input key (`None` = absent). Also returns `(hits, misses)` counts
+    /// so callers can feed `ProcessingCounters` without a second cache probe.
+    pub fn read_many(&self, keys: &[TKey]) -> Result<(Vec<Option<TData>>, u64, u64), StoreError>
     where
-        TKey: Copy + AsRef<[u8]>,
+        TKey: Clone + AsRef<[u8]> + ToString,
+        TData: DeserializeOwned,
     {
-        self.cache.get(&key)
+        let mut results: Vec<Option<TData>> = Vec::with_capacity(keys.len());
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_db_keys: Vec<DbKey> = Vec::new();
+        let mut hits = 0u64;
+
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(data) = self.cache.get(key) {
+                results.push(Some(data));
+                hits += 1;
+            } else {
+                results.push(None);
+                miss_indices.push(i);
+                miss_db_keys.push(DbKey::new(&self.prefix, key.clone()));
+            }
+        }
+
+        let misses = miss_indices.len() as u64;
+        if !miss_db_keys.is_empty() {
+            let db_results = self.db.multi_get(miss_db_keys.iter());
+            for (slot, db_result) in miss_indices.into_iter().zip(db_results) {
+                match db_result {
+                    Ok(Some(slice)) => {
+                        let data: TData = bincode::deserialize(&slice)?;
+                        self.cache.insert(keys[slot].clone(), data.clone());
+                        results[slot] = Some(data);
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
+        Ok((results, hits, misses))
     }
 
     pub fn has(&self, key: TKey) -> Result<bool, StoreError>
@@ -436,7 +476,7 @@ mod tests {
         assert_eq!(result, value);
 
         // Key should now be in the primary cache
-        assert_eq!(access.read_from_cache(key).unwrap(), value);
+        assert_eq!(access.read_from_cache(&key).unwrap(), value);
     }
 
     #[test]

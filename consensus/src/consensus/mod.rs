@@ -187,6 +187,7 @@ impl Consensus {
         //
 
         let storage = ConsensusStorage::new(db.clone(), config.clone());
+        storage.windowed_production_prefix_store.attach_counters(counters.clone());
 
         //
         // Services and managers

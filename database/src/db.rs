@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 pub use conn_builder::ConnBuilder;
 use keryx_utils::fd_budget::FDGuard;
-pub use rocksdb_preset::RocksDbPreset;
+pub use rocksdb_preset::{DEFAULT_HDD_RATE_LIMIT_BYTES_PER_SEC, RocksDbPreset, RocksDbResources};
 
 mod conn_builder;
 mod rocksdb_preset;

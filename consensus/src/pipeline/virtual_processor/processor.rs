@@ -191,7 +191,7 @@ pub struct VirtualStateProcessor {
     notification_root: Arc<ConsensusNotificationRoot>,
 
     // Counters
-    counters: Arc<ProcessingCounters>,
+    pub(super) counters: Arc<ProcessingCounters>,
 
     // Mining Rule
     _mining_rules: Arc<MiningRules>,

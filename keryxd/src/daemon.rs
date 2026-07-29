@@ -11,7 +11,7 @@ use keryx_consensus_notify::{root::ConsensusNotificationRoot, service::NotifySer
 use keryx_core::{core::Core, debug, info, warn};
 use keryx_core::{kaspad_env::version, task::tick::TickService};
 use keryx_database::{
-    prelude::{CachePolicy, DbWriter, DirectDbWriter, RocksDbPreset},
+    prelude::{CachePolicy, DbWriter, DirectDbWriter, RocksDbPreset, RocksDbResources},
     registry::DatabaseStorePrefixes,
 };
 use keryx_grpc_server::service::GrpcService;
@@ -213,10 +213,23 @@ pub fn create_core(args: Args, fd_total_budget: i32) -> (Arc<Core>, Arc<RpcCoreS
     create_core_with_runtime(&rt, &args, fd_total_budget)
 }
 
+/// Baseline process-wide RocksDB block cache, before `--ram-scale`.
+const BASE_ROCKSDB_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// Floor for the process-wide block cache, however low `--ram-scale` is set.
+const MIN_ROCKSDB_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Baseline process-wide memtable budget, before `--ram-scale`. Sized per preset: the HDD preset
+/// uses a 256 MB write buffer per database, so it needs headroom the default preset does not.
+const BASE_MEMTABLE_BYTES_DEFAULT: usize = 256 * 1024 * 1024;
+const BASE_MEMTABLE_BYTES_HDD: usize = 768 * 1024 * 1024;
+/// Floors for the memtable budget. Must stay at/above one write buffer per preset or flushes
+/// would trigger on every write.
+const MIN_MEMTABLE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+const MIN_MEMTABLE_BYTES_HDD: usize = 512 * 1024 * 1024;
+
 /// Configure RocksDB parameters from CLI arguments.
 ///
-/// Returns: (preset, cache_budget, wal_directory)
-fn configure_rocksdb(args: &Args) -> (RocksDbPreset, Option<usize>, Option<PathBuf>) {
+/// Returns: (preset, shared resources, wal_directory)
+fn configure_rocksdb(args: &Args) -> (RocksDbPreset, Option<RocksDbResources>, Option<PathBuf>) {
     // Parse preset
     let preset = if let Some(preset_str) = &args.rocksdb_preset {
         match preset_str.parse::<RocksDbPreset>() {
@@ -235,23 +248,40 @@ fn configure_rocksdb(args: &Args) -> (RocksDbPreset, Option<usize>, Option<PathB
         RocksDbPreset::Default
     };
 
-    // Calculate cache budget for HDD preset
-    let cache_budget = if matches!(preset, RocksDbPreset::Hdd) {
-        if let Some(cache_mb) = args.rocksdb_cache_size {
-            let cache_bytes = cache_mb * 1024 * 1024;
-            info!("Custom RocksDB cache size: {} MB", cache_mb);
-            Some(cache_bytes)
-        } else {
-            let base_cache = 256 * 1024 * 1024;
-            let scaled_cache = (base_cache as f64 * args.ram_scale) as usize;
-            let min_cache = 64 * 1024 * 1024;
-            let final_cache = scaled_cache.max(min_cache);
-            info!("RocksDB cache size: {} MB (scaled by ram-scale)", final_cache / 1024 / 1024);
-            Some(final_cache)
+    // Process-wide memory budgets. Both are shared by every database the node opens (meta, active
+    // consensus, staging consensus, utxoindex) — building them per-connection multiplied whatever
+    // the operator asked for by the number of open databases.
+    let cache_bytes = match args.rocksdb_cache_size {
+        Some(cache_mb) => {
+            info!("Custom RocksDB cache size: {} MB (shared by all databases)", cache_mb);
+            cache_mb * 1024 * 1024
         }
-    } else {
-        None
+        None => {
+            let scaled = (BASE_ROCKSDB_CACHE_BYTES as f64 * args.ram_scale) as usize;
+            let final_cache = scaled.max(MIN_ROCKSDB_CACHE_BYTES);
+            info!("RocksDB cache size: {} MB (shared by all databases, scaled by ram-scale)", final_cache / 1024 / 1024);
+            final_cache
+        }
     };
+
+    let (base_memtable, min_memtable) = match preset {
+        RocksDbPreset::Hdd | RocksDbPreset::HddQd1 => (BASE_MEMTABLE_BYTES_HDD, MIN_MEMTABLE_BYTES_HDD),
+        RocksDbPreset::Default => (BASE_MEMTABLE_BYTES_DEFAULT, MIN_MEMTABLE_BYTES_DEFAULT),
+    };
+    let memtable_bytes = ((base_memtable as f64 * args.ram_scale) as usize).max(min_memtable);
+    info!("RocksDB memtable budget: {} MB (shared by all databases)", memtable_bytes / 1024 / 1024);
+
+    // Background-write rate limiting applies to the HDD presets only.
+    let rate_limit = matches!(preset, RocksDbPreset::Hdd | RocksDbPreset::HddQd1).then(|| {
+        let limit = args
+            .rocksdb_rate_limit_mb
+            .map(|mb| (mb * 1024 * 1024) as u64)
+            .unwrap_or(keryx_database::prelude::DEFAULT_HDD_RATE_LIMIT_BYTES_PER_SEC);
+        info!("RocksDB background write rate limit: {} MB/s", limit / 1024 / 1024);
+        limit
+    });
+
+    let resources = Some(RocksDbResources::new(cache_bytes, memtable_bytes, rate_limit));
 
     // Setup WAL directory if specified
     let wal_dir = args.rocksdb_wal_dir.as_ref().map(|custom_wal_dir| {
@@ -260,7 +290,7 @@ fn configure_rocksdb(args: &Args) -> (RocksDbPreset, Option<usize>, Option<PathB
         wal_path
     });
 
-    (preset, cache_budget, wal_dir)
+    (preset, resources, wal_dir)
 }
 
 /// Create [`Core`] instance with supplied [`Args`] and [`Runtime`].
@@ -286,7 +316,7 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
     };
 
     // Configure RocksDB parameters
-    let (rocksdb_preset, cache_budget, wal_dir) = configure_rocksdb(args);
+    let (rocksdb_preset, resources, wal_dir) = configure_rocksdb(args);
 
     // Make sure args forms a valid set of properties
     if let Err(err) = validate_args(args) {
@@ -391,7 +421,7 @@ do you confirm? (answer y/n or pass --yes to the Keryxd command line to confirm 
         .with_files_limit(META_DB_FILE_LIMIT)
         .with_preset(rocksdb_preset)
         .with_wal_dir(wal_dir.clone())
-        .with_cache_budget(cache_budget)
+        .with_resources(resources.clone())
         .build()
         .unwrap();
 
@@ -409,7 +439,7 @@ do you confirm? (answer y/n or pass --yes to the Keryxd command line to confirm 
                     .with_files_limit(1)
                     .with_preset(rocksdb_preset)
                     .with_wal_dir(wal_dir.clone())
-                    .with_cache_budget(cache_budget)
+                    .with_resources(resources.clone())
                     .build()
                     .unwrap();
 
@@ -464,7 +494,7 @@ Do you confirm? (y/n)";
                         .with_files_limit(10)
                         .with_preset(rocksdb_preset)
                         .with_wal_dir(wal_dir.clone())
-                        .with_cache_budget(cache_budget)
+                        .with_resources(resources.clone())
                         .build()
                         .unwrap();
 
@@ -528,7 +558,7 @@ Do you confirm? (y/n)";
             .with_files_limit(META_DB_FILE_LIMIT)
             .with_preset(rocksdb_preset)
             .with_wal_dir(wal_dir.clone())
-            .with_cache_budget(cache_budget)
+            .with_resources(resources.clone())
             .build()
             .unwrap();
     }
@@ -588,7 +618,7 @@ Do you confirm? (y/n)";
         mining_rules.clone(),
         rocksdb_preset,
         wal_dir.clone(),
-        cache_budget,
+        resources.clone(),
     ));
     let consensus_manager = Arc::new(ConsensusManager::new(consensus_factory));
     let consensus_monitor = Arc::new(ConsensusMonitor::new(processing_counters.clone(), tick_service.clone()));
@@ -618,7 +648,7 @@ Do you confirm? (y/n)";
             .with_files_limit(utxo_files_limit)
             .with_preset(rocksdb_preset)
             .with_wal_dir(wal_dir.clone())
-            .with_cache_budget(cache_budget)
+            .with_resources(resources.clone())
             .build()
             .unwrap();
         let utxoindex = UtxoIndexProxy::new(UtxoIndex::new(consensus_manager.clone(), utxoindex_db).unwrap());

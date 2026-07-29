@@ -99,6 +99,16 @@ impl AgeBucketsStoreReader for DbAgeBucketsStore {
     }
 }
 
+impl DbAgeBucketsStore {
+    /// Batch-read bucket aggregates. Absent keys yield empty buckets. Returns
+    /// `(values, cache_hits, cache_misses)` for ProcessingCounters.
+    pub fn get_many(&self, script_public_keys: &[ScriptPublicKey]) -> Result<(Vec<AgeBuckets>, u64, u64), StoreError> {
+        let keys: Vec<ScriptPublicKeyBucket> = script_public_keys.iter().map(ScriptPublicKeyBucket::from).collect();
+        let (raw, hits, misses) = self.access.read_many(&keys)?;
+        Ok((raw.into_iter().map(|v| v.unwrap_or_default()).collect(), hits, misses))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

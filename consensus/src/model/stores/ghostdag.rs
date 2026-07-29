@@ -319,21 +319,21 @@ impl DbGhostdagStore {
 
 impl GhostdagStoreReader for DbGhostdagStore {
     fn get_blue_score(&self, hash: Hash) -> Result<u64, StoreError> {
-        if let Some(ghostdag_data) = self.access.read_from_cache(hash) {
+        if let Some(ghostdag_data) = self.access.read_from_cache(&hash) {
             return Ok(ghostdag_data.blue_score);
         }
         Ok(self.compact_access.read(hash)?.blue_score)
     }
 
     fn get_blue_work(&self, hash: Hash) -> Result<BlueWorkType, StoreError> {
-        if let Some(ghostdag_data) = self.access.read_from_cache(hash) {
+        if let Some(ghostdag_data) = self.access.read_from_cache(&hash) {
             return Ok(ghostdag_data.blue_work);
         }
         Ok(self.compact_access.read(hash)?.blue_work)
     }
 
     fn get_selected_parent(&self, hash: Hash) -> Result<Hash, StoreError> {
-        if let Some(ghostdag_data) = self.access.read_from_cache(hash) {
+        if let Some(ghostdag_data) = self.access.read_from_cache(&hash) {
             return Ok(ghostdag_data.selected_parent);
         }
         Ok(self.compact_access.read(hash)?.selected_parent)
