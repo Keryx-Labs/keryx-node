@@ -177,7 +177,8 @@ impl IbdFlow {
         // the pruning point), so its local status cannot witness the anchored chain forever.
         // Fallback witness: once our own pruning point sits at/above the anchor daa, we
         // necessarily validated through the anchor era on the anchored chain (no other chain
-        // passes body validation beyond the H5.2 gate), so enforcement stays armed.
+        // passes header validation through the H5.3 difficulty-reset window, which forces
+        // genesis bits and rejects the abandoned branch's inherited ones), so enforcement stays armed.
         let anchor_witnessed = if let Some((anchor_hash, anchor_daa)) = self.ctx.config.chain_anchor {
             match consensus.async_get_block_status(anchor_hash).await {
                 Some(status) if status.is_valid() => true,

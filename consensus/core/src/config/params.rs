@@ -183,13 +183,17 @@ pub const H5_3_ACTIVATION_DAA: u64 = 63_250_000;
 /// DAG knows the block — or, after the anchor gets pruned, once the local pruning point sits
 /// at/above the anchor daa (only the anchored chain validates past the H5.2 gate, so a
 /// post-anchor pruning point witnesses it). Fresh-bootstrap nodes are never affected.
-/// Selected-chain block 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce,
-/// pinned 2026-07-25 while the network was stalled (frozen tip after the H5.2 naked-catch-up
-/// validation, ahead of the v1.4.0 release).
-pub const CHAIN_ANCHOR_DAA: u64 = 59_192_679;
+/// Selected-chain block d5f19559ff7cc7c482e5ae6c06d5c3d5f7988daf815b17dd41e93974fa09696f,
+/// pinned 2026-07-30 on the H5.3 relaunch chain. It MUST sit above `H5_3_ACTIVATION_DAA`: the
+/// branch abandoned at the relaunch shares every block below that score, so only a post-gate block
+/// discriminates. Re-pin it whenever the relaunch base is rebuilt — an anchor absent from the local
+/// DAG leaves `anchor_witnessed` false, which disarms the check silently rather than breaking it.
+/// (Previous anchor: 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce, daa
+/// 59_192_679, pinned 2026-07-25 for the H5.2 relaunch.)
+pub const CHAIN_ANCHOR_DAA: u64 = 63_257_773;
 pub const CHAIN_ANCHOR_HASH: Hash = Hash::from_bytes([
-    0x34, 0x61, 0xd9, 0x17, 0x80, 0x83, 0xb2, 0x4d, 0xad, 0xb1, 0x36, 0x18, 0x75, 0x8b, 0x5c, 0x4c,
-    0x92, 0xfa, 0xa7, 0xc3, 0xc5, 0xdc, 0x1a, 0xcd, 0xcd, 0x6a, 0x6a, 0xbe, 0x53, 0x00, 0xe2, 0xce,
+    0xd5, 0xf1, 0x95, 0x59, 0xff, 0x7c, 0xc7, 0xc4, 0x82, 0xe5, 0xae, 0x6c, 0x06, 0xd5, 0xc3, 0xd5,
+    0xf7, 0x98, 0x8d, 0xaf, 0x81, 0x5b, 0x17, 0xdd, 0x41, 0xe9, 0x39, 0x74, 0xfa, 0x09, 0x69, 0x6f,
 ]);
 
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
