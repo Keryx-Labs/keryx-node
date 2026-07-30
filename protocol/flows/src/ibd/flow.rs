@@ -9,7 +9,7 @@ use keryx_consensus_core::{
     BlockHashSet,
     api::BlockValidationFuture,
     block::Block,
-    config::params::POM_PROOF_RETENTION_DEPTH,
+    config::params::POM_PROOF_SERVE_DEPTH_DAA,
     header::Header,
     pom::PomProof,
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
@@ -970,7 +970,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             if block.is_header_only() {
                 return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
             }
-            if high_daa.saturating_sub(block.header.daa_score) > POM_PROOF_RETENTION_DEPTH {
+            if high_daa.saturating_sub(block.header.daa_score) > POM_PROOF_SERVE_DEPTH_DAA {
                 block.pom_tier = block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier));
                 block.pom_proof = None;
             }
@@ -1021,7 +1021,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             if blk_body.is_empty() {
                 return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", expected_hash)));
             }
-            let (pom_proof, pom_tier) = if high_daa.saturating_sub(blk_header.daa_score) > POM_PROOF_RETENTION_DEPTH {
+            let (pom_proof, pom_tier) = if high_daa.saturating_sub(blk_header.daa_score) > POM_PROOF_SERVE_DEPTH_DAA {
                 (None, pom_tier.or_else(|| pom_proof.as_ref().map(|p| p.tier)))
             } else {
                 (pom_proof, pom_tier)

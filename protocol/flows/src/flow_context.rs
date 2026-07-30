@@ -11,7 +11,7 @@ use keryx_connectionmanager::ConnectionManager;
 use keryx_consensus_core::api::{BlockValidationFuture, BlockValidationFutures};
 use keryx_consensus_core::block::Block;
 use keryx_consensus_core::config::Config;
-use keryx_consensus_core::config::params::POM_PROOF_RETENTION_DEPTH;
+use keryx_consensus_core::config::params::POM_PROOF_SERVE_DEPTH_DAA;
 use keryx_consensus_core::errors::block::RuleError;
 use keryx_consensus_core::tx::{Transaction, TransactionId};
 use keryx_consensus_notify::{
@@ -308,9 +308,10 @@ impl FlowContext {
     /// into a loud error so an operator catches it immediately instead of debugging a frozen chain.
     /// Returns `true` when the block is naked. Called from every block/body serving path.
     ///
-    /// A naked OLD block is now expected and routine: possession proofs beyond
-    /// `POM_PROOF_RETENTION_DEPTH` are garbage-collected (they are only ever consumed by IBD, which
-    /// skips proof verification). Only a naked RECENT block signals a genuine propagation hole — the
+    /// A naked OLD block is now expected and routine: past `POM_PROOF_SERVE_DEPTH_DAA` the serving
+    /// paths strip the proof deliberately, and the GC eventually reclaims it (on its own, deeper
+    /// horizon — see `POM_PROOF_GC_DEPTH_CHAIN_BLOCKS`); blocks that deep are only ever requested
+    /// through IBD, which skips proof verification. Only a naked RECENT block signals a hole — the
     /// wedge condition — so we scream for those alone and stay silent for the GC'd old blocks served
     /// routinely during IBD, keeping the GC fully transparent to operators.
     pub fn warn_if_serving_naked_pom_block(&self, block: &Block) -> bool {
@@ -318,7 +319,7 @@ impl FlowContext {
         if naked {
             let virtual_daa = self.consensus().unguarded_session_blocking().get_virtual_daa_score();
             let depth = virtual_daa.saturating_sub(block.header.daa_score);
-            if depth <= POM_PROOF_RETENTION_DEPTH {
+            if depth <= POM_PROOF_SERVE_DEPTH_DAA {
                 error!(
                     "PoM guard-rail: about to serve RECENT block {} (daa {}, depth {}) WITHOUT its possession proof. Proof-enforcing peers will reject it — this is how a propagation hole becomes a network wedge. The proof should be re-synced from a proof-carrying node.",
                     block.hash(),

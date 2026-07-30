@@ -1,5 +1,5 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use keryx_consensus_core::config::params::POM_PROOF_RETENTION_DEPTH;
+use keryx_consensus_core::config::params::POM_PROOF_SERVE_DEPTH_DAA;
 use keryx_core::debug;
 use keryx_p2p_lib::{
     IncomingRoute, Router, common::ProtocolError, dequeue_with_request_id, make_response, pb::kaspad_message::Payload,
@@ -46,7 +46,7 @@ impl HandleBlockBodyRequests {
                 // receiver would only persist for its GC to delete later.
                 let block = session.async_get_block(hash).await?;
                 self.ctx.warn_if_serving_naked_pom_block(&block);
-                let deep = virtual_daa.saturating_sub(block.header.daa_score) > POM_PROOF_RETENTION_DEPTH;
+                let deep = virtual_daa.saturating_sub(block.header.daa_score) > POM_PROOF_SERVE_DEPTH_DAA;
                 let mut body_msg: keryx_p2p_lib::pb::BlockBodyMessage = block.transactions.as_ref().into();
                 body_msg.pom_tier =
                     block.pom_tier.map(|t| t as u32).or_else(|| block.pom_proof.as_ref().map(|p| p.tier as u32));

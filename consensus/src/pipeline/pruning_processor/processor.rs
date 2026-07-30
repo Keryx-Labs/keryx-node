@@ -31,7 +31,7 @@ use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, BlockLevel,
     blockhash::ORIGIN,
     blockstatus::BlockStatus::StatusHeaderOnly,
-    config::{Config, params::POM_PROOF_RETENTION_DEPTH},
+    config::{Config, params::POM_PROOF_GC_DEPTH_CHAIN_BLOCKS},
     muhash::MuHashExtensions,
     pruning::{PruningPointProof, PruningPointTrustedData},
     trusted::ExternalGhostdagData,
@@ -210,7 +210,7 @@ impl PruningProcessor {
         debug!("Ratio prefix collapse: folded {deleted} entries below chain index {floor_index} into per-SPK floors");
     }
 
-    /// Garbage-collect PoM possession proofs older than `POM_PROOF_RETENTION_DEPTH` chain blocks.
+    /// Garbage-collect PoM possession proofs older than `POM_PROOF_GC_DEPTH_CHAIN_BLOCKS` chain blocks.
     /// Returns whether a batch was swept (i.e. there may be more backlog to drain).
     ///
     /// Runs on a dedicated thread — no flag, transparent on every node. It is a
@@ -226,7 +226,7 @@ impl PruningProcessor {
     /// on — the proofs of the non-chain reachability-tree subtree rooted at it. (b) closes the
     /// pre-H5 leak: a permanently-unmerged block is in no mergeset, so the mergeset-only walk never
     /// reclaimed it and it survived until the far deeper main pruning pass (`pruning_depth`) instead
-    /// of the `POM_PROOF_RETENTION_DEPTH` window — unbounded-looking growth on pruned nodes, worst
+    /// of the `POM_PROOF_GC_DEPTH_CHAIN_BLOCKS` window — unbounded-looking growth on pruned nodes, worst
     /// during sibling floods. An in-memory cursor advances from the pruning point up to
     /// `tip - retention`, processing at most `GC_BATCH` chain blocks per pruning message so a large
     /// backlog drains gradually without ever blocking consensus.
@@ -236,7 +236,7 @@ impl PruningProcessor {
         let Ok((tip_index, tip_hash)) = self.selected_chain_store.read().get_tip() else {
             return false;
         };
-        let target = tip_index.saturating_sub(POM_PROOF_RETENTION_DEPTH);
+        let target = tip_index.saturating_sub(POM_PROOF_GC_DEPTH_CHAIN_BLOCKS);
         if target == 0 {
             return false;
         }
@@ -311,7 +311,7 @@ impl PruningProcessor {
             from + 1,
             to,
             deleted,
-            POM_PROOF_RETENTION_DEPTH,
+            POM_PROOF_GC_DEPTH_CHAIN_BLOCKS,
             if h5 { "on" } else { "off" },
         );
         true

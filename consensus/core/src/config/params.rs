@@ -266,20 +266,38 @@ pub const POM_WALK_STEPS: u32 = 256;
 /// Fiat-Shamir-opened steps revealed per `PomProof` (soundness `~f^t` vs proof size).
 pub const POM_OPENINGS: usize = 32;
 
-/// Selected-chain depth, in chain blocks, behind which a block's persisted `PomProof` may be
-/// garbage-collected. A proof is only ever needed to (re-)serve a *recent* block to peers via relay;
-/// far older blocks are only ever requested through IBD, which does not verify the proof
-/// (`skip_pom_proof`). So keeping proofs for the last `POM_PROOF_RETENTION_DEPTH` DAA-score depth is
-/// far more than the relay horizon (a few hundred blocks) and lets the rest be reclaimed. Deleting a
-/// proof can never corrupt consensus state: the proof is not part of the UTXO set / state, and the
+/// Depth, in DAA score below the virtual, beyond which a served block ships WITHOUT its ~228 KB
+/// possession proof. Above this depth a peer can still be relaying the block and will reject a
+/// naked one, so this must stay above every path that verifies proofs.
+///
+/// It is bounded structurally, not by observation. Relay itself sits at the tip, and IBD skips
+/// proof verification (`skip_pom_proof`), so the deepest proof-requiring path is orphan resolution
+/// — and that is capped twice: `orphan_resolution_range = 5 + ceil(log2(bps))` = 9 at 10 BPS (the
+/// locator reaches ~2^9 = 512 blocks), and `check_orphan_ibd_conditions` hands over to IBD as soon
+/// as the orphan leaves `[ibd_daa - max_orphans/10, ibd_daa + max_orphans/2)` with
+/// `max_orphans = MAX_ORPHANS_UPPER_BOUND = 1024`. The real horizon is therefore ~1 024 DAA; this
+/// value keeps a ~5x margin over it. A value set too low is self-detecting rather than silent:
+/// `warn_if_serving_naked_pom_block` raises an `error!` the first time a block inside the window
+/// would be served naked — the wedge condition, caught before it cascades.
+pub const POM_PROOF_SERVE_DEPTH_DAA: u64 = 5_000;
+
+/// Selected-chain depth, in CHAIN BLOCKS, behind which a persisted `PomProof` may be
+/// garbage-collected. Deliberately a different unit from [`POM_PROOF_SERVE_DEPTH_DAA`], and
+/// deliberately NOT the same horizon: the GC must retain a strict SUPERSET of what serving can
+/// still be asked for, or it deletes a proof the node is about to ship — exactly the naked-block
+/// wedge of 2026-06-29. At 10 BPS a chain block lands roughly every ~10 DAA, so this value spans
+/// ~50 000 DAA, an order of magnitude above the serving threshold. Keep GC ≫ serve when tuning
+/// either; equalising them would remove that safety margin, not tidy it up.
+///
+/// Lowered 25_000 → 5_000 at the H5.3 relaunch (a coordinated upgrade, which this needs: a node
+/// that GCs earlier than its peers serves proofless blocks inside the window they still expect).
+/// v2 proofs record the full K=256-step walk (~228 KB each, ~2.7x the v1 spot-check), so this takes
+/// the pruned proof store from ~6 GB to ~1.2 GB and the bootstrap snapshot with it.
+///
+/// Deleting a proof can never corrupt consensus state: it is not part of the UTXO set, and the
 /// header `utxo_commitment` already pins the state. The GC pass runs unconditionally on every node
 /// (see the pruning processor) — no flag, transparent — so pruned datadirs stay bounded by design.
-///
-/// Lowered 50_000 → 25_000 for the H4 verifier-v2 proofs: v2 records the full K=256-step walk
-/// (256 Merkle paths) instead of the v1 32/256 spot-check, so each proof is ~2.7× bigger (~228 KB
-/// vs ~48 KB). At 25_000 the pruned proof store stays ~6 GB (vs ~12 GB at 50_000), keeping the
-/// bootstrap datadir near its H3 size. Still far above the relay horizon; not consensus (per above).
-pub const POM_PROOF_RETENTION_DEPTH: u64 = 25_000;
+pub const POM_PROOF_GC_DEPTH_CHAIN_BLOCKS: u64 = 5_000;
 
 /// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
 /// produced offline by `pom-rt-builder` (canonical: name-sorted GGUF tensors). Tier index =

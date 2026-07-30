@@ -1,5 +1,5 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use keryx_consensus_core::config::params::POM_PROOF_RETENTION_DEPTH;
+use keryx_consensus_core::config::params::POM_PROOF_SERVE_DEPTH_DAA;
 use keryx_core::debug;
 use keryx_p2p_lib::{
     IncomingRoute, Router, common::ProtocolError, convert::header::HeaderFormat, dequeue_with_request_id, make_response,
@@ -44,7 +44,7 @@ impl HandleIbdBlockRequests {
                 self.ctx.warn_if_serving_naked_pom_block(&block);
                 // Blocks beyond the proof retention window can never be relayed as recent, so ship
                 // them without the 200+ KB proof (tier kept for the coinbase tier-reward split).
-                if virtual_daa.saturating_sub(block.header.daa_score) > POM_PROOF_RETENTION_DEPTH {
+                if virtual_daa.saturating_sub(block.header.daa_score) > POM_PROOF_SERVE_DEPTH_DAA {
                     block.pom_tier = block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier));
                     block.pom_proof = None;
                 }
