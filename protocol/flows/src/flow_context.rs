@@ -41,6 +41,7 @@ use keryx_utils::iter::IterExtensions;
 use keryx_utils::networking::PeerId;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Instant;
 use std::{collections::hash_map::Entry, fmt::Display};
 use std::{
@@ -406,6 +407,13 @@ impl FlowContext {
 
     pub fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
         self.connection_manager.read().clone()
+    }
+
+    pub async fn ban_peer_automatically(&self, ip: IpAddr) -> bool {
+        match self.connection_manager() {
+            Some(connection_manager) => connection_manager.ban_automatically(ip).await,
+            None => false,
+        }
     }
 
     pub fn consensus(&self) -> ConsensusInstance {

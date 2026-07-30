@@ -87,8 +87,9 @@ impl Flow for HandleRelayInvsFlow {
         match self.start_impl().await {
             Err(e) if e.is_ban_worthy() => {
                 let peer_ip = self.router.net_address().ip();
-                self.ctx.address_manager.lock().ban(peer_ip.into());
-                warn!("Banned peer {} for ban-worthy protocol violation: {}", self.router, e);
+                if self.ctx.ban_peer_automatically(peer_ip).await {
+                    warn!("Banned peer {} for ban-worthy protocol violation: {}", self.router, e);
+                }
                 Err(e)
             }
             res => res,
@@ -165,15 +166,26 @@ impl HandleRelayInvsFlow {
                 self.rd_violation_count += 1;
                 if self.rd_violation_count >= RD_VIOLATION_BAN_THRESHOLD {
                     let peer_ip = self.router.net_address().ip();
-                    warn!(
-                        "Peer {} reached {} R&D violations (last: block {} — {}) — banning",
-                        peer_ip, self.rd_violation_count, block.hash(), reason
-                    );
-                    if let Some(cm) = self.ctx.connection_manager() {
-                        cm.ban(peer_ip).await;
+                    if self.ctx.ban_peer_automatically(peer_ip).await {
+                        warn!(
+                            "Peer {} reached {} R&D violations (last: block {} — {}) — banning",
+                            peer_ip,
+                            self.rd_violation_count,
+                            block.hash(),
+                            reason
+                        );
+                    } else {
+                        warn!(
+                            "Peer {} reached {} R&D violations (last: block {} — {}) — disconnecting without a ban",
+                            peer_ip,
+                            self.rd_violation_count,
+                            block.hash(),
+                            reason
+                        );
                     }
                     return Err(ProtocolError::OtherOwned(format!(
-                        "peer banned after {} blocks missing R&D allocation", self.rd_violation_count
+                        "peer disconnected after {} blocks missing R&D allocation",
+                        self.rd_violation_count
                     )));
                 }
                 warn!(

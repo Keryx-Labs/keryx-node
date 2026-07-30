@@ -27,6 +27,18 @@ use tokio::{
 const PING_TIMEOUT_BAN_THRESHOLD: u32 = 3;
 const PING_TIMEOUT_WINDOW: Duration = Duration::from_secs(600); // 10 minutes
 
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    }
+}
+
+fn is_fixed_seed_ip(seeders: &[&str], ip: IpAddr) -> bool {
+    let ip = canonical_ip(ip);
+    seeders.iter().filter_map(|seeder| seeder.parse().ok()).any(|seeder| canonical_ip(seeder) == ip)
+}
+
 struct PingTimeoutRecord {
     count: u32,
     window_start: Instant,
@@ -37,6 +49,7 @@ pub struct ConnectionManager {
     outbound_target: usize,
     inbound_limit: usize,
     dns_seeders: &'static [&'static str],
+    ban_exempt_seeders: &'static [&'static str],
     default_port: u16,
     address_manager: Arc<ParkingLotMutex<AddressManager>>,
     connection_requests: TokioMutex<HashMap<SocketAddr, ConnectionRequest>>,
@@ -64,6 +77,7 @@ impl ConnectionManager {
         outbound_target: usize,
         inbound_limit: usize,
         dns_seeders: &'static [&'static str],
+        ban_exempt_seeders: &'static [&'static str],
         default_port: u16,
         address_manager: Arc<ParkingLotMutex<AddressManager>>,
     ) -> Arc<Self> {
@@ -77,6 +91,7 @@ impl ConnectionManager {
             force_next_iteration: tx,
             shutdown_signal: SingleTrigger::new(),
             dns_seeders,
+            ban_exempt_seeders,
             default_port,
             ping_timeout_tracker: Default::default(),
         });
@@ -319,23 +334,34 @@ impl ConnectionManager {
     /// Bans the given IP and disconnects from all the peers with that IP.
     ///
     /// _GO-KASPAD: BanByIP_
-    pub async fn ban(&self, ip: IpAddr) {
+    pub async fn ban(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
         if self.ip_has_permanent_connection(ip).await {
-            return;
+            return false;
         }
+        self.address_manager.lock().ban(ip.into());
         for peer in self.p2p_adaptor.active_peers() {
-            if peer.net_address().ip() == ip {
+            if canonical_ip(peer.net_address().ip()) == ip {
                 self.p2p_adaptor.terminate(peer.key()).await;
             }
         }
-        self.address_manager.lock().ban(ip.into());
+        true
+    }
+
+    pub async fn ban_automatically(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+        if is_fixed_seed_ip(self.ban_exempt_seeders, ip) || self.ip_has_permanent_connection(ip).await {
+            return false;
+        }
+        self.ban(ip).await
     }
 
     /// Records a ping timeout for the given IP. Bans it after PING_TIMEOUT_BAN_THRESHOLD
     /// timeouts within PING_TIMEOUT_WINDOW — targets phantom nodes that flood inbound slots
     /// by connecting silently then immediately reconnecting after each timeout.
     pub async fn record_ping_timeout(&self, ip: IpAddr) {
-        if self.ip_has_permanent_connection(ip).await {
+        let ip = canonical_ip(ip);
+        if is_fixed_seed_ip(self.ban_exempt_seeders, ip) || self.ip_has_permanent_connection(ip).await {
             return;
         }
         let should_ban = {
@@ -354,9 +380,8 @@ impl ConnectionManager {
                 false
             }
         };
-        if should_ban {
+        if should_ban && self.ban_automatically(ip).await {
             warn!("Banning peer {} after {} ping timeouts within {:?}", ip, PING_TIMEOUT_BAN_THRESHOLD, PING_TIMEOUT_WINDOW);
-            self.ban(ip).await;
         }
     }
 
@@ -372,6 +397,21 @@ impl ConnectionManager {
 
     /// Returns whether the given IP has some permanent request.
     pub async fn ip_has_permanent_connection(&self, ip: IpAddr) -> bool {
-        self.connection_requests.lock().await.iter().any(|(address, request)| request.is_permanent && address.ip() == ip)
+        let ip = canonical_ip(ip);
+        self.connection_requests.lock().await.iter().any(|(address, request)| request.is_permanent && canonical_ip(address.ip()) == ip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_seed_ip_is_ban_exempt() {
+        let seeders = &["seed.example.net", "192.0.2.1"];
+
+        assert!(is_fixed_seed_ip(seeders, "192.0.2.1".parse().unwrap()));
+        assert!(is_fixed_seed_ip(seeders, "::ffff:192.0.2.1".parse().unwrap()));
+        assert!(!is_fixed_seed_ip(seeders, "127.0.0.1".parse().unwrap()));
     }
 }

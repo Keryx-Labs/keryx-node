@@ -102,8 +102,9 @@ impl IbdFlow {
                         info!("IBD with peer {} completed with error: {}", self.router, e);
                         if e.is_ban_worthy() {
                             let peer_ip = self.router.net_address().ip();
-                            self.ctx.address_manager.lock().ban(peer_ip.into());
-                            warn!("Banned peer {} for ban-worthy protocol violation: {}", self.router, e);
+                            if self.ctx.ban_peer_automatically(peer_ip).await {
+                                warn!("Banned peer {} for ban-worthy protocol violation: {}", self.router, e);
+                            }
                         }
                         return Err(e);
                     }
@@ -302,8 +303,9 @@ impl IbdFlow {
             // `highest_known_syncer_chain_hash`). So it means there's a finality conflict.
             //
             let peer_ip = self.router.net_address().ip();
-            self.ctx.address_manager.lock().ban(peer_ip.into());
-            warn!("Banned peer {} for finality conflict with local pruning point", self.router);
+            if self.ctx.ban_peer_automatically(peer_ip).await {
+                warn!("Banned peer {} for finality conflict with local pruning point", self.router);
+            }
             return Err(ProtocolError::Other("peer is in a finality conflict with the local pruning point"));
         }
 
@@ -335,8 +337,12 @@ impl IbdFlow {
                     // consensus has matured for long enough (and not recently synced). This is mostly a spam-protector
                     // since subsequent checks identify these violations as well
                     let peer_ip = self.router.net_address().ip();
-                    self.ctx.address_manager.lock().ban(peer_ip.into());
-                    warn!("Banned peer {} for IBD spam (peer has no known block while local consensus is up to date)", self.router);
+                    if self.ctx.ban_peer_automatically(peer_ip).await {
+                        warn!(
+                            "Banned peer {} for IBD spam (peer has no known block while local consensus is up to date)",
+                            self.router
+                        );
+                    }
                     return Err(ProtocolError::Other(
                         "peer has no known block but local consensus appears to be up to date, this is most likely a spam attempt",
                     ));
@@ -447,8 +453,9 @@ impl IbdFlow {
         // Check if past pruning points violate finality of current consensus
         if self.ctx.consensus().session().await.async_are_pruning_points_violating_finality(pruning_points.clone()).await {
             let peer_ip = self.router.net_address().ip();
-            self.ctx.address_manager.lock().ban(peer_ip.into());
-            warn!("Banned peer {} for sending pruning points that violate finality", self.router);
+            if self.ctx.ban_peer_automatically(peer_ip).await {
+                warn!("Banned peer {} for sending pruning points that violate finality", self.router);
+            }
             return Err(ProtocolError::Other("pruning points are violating finality"));
         }
 
