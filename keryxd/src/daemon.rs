@@ -698,6 +698,7 @@ Do you confirm? (y/n)";
         outbound_target,
         inbound_limit,
         dns_seeders,
+        config.automatic_ban_exemptions,
         config.default_p2p_port(),
         p2p_tower_counters.clone(),
     ));

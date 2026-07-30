@@ -1139,7 +1139,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             if connection_manager.ip_has_permanent_connection(ip).await {
                 return Err(RpcError::IpHasPermanentConnection(request.ip));
             }
-            connection_manager.ban(ip).await;
+            if !connection_manager.ban(ip).await {
+                return Err(RpcError::IpHasPermanentConnection(request.ip));
+            }
         } else {
             return Err(RpcError::NoConnectionManager);
         }

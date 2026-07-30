@@ -825,6 +825,7 @@ impl From<Params> for OverrideParams {
 #[derive(Clone, Debug)]
 pub struct Params {
     pub dns_seeders: &'static [&'static str],
+    pub automatic_ban_exemptions: &'static [&'static str],
     pub net: NetworkId,
     pub genesis: GenesisBlock,
 
@@ -1153,6 +1154,7 @@ impl Params {
     pub fn override_params(self, overrides: OverrideParams) -> Self {
         Self {
             dns_seeders: self.dns_seeders,
+            automatic_ban_exemptions: self.automatic_ban_exemptions,
             net: self.net,
             genesis: self.genesis.clone(),
 
@@ -1288,11 +1290,14 @@ impl From<NetworkId> for Params {
     }
 }
 
+const MAINNET_BOOTSTRAP_PEER: &str = "141.95.35.181";
+
 pub const MAINNET_PARAMS: Params = Params {
     // A literal IP is valid here: the seeder string is resolved through
     // `(seeder, default_port).to_socket_addrs()`, which parses an IP address before
     // falling back to a DNS lookup. It acts as a fixed bootstrap peer on port 22111.
-    dns_seeders: &["seed.keryx-labs.com", "141.95.35.181"],
+    dns_seeders: &["seed.keryx-labs.com", MAINNET_BOOTSTRAP_PEER],
+    automatic_ban_exemptions: &[MAINNET_BOOTSTRAP_PEER],
     net: NetworkId::new(NetworkType::Mainnet),
     genesis: GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
@@ -1430,6 +1435,7 @@ pub const MAINNET_PARAMS: Params = Params {
 
 pub const TESTNET_PARAMS: Params = Params {
     dns_seeders: &[],
+    automatic_ban_exemptions: &[],
     net: NetworkId::with_suffix(NetworkType::Testnet, 10),
     genesis: TESTNET_GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
@@ -1538,6 +1544,7 @@ pub const TESTNET_PARAMS: Params = Params {
 
 pub const SIMNET_PARAMS: Params = Params {
     dns_seeders: &[],
+    automatic_ban_exemptions: &[],
     net: NetworkId::new(NetworkType::Simnet),
     genesis: SIMNET_GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
@@ -1608,6 +1615,7 @@ pub const SIMNET_PARAMS: Params = Params {
 
 pub const DEVNET_PARAMS: Params = Params {
     dns_seeders: &[],
+    automatic_ban_exemptions: &[],
     net: NetworkId::new(NetworkType::Devnet),
     genesis: DEVNET_GENESIS,
     timestamp_deviation_tolerance: TIMESTAMP_DEVIATION_TOLERANCE,
