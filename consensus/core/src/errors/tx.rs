@@ -135,6 +135,12 @@ pub enum TxRuleError {
     #[error("AiResponse references model_id {0} not declared in coinbase ai:cap: field")]
     AiResponseModelCapMissing(String),
 
+    /// Mempool admission guard mirroring the block-level `AiRequest` payload rules: such a
+    /// transaction is invalid by consensus and disqualifies every block that includes it, so it
+    /// must never reach a template. Carries the block-level reason verbatim.
+    #[error("AiRequest would be rejected by consensus: {0}")]
+    AiRequestPayloadRule(String),
+
     /// [`TxRuleError::FeerateTooLow`] is not a consensus error but a mempool error triggered by the
     /// fee/mass RBF validation rule
     #[error("fee rate per contextual mass gram is not greater than the fee rate of the replaced transaction")]

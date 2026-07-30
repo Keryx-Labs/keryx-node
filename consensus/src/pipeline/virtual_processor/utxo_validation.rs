@@ -392,16 +392,7 @@ impl VirtualStateProcessor {
             // disqualification, are unchanged, so patched and unpatched nodes agree and no gate
             // is needed. (The complementary fix is upstream — keeping such a tx out of the
             // mempool so honest miners never include it and lose their block.)
-            let ai_reward_minimums = if self.coin_age_activation.is_active(header.daa_score) {
-                INFERENCE_REWARD_MINIMUMS_V2_H4
-            } else if self.inference_min_h2_activation.is_active(header.daa_score) {
-                self.inference_reward_minimums_v2_h2
-            } else if self.opoi_v2_activation.is_active(header.daa_score) {
-                self.inference_reward_minimums_v2
-            } else {
-                self.inference_reward_minimums
-            };
-            check_ai_request_payload_rules_all(&txs, ai_reward_minimums)?;
+            check_ai_request_payload_rules_all(&txs, self.ai_reward_minimums(header.daa_score))?;
         }
 
         // Verify all transactions are valid in context
@@ -415,25 +406,27 @@ impl VirtualStateProcessor {
 
         // Enforce AiRequest inference_reward minimums and fee coverage after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
-            // OPoI v2 hardfork: swap to the uncensored lineup at/after activation. DAA-gated so
-            // IBD re-validates historical (pre-v2) blocks against the legacy lineup unchanged.
-            // (Activation is announced by the consolidated KERYX HARDFORK banner above.)
-            let minimums = if self.coin_age_activation.is_active(header.daa_score) {
-                // H4 candle-free lineup floors (new bareme 0.5/1/1.5/2.5/4 KRX). New model_ids, so
-                // the H2 table no longer matches any served model post-H4.
-                INFERENCE_REWARD_MINIMUMS_V2_H4
-            } else if self.inference_min_h2_activation.is_active(header.daa_score) {
-                // H2 (5-tier) floors: adds Qwen3-1.7B + 70B-Q2, absent from the v2 table.
-                self.inference_reward_minimums_v2_h2
-            } else if self.opoi_v2_activation.is_active(header.daa_score) {
-                self.inference_reward_minimums_v2
-            } else {
-                self.inference_reward_minimums
-            };
-            check_ai_request_inference_rewards(&txs, &validated_transactions, minimums)?;
+            check_ai_request_inference_rewards(&txs, &validated_transactions, self.ai_reward_minimums(header.daa_score))?;
         }
 
         Ok(())
+    }
+
+    /// The `AiRequest` reward-minimum table in force at `daa_score`. DAA-gated so IBD re-validates
+    /// historical blocks against the lineup of their own era: H4 swaps to the candle-free floors
+    /// (new model_ids, so the H2 table matches nothing post-H4), H2 adds Qwen3-1.7B and 70B-Q2, and
+    /// OPoI v2 introduced the uncensored lineup. Resolved in one place so the pre-UTXO fast path,
+    /// the full block check and mempool admission cannot read different tables for the same score.
+    pub(super) fn ai_reward_minimums(&self, daa_score: u64) -> &[([u8; 32], u64)] {
+        if self.coin_age_activation.is_active(daa_score) {
+            INFERENCE_REWARD_MINIMUMS_V2_H4
+        } else if self.inference_min_h2_activation.is_active(daa_score) {
+            self.inference_reward_minimums_v2_h2
+        } else if self.opoi_v2_activation.is_active(daa_score) {
+            self.inference_reward_minimums_v2
+        } else {
+            self.inference_reward_minimums
+        }
     }
 
     fn verify_header_pruning_point(
@@ -1451,13 +1444,21 @@ fn check_ai_request_escrow_output(tx: &Transaction, req: &AiRequestPayload) -> B
 /// logged reason differs.
 fn check_ai_request_payload_rules_all(txs: &[Transaction], minimums: &[([u8; 32], u64)]) -> BlockProcessResult<()> {
     for tx in txs.iter().skip(1) {
-        if !tx.is_ai_request() {
-            continue;
-        }
-        if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-            check_ai_request_payload_rules(tx, &req, minimums)?;
-            check_ai_request_escrow_output(tx, &req)?;
-        }
+        check_ai_request_tx_payload_rules(tx, minimums)?;
+    }
+    Ok(())
+}
+
+/// Same rules for a SINGLE transaction, with no block around it — the entry point used by mempool
+/// admission (`validate_mempool_transaction_impl`) so a transaction that would poison every block
+/// including it never reaches a template. A non-`AiRequest` transaction passes untouched.
+pub(super) fn check_ai_request_tx_payload_rules(tx: &Transaction, minimums: &[([u8; 32], u64)]) -> BlockProcessResult<()> {
+    if !tx.is_ai_request() {
+        return Ok(());
+    }
+    if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+        check_ai_request_payload_rules(tx, &req, minimums)?;
+        check_ai_request_escrow_output(tx, &req)?;
     }
     Ok(())
 }
@@ -1790,6 +1791,27 @@ mod tests {
             check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &minimums),
             Err(AiRequestMissingEscrowOutput(_))
         ));
+    }
+
+    /// Mempool admission uses the single-transaction entry point, with no block around it. The
+    /// real case of 2026-07-30: 400 000 000 sompi paid where 420 000 000 was required, a request
+    /// that poisoned every block including it. A non-AiRequest transaction must pass untouched.
+    #[test]
+    fn single_tx_entry_point_rejects_the_underpaid_request_and_passes_others() {
+        let model_id = [0x55u8; 32];
+        let minimums = [(model_id, 400_000_000u64)];
+        let underpaid = ai_request_with_reward(model_id, 400_000_000);
+        assert!(matches!(
+            check_ai_request_tx_payload_rules(&underpaid, &minimums),
+            Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))
+        ));
+
+        let ok = ai_request_with_reward(model_id, 400_000_000 + 2 * INFERENCE_REWARD_TOKEN_STEP);
+        assert!(check_ai_request_tx_payload_rules(&ok, &minimums).is_ok());
+
+        // A plain transaction carries no AiRequest payload and is none of this rule's business.
+        let plain = Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_NATIVE, 0, vec![]);
+        assert!(check_ai_request_tx_payload_rules(&plain, &minimums).is_ok());
     }
 
     /// The fast path and the full check must reach the same verdict — that equivalence is the

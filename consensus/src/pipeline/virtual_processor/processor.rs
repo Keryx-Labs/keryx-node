@@ -50,7 +50,7 @@ use crate::{
     processes::{
         coinbase::CoinbaseManager,
         ghostdag::ordering::SortableBlock,
-        transaction_validator::{TransactionValidator, errors::TxResult, tx_validation_in_utxo_context::TxValidationFlags},
+        transaction_validator::{TransactionValidator, errors::{TxResult, TxRuleError}, tx_validation_in_utxo_context::TxValidationFlags},
         window::WindowManager,
     },
 };
@@ -87,6 +87,7 @@ use keryx_muhash::MuHash;
 use keryx_notify::{events::EventType, notifier::Notify};
 use once_cell::unsync::Lazy;
 
+use super::utxo_validation::check_ai_request_tx_payload_rules;
 use super::errors::{PruningImportError, PruningImportResult};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use itertools::Itertools;
@@ -1187,6 +1188,15 @@ impl VirtualStateProcessor {
             virtual_daa_score,
             virtual_past_median_time,
         )?;
+        // Keep a consensus-invalid AiRequest out of the mempool entirely. Such a transaction
+        // disqualifies EVERY block that includes it, so an honest miner that accepts it into a
+        // template loses the block it mines — the sender pays nothing, the miner pays everything.
+        // Local admission policy over the same rules the block check enforces, evaluated at the
+        // virtual score: no gate, and no way for it to reject a block a peer would accept.
+        if self.model_cap_enforcement_activation.is_active(virtual_daa_score) {
+            check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score))
+                .map_err(|e| TxRuleError::AiRequestPayloadRule(e.to_string()))?;
+        }
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
     }
