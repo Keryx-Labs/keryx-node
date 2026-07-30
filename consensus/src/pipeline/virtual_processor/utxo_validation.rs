@@ -382,6 +382,30 @@ impl VirtualStateProcessor {
                 );
             }
             self.check_ai_response_model_caps(&txs)?;
+
+            // ANTI-DoS FAST-FAIL (2026-07-30): the inference_reward-minimum portion of the
+            // AiRequest check needs only the tx payload + the daa-gated minimums table (NOT
+            // UTXO state or fees), so run it HERE — before the expensive parallel UTXO
+            // validation below. A flood of blocks each carrying a single below-minimum
+            // AiRequest is a cheap-to-produce / expensive-to-fully-validate DoS (observed
+            // on-chain 2026-07-30: tx 97fae1b2fc401649dda6c23977bb452149e58eda9abdeea81448d459
+            // 5c52c7fa, inference_reward 400_000_000 < 420_000_000 sompi min) that otherwise
+            // makes honest nodes spend their whole single-threaded UTXO-validation budget
+            // rejecting flood blocks and fall behind the attacker's chain. The verdict is
+            // IDENTICAL to the post-UTXO check_ai_request_inference_rewards below (same error,
+            // same block disqualified from the virtual chain) — patched and unpatched nodes
+            // agree, so there is no consensus divergence. Catches any below-min AiRequest, not
+            // just the current attack hash.
+            let ai_reward_minimums = if self.coin_age_activation.is_active(header.daa_score) {
+                INFERENCE_REWARD_MINIMUMS_V2_H4
+            } else if self.inference_min_h2_activation.is_active(header.daa_score) {
+                self.inference_reward_minimums_v2_h2
+            } else if self.opoi_v2_activation.is_active(header.daa_score) {
+                self.inference_reward_minimums_v2
+            } else {
+                self.inference_reward_minimums
+            };
+            check_ai_request_reward_minimums_fast(&txs, ai_reward_minimums)?;
         }
 
         // Verify all transactions are valid in context
@@ -1343,6 +1367,39 @@ impl VirtualStateProcessor {
 /// - priority_fee below MIN_AI_REQUEST_PRIORITY_FEE
 /// - UTXO fee < priority_fee (inference_reward now goes to output[1] escrow, not fee)
 /// - output[1] missing, not a CSV P2PK script, or value < inference_reward
+// Fast-fail subset of `check_ai_request_inference_rewards`: enforces ONLY the
+// inference_reward-minimum rule, which depends solely on the tx payload and the (already
+// daa-gated) `minimums` table — no UTXO context, no fees. Called BEFORE the expensive
+// parallel UTXO validation as an anti-DoS guard against a flood of below-minimum-AiRequest
+// blocks (see call site, 2026-07-30). The logic and error here MUST stay identical to the
+// inference_reward branch of `check_ai_request_inference_rewards` below so the verdict is the
+// same whether reached early or late — otherwise nodes would diverge.
+fn check_ai_request_reward_minimums_fast(
+    txs: &[Transaction],
+    minimums: &[([u8; 32], u64)],
+) -> BlockProcessResult<()> {
+    for tx in txs.iter().skip(1) {
+        if !tx.is_ai_request() {
+            continue;
+        }
+        if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+            if let Some(&(_, base_reward)) = minimums.iter().find(|(id, _)| *id == req.model_id) {
+                let token_surcharge = ((req.max_tokens as u64 + 63) / 64) * INFERENCE_REWARD_TOKEN_STEP;
+                let effective_min = base_reward + token_surcharge;
+                if req.inference_reward < effective_min {
+                    return Err(AiRequestInferenceRewardBelowMinimum(
+                        tx.id(),
+                        req.inference_reward,
+                        effective_min,
+                        hex::encode(req.model_id),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check_ai_request_inference_rewards(
     txs: &[Transaction],
     validated: &[(keryx_consensus_core::tx::ValidatedTransaction<'_>, u32)],
