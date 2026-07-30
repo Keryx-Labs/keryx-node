@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost http://localhost:1420 ws://localhost:1420 https://keryx-labs.com; script-src 'self'" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Keryx Node Launcher</title>
+  <!-- Critical first-paint styles: CSS module loads via JS, so constrain logo before that. -->
+  <style>
+    html, body { height: 100%; margin: 0; background: #070a08; color: #e8f5ec; }
+    .logo { width: 40px; height: 40px; object-fit: contain; display: block; }
+  </style>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+</head>
+<body>
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <img src="/logo.png" alt="Keryx" class="logo" width="40" height="40" />
+      <div>
+        <div class="brand-name">KERYX</div>
+        <div class="brand-sub">Node Launcher</div>
+      </div>
+    </div>
+    <nav class="tabs" id="mainTabs" hidden>
+      <button type="button" class="tab active" data-tab="control">Control</button>
+      <button type="button" class="tab" data-tab="settings">Settings</button>
+    </nav>
+    <div class="status-pill" id="statusPill">
+      <span class="dot"></span>
+      <span id="statusText">Stopped</span>
+    </div>
+  </header>
+
+  <!-- ========== FIRST-RUN WIZARD ========== -->
+  <main class="wizard" id="viewWizard" hidden>
+    <ol class="steps" id="stepIndicators">
+      <li class="step active" data-step="1"><span>1</span><span class="step-label">Location</span></li>
+      <li class="step" data-step="2"><span>2</span><span class="step-label">Binary</span></li>
+      <li class="step" data-step="3"><span>3</span><span class="step-label">Network</span></li>
+      <li class="step" data-step="4"><span>4</span><span class="step-label">Sync</span></li>
+      <li class="step" data-step="5"><span>5</span><span class="step-label">Performance</span></li>
+      <li class="step" data-step="6"><span>6</span><span class="step-label">Install</span></li>
+    </ol>
+
+    <section class="panel wizard-panel" data-wizard-step="1">
+      <h2>Install location</h2>
+      <p class="hint">Choose where the node program and blockchain data will live. Prefer a drive with plenty of free space.</p>
+      <label class="field">
+        <span>Install directory</span>
+        <div class="row">
+          <input type="text" id="installDir" spellcheck="false" />
+          <button type="button" class="btn ghost" data-browse="installDir">Browse</button>
+        </div>
+      </label>
+      <label class="field">
+        <span>App data directory (--appdir)</span>
+        <div class="row">
+          <input type="text" id="appdir" spellcheck="false" />
+          <button type="button" class="btn ghost" data-browse="appdir">Browse</button>
+        </div>
+      </label>
+    </section>
+
+    <section class="panel wizard-panel" data-wizard-step="2" hidden>
+      <h2>Node binary</h2>
+      <p class="hint">Download the latest official Windows release, or point to a folder / <span class="mono">keryxd.exe</span> you already built.</p>
+      <div class="choice-grid" id="binaryModeCards">
+        <button type="button" class="choice-card active" data-binary-mode="download">
+          <div class="choice-title">Download latest release</div>
+          <div class="choice-desc">Fetches <span class="mono">win64</span> from GitHub Releases and installs into <span class="mono">bin/</span>.</div>
+        </button>
+        <button type="button" class="choice-card" data-binary-mode="local">
+          <div class="choice-title">Use local build</div>
+          <div class="choice-desc">Browse to a compiled <span class="mono">keryxd.exe</span> or the folder that contains it.</div>
+        </button>
+      </div>
+      <div id="binaryDownloadPanel">
+        <div class="release-meta mono" id="releaseMeta">Checking GitHub for the latest release…</div>
+        <div class="actions">
+          <button type="button" class="btn primary" id="btnDownloadRelease">Download &amp; install</button>
+        </div>
+        <p class="error mono" id="downloadError" hidden></p>
+      </div>
+      <div id="binaryLocalPanel" hidden>
+        <label class="field">
+          <span>Binary source (file or folder)</span>
+          <div class="row">
+            <input type="text" id="binarySource" spellcheck="false" />
+            <button type="button" class="btn ghost" id="btnBrowseBinary">Browse file</button>
+            <button type="button" class="btn ghost" id="btnBrowseBinaryDir">Browse folder</button>
+          </div>
+        </label>
+      </div>
+    </section>
+
+    <section class="panel wizard-panel" data-wizard-step="3" hidden>
+      <h2>Network</h2>
+      <p class="hint">Mainnet is the live network. Use testnet / devnet / simnet only for experiments.</p>
+      <label class="field">
+        <span>Network</span>
+        <select id="network">
+          <option value="mainnet">mainnet — live network (recommended)</option>
+          <option value="testnet">testnet — public test chain</option>
+          <option value="devnet">devnet — development</option>
+          <option value="simnet">simnet — local simulation</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="panel wizard-panel" data-wizard-step="4" hidden>
+      <h2>How to sync</h2>
+      <p class="hint">Syncing from peers works from scratch. A <span class="mono">datadir.zip</span> snapshot is optional and much faster if you already have one.</p>
+      <div class="choice-grid" id="syncModeCards">
+        <button type="button" class="choice-card active" data-sync-mode="scratch">
+          <div class="choice-title">Sync from scratch</div>
+          <div class="choice-desc">Download the chain from peers. Takes longer, needs no extra files.</div>
+        </button>
+        <button type="button" class="choice-card" data-sync-mode="zip">
+          <div class="choice-title">Restore datadir.zip</div>
+          <div class="choice-desc">Point to a snapshot zip; it will be extracted into your app data folder during install.</div>
+        </button>
+      </div>
+      <div id="syncZipPanel" hidden>
+        <label class="field">
+          <span>datadir.zip</span>
+          <div class="row">
+            <input type="text" id="datadirZip" spellcheck="false" placeholder="Path to datadir.zip" />
+            <button type="button" class="btn ghost" data-browse-file="datadirZip">Browse</button>
+          </div>
+        </label>
+      </div>
+    </section>
+
+    <section class="panel wizard-panel" data-wizard-step="5" hidden>
+      <h2>Performance</h2>
+      <p class="hint">Suggested from this PC’s RAM and the disk behind your data folder. Adjust if you know better.</p>
+
+      <div class="hw-loading" id="hwLoading" hidden>
+        <div class="hw-spinner" aria-hidden="true"></div>
+        <div class="hw-loading-copy">
+          <div class="hw-loading-title" id="hwLoadingTitle">Analyzing your system…</div>
+          <div class="hw-loading-detail mono" id="hwLoadingDetail">Checking available memory</div>
+        </div>
+      </div>
+
+      <div class="hw-results" id="hwResults">
+        <div class="hw-meta mono" id="hwMeta">Detecting hardware…</div>
+        <p class="warn mono" id="hwWarning" hidden></p>
+
+        <div class="choice-grid" id="storageProfileCards">
+          <button type="button" class="choice-card" data-storage-profile="ssd">
+            <div class="choice-title">SSD / NVMe</div>
+            <div class="choice-desc">Faster storage profile (<span class="mono">default</span> RocksDB preset).</div>
+            <div class="choice-badge" id="ssdBadge" hidden>Recommended</div>
+          </button>
+          <button type="button" class="choice-card active" data-storage-profile="hdd">
+            <div class="choice-title">HDD</div>
+            <div class="choice-desc">Mechanical drive profile with write rate limiting.</div>
+            <div class="choice-badge" id="hddBadge" hidden>Recommended</div>
+          </button>
+        </div>
+
+        <label class="field">
+          <span>RAM scale <span class="muted" id="ramScaleValue">1.0</span></span>
+          <input type="range" id="ramScale" min="0.25" max="8" step="0.25" value="1" />
+        </label>
+
+        <div class="grid-2">
+          <label class="field">
+            <span>RocksDB cache (MB)</span>
+            <input type="number" id="rocksdbCacheSize" min="0" step="256" />
+          </label>
+          <label class="field">
+            <span>Write rate limit (MB/s)</span>
+            <input type="number" id="rocksdbRateLimitMb" min="0" step="1" />
+            <span class="field-note muted" id="rateLimitNote"></span>
+          </label>
+        </div>
+
+        <div class="ram-meter" id="ramMeter">
+          <div class="ram-meter-bar"><div class="ram-meter-fill" id="ramMeterFill"></div></div>
+          <div class="ram-meter-label mono" id="ramMeterLabel">Estimated RAM: —</div>
+          <p class="field-note muted" id="ramMeterNote">
+            Theoretical estimate from these settings (cache, RAM scale, SSD/HDD profile) — not a live measurement of a running node.
+            “Machine free” is a snapshot of RAM available right now. Actual use during sync can be higher or lower.
+          </p>
+        </div>
+
+        <div class="actions">
+          <button type="button" class="btn ghost" id="btnResetSuggested">Reset to suggested</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel wizard-panel" data-wizard-step="6" hidden>
+      <h2>Install</h2>
+      <p class="hint">Review the summary, then install. After that the Control screen opens on every launch.</p>
+
+      <div class="hw-loading" id="peerLoading" hidden>
+        <div class="hw-spinner" aria-hidden="true"></div>
+        <div class="hw-loading-copy">
+          <div class="hw-loading-title">Finding good peers…</div>
+          <div class="hw-loading-detail mono" id="peerLoadingDetail">Resolving DNS seed…</div>
+        </div>
+      </div>
+      <p class="warn mono" id="peerTuneWarning" hidden></p>
+
+      <pre class="cmd mono" id="installSummary"></pre>
+      <div class="progress" id="progressWrap" hidden>
+        <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-msg mono" id="progressMsg"></div>
+      </div>
+      <p class="error mono" id="installError" hidden></p>
+    </section>
+
+    <div class="wizard-nav">
+      <button type="button" class="btn ghost" id="btnWizardBack" disabled>Back</button>
+      <div class="wizard-nav-right">
+        <button type="button" class="btn ghost" id="btnWizardSave">Save progress</button>
+        <button type="button" class="btn primary" id="btnWizardNext">Continue</button>
+        <button type="button" class="btn primary" id="btnWizardInstall" hidden>Install node</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- ========== CONTROL ========== -->
+  <main class="layout control-layout is-hidden" id="viewControl" hidden>
+    <section class="panel wide control-panel">
+      <div class="control-hero">
+        <div class="control-meta">
+          <div class="control-label mono">NODE</div>
+          <div class="control-title" id="controlTitle">Ready</div>
+          <div class="control-path mono" id="controlPath"></div>
+        </div>
+        <div class="control-actions">
+          <button type="button" class="btn primary btn-lg" id="btnRunToggle" data-running="false">Start node</button>
+          <button type="button" class="btn ghost btn-icon btn-lg" id="btnRestart" disabled title="Restart node" aria-label="Restart node">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-2.6-6.3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <button type="button" class="btn ghost btn-lg" id="btnControlResetSetup" title="Stop the node and open the setup wizard from scratch.">Setup from scratch</button>
+        </div>
+      </div>
+
+      <div class="sync-panel" id="syncPanel">
+        <div class="sync-row">
+          <span class="sync-badge mono" id="syncBadge">Sync —</span>
+          <span class="sync-eta mono" id="syncEta"></span>
+        </div>
+        <div class="sync-bar" aria-hidden="true">
+          <div class="sync-bar-fill" id="syncBarFill"></div>
+        </div>
+        <div class="sync-time mono" id="syncTime"></div>
+        <div class="sync-meta mono" id="syncMeta"></div>
+      </div>
+
+      <pre class="logs mono" id="logs"></pre>
+    </section>
+  </main>
+
+  <!-- ========== SETTINGS (only when Settings tab is active) ========== -->
+  <main class="layout is-hidden" id="viewSettings" hidden>
+    <section class="panel">
+      <h2>Paths</h2>
+      <label class="field">
+        <span>Install directory <i class="tip" tabindex="0" data-tip="Folder where the node program is installed (keryxd and helper files)."></i></span>
+        <div class="row">
+          <input type="text" id="s_installDir" spellcheck="false" />
+          <button type="button" class="btn ghost" data-browse="s_installDir">Browse</button>
+        </div>
+      </label>
+      <label class="field">
+        <span>App data (--appdir) <i class="tip" tabindex="0" data-tip="Folder where the blockchain and database are stored. Use a drive with plenty of free space (HDD is fine)."></i></span>
+        <div class="row">
+          <input type="text" id="s_appdir" spellcheck="false" />
+          <button type="button" class="btn ghost" data-browse="s_appdir">Browse</button>
+        </div>
+      </label>
+      <label class="field">
+        <span>Binary source <i class="tip" tabindex="0" data-tip="Path to the keryxd.exe used when installing or re-installing. Usually your repo build under target/release."></i></span>
+        <div class="row">
+          <input type="text" id="s_binarySource" spellcheck="false" />
+          <button type="button" class="btn ghost" data-browse-file="s_binarySource">Browse</button>
+        </div>
+      </label>
+      <div class="actions">
+        <button type="button" class="btn ghost" id="btnReinstall" title="Copies keryxd.exe into the install folder again without deleting the blockchain.">Re-install binary</button>
+        <button type="button" class="btn ghost" id="btnOpenInstall" title="Opens the install folder in File Explorer.">Open folder</button>
+        <button type="button" class="btn ghost" id="btnRunSetupAgain" title="Opens the first-run setup wizard again. Your saved settings are kept.">Run setup again</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Performance</h2>
+      <div class="grid-2">
+        <label class="field"><span>Network <i class="tip" tabindex="0" data-tip="Which network to join. Mainnet is the real network. Testnet/devnet/simnet are for testing only."></i></span>
+          <select id="s_network">
+            <option value="mainnet">mainnet</option>
+            <option value="testnet">testnet</option>
+            <option value="devnet">devnet</option>
+            <option value="simnet">simnet</option>
+          </select>
+        </label>
+        <label class="field"><span>Testnet suffix <i class="tip" tabindex="0" data-tip="Testnet number (e.g. 10). Only used when Network is set to testnet."></i></span><input type="number" id="s_testnetSuffix" min="0" /></label>
+        <label class="field"><span>RAM scale <i class="tip" tabindex="0" data-tip="Memory multiplier for caches. 1.0 is default. 2.0 uses about twice the RAM and can speed up sync if you have spare memory."></i></span><input type="number" id="s_ramScale" min="0.25" max="8" step="0.25" /></label>
+        <label class="field"><span>RocksDB preset <i class="tip" tabindex="0" data-tip="Disk database tuning. default = SSD/NVMe. hdd = mechanical hard drive. hdd-qd1 = slow HDD with short queue depth (e.g. WD Red)."></i></span>
+          <select id="s_rocksdbPreset">
+            <option value="default">default</option>
+            <option value="hdd">hdd</option>
+            <option value="hdd-qd1">hdd-qd1</option>
+          </select>
+        </label>
+        <label class="field"><span>Cache (MB) <i class="tip" tabindex="0" data-tip="How much RAM the database may use as cache. More cache usually means less disk reading and faster sync."></i></span><input type="number" id="s_rocksdbCacheSize" min="0" step="256" /></label>
+        <label class="field"><span>Rate limit (MB/s) <i class="tip" tabindex="0" data-tip="Max write speed to disk. Too high can stall an HDD; too low slows sync. Leave the HDD preset defaults unless you know your drive."></i></span><input type="number" id="s_rocksdbRateLimitMb" min="0" /></label>
+      </div>
+      <label class="field">
+        <span>WAL directory <i class="tip" tabindex="0" data-tip="Optional folder for the database write-ahead log. Putting this on an SSD/NVMe while chain data stays on HDD often helps a lot."></i></span>
+        <div class="row">
+          <input type="text" id="s_rocksdbWalDir" spellcheck="false" />
+          <button type="button" class="btn ghost" data-browse="s_rocksdbWalDir">Browse</button>
+        </div>
+      </label>
+    </section>
+
+    <section class="panel wide">
+      <h2>Peers</h2>
+      <label class="check">
+        <input type="checkbox" id="s_connectOnly" />
+        <span>Connect only <i class="tip" tabindex="0" data-tip="Talk only to the peers listed below (no public discovery, no inbound peers). Use for lab setups or a trusted node. For normal mainnet use, leave this off."></i></span>
+      </label>
+      <label class="field"><span>Peers <i class="tip" tabindex="0" data-tip="Nodes to contact at startup, one host:port per line. P2P port is usually 22111. Empty is fine — the node discovers peers via DNS seed. Auto-tune probes the seed and keeps the fastest responders."></i></span><textarea id="s_peers" rows="8" class="mono" spellcheck="false" placeholder="(empty — DNS seed / gossip)"></textarea></label>
+      <div class="actions">
+        <button type="button" class="btn ghost" id="btnAutoTunePeers" title="Probe DNS seed peers and keep the lowest-latency ones.">Auto-tune peers</button>
+        <button type="button" class="btn ghost" id="btnClearPeers" title="Clear the preferred peer list.">Clear peers</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Network &amp; RPC</h2>
+      <div class="grid-2">
+        <label class="field"><span>P2P listen <i class="tip" tabindex="0" data-tip="Address:port where this node listens for other peers. Empty = default (all interfaces, port 22111 on mainnet)."></i></span><input type="text" id="s_listen" spellcheck="false" /></label>
+        <label class="field"><span>External IP <i class="tip" tabindex="0" data-tip="Public IP you advertise to the network (useful behind a router/NAT). Leave empty if unsure."></i></span><input type="text" id="s_externalip" spellcheck="false" /></label>
+        <label class="field"><span>Outbound <i class="tip" tabindex="0" data-tip="How many peer connections this node opens on its own. More = more redundancy. Default 8 is usually enough."></i></span><input type="number" id="s_outboundTarget" min="0" /></label>
+        <label class="field"><span>Max inbound <i class="tip" tabindex="0" data-tip="How many outside peers may connect to you at once. Higher helps the network but uses more CPU and bandwidth."></i></span><input type="number" id="s_inboundLimit" min="0" /></label>
+        <label class="field"><span>gRPC <i class="tip" tabindex="0" data-tip="API port used by wallets, miners, and this launcher for status. Mainnet default is 22110. Empty = default."></i></span><input type="text" id="s_rpclisten" spellcheck="false" /></label>
+        <label class="field"><span>wRPC JSON <i class="tip" tabindex="0" data-tip="Optional WebSocket JSON API for web/tools. Leave empty unless you need it."></i></span><input type="text" id="s_rpclistenJson" spellcheck="false" /></label>
+        <label class="field"><span>wRPC Borsh <i class="tip" tabindex="0" data-tip="Optional WebSocket binary (Borsh) API for advanced clients. Leave empty for normal use."></i></span><input type="text" id="s_rpclistenBorsh" spellcheck="false" /></label>
+        <label class="field"><span>RPC max clients <i class="tip" tabindex="0" data-tip="Max simultaneous RPC clients. Raise it if many apps talk to this node at once."></i></span><input type="number" id="s_rpcMaxClients" min="0" /></label>
+      </div>
+      <div class="checks">
+        <label class="check"><input type="checkbox" id="s_disableUpnp" /><span>Disable UPnP <i class="tip" tabindex="0" data-tip="Do not auto-open ports on your router. Enable if UPnP misbehaves or you already forwarded the port manually."></i></span></label>
+        <label class="check"><input type="checkbox" id="s_disableDnsSeeding" /><span>Disable DNS seed <i class="tip" tabindex="0" data-tip="Do not discover peers via DNS. Only useful when you rely on your own peer list (or Connect only)."></i></span></label>
+        <label class="check"><input type="checkbox" id="s_disableGrpc" /><span>Disable gRPC <i class="tip" tabindex="0" data-tip="Turns off the gRPC API. The launcher will lose sync status; wallets/miners may fail. Avoid for normal use."></i></span></label>
+        <label class="check"><input type="checkbox" id="s_unsafeRpc" /><span>Unsafe RPC <i class="tip" tabindex="0" data-tip="Allows RPC commands that change node state. Local/advanced use only — do not expose this to the internet."></i></span></label>
+        <label class="check"><input type="checkbox" id="s_enableUnsyncedMining" /><span>Unsynced mining <i class="tip" tabindex="0" data-tip="Allow mining before the node is fully synced. Mainly for testing — leave off on mainnet."></i></span></label>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Logging &amp; extras</h2>
+      <div class="grid-2">
+        <label class="field"><span>Log level <i class="tip" tabindex="0" data-tip="How much detail to log. INFO is normal. DEBUG/TRACE are very verbose. ERROR shows only serious failures."></i></span>
+          <select id="s_logLevel">
+            <option>ERROR</option><option>WARN</option><option selected>INFO</option><option>DEBUG</option><option>TRACE</option>
+          </select>
+        </label>
+        <label class="field"><span>Async threads <i class="tip" tabindex="0" data-tip="Internal runtime threads. 0 = automatic (recommended). Change only if you know why."></i></span><input type="number" id="s_asyncThreads" min="0" /></label>
+        <label class="field"><span>Retention days <i class="tip" tabindex="0" data-tip="How many days of older data to keep before pruning (when applicable). Empty = node default."></i></span><input type="text" id="s_retentionPeriodDays" spellcheck="false" /></label>
+        <label class="field"><span>UA comments <i class="tip" tabindex="0" data-tip="Optional extra text in the name this node shows to peers (user-agent). Comma-separated."></i></span><input type="text" id="s_userAgentComments" spellcheck="false" /></label>
+      </div>
+      <label class="field">
+        <span>Log directory <i class="tip" tabindex="0" data-tip="Where log files are written. Empty = default folder under app data."></i></span>
+        <div class="row">
+          <input type="text" id="s_logdir" spellcheck="false" />
+          <button type="button" class="btn ghost" data-browse="s_logdir">Browse</button>
+        </div>
+      </label>
+      <div class="checks">
+        <label class="check"><input type="checkbox" id="s_noLogFiles" /><span>No log files <i class="tip" tabindex="0" data-tip="Do not write logs to disk (console only). Saves space, but harder to debug later."></i></span></label>
+        <label class="check"><input type="checkbox" id="s_utxoindex" /><span>UTXO index <i class="tip" tabindex="0" data-tip="Keeps a balance (UTXO) index for some wallets/queries. Uses more disk and a bit more CPU."></i></span></label>
+        <label class="check"><input type="checkbox" id="s_archival" /><span>Archival <i class="tip" tabindex="0" data-tip="Full-history node: keeps much more data and prunes less. Needs a lot more disk space."></i></span></label>
+        <label class="check"><input type="checkbox" id="s_resetDb" /><span>Reset DB on start <i class="tip" tabindex="0" data-tip="Deletes the local database on next start and syncs from scratch. Use with care."></i></span></label>
+      </div>
+    </section>
+
+    <section class="panel wide">
+      <h2>Command preview <i class="tip tip-inline" tabindex="0" data-tip="Exact command line the launcher will run when you start the node. Handy to review or copy."></i></h2>
+      <pre class="cmd mono" id="cmdPreview"></pre>
+      <div class="actions">
+        <button type="button" class="btn primary" id="btnSave" title="Save these options for the next time you open the launcher.">Save settings</button>
+        <span class="saved-msg mono" id="savedMsg" hidden>Saved</span>
+      </div>
+    </section>
+  </main>
+
+  <div id="tipBubble" role="tooltip" aria-hidden="true"></div>
+
+  <!-- Confirm modal -->
+  <div class="modal-backdrop" id="confirmModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+      <h2 id="confirmModalTitle">Setup from scratch?</h2>
+      <p class="modal-body" id="confirmModalBody">
+        This stops the node if it is running, clears your launcher settings, and opens the first-run wizard again.
+        Blockchain data on disk is not deleted — only the launcher configuration.
+      </p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="confirmModalCancel">Cancel</button>
+        <button type="button" class="btn danger" id="confirmModalOk">Reset &amp; reconfigure</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

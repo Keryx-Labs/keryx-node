@@ -1,0 +1,10 @@
+node_modules/
+dist/
+release/
+src-tauri/target/
+src-tauri/gen/
+bundled/*.exe
+bundled/*.dll
+!bundled/.gitkeep
+*.log
+.DS_Store

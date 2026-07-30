@@ -1,0 +1,27 @@
+{
+  "name": "keryx-node-launcher",
+  "version": "1.0.0",
+  "description": "Windows installer and control panel for the Keryx full node (keryxd)",
+  "private": true,
+  "type": "module",
+  "author": "Keryx Labs",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "start": "tauri dev",
+    "dist": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0",
+    "@tauri-apps/plugin-opener": "^2.5.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}
