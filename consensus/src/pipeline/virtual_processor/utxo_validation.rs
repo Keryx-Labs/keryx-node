@@ -382,6 +382,26 @@ impl VirtualStateProcessor {
                 );
             }
             self.check_ai_response_model_caps(&txs)?;
+
+            // Fast-fail: the inference_reward minimum depends only on the tx payload and the
+            // daa-gated minimums table, so check it HERE rather than after the parallel UTXO
+            // validation below. A single below-minimum AiRequest poisons every block that
+            // includes it, and each such block otherwise costs a full UTXO pass before being
+            // disqualified — work spent to reach a verdict the payload alone already decides.
+            // Scheduling only: the rule, the error and the resulting disqualification are
+            // unchanged, so patched and unpatched nodes agree and no gate is needed.
+            // (The complementary fix is upstream — keeping such a tx out of the mempool so
+            // honest miners never include it and lose their block.)
+            let ai_reward_minimums = if self.coin_age_activation.is_active(header.daa_score) {
+                INFERENCE_REWARD_MINIMUMS_V2_H4
+            } else if self.inference_min_h2_activation.is_active(header.daa_score) {
+                self.inference_reward_minimums_v2_h2
+            } else if self.opoi_v2_activation.is_active(header.daa_score) {
+                self.inference_reward_minimums_v2
+            } else {
+                self.inference_reward_minimums
+            };
+            check_ai_request_reward_minimums(&txs, ai_reward_minimums)?;
         }
 
         // Verify all transactions are valid in context
@@ -1388,6 +1408,46 @@ impl VirtualStateProcessor {
 /// - priority_fee below MIN_AI_REQUEST_PRIORITY_FEE
 /// - UTXO fee < priority_fee (inference_reward now goes to output[1] escrow, not fee)
 /// - output[1] missing, not a CSV P2PK script, or value < inference_reward
+// Fast-fail subset of `check_ai_request_inference_rewards`: enforces ONLY the
+// inference_reward-minimum rule, which depends solely on the tx payload and the (already
+// daa-gated) `minimums` table — no UTXO context, no fees. Called BEFORE the expensive
+// parallel UTXO validation as an anti-DoS guard against a flood of below-minimum-AiRequest
+// blocks (see call site, 2026-07-30). The logic and error here MUST stay identical to the
+// inference_reward branch of `check_ai_request_inference_rewards` below so the verdict is the
+// same whether reached early or late — otherwise nodes would diverge.
+/// The `inference_reward` minimum rule for ONE `AiRequest`, in one place: it depends solely on the
+/// tx payload and the (already daa-gated) `minimums` table — no UTXO context, no fees. Called from
+/// both the pre-UTXO fast path (`check_ai_request_reward_minimums`) and the full post-UTXO check,
+/// so the two can never drift apart and reach different verdicts for the same block.
+/// `effective_min = base[model] + ceil(max_tokens / 64) * TOKEN_STEP`.
+fn check_ai_request_reward_minimum(tx: &Transaction, req: &AiRequestPayload, minimums: &[([u8; 32], u64)]) -> BlockProcessResult<()> {
+    if let Some(&(_, base_reward)) = minimums.iter().find(|(id, _)| *id == req.model_id) {
+        let token_surcharge = ((req.max_tokens as u64 + 63) / 64) * INFERENCE_REWARD_TOKEN_STEP;
+        let effective_min = base_reward + token_surcharge;
+        if req.inference_reward < effective_min {
+            return Err(AiRequestInferenceRewardBelowMinimum(tx.id(), req.inference_reward, effective_min, hex::encode(req.model_id)));
+        }
+    }
+    Ok(())
+}
+
+/// Payload-only subset of `check_ai_request_inference_rewards`, run BEFORE the parallel UTXO
+/// validation: a block whose only defect is a below-minimum `AiRequest` is rejected without first
+/// paying for the full UTXO pass. The verdict is identical either way (same rule, same error, same
+/// block disqualified from the virtual chain), so patched and unpatched nodes agree — this is a
+/// scheduling change, not a rule change, and needs no gate.
+fn check_ai_request_reward_minimums(txs: &[Transaction], minimums: &[([u8; 32], u64)]) -> BlockProcessResult<()> {
+    for tx in txs.iter().skip(1) {
+        if !tx.is_ai_request() {
+            continue;
+        }
+        if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+            check_ai_request_reward_minimum(tx, &req, minimums)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_ai_request_inference_rewards(
     txs: &[Transaction],
     validated: &[(keryx_consensus_core::tx::ValidatedTransaction<'_>, u32)],
@@ -1401,20 +1461,8 @@ fn check_ai_request_inference_rewards(
             continue;
         }
         if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-            // Check inference_reward minimum per model_id, including token-count surcharge.
-            // effective_min = base[model] + ceil(max_tokens / 64) * TOKEN_STEP
-            if let Some(&(_, base_reward)) = minimums.iter().find(|(id, _)| *id == req.model_id) {
-                let token_surcharge = ((req.max_tokens as u64 + 63) / 64) * INFERENCE_REWARD_TOKEN_STEP;
-                let effective_min = base_reward + token_surcharge;
-                if req.inference_reward < effective_min {
-                    return Err(AiRequestInferenceRewardBelowMinimum(
-                        tx.id(),
-                        req.inference_reward,
-                        effective_min,
-                        hex::encode(req.model_id),
-                    ));
-                }
-            }
+            // Check inference_reward minimum per model_id (shared with the pre-UTXO fast path).
+            check_ai_request_reward_minimum(tx, &req, minimums)?;
             // Check priority_fee minimum (burned as TX fee).
             if req.priority_fee < keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE {
                 return Err(AiRequestPriorityFeeBelowMinimum(
@@ -1618,6 +1666,75 @@ mod tests {
         let resp_bad = make_ai_response_for(&req_bad);
         let txs = vec![make_coinbase_with_caps(&[declared]), req_ok, req_bad, resp_ok, resp_bad];
         assert!(matches!(check_ai_response_model_caps(&txs), Err(AiResponseModelCapMissing(_, _))));
+    }
+
+    // ── check_ai_request_reward_minimums (pre-UTXO fast path) ────────────────
+
+    /// `max_tokens` here is 100 ⇒ ceil(100/64) = 2 surcharge steps on top of the base.
+    fn ai_request_with_reward(model_id: [u8; 32], inference_reward: u64) -> Transaction {
+        let req = AiRequestPayload::new(model_id, 100, inference_reward, 30_000_000, b"test prompt".to_vec());
+        Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize())
+    }
+
+    #[test]
+    fn reward_at_the_effective_minimum_is_accepted() {
+        let model_id = [0x55u8; 32];
+        let base = 400_000_000u64;
+        let minimums = [(model_id, base)];
+        let effective_min = base + 2 * INFERENCE_REWARD_TOKEN_STEP;
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_reward(model_id, effective_min)];
+        assert!(check_ai_request_reward_minimums(&txs, &minimums).is_ok());
+    }
+
+    #[test]
+    fn reward_one_sompi_below_the_effective_minimum_is_rejected() {
+        let model_id = [0x55u8; 32];
+        let base = 400_000_000u64;
+        let minimums = [(model_id, base)];
+        let effective_min = base + 2 * INFERENCE_REWARD_TOKEN_STEP;
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_reward(model_id, effective_min - 1)];
+        assert!(matches!(
+            check_ai_request_reward_minimums(&txs, &minimums),
+            Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))
+        ));
+    }
+
+    /// The token surcharge is the part a sender is most likely to omit — paying only the base
+    /// must still be rejected (the on-chain case of 2026-07-30: 400M paid, 420M required).
+    #[test]
+    fn base_reward_without_the_token_surcharge_is_rejected() {
+        let model_id = [0x55u8; 32];
+        let base = 400_000_000u64;
+        let minimums = [(model_id, base)];
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_reward(model_id, base)];
+        assert!(matches!(
+            check_ai_request_reward_minimums(&txs, &minimums),
+            Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))
+        ));
+    }
+
+    /// A model absent from the table has no floor to enforce — the era's own gating decides which
+    /// table is in force, and an unknown model_id must not be rejected by this rule.
+    #[test]
+    fn unknown_model_id_has_no_minimum() {
+        let minimums = [([0x55u8; 32], 400_000_000u64)];
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_reward([0x66u8; 32], 1)];
+        assert!(check_ai_request_reward_minimums(&txs, &minimums).is_ok());
+    }
+
+    /// The fast path and the full check must reach the same verdict — that equivalence is the
+    /// reason running the rule earlier needs no gate.
+    #[test]
+    fn fast_path_matches_the_full_check_verdict() {
+        let model_id = [0x55u8; 32];
+        let base = 400_000_000u64;
+        let minimums = [(model_id, base)];
+        let bad = ai_request_with_reward(model_id, base);
+        let txs = vec![make_coinbase_no_caps(), bad];
+        let fast = check_ai_request_reward_minimums(&txs, &minimums);
+        let full = check_ai_request_inference_rewards(&txs, &[], &minimums);
+        assert!(matches!(fast, Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))));
+        assert!(matches!(full, Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))));
     }
 
     #[test]
