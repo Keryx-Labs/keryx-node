@@ -983,6 +983,13 @@ impl VirtualStateProcessor {
             let d = deltas.entry(entry.script_public_key.clone()).or_default();
             if entry.effective_daa <= mature_bound {
                 d.0 -= entry.amount as i128;
+                // Spent while mature: drop its retained promotion too. A spent coin can never
+                // need a demotion (a reorg re-introducing it re-adds it through `diff.add`,
+                // which re-classifies and re-enqueues it), while a lingering entry gets demoted
+                // by later score drops against a coin that no longer exists, corrupting the
+                // buckets. Invariant (matching the startup reseed): every queued entry's coin
+                // exists in the virtual UTXO set.
+                self.maturation_queue_store.delete_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint).unwrap();
             } else {
                 d.1 -= entry.amount as i128;
                 d.2 -= (entry.amount as i128) * (entry.effective_daa as i128);
@@ -995,11 +1002,14 @@ impl VirtualStateProcessor {
                 continue;
             }
             let b = self.age_buckets_store.get(&spk).unwrap();
-            let next = AgeBuckets {
-                b_mat: (b.b_mat as i128 + dm).max(0) as u64,
-                b_imm: (b.b_imm as i128 + div).max(0) as u64,
-                a_imm: (b.a_imm as i128 + dia).max(0) as u128,
-            };
+            let (nm, ni, na) = (b.b_mat as i128 + dm, b.b_imm as i128 + div, b.a_imm as i128 + dia);
+            if nm < 0 || ni < 0 || na < 0 {
+                warn!(
+                    "coin-age: bucket underflow while applying a diff (b_mat {} {:+}, b_imm {} {:+}, a_imm {} {:+}) — clamping to 0; the index is inconsistent and will be re-derived at next startup",
+                    b.b_mat, dm, b.b_imm, div, b.a_imm, dia
+                );
+            }
+            let next = AgeBuckets { b_mat: nm.max(0) as u64, b_imm: ni.max(0) as u64, a_imm: na.max(0) as u128 };
             self.age_buckets_store.set_batch(batch, &spk, next).unwrap();
         }
     }
@@ -1037,6 +1047,12 @@ impl VirtualStateProcessor {
                     continue;
                 }
                 let b = self.age_buckets_store.get(&due.script_public_key).unwrap();
+                if b.b_mat < due.amount {
+                    warn!(
+                        "coin-age sweep: demotion underflows b_mat ({} < {}, anchor {}) — clamping; queue entry with no backing coin (ghost)",
+                        b.b_mat, due.amount, due.anchor
+                    );
+                }
                 let next = AgeBuckets {
                     b_mat: b.b_mat.saturating_sub(due.amount),
                     b_imm: b.b_imm.saturating_add(due.amount),
@@ -1052,6 +1068,15 @@ impl VirtualStateProcessor {
             // Consecutive read-modify-writes on the same SPK stay coherent through the store's
             // write-through cache (set_batch inserts the cache before the batch lands).
             let b = self.age_buckets_store.get(&due.script_public_key).unwrap();
+            if b.b_imm < due.amount || b.a_imm < due.amount as u128 * due.anchor as u128 {
+                warn!(
+                    "coin-age sweep: promotion underflows the immature bucket (b_imm {} < {} or a_imm {} < {}) — clamping; queue entry with no backing coin (ghost)",
+                    b.b_imm,
+                    due.amount,
+                    b.a_imm,
+                    due.amount as u128 * due.anchor as u128
+                );
+            }
             let next = AgeBuckets {
                 b_mat: b.b_mat.saturating_add(due.amount),
                 b_imm: b.b_imm.saturating_sub(due.amount),
@@ -1103,7 +1128,16 @@ impl VirtualStateProcessor {
             for (raw, e) in self.maturation_queue_store.due_range(pov_daa_score, watermark) {
                 if &e.script_public_key == spk {
                     let outpoint = DbMaturationQueueStore::outpoint_of(&raw);
-                    if view_diffs.iter().any(|d| d.add.contains_key(&outpoint)) {
+                    // Mirror of the write-path guard in `sweep_maturation_queue`: skip ONLY the
+                    // pure re-add (spent-after-maturing restore). A coin both re-added and
+                    // removed (re-anchored with a different `effective_daa`) MUST be demoted so
+                    // the content correction's remove folds on the demoted value — skipping it
+                    // here leaves it mature while the remove folds immature, shifting the
+                    // numerator by the coin's amount for any POV below the (node-local)
+                    // watermark: a cross-node divergence.
+                    if view_diffs.iter().any(|d| d.add.contains_key(&outpoint))
+                        && !view_diffs.iter().any(|d| d.remove.contains_key(&outpoint))
+                    {
                         continue;
                     }
                     mat -= e.amount as i128;
