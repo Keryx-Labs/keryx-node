@@ -93,7 +93,9 @@ impl ProtocolError {
     /// - a structurally invalid coinbase (missing/invalid OPoI tag),
     /// - a block failing difficulty validation or building on a known-invalid block
     ///   (the exact signature of the pre-relaunch branch),
-    /// - a chain that excludes the configured chain anchor (see `Params::chain_anchor`).
+    /// - a chain proven to exclude the configured chain anchor, i.e. a chain block shared with the
+    ///   peer that sits below the anchor daa (see `Params::chain_anchor`). An inconclusive anchor
+    ///   negotiation is an ambiguous ending and is deliberately not reported as `WrongChain`.
     ///
     /// Ambiguous endings (timeouts, closed connections) are deliberately NOT ban-worthy.
     pub fn is_ban_worthy(&self) -> bool {

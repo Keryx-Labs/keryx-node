@@ -171,7 +171,8 @@ impl IbdFlow {
         // from the negotiation invariant: the anchor is a block both sides know, so if it were in
         // the syncer's chain the highest shared chain block could not sit below its daa score.
         // Skipped while we don't know the anchor yet (fresh bootstrap) so IBD-from-scratch is
-        // never affected.
+        // never affected. Only a positive placement of the highest shared chain block below the
+        // anchor daa bans; an inconclusive negotiation refuses the syncer without banning.
         // The anchor block itself is eventually pruned (headers and statuses are dropped below
         // the pruning point), so its local status cannot witness the anchored chain forever.
         // Fallback witness: once our own pruning point sits at/above the anchor daa, we
@@ -188,15 +189,29 @@ impl IbdFlow {
         if let Some((anchor_hash, anchor_daa)) = self.ctx.config.chain_anchor
             && anchor_witnessed
         {
-            let syncer_chain_contains_anchor = match highest_known_syncer_chain_hash {
-                Some(hash) => consensus.async_get_header(hash).await?.daa_score >= anchor_daa,
-                None => false,
-            };
-            if !syncer_chain_contains_anchor {
-                return Err(ProtocolError::WrongChain(format!(
-                    "syncer chain (sink {}) does not contain the chain anchor {} (daa {})",
-                    syncer_virtual_selected_parent, anchor_hash, anchor_daa
-                )));
+            match highest_known_syncer_chain_hash {
+                // A shared chain block below the anchor daa is positive proof of divergence: the
+                // two chains split under the anchor, so the syncer is on an abandoned branch.
+                // Ban-worthy — abandoned-branch peers answer a plain disconnect with a reconnect.
+                Some(hash) => {
+                    if consensus.async_get_header(hash).await?.daa_score < anchor_daa {
+                        return Err(ProtocolError::WrongChain(format!(
+                            "syncer chain (sink {}) does not contain the chain anchor {} (daa {})",
+                            syncer_virtual_selected_parent, anchor_hash, anchor_daa
+                        )));
+                    }
+                }
+                // No shared chain block at all proves nothing about the syncer's chain — it is an
+                // ambiguous negotiation outcome, and negotiation is at its most fragile exactly
+                // when a healthy node returns from downtime and needs IBD. Refuse this syncer for
+                // now, but do NOT ban: a single unlucky negotiation must not cut an honest node
+                // off from the seed. See `ProtocolError::is_ban_worthy`.
+                None => {
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "no chain block in common with syncer (sink {}), cannot place the chain anchor {} (daa {})",
+                        syncer_virtual_selected_parent, anchor_hash, anchor_daa
+                    )));
+                }
             }
         }
 
