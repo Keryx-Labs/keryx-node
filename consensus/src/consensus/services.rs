@@ -105,6 +105,7 @@ impl ConsensusServices {
             params.difficulty_reset_activation,
             params.difficulty_reset_activation_h4,
             params.difficulty_reset_activation_h5,
+            params.difficulty_reset_activation_h5_3,
             params.h5_activation,
         );
         let depth_manager = BlockDepthManager::new(

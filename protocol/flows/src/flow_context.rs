@@ -746,7 +746,7 @@ impl FlowContext {
 /// NOTE: the comparison is a numeric (major, minor, patch) tuple — keep future version numbers
 /// monotonically increasing under that ordering (e.g. a hypothetical 1.4.41 must not be followed
 /// by a "1.4.5", which compares lower).
-const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 0);
+const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 1);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
@@ -808,8 +808,9 @@ impl ConnectionInitializer for FlowContext {
             return Err(ProtocolError::WrongNetwork(network_name, peer_version.network));
         }
 
-        // Handshake version gate (local peering policy): reject pre-H5.2 keryxd builds before
-        // registering any flow — they are on the abandoned branch and would only churn IBD noise.
+        // Handshake version gate (local peering policy): reject pre-relaunch keryxd builds before
+        // registering any flow — they cannot follow the post-H5.3 chain (the difficulty-reset window
+        // makes our blocks invalid to them) and would only churn IBD noise.
         if let Some((major, minor, patch)) = parse_keryxd_user_agent_version(&peer_version.user_agent)
             && (major, minor, patch) < MINIMUM_KERYXD_PEER_VERSION
         {

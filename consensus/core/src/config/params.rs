@@ -157,6 +157,24 @@ pub const H5_1_ACTIVATION_DAA: u64 = 59_027_921;
 /// mined with an earlier seed era fail body validation beyond it). MUST be mirrored miner-side.
 pub const H5_2_ACTIVATION_DAA: u64 = 59_170_000;
 
+/// H5.3 relaunch activation — the ONE gate of the 2026-07-30 relaunch, opening a difficulty-reset
+/// window (`difficulty_reset_activation_h5_3`). The score is the last one preceding the coin-age
+/// divergence incident: the relaunch base is a datadir capped here.
+///
+/// The reset window is what separates the two chains, in both directions and permanently.
+/// `calculate_difficulty_bits` returns `genesis_bits` unconditionally inside the window, and that
+/// is the value header validation compares the declared bits against — so an un-upgraded node
+/// rejects our blocks (it expects the inherited ~1.64 G), and we reject the abandoned branch's
+/// (they carry the inherited bits). The separation outlives the window because the abandoned
+/// branch STARTS at this gate: reaching it from the relaunched chain means traversing blocks that
+/// sit inside the window and are rejected, whatever weight that branch accumulates.
+///
+/// Deliberately NOT paired with a walk-seed salt rotation. A salt would add nothing to the
+/// separation above and would force every miner to update in lockstep; without one the relaunch is
+/// a node-only upgrade and existing rigs keep mining. Peers below the release version are refused
+/// at the handshake instead (`MINIMUM_KERYXD_PEER_VERSION`).
+pub const H5_3_ACTIVATION_DAA: u64 = 63_250_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -987,6 +1005,13 @@ pub struct Params {
     /// relaunch, so stock difficulty is far too high). `never()` while H5 is unscheduled.
     pub difficulty_reset_activation_h5: ForkActivation,
 
+    /// FOURTH difficulty-reset window, for the H5.3 relaunch. Same self-contained semantics and the
+    /// same reason for a dedicated field. Driven by `H5_3_ACTIVATION_DAA` — the difficulty at the
+    /// relaunch score is the pre-incident one (measured 1.64 G, calibrated for ~36 GH/s), so
+    /// without this window a chain restarting on partial hashrate would crawl until the DAA window
+    /// caught up. `never()` while H5.3 is unscheduled.
+    pub difficulty_reset_activation_h5_3: ForkActivation,
+
     /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
     /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
     /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
@@ -1234,6 +1259,7 @@ impl Params {
             difficulty_reset_activation: self.difficulty_reset_activation,
             difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
             difficulty_reset_activation_h5: self.difficulty_reset_activation_h5,
+            difficulty_reset_activation_h5_3: self.difficulty_reset_activation_h5_3,
             h5_activation: self.h5_activation,
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
@@ -1415,6 +1441,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // 59_009_036, plus f4ba3d20 at 59_009_012) stay pre-H5 and the very first re-mined block fires
     // the reset, same as H4.
     difficulty_reset_activation_h5: ForkActivation::new(H5_ACTIVATION_DAA),
+    difficulty_reset_activation_h5_3: ForkActivation::new(H5_3_ACTIVATION_DAA),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
@@ -1519,6 +1546,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // H5 reset ENABLED on testnet at the same gate as the H5 bundle, so the additive-reset path is
     // exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
     difficulty_reset_activation_h5: ForkActivation::new(3_000),
+    difficulty_reset_activation_h5_3: ForkActivation::new(5_000),
     // H5 bundle gate active early on testnet for validation.
     h5_activation: ForkActivation::new(3_000),
     // H5.1 mirrors the H5 testnet gate so both eras cross together in one E2E run.
@@ -1599,6 +1627,7 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
     difficulty_reset_activation_h5: ForkActivation::never(),
+    difficulty_reset_activation_h5_3: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
@@ -1668,6 +1697,7 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
     difficulty_reset_activation_h5: ForkActivation::never(),
+    difficulty_reset_activation_h5_3: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),

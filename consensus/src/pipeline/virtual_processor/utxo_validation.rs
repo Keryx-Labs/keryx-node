@@ -69,15 +69,16 @@ use std::{
 /// SKIPS the exact activation value and an equality-matched banner never prints. Logging only, so
 /// a process-global guard is fine: it has no bearing on consensus.
 static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H5_3_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Max DAA a block may sit past the H4 gate and still trigger the activation banner. The gate uses
 /// an at-or-after match (an exact-equality banner would be skipped at 10 BPS), which alone is true
-/// forever after the fork — so a node that boots already synced far beyond H4 re-prints the banner
+/// forever after the fork — so a node that boots already synced far beyond a gate re-prints its banner
 /// on every restart, its first validated chain block always being "at or after" the long-passed
 /// gate. Bounding to gate + this window keeps the print to the actual crossing (live, or during IBD
 /// where the first post-gate chain block sits a handful of DAA past the gate) and stays silent once
 /// the chain has moved on. ~1 day at 10 BPS — orders of magnitude above any crossing lag.
-const H4_BANNER_MAX_LAG: u64 = 864_000;
+const BANNER_MAX_LAG: u64 = 864_000;
 
 /// Pre-resolved production-window context of a single validated block (its selected parent
 /// `m_sp`), shared by every rewarded blue of that block — see [`VirtualStateProcessor::production_window_ctx`].
@@ -352,11 +353,11 @@ impl VirtualStateProcessor {
         // H4 hardfork (coin-age holder-reward v3): fire on the FIRST block at or after the gate,
         // not on an exact DAA match — a chain block's daa_score advances by its mergeset's DAA-added
         // count and routinely skips the exact activation value at 10 BPS. Bounded to a window past
-        // the gate (H4_BANNER_MAX_LAG) so a node booting already synced far beyond H4 no longer
+        // the gate (BANNER_MAX_LAG) so a node booting already synced far beyond H4 no longer
         // re-prints it on every restart. `compare_exchange` keeps it to one print per process (the
         // first post-gate block within the window, whether reached live or during IBD).
         if self.coin_age_activation.is_active(header.daa_score)
-            && header.daa_score < self.coin_age_activation.daa_score() + H4_BANNER_MAX_LAG
+            && header.daa_score < self.coin_age_activation.daa_score() + BANNER_MAX_LAG
             && COIN_AGE_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             // Header carries the GATE score (the fork's identity, always exact), not this block's —
@@ -369,6 +370,23 @@ impl VirtualStateProcessor {
             info!("  UTXO muhash   — per-coin effective_daa now committed in the multiset");
             info!("  Rotation      — moving a pot to a fresh address no longer buys the top bracket");
             info!("  Bracket table — floor 50% (was 40%), ramp to 100% now spans 90 days (was 30)");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // H5.3 relaunch banner. Same latching shape as H4 — fires on the first block at or AFTER
+        // the gate, never on strict equality: the DAA score is a cumulative count and routinely
+        // skips the exact activation value at 10 BPS, so an equality test would leave the banner
+        // silent and its absence would read as "the fork did not activate".
+        if self.difficulty_reset_activation_h5_3.is_active(header.daa_score)
+            && header.daa_score < self.difficulty_reset_activation_h5_3.daa_score() + BANNER_MAX_LAG
+            && H5_3_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H5.3 · DAA {} ════════════════", self.difficulty_reset_activation_h5_3.daa_score());
+            info!("  Relaunch      — chain restarted at the last score preceding the coin-age divergence incident");
+            info!("  Difficulty    — reset window open: blocks build at genesis bits until the DAA re-converges");
+            info!("  Separation    — the abandoned branch carries the inherited bits and is rejected from here on");
+            info!("  Miners        — unchanged: no walk-seed rotation, existing rigs keep mining");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
