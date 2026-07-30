@@ -212,28 +212,28 @@ impl DbHeadersStore {
 
 impl HeaderStoreReader for DbHeadersStore {
     fn get_daa_score(&self, hash: Hash) -> Result<u64, StoreError> {
-        if let Some(header_with_block_level) = self.headers_access.read_from_cache(hash) {
+        if let Some(header_with_block_level) = self.headers_access.read_from_cache(&hash) {
             return Ok(header_with_block_level.header.daa_score);
         }
         Ok(self.compact_headers_access.read(hash)?.daa_score)
     }
 
     fn get_blue_score(&self, hash: Hash) -> Result<u64, StoreError> {
-        if let Some(header_with_block_level) = self.headers_access.read_from_cache(hash) {
+        if let Some(header_with_block_level) = self.headers_access.read_from_cache(&hash) {
             return Ok(header_with_block_level.header.blue_score);
         }
         Ok(self.compact_headers_access.read(hash)?.blue_score)
     }
 
     fn get_timestamp(&self, hash: Hash) -> Result<u64, StoreError> {
-        if let Some(header_with_block_level) = self.headers_access.read_from_cache(hash) {
+        if let Some(header_with_block_level) = self.headers_access.read_from_cache(&hash) {
             return Ok(header_with_block_level.header.timestamp);
         }
         Ok(self.compact_headers_access.read(hash)?.timestamp)
     }
 
     fn get_bits(&self, hash: Hash) -> Result<u32, StoreError> {
-        if let Some(header_with_block_level) = self.headers_access.read_from_cache(hash) {
+        if let Some(header_with_block_level) = self.headers_access.read_from_cache(&hash) {
             return Ok(header_with_block_level.header.bits);
         }
         Ok(self.compact_headers_access.read(hash)?.bits)
@@ -251,7 +251,7 @@ impl HeaderStoreReader for DbHeadersStore {
     }
 
     fn get_compact_header_data(&self, hash: Hash) -> Result<CompactHeaderData, StoreError> {
-        if let Some(header_with_block_level) = self.headers_access.read_from_cache(hash) {
+        if let Some(header_with_block_level) = self.headers_access.read_from_cache(&hash) {
             return Ok(header_with_block_level.header.as_ref().into());
         }
         self.compact_headers_access.read(hash)

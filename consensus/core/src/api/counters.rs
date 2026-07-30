@@ -11,6 +11,18 @@ pub struct ProcessingCounters {
     pub chain_block_counts: AtomicU64,
     pub chain_disqualified_counts: AtomicU64,
     pub mass_counts: AtomicU64,
+    /// App-cache hits for the address-balance index (virtual-commit RMW path).
+    pub address_balance_cache_hits: AtomicU64,
+    /// App-cache misses for the address-balance index — each miss is a RocksDB point read.
+    pub address_balance_cache_misses: AtomicU64,
+    /// App-cache hits for the coin-age bucket index.
+    pub age_buckets_cache_hits: AtomicU64,
+    /// App-cache misses for the coin-age bucket index.
+    pub age_buckets_cache_misses: AtomicU64,
+    /// Hits on the windowed-production prefix SeekForPrev cache.
+    pub windowed_prefix_cache_hits: AtomicU64,
+    /// Misses that fall through to a RocksDB `SeekForPrev` on the production prefix index.
+    pub windowed_prefix_cache_misses: AtomicU64,
 }
 
 impl ProcessingCounters {
@@ -25,6 +37,12 @@ impl ProcessingCounters {
             chain_block_counts: self.chain_block_counts.load(Ordering::Relaxed),
             chain_disqualified_counts: self.chain_disqualified_counts.load(Ordering::Relaxed),
             mass_counts: self.mass_counts.load(Ordering::Relaxed),
+            address_balance_cache_hits: self.address_balance_cache_hits.load(Ordering::Relaxed),
+            address_balance_cache_misses: self.address_balance_cache_misses.load(Ordering::Relaxed),
+            age_buckets_cache_hits: self.age_buckets_cache_hits.load(Ordering::Relaxed),
+            age_buckets_cache_misses: self.age_buckets_cache_misses.load(Ordering::Relaxed),
+            windowed_prefix_cache_hits: self.windowed_prefix_cache_hits.load(Ordering::Relaxed),
+            windowed_prefix_cache_misses: self.windowed_prefix_cache_misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -40,6 +58,12 @@ pub struct ProcessingCountersSnapshot {
     pub chain_block_counts: u64,
     pub chain_disqualified_counts: u64,
     pub mass_counts: u64,
+    pub address_balance_cache_hits: u64,
+    pub address_balance_cache_misses: u64,
+    pub age_buckets_cache_hits: u64,
+    pub age_buckets_cache_misses: u64,
+    pub windowed_prefix_cache_hits: u64,
+    pub windowed_prefix_cache_misses: u64,
 }
 
 impl core::ops::Sub for &ProcessingCountersSnapshot {
@@ -56,6 +80,12 @@ impl core::ops::Sub for &ProcessingCountersSnapshot {
             chain_block_counts: self.chain_block_counts.saturating_sub(rhs.chain_block_counts),
             chain_disqualified_counts: self.chain_disqualified_counts.saturating_sub(rhs.chain_disqualified_counts),
             mass_counts: self.mass_counts.saturating_sub(rhs.mass_counts),
+            address_balance_cache_hits: self.address_balance_cache_hits.saturating_sub(rhs.address_balance_cache_hits),
+            address_balance_cache_misses: self.address_balance_cache_misses.saturating_sub(rhs.address_balance_cache_misses),
+            age_buckets_cache_hits: self.age_buckets_cache_hits.saturating_sub(rhs.age_buckets_cache_hits),
+            age_buckets_cache_misses: self.age_buckets_cache_misses.saturating_sub(rhs.age_buckets_cache_misses),
+            windowed_prefix_cache_hits: self.windowed_prefix_cache_hits.saturating_sub(rhs.windowed_prefix_cache_hits),
+            windowed_prefix_cache_misses: self.windowed_prefix_cache_misses.saturating_sub(rhs.windowed_prefix_cache_misses),
         }
     }
 }

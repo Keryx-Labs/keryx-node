@@ -140,6 +140,16 @@ impl AddressAmountStoreReader for DbAddressAmountStore {
     }
 }
 
+impl DbAddressAmountStore {
+    /// Batch-read aggregates for `script_public_keys`. Absent keys yield `0`. Returns
+    /// `(values, cache_hits, cache_misses)` so the virtual processor can feed ProcessingCounters.
+    pub fn get_many(&self, script_public_keys: &[ScriptPublicKey]) -> Result<(Vec<u64>, u64, u64), StoreError> {
+        let keys: Vec<ScriptPublicKeyBucket> = script_public_keys.iter().map(ScriptPublicKeyBucket::from).collect();
+        let (raw, hits, misses) = self.access.read_many(&keys)?;
+        Ok((raw.into_iter().map(|v| v.unwrap_or(0)).collect(), hits, misses))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

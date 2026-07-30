@@ -62,6 +62,22 @@ impl ConsensusMonitor {
                 if delta.body_counts != 0 { delta.mass_counts as f64 / delta.body_counts as f64 } else { 0f64 },
             );
 
+            // The production-prefix store has no read cache (its counters stay 0) — reporting it
+            // would read as a cache with a 0% hit rate rather than as an absent one.
+            let index_reads = delta.address_balance_cache_hits
+                + delta.address_balance_cache_misses
+                + delta.age_buckets_cache_hits
+                + delta.age_buckets_cache_misses;
+            if index_reads > 0 {
+                info!(
+                    "Virtual-index cache: balance {}/{} hits/misses; age {}/{}",
+                    delta.address_balance_cache_hits,
+                    delta.address_balance_cache_misses,
+                    delta.age_buckets_cache_hits,
+                    delta.age_buckets_cache_misses,
+                );
+            }
+
             if delta.chain_disqualified_counts > 0 {
                 warn!(
                     "Consensus detected UTXO-invalid blocks which are disqualified from the virtual selected chain (possibly due to inheritance): {} disqualified vs. {} valid chain blocks",

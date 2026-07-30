@@ -128,6 +128,16 @@ impl ConsensusStorage {
         let utxo_diffs_budget = scaled(40_000_000);
         let block_window_budget = scaled(200_000_000); // x 2 for difficulty and median time
         let acceptance_data_budget = scaled(40_000_000);
+        // PoM proofs are ~228 KB each (K=256 walk steps, each with a Merkle path). A count-based
+        // policy of 10_000 items — what this store used to share with the header-data caches —
+        // reaches ~2.3 GB and, since item counts are not scaled, ignores `--ram-scale` entirely.
+        let pom_proof_budget = scaled(64_000_000);
+        // Ratio-reward / coin-age indexes are SPK-keyed over a UTXO-scale keyspace. The old
+        // Count(10_000) shared with the UTXO set cache had near-zero hit rate; every virtual-commit
+        // RMW then paid a random HDD read (~9 ms). Budget by bytes so `--ram-scale` actually grows
+        // the hot set. ~80 B/entry ≈ SPK key + u64/AgeBuckets + IndexMap overhead.
+        let address_index_budget = scaled(128_000_000);
+        let address_index_unit_bytes = 80;
 
         // Unit sizes in bytes
         let daa_excluded_bytes = size_of::<Hash>() + size_of::<BlockHashSet>(); // Expected empty sets
@@ -189,9 +199,16 @@ impl ConsensusStorage {
         let block_data_builder = PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked();
         let header_data_builder = PolicyBuilder::new().max_items(perf_params.header_data_cache_size).untracked();
         let utxo_set_builder = PolicyBuilder::new().max_items(perf_params.utxo_set_cache_size).untracked();
+        let address_index_builder = PolicyBuilder::new()
+            .bytes_budget(address_index_budget)
+            .unit_bytes(address_index_unit_bytes)
+            .min_items(1024)
+            .untracked();
         let transactions_builder = PolicyBuilder::new().bytes_budget(transactions_budget).tracked_bytes();
         let acceptance_data_builder = PolicyBuilder::new().bytes_budget(acceptance_data_budget).tracked_bytes();
         let past_pruning_points_builder = PolicyBuilder::new().max_items(1024).untracked();
+        // Tracked by bytes (`PomProof::estimate_mem_bytes`), never by count — see `pom_proof_budget`.
+        let pom_proof_builder = PolicyBuilder::new().bytes_budget(pom_proof_budget).min_items(16).tracked_bytes();
 
         // TODO: consider tracking UtxoDiff byte sizes more accurately including the exact size of ScriptPublicKey
 
@@ -224,7 +241,7 @@ impl ConsensusStorage {
         ));
         let daa_excluded_store = Arc::new(DbDaaStore::new(db.clone(), daa_excluded_builder.build()));
         let pom_tier_store = Arc::new(DbPomTierStore::new(db.clone(), header_data_builder.build()));
-        let pom_proof_store = Arc::new(DbPomProofStore::new(db.clone(), header_data_builder.build()));
+        let pom_proof_store = Arc::new(DbPomProofStore::new(db.clone(), pom_proof_builder.build()));
         let headers_store = Arc::new(DbHeadersStore::new(db.clone(), headers_builder.build(), headers_compact_builder.build()));
         let depth_store = Arc::new(DbDepthStore::new(db.clone(), header_data_builder.build()));
         let selected_chain_store = Arc::new(RwLock::new(DbSelectedChainStore::new(db.clone(), header_data_builder.build())));
@@ -240,12 +257,12 @@ impl ConsensusStorage {
         let utxo_multisets_store = Arc::new(DbUtxoMultisetsStore::new(db.clone(), block_data_builder.build()));
         let acceptance_data_store = Arc::new(DbAcceptanceDataStore::new(db.clone(), acceptance_data_builder.build()));
 
-        // Ratio-reward indexes (Stage 2): balance keyspace is ~all addresses (utxo-set scale),
-        // windowed production is small (only recently-active miners) but shares the same shape.
+        // Ratio-reward indexes (Stage 2): balance keyspace is ~all addresses (utxo-set scale).
+        // Dedicated byte-budget cache (honours `--ram-scale`) — not the tiny Count(10k) UTXO policy.
         let address_balance_store =
-            Arc::new(DbAddressAmountStore::new(db.clone(), utxo_set_builder.build(), DatabaseStorePrefixes::AddressBalance.into()));
+            Arc::new(DbAddressAmountStore::new(db.clone(), address_index_builder.build(), DatabaseStorePrefixes::AddressBalance.into()));
         // Coin-age (v3) bucket aggregates: same keyspace scale and cache class as the balance index.
-        let age_buckets_store = Arc::new(DbAgeBucketsStore::new(db.clone(), utxo_set_builder.build()));
+        let age_buckets_store = Arc::new(DbAgeBucketsStore::new(db.clone(), address_index_builder.build()));
         let maturation_queue_store = Arc::new(DbMaturationQueueStore::new(db.clone()));
         let windowed_production_prefix_store = Arc::new(DbWindowedProductionPrefixStore::new(db.clone()));
 

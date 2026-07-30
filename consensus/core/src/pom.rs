@@ -504,19 +504,57 @@ pub fn verify_pom_proof<Hf: Fn(u64) -> [u8; 32]>(
         return Err(PomVerifyError::BadFinalTracePath);
     }
     let chs = fs_challenges(pre_pow_hash, nonce, &proof.trace_root, &proof.pow_value, t, k);
-    for (op, &i) in proof.openings.iter().zip(chs.iter()) {
-        let i = i as u64;
-        if !verify_merkle(trace_leaf(op.state_before), i, &op.trace_path_before, &proof.trace_root) {
-            return Err(PomVerifyError::BadStateBeforePath);
+    // Each opening's three Merkle checks (+ transition) are independent of the others.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        let bad = proof.openings.par_iter().zip(chs.par_iter()).any(|(op, &i)| {
+            let i = i as u64;
+            if !verify_merkle(trace_leaf(op.state_before), i, &op.trace_path_before, &proof.trace_root) {
+                return true;
+            }
+            let off = op.state_before % n_chunks;
+            if !verify_merkle(blake(&op.chunk), off, &op.weight_path, r_t) {
+                return true;
+            }
+            let state_after = transition_v1(op.state_before, &chunk_to_words(&op.chunk));
+            !verify_merkle(trace_leaf(state_after), i + 1, &op.trace_path_after, &proof.trace_root)
+        });
+        if bad {
+            // Distinguish error kinds with a sequential re-check so callers still see the precise
+            // variant (parallel path only answers "any bad").
+            for (op, &i) in proof.openings.iter().zip(chs.iter()) {
+                let i = i as u64;
+                if !verify_merkle(trace_leaf(op.state_before), i, &op.trace_path_before, &proof.trace_root) {
+                    return Err(PomVerifyError::BadStateBeforePath);
+                }
+                let off = op.state_before % n_chunks;
+                if !verify_merkle(blake(&op.chunk), off, &op.weight_path, r_t) {
+                    return Err(PomVerifyError::BadWeightPath);
+                }
+                let state_after = transition_v1(op.state_before, &chunk_to_words(&op.chunk));
+                if !verify_merkle(trace_leaf(state_after), i + 1, &op.trace_path_after, &proof.trace_root) {
+                    return Err(PomVerifyError::BadStateAfterPath);
+                }
+            }
         }
-        let off = op.state_before % n_chunks;
-        if !verify_merkle(blake(&op.chunk), off, &op.weight_path, r_t) {
-            return Err(PomVerifyError::BadWeightPath);
-        }
-        // Pre-H4 spot-check path — only ever runs for pre-H4 (hence pre-H5) blocks, always walk v1.
-        let state_after = transition_v1(op.state_before, &chunk_to_words(&op.chunk));
-        if !verify_merkle(trace_leaf(state_after), i + 1, &op.trace_path_after, &proof.trace_root) {
-            return Err(PomVerifyError::BadStateAfterPath);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (op, &i) in proof.openings.iter().zip(chs.iter()) {
+            let i = i as u64;
+            if !verify_merkle(trace_leaf(op.state_before), i, &op.trace_path_before, &proof.trace_root) {
+                return Err(PomVerifyError::BadStateBeforePath);
+            }
+            let off = op.state_before % n_chunks;
+            if !verify_merkle(blake(&op.chunk), off, &op.weight_path, r_t) {
+                return Err(PomVerifyError::BadWeightPath);
+            }
+            // Pre-H4 spot-check path — only ever runs for pre-H4 (hence pre-H5) blocks, always walk v1.
+            let state_after = transition_v1(op.state_before, &chunk_to_words(&op.chunk));
+            if !verify_merkle(trace_leaf(state_after), i + 1, &op.trace_path_after, &proof.trace_root) {
+                return Err(PomVerifyError::BadStateAfterPath);
+            }
         }
     }
     Ok(())
@@ -557,13 +595,29 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
     // H5 era selection: `walk_v2` (from `h5_activation` on the block's daa_score) picks the
     // non-foldable mix64-chained transition; pre-H5 blocks re-walk with the frozen v1 fold.
     let transition = if walk_v2 { transition_v2 } else { transition_v1 };
+    // Walk transitions are sequential (each chunk index depends on prior state), but the Merkle
+    // inclusion checks are independent once `(leaf, index, path)` are known — parallelise them.
     let mut state = seed;
+    let mut checks: Vec<([u8; 32], u64, &[[u8; 32]])> = Vec::with_capacity(steps.len());
     for step in steps.iter() {
         let off = state % n_chunks;
-        if !verify_merkle(blake(&step.chunk), off, &step.weight_path, r_t) {
+        checks.push((blake(&step.chunk), off, step.weight_path.as_slice()));
+        state = transition(state, &chunk_to_words(&step.chunk));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        if checks.par_iter().any(|(leaf, off, path)| !verify_merkle(*leaf, *off, path, r_t)) {
             return Err(PomVerifyError::BadWeightPath);
         }
-        state = transition(state, &chunk_to_words(&step.chunk));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (leaf, off, path) in &checks {
+            if !verify_merkle(*leaf, *off, path, r_t) {
+                return Err(PomVerifyError::BadWeightPath);
+            }
+        }
     }
     if state != proof.final_state {
         return Err(PomVerifyError::FinalStateMismatch);

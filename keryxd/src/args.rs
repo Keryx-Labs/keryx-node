@@ -97,6 +97,7 @@ pub struct Args {
     pub rocksdb_preset: Option<String>,
     pub rocksdb_wal_dir: Option<String>,
     pub rocksdb_cache_size: Option<usize>,
+    pub rocksdb_rate_limit_mb: Option<usize>,
 }
 
 impl Default for Args {
@@ -152,6 +153,7 @@ impl Default for Args {
             rocksdb_preset: None,
             rocksdb_wal_dir: None,
             rocksdb_cache_size: None,
+            rocksdb_rate_limit_mb: None,
         }
     }
 }
@@ -424,8 +426,9 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
                 .env("KERYXD_ROCKSDB_PRESET")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(String))
-                .help("RocksDB configuration preset: 'default' (SSD/NVMe) or 'hdd' (optimized for hard disk drives with BlobDB, compression, rate limiting). \
-                       HDD preset recommended for archival nodes on HDD storage (see docs/archival.md).")
+                .help("RocksDB configuration preset: 'default' (SSD/NVMe), 'hdd' (spinning disk with BlobDB, compression, autotuned rate limiting), \
+                       or 'hdd-qd1' (USB BOT / no-NCQ — single compaction thread). HDD presets recommended for archival nodes on HDD storage \
+                       (see docs/storage-performance.md).")
         )
         .arg(
             Arg::new("rocksdb-wal-dir")
@@ -442,8 +445,19 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
                 .env("KERYXD_ROCKSDB_CACHE_SIZE")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(usize))
-                .help("RocksDB block cache size in MB. Default: 256MB for HDD preset (scales with --ram-scale). \
-                       Increase for public RPC nodes with heavy query loads. Example: --rocksdb-cache-size=2048 for 2GB cache.")
+                .help("RocksDB block cache size in MB, shared by all databases the node opens. Default: 256MB \
+                       (scales with --ram-scale). Increase for public RPC nodes with heavy query loads. \
+                       Example: --rocksdb-cache-size=2048 for 2GB cache.")
+        )
+        .arg(
+            Arg::new("rocksdb-rate-limit-mb")
+                .long("rocksdb-rate-limit-mb")
+                .env("KERYXD_ROCKSDB_RATE_LIMIT_MB")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(usize))
+                .help("RocksDB background write rate limit in MB/s (HDD / hdd-qd1 presets only). Default: 48. Lower it if the \
+                       disk is shared with other workloads; raise it if compaction cannot keep up (write stalls). \
+                       See docs/storage-performance.md.")
         )
         ;
 
@@ -536,6 +550,7 @@ impl Args {
             rocksdb_preset: m.get_one::<String>("rocksdb-preset").cloned().or(defaults.rocksdb_preset),
             rocksdb_wal_dir: m.get_one::<String>("rocksdb-wal-dir").cloned().or(defaults.rocksdb_wal_dir),
             rocksdb_cache_size: m.get_one::<usize>("rocksdb-cache-size").cloned().or(defaults.rocksdb_cache_size),
+            rocksdb_rate_limit_mb: m.get_one::<usize>("rocksdb-rate-limit-mb").cloned().or(defaults.rocksdb_rate_limit_mb),
         };
 
         if arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", false) {

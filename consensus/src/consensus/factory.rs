@@ -9,8 +9,8 @@ use keryx_consensusmanager::{ConsensusFactory, ConsensusInstance, DynConsensusCt
 use keryx_core::{debug, time::unix_now, warn};
 use keryx_database::{
     prelude::{
-        BatchDbWriter, CachePolicy, CachedDbAccess, CachedDbItem, DB, DirectDbWriter, RocksDbPreset, StoreError, StoreResult,
-        StoreResultExt,
+        BatchDbWriter, CachePolicy, CachedDbAccess, CachedDbItem, DB, DirectDbWriter, RocksDbPreset, RocksDbResources, StoreError,
+        StoreResult, StoreResultExt,
     },
     registry::DatabaseStorePrefixes,
 };
@@ -258,7 +258,7 @@ pub struct Factory {
     mining_rules: Arc<MiningRules>,
     rocksdb_preset: RocksDbPreset,
     wal_dir: Option<PathBuf>,
-    cache_budget: Option<usize>,
+    resources: Option<RocksDbResources>,
 }
 
 impl Factory {
@@ -275,7 +275,7 @@ impl Factory {
         mining_rules: Arc<MiningRules>,
         rocksdb_preset: RocksDbPreset,
         wal_dir: Option<PathBuf>,
-        cache_budget: Option<usize>,
+        resources: Option<RocksDbResources>,
     ) -> Self {
         assert!(fd_budget > 0, "fd_budget has to be positive");
         let mut config = config.clone();
@@ -296,7 +296,7 @@ impl Factory {
             mining_rules,
             rocksdb_preset,
             wal_dir,
-            cache_budget,
+            resources,
         };
         factory.delete_inactive_consensus_entries();
         factory
@@ -329,7 +329,7 @@ impl ConsensusFactory for Factory {
             .with_files_limit(self.fd_budget / 2) // active and staging consensuses should have equal budgets
             .with_preset(self.rocksdb_preset)
             .with_wal_dir(self.wal_dir.clone())
-            .with_cache_budget(self.cache_budget)
+            .with_resources(self.resources.clone())
             .build()
             .unwrap();
 
@@ -367,7 +367,7 @@ impl ConsensusFactory for Factory {
             .with_files_limit(self.fd_budget / 2) // active and staging consensuses should have equal budgets
             .with_preset(self.rocksdb_preset)
             .with_wal_dir(self.wal_dir.clone())
-            .with_cache_budget(self.cache_budget)
+            .with_resources(self.resources.clone())
             .build()
             .unwrap();
 

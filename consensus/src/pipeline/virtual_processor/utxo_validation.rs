@@ -941,12 +941,18 @@ impl VirtualStateProcessor {
         for entry in diff.remove.values() {
             *deltas.entry(entry.script_public_key.clone()).or_default() -= entry.amount as i128;
         }
-        for (spk, delta) in deltas {
-            if delta == 0 {
-                continue;
-            }
-            let new_balance = (self.address_balance_store.get(&spk).unwrap() as i128 + delta).max(0) as u64;
-            self.address_balance_store.set_batch(batch, &spk, new_balance).unwrap();
+        deltas.retain(|_, d| *d != 0);
+        if deltas.is_empty() {
+            return;
+        }
+        let spks: Vec<ScriptPublicKey> = deltas.keys().cloned().collect();
+        let (balances, hits, misses) = self.address_balance_store.get_many(&spks).unwrap();
+        self.counters.address_balance_cache_hits.fetch_add(hits, std::sync::atomic::Ordering::Relaxed);
+        self.counters.address_balance_cache_misses.fetch_add(misses, std::sync::atomic::Ordering::Relaxed);
+        for (spk, balance) in spks.iter().zip(balances) {
+            let delta = deltas[spk];
+            let new_balance = (balance as i128 + delta).max(0) as u64;
+            self.address_balance_store.set_batch(batch, spk, new_balance).unwrap();
         }
     }
 
@@ -997,11 +1003,16 @@ impl VirtualStateProcessor {
                 self.maturation_queue_store.delete_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint).unwrap();
             }
         }
-        for (spk, (dm, div, dia)) in deltas {
-            if (dm, div, dia) == (0, 0, 0) {
-                continue;
-            }
-            let b = self.age_buckets_store.get(&spk).unwrap();
+        deltas.retain(|_, d| *d != (0, 0, 0));
+        if deltas.is_empty() {
+            return;
+        }
+        let spks: Vec<ScriptPublicKey> = deltas.keys().cloned().collect();
+        let (buckets, hits, misses) = self.age_buckets_store.get_many(&spks).unwrap();
+        self.counters.age_buckets_cache_hits.fetch_add(hits, std::sync::atomic::Ordering::Relaxed);
+        self.counters.age_buckets_cache_misses.fetch_add(misses, std::sync::atomic::Ordering::Relaxed);
+        for (spk, b) in spks.iter().zip(buckets) {
+            let (dm, div, dia) = deltas[spk];
             let (nm, ni, na) = (b.b_mat as i128 + dm, b.b_imm as i128 + div, b.a_imm as i128 + dia);
             if nm < 0 || ni < 0 || na < 0 {
                 warn!(
@@ -1010,7 +1021,7 @@ impl VirtualStateProcessor {
                 );
             }
             let next = AgeBuckets { b_mat: nm.max(0) as u64, b_imm: ni.max(0) as u64, a_imm: na.max(0) as u128 };
-            self.age_buckets_store.set_batch(batch, &spk, next).unwrap();
+            self.age_buckets_store.set_batch(batch, spk, next).unwrap();
         }
     }
 
