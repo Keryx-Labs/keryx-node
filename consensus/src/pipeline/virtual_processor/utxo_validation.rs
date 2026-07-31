@@ -70,6 +70,7 @@ use std::{
 /// a process-global guard is fine: it has no bearing on consensus.
 static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_3_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H5_4_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Max DAA a block may sit past the H4 gate and still trigger the activation banner. The gate uses
 /// an at-or-after match (an exact-equality banner would be skipped at 10 BPS), which alone is true
@@ -386,6 +387,22 @@ impl VirtualStateProcessor {
             info!("  Relaunch      — chain restarted at the last score preceding the coin-age divergence incident");
             info!("  Difficulty    — reset window open: blocks build at genesis bits until the DAA re-converges");
             info!("  Separation    — the abandoned branch carries the inherited bits and is rejected from here on");
+            info!("  Miners        — unchanged: no walk-seed rotation, existing rigs keep mining");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // H5.4 relaunch banner. Same latching shape as H4/H5.3 — fires on the first block at or
+        // AFTER the gate, never on strict equality (the DAA score routinely skips the exact
+        // activation value at 10 BPS).
+        if self.difficulty_reset_activation_h5_4.is_active(header.daa_score)
+            && header.daa_score < self.difficulty_reset_activation_h5_4.daa_score() + BANNER_MAX_LAG
+            && H5_4_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H5.4 · DAA {} ════════════════", self.difficulty_reset_activation_h5_4.daa_score());
+            info!("  Relaunch      — chain restarted from the pre-incident base after the PoM proof-transport wedge");
+            info!("  Difficulty    — reset window open: blocks build at genesis bits until the DAA re-converges");
+            info!("  Separation    — un-upgraded nodes expect the inherited (decayed) bits and are cut off from here on");
             info!("  Miners        — unchanged: no walk-seed rotation, existing rigs keep mining");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");

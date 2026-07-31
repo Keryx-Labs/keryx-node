@@ -240,6 +240,7 @@ pub struct VirtualStateProcessor {
     // numerator switches to the per-coin-capped effective balance. Dormant (`never()`) until H4.
     pub(super) coin_age_activation: ForkActivation,
     pub(super) difficulty_reset_activation_h5_3: ForkActivation,
+    pub(super) difficulty_reset_activation_h5_4: ForkActivation,
     // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
     pub(super) coin_age_maturity_w: u64,
     // Retention horizon (DAA score) for PROMOTED maturation-queue entries, enabling read-path
@@ -375,6 +376,7 @@ impl VirtualStateProcessor {
             ratio_reward_window_daa: params.ratio_reward_window_daa,
             coin_age_activation: params.coin_age_activation,
             difficulty_reset_activation_h5_3: params.difficulty_reset_activation_h5_3,
+            difficulty_reset_activation_h5_4: params.difficulty_reset_activation_h5_4,
             coin_age_maturity_w: params.coin_age_maturity_w,
             coin_age_retention: params.finality_depth(),
             is_archival,

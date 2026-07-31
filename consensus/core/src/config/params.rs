@@ -175,6 +175,27 @@ pub const H5_2_ACTIVATION_DAA: u64 = 59_170_000;
 /// at the handshake instead (`MINIMUM_KERYXD_PEER_VERSION`).
 pub const H5_3_ACTIVATION_DAA: u64 = 63_250_000;
 
+/// H5.4 activation — second gate of the 2026-07-31 relaunch, opening a FIFTH difficulty-reset
+/// window (`difficulty_reset_activation_h5_4`). The H5.3 relaunch degenerated within hours (PoM
+/// proof-transport wedge: IBD-served blocks travelled naked, fragmenting the network); the v1.4.2
+/// relaunch restarted from the pre-incident snapshot (tip DAA 63_267_836), but by then the DAA on
+/// the private relaunch chain had decayed to ~52 — each new block weighed ~1/1000th of a
+/// reset-window block, leaving the abandoned v1.4.1 branch a live weight race. Re-opening the
+/// reset window pins blocks back at genesis bits (65_536), settling the cumulative-weight race in
+/// minutes instead of days.
+///
+/// Same separation semantics as H5.3: un-upgraded nodes expect the inherited (decayed) bits and
+/// reject post-gate blocks, while the abandoned branch never contains the gate. Paired with a
+/// chain-anchor re-pin (`CHAIN_ANCHOR_HASH`) rather than a walk-seed salt rotation — node-only
+/// upgrade, existing rigs keep mining.
+///
+/// Same gate placement as H5/H5.3: the score equals the virtual_daa_score the chain is frozen at
+/// before the restart — the daa_score every newly-mined block will carry (a template inherits the
+/// virtual's daa, NOT virtual+1) — so every stored block stays pre-H5.4 and the very first
+/// re-mined block fires the reset. The chain MUST NOT advance past this score on the old binary:
+/// blocks above it carrying the inherited (decayed) bits are rejected by upgraded nodes.
+pub const H5_4_ACTIVATION_DAA: u64 = 63_280_622;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -183,17 +204,20 @@ pub const H5_3_ACTIVATION_DAA: u64 = 63_250_000;
 /// DAG knows the block — or, after the anchor gets pruned, once the local pruning point sits
 /// at/above the anchor daa (only the anchored chain validates past the H5.2 gate, so a
 /// post-anchor pruning point witnesses it). Fresh-bootstrap nodes are never affected.
-/// Selected-chain block d5f19559ff7cc7c482e5ae6c06d5c3d5f7988daf815b17dd41e93974fa09696f,
-/// pinned 2026-07-30 on the H5.3 relaunch chain. It MUST sit above `H5_3_ACTIVATION_DAA`: the
-/// branch abandoned at the relaunch shares every block below that score, so only a post-gate block
-/// discriminates. Re-pin it whenever the relaunch base is rebuilt — an anchor absent from the local
-/// DAG leaves `anchor_witnessed` false, which disarms the check silently rather than breaking it.
-/// (Previous anchor: 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce, daa
-/// 59_192_679, pinned 2026-07-25 for the H5.2 relaunch.)
-pub const CHAIN_ANCHOR_DAA: u64 = 63_257_773;
+/// Selected-chain block bb184bbc384e45ea2c0113bb51dcf95226eaadca89387760a60f5299023cc4f4,
+/// pinned 2026-07-31 on the H5.4 (v1.4.2) relaunch chain. It MUST sit above the score where the
+/// abandoned branch diverged (the v1.4.2 relaunch snapshot tip, DAA 63_267_836): both branches
+/// share every block below that score, so only a block above it discriminates. Re-pin it whenever
+/// the relaunch base is rebuilt — an anchor absent from the local DAG leaves `anchor_witnessed`
+/// false, which disarms the check silently rather than breaking it.
+/// (Previous anchors: d5f19559ff7cc7c482e5ae6c06d5c3d5f7988daf815b17dd41e93974fa09696f, daa
+/// 63_257_773, pinned 2026-07-30 for the H5.3 relaunch;
+/// 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce, daa 59_192_679, pinned
+/// 2026-07-25 for the H5.2 relaunch.)
+pub const CHAIN_ANCHOR_DAA: u64 = 63_277_286;
 pub const CHAIN_ANCHOR_HASH: Hash = Hash::from_bytes([
-    0xd5, 0xf1, 0x95, 0x59, 0xff, 0x7c, 0xc7, 0xc4, 0x82, 0xe5, 0xae, 0x6c, 0x06, 0xd5, 0xc3, 0xd5,
-    0xf7, 0x98, 0x8d, 0xaf, 0x81, 0x5b, 0x17, 0xdd, 0x41, 0xe9, 0x39, 0x74, 0xfa, 0x09, 0x69, 0x6f,
+    0xbb, 0x18, 0x4b, 0xbc, 0x38, 0x4e, 0x45, 0xea, 0x2c, 0x01, 0x13, 0xbb, 0x51, 0xdc, 0xf9, 0x52,
+    0x26, 0xea, 0xad, 0xca, 0x89, 0x38, 0x77, 0x60, 0xa6, 0x0f, 0x52, 0x99, 0x02, 0x3c, 0xc4, 0xf4,
 ]);
 
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
@@ -1034,6 +1058,12 @@ pub struct Params {
     /// caught up. `never()` while H5.3 is unscheduled.
     pub difficulty_reset_activation_h5_3: ForkActivation,
 
+    /// FIFTH difficulty-reset window, for the H5.4 (v1.4.2) relaunch. Same self-contained
+    /// semantics and the same reason for a dedicated field. Driven by `H5_4_ACTIVATION_DAA` — the
+    /// DAA on the relaunch chain had decayed to ~52 before the gate, leaving the abandoned branch
+    /// a live cumulative-weight race. `never()` while H5.4 is unscheduled.
+    pub difficulty_reset_activation_h5_4: ForkActivation,
+
     /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
     /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
     /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
@@ -1282,6 +1312,7 @@ impl Params {
             difficulty_reset_activation_h4: self.difficulty_reset_activation_h4,
             difficulty_reset_activation_h5: self.difficulty_reset_activation_h5,
             difficulty_reset_activation_h5_3: self.difficulty_reset_activation_h5_3,
+            difficulty_reset_activation_h5_4: self.difficulty_reset_activation_h5_4,
             h5_activation: self.h5_activation,
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
@@ -1464,6 +1495,9 @@ pub const MAINNET_PARAMS: Params = Params {
     // the reset, same as H4.
     difficulty_reset_activation_h5: ForkActivation::new(H5_ACTIVATION_DAA),
     difficulty_reset_activation_h5_3: ForkActivation::new(H5_3_ACTIVATION_DAA),
+    // H5.4 relaunch difficulty reset — additive, gate = the frozen virtual daa of the v1.4.2
+    // relaunch chain (see H5_4_ACTIVATION_DAA for the placement rule).
+    difficulty_reset_activation_h5_4: ForkActivation::new(H5_4_ACTIVATION_DAA),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
@@ -1569,6 +1603,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
     difficulty_reset_activation_h5: ForkActivation::new(3_000),
     difficulty_reset_activation_h5_3: ForkActivation::new(5_000),
+    // H5.4 reset ENABLED on testnet, on its own window past the H5.3 one.
+    difficulty_reset_activation_h5_4: ForkActivation::new(6_000),
     // H5 bundle gate active early on testnet for validation.
     h5_activation: ForkActivation::new(3_000),
     // H5.1 mirrors the H5 testnet gate so both eras cross together in one E2E run.
@@ -1650,6 +1686,7 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation_h4: ForkActivation::never(),
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
+    difficulty_reset_activation_h5_4: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
@@ -1720,6 +1757,7 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation_h4: ForkActivation::never(),
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
+    difficulty_reset_activation_h5_4: ForkActivation::never(),
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
