@@ -195,7 +195,7 @@ impl BlockBodyProcessor {
         Ok(true)
     }
 
-    fn check_pom_proof(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+    pub(super) fn check_pom_proof(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let header = &block.header;
         // PoM *is* the proof-of-work under `pom_activation`; skipping PoW (simnet / tests) skips
         // its verification too, exactly like the legacy kHeavyHash check. The block's declared

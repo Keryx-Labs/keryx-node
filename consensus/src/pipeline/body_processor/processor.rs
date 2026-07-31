@@ -258,7 +258,27 @@ impl BlockBodyProcessor {
         // for the tier-reward coinbase split read by the virtual processor. The in-memory
         // `block.pom_proof` is dropped once a block is reloaded from storage, so both must be
         // captured here while it is still attached to the block.
-        let pom_proof = block.pom_proof.clone();
+        //
+        // The IBD path skips `check_pom_proof` at validation (`skip_pom_proof`), but a carried
+        // proof would still be persisted here and re-served later. Never persist an UNVERIFIED
+        // proof — a malicious syncer could feed a bogus one that proof-enforcing relay peers would
+        // then reject from US. Verify it now; on failure persist the block naked (the tier still
+        // travels separately) and let the re-proof loop fetch a valid proof from another peer.
+        let pom_proof = if skip_pom_proof && block.pom_proof.is_some() {
+            match self.check_pom_proof(block) {
+                Ok(()) => block.pom_proof.clone(),
+                Err(e) => {
+                    keryx_core::warn!(
+                        "IBD-carried PoM proof of {} failed verification ({}) — persisting the block without it",
+                        block.hash(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            block.pom_proof.clone()
+        };
         self.commit_body(block.hash(), block.header.direct_parents(), block.transactions.clone(), pom_proof, block.pom_tier);
 
         // Send a BlockAdded notification
