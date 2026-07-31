@@ -12,6 +12,7 @@ use keryx_consensus_core::{
     errors::consensus::ConsensusResult,
     header::Header,
     mass::{ContextualMasses, NonContextualMasses},
+    pom::PomProof,
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, TransactionQueryResult, TransactionType, UtxoEntry},
@@ -386,6 +387,10 @@ impl ConsensusSessionOwned {
 
     pub async fn async_get_block(&self, hash: Hash) -> ConsensusResult<Block> {
         self.clone().spawn_blocking(move |c| c.get_block(hash)).await
+    }
+
+    pub async fn async_adopt_pom_proof(&self, hash: Hash, proof: PomProof) -> ConsensusResult<bool> {
+        self.clone().spawn_blocking(move |c| c.adopt_pom_proof(hash, proof)).await
     }
 
     pub async fn async_get_block_body(&self, hash: Hash) -> ConsensusResult<Arc<Vec<Transaction>>> {

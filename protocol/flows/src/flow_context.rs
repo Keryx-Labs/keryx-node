@@ -40,7 +40,7 @@ use keryx_p2p_mining::rule_engine::MiningRuleEngine;
 use keryx_utils::iter::IterExtensions;
 use keryx_utils::networking::PeerId;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::time::Instant;
 use std::{collections::hash_map::Entry, fmt::Display};
@@ -235,6 +235,11 @@ pub struct FlowContextInner {
 
     // Mining rule engine
     mining_rule_engine: Arc<MiningRuleEngine>,
+
+    // Blocks detected as stored without their PoM possession proof while still within the proof
+    // service window (FIFO + dedup, bounded). Drained by the relay flow, which re-fetches each
+    // block from a peer and adopts the proof — the self-healing counterpart of the guard-rail.
+    pom_reproof_queue: Mutex<(VecDeque<Hash>, HashSet<Hash>)>,
 }
 
 #[derive(Clone)]
@@ -320,6 +325,7 @@ impl FlowContext {
             let virtual_daa = self.consensus().unguarded_session_blocking().get_virtual_daa_score();
             let depth = virtual_daa.saturating_sub(block.header.daa_score);
             if depth <= POM_PROOF_SERVE_DEPTH_DAA {
+                self.enqueue_pom_reproof(block.hash());
                 error!(
                     "PoM guard-rail: about to serve RECENT block {} (daa {}, depth {}) WITHOUT its possession proof. Proof-enforcing peers will reject it — this is how a propagation hole becomes a network wedge. The proof should be re-synced from a proof-carrying node.",
                     block.hash(),
@@ -336,6 +342,37 @@ impl FlowContext {
             }
         }
         naked
+    }
+
+    /// Queues a block whose possession proof is missing while still within the proof service
+    /// window, for re-fetching by the relay flow. FIFO with dedup; bounded — under a mass naked
+    /// band the oldest entries are dropped first, and the guard-rail re-queues any block that is
+    /// still naked the next time it is served.
+    pub fn enqueue_pom_reproof(&self, hash: Hash) {
+        const POM_REPROOF_QUEUE_CAP: usize = 4096;
+        let mut guard = self.pom_reproof_queue.lock();
+        let (queue, dedup) = &mut *guard;
+        if !dedup.insert(hash) {
+            return;
+        }
+        if queue.len() >= POM_REPROOF_QUEUE_CAP {
+            if let Some(evicted) = queue.pop_front() {
+                dedup.remove(&evicted);
+            }
+        }
+        queue.push_back(hash);
+    }
+
+    /// Takes up to `max` blocks queued for proof re-fetching. Taken entries leave the dedup set,
+    /// so a block whose re-fetch fails can be re-queued by the next guard-rail hit.
+    pub fn take_pom_reproof_candidates(&self, max: usize) -> Vec<Hash> {
+        let mut guard = self.pom_reproof_queue.lock();
+        let (queue, dedup) = &mut *guard;
+        let taken: Vec<Hash> = queue.drain(..max.min(queue.len())).collect();
+        for hash in &taken {
+            dedup.remove(hash);
+        }
+        taken
     }
 
     pub fn new(
@@ -376,6 +413,7 @@ impl FlowContext {
                 max_orphans,
                 config,
                 mining_rule_engine,
+                pom_reproof_queue: Mutex::new((VecDeque::new(), HashSet::new())),
             }),
         }
     }

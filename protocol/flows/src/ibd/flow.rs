@@ -973,6 +973,11 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             if high_daa.saturating_sub(block.header.daa_score) > POM_PROOF_SERVE_DEPTH_DAA {
                 block.pom_tier = block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier));
                 block.pom_proof = None;
+            } else if block.pom_proof.is_none() && self.ctx.config.pom_activation.is_active(block.header.daa_score) {
+                // The syncer served a block naked while it is still within OUR proof service
+                // window: persisting it as-is would make us the next contagion source. Queue it
+                // for the relay flow to re-fetch the proof from another peer.
+                self.ctx.enqueue_pom_reproof(block.hash());
             }
             current_daa_score = block.header.daa_score;
             current_timestamp = block.header.timestamp;
@@ -1024,6 +1029,11 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             let (pom_proof, pom_tier) = if high_daa.saturating_sub(blk_header.daa_score) > POM_PROOF_SERVE_DEPTH_DAA {
                 (None, pom_tier.or_else(|| pom_proof.as_ref().map(|p| p.tier)))
             } else {
+                if pom_proof.is_none() && self.ctx.config.pom_activation.is_active(blk_header.daa_score) {
+                    // Naked-recent from the syncer — queue for the relay flow's proof re-fetch
+                    // (see the full-block chunk path above).
+                    self.ctx.enqueue_pom_reproof(blk_header.hash);
+                }
                 (pom_proof, pom_tier)
             };
             let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof, pom_tier };

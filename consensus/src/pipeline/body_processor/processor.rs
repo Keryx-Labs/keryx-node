@@ -55,7 +55,7 @@ pub struct BlockBodyProcessor {
     pub(super) thread_pool: Arc<ThreadPool>,
 
     // DB
-    db: Arc<DB>,
+    pub(super) db: Arc<DB>,
 
     // Config
     pub(super) max_block_mass: u64,
@@ -88,7 +88,7 @@ pub struct BlockBodyProcessor {
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
     pub(super) _ghostdag_store: Arc<DbGhostdagStore>,
-    pub(super) _headers_store: Arc<DbHeadersStore>,
+    pub(super) headers_store: Arc<DbHeadersStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, persisted at commit for the tier-reward coinbase split.
     pub(super) pom_tier_store: Arc<DbPomTierStore>,
@@ -152,7 +152,7 @@ impl BlockBodyProcessor {
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
-            _headers_store: storage.headers_store.clone(),
+            headers_store: storage.headers_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
             pom_proof_store: storage.pom_proof_store.clone(),

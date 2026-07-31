@@ -7,7 +7,7 @@ use keryx_addresses::Address;
 use keryx_consensus::processes::coinbase::RD_ALLOCATION_ADDRESS;
 use keryx_consensus_core::{api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, errors::block::RuleError};
 use keryx_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
-use keryx_core::{debug, warn};
+use keryx_core::{debug, info, warn};
 use keryx_hashes::Hash;
 use keryx_txscript::pay_to_address_script;
 use keryx_p2p_lib::{
@@ -113,6 +113,14 @@ impl HandleRelayInvsFlow {
         loop {
             // Loop over incoming block inv messages
             let inv = self.invs_route.dequeue().await?;
+
+            // Self-healing: re-fetch the possession proof of blocks flagged naked-recent (by the
+            // serving guard-rail or the IBD receive path). Piggybacks on the inv cadence so it
+            // needs no timer, and drains a couple per inv to stay negligible next to relay work.
+            for naked_hash in self.ctx.take_pom_reproof_candidates(2) {
+                self.try_readopt_pom_proof(naked_hash).await?;
+            }
+
             let session = self.ctx.consensus().unguarded_session();
             let is_ibd_in_transitional_state = session.async_is_consensus_in_transitional_ibd_state().await;
 
@@ -303,6 +311,27 @@ impl HandleRelayInvsFlow {
 
     fn enqueue_orphan_roots(&mut self, _orphan: Hash, roots: Vec<Hash>, known_within_range: bool) {
         self.invs_route.enqueue_indirect_invs(roots, known_within_range)
+    }
+
+    /// Re-fetches a block whose possession proof is missing locally and adopts the proof it
+    /// carries. Peers serving the block naked as well are left for a later guard-rail re-queue —
+    /// another peer (or the same one, once healed itself) may carry the proof.
+    async fn try_readopt_pom_proof(&mut self, requested_hash: Hash) -> Result<(), ProtocolError> {
+        let Some((block, request_scope)) = self.request_block(requested_hash, self.msg_route.id(), self.header_format).await? else {
+            return Ok(());
+        };
+        request_scope.report_obtained();
+        let Some(proof) = block.pom_proof else {
+            debug!("PoM re-proof: peer {} also serves {} without its proof — retrying later", self.router, requested_hash);
+            return Ok(());
+        };
+        let session = self.ctx.consensus().unguarded_session();
+        match session.async_adopt_pom_proof(requested_hash, (*proof).clone()).await {
+            Ok(true) => info!("PoM re-proof: adopted the possession proof of {} from peer {}", requested_hash, self.router),
+            Ok(false) => {}
+            Err(e) => debug!("PoM re-proof: proof of {} from peer {} not adopted: {}", requested_hash, self.router, e),
+        }
+        Ok(())
     }
 
     async fn request_block(

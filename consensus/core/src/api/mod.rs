@@ -19,6 +19,7 @@ use crate::{
     },
     header::Header,
     mass::{ContextualMasses, NonContextualMasses},
+    pom::PomProof,
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList, PruningProofMetadata},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{
@@ -316,6 +317,14 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn get_block(&self, hash: Hash) -> ConsensusResult<Block> {
+        unimplemented!()
+    }
+
+    /// Verifies `proof` against the stored header of `hash` and persists it when the proof store
+    /// has none. Returns whether the proof was adopted (`false` when one is already present).
+    /// Self-healing entry point for blocks persisted without their possession proof by the
+    /// proof-skipping IBD path.
+    fn adopt_pom_proof(&self, hash: Hash, proof: PomProof) -> ConsensusResult<bool> {
         unimplemented!()
     }
 

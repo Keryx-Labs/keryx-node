@@ -2,17 +2,26 @@ use std::{collections::HashSet, sync::Arc};
 
 use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
+use crate::model::stores::headers::HeaderStoreReader;
+use crate::model::stores::pom_proof::PomProofStoreReader;
 use crate::processes::{coinbase::coinbase_outputs_limit, transaction_validator::errors::TxRuleError};
 use keryx_consensus_core::{
     block::Block,
     config::params::{POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
+    errors::consensus::{ConsensusError, ConsensusResult},
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
-    pom::{pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_pow_value, pom_pow_value_h3, verify_pom_proof, verify_pom_proof_v2},
+    pom::{
+        PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_pow_value, pom_pow_value_h3,
+        verify_pom_proof, verify_pom_proof_v2,
+    },
     tx::TransactionOutpoint,
 };
+use keryx_database::prelude::StoreError;
+use keryx_hashes::Hash;
 use keryx_math::Uint256;
+use rocksdb::WriteBatch;
 
 impl BlockBodyProcessor {
     pub fn validate_body_in_isolation(self: &Arc<Self>, block: &Block, skip_pom_proof: bool) -> BlockProcessResult<Mass> {
@@ -160,6 +169,32 @@ impl BlockBodyProcessor {
     /// block must carry a valid `PomProof` proving the producer held the declared tier's
     /// weight blob in VRAM while mining. 100% deterministic (no ε) — see `pom::verify_pom_proof`.
     /// Genesis bypasses body validation entirely, so no exemption is needed here.
+    /// Verifies `proof` against the stored header of `hash` and persists it when the proof store
+    /// has none. Self-healing entry point for blocks persisted "naked" by the proof-skipping IBD
+    /// path. Safe to feed from any peer: the header pins the walk seed and (H3+) `pom_final_state`,
+    /// so a proof passing `check_pom_proof` here is exactly the proof the block was mined with.
+    pub fn adopt_pom_proof(self: &Arc<Self>, hash: Hash, proof: PomProof) -> ConsensusResult<bool> {
+        if self.pom_proof_store.has(hash).unwrap_or(false) {
+            return Ok(false);
+        }
+        let header = match self.headers_store.get_header(hash) {
+            Ok(header) => header,
+            Err(_) => return Err(ConsensusError::HeaderNotFound(hash)),
+        };
+        let candidate = Block::from_header_arc(header).with_pom_proof(proof.clone());
+        self.check_pom_proof(&candidate)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("PoM proof adoption rejected for {}: {}", hash, e)))?;
+        let mut batch = WriteBatch::default();
+        match self.pom_proof_store.insert_batch(&mut batch, hash, &proof) {
+            Ok(()) => {}
+            // Raced with a concurrent adopter or the block's own body commit — nothing to do.
+            Err(StoreError::HashAlreadyExists(_)) => return Ok(false),
+            Err(e) => return Err(ConsensusError::GeneralOwned(format!("PoM proof adoption store error for {}: {}", hash, e))),
+        }
+        self.db.write(batch).unwrap();
+        Ok(true)
+    }
+
     fn check_pom_proof(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let header = &block.header;
         // PoM *is* the proof-of-work under `pom_activation`; skipping PoW (simnet / tests) skips

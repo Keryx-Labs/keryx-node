@@ -1245,6 +1245,10 @@ impl ConsensusApi for Consensus {
         })
     }
 
+    fn adopt_pom_proof(&self, hash: Hash, proof: keryx_consensus_core::pom::PomProof) -> ConsensusResult<bool> {
+        self.body_processor.adopt_pom_proof(hash, proof)
+    }
+
     fn get_block_transactions(&self, hash: Hash, indices: Option<Vec<TransactionIndexType>>) -> ConsensusResult<Vec<Transaction>> {
         let transactions = self.block_transactions_store.get(hash).optional().unwrap().ok_or(ConsensusError::BlockNotFound(hash))?;
         let tx_len = transactions.len();
