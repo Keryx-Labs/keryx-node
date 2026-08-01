@@ -79,8 +79,9 @@ impl DbAgeBucketsStore {
         self.access.delete_all(BatchDbWriter::new(batch))
     }
 
-    /// Test helper: collects the whole index into a map (see `DbAddressAmountStore::collect`).
-    #[cfg(test)]
+    /// Collects the whole index into a map (see `DbAddressAmountStore::collect`). Bounded by the
+    /// number of non-empty addresses (~10⁴ at current scale); used by tests and by the periodic
+    /// coin-age self-check (`selfcheck_age_buckets_index`).
     pub fn collect(&self) -> std::collections::HashMap<ScriptPublicKey, AgeBuckets> {
         self.access
             .iterator()

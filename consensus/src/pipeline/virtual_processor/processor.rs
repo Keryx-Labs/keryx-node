@@ -149,6 +149,9 @@ pub struct VirtualStateProcessor {
     pub(super) address_balance_store: Arc<DbAddressAmountStore>,
     pub(super) age_buckets_store: Arc<DbAgeBucketsStore>,
     pub(super) maturation_queue_store: Arc<DbMaturationQueueStore>,
+    /// Last coin-age self-check position: (virtual daa score, wall-clock instant). Paces the
+    /// periodic `selfcheck_age_buckets_index` (see `maybe_selfcheck_age_buckets`).
+    pub(super) age_selfcheck_last: parking_lot::Mutex<Option<(u64, std::time::Instant)>>,
     /// Gold-standard prefix-sum production index (pure function of the chain): producer payout SPK → Σ
     /// `base_miner_cut` cumulated over the selected chain, kept in lockstep with it. The ratio
     /// denominator (windowed production at a block's selected-parent view) is the difference of two
@@ -330,6 +333,7 @@ impl VirtualStateProcessor {
             address_balance_store: storage.address_balance_store.clone(),
             age_buckets_store: storage.age_buckets_store.clone(),
             maturation_queue_store: storage.maturation_queue_store.clone(),
+            age_selfcheck_last: parking_lot::Mutex::new(None),
             windowed_production_prefix_store: storage.windowed_production_prefix_store.clone(),
             block_production_cache: parking_lot::RwLock::new(BlockHashMap::default()),
             virtual_stores: storage.virtual_stores.clone(),
@@ -754,8 +758,9 @@ impl VirtualStateProcessor {
         // batch (lockstep, like the balance index above). Ungated passive aggregates — read only
         // at/after `coin_age_activation`. A `true` sweep result = the score dropped past the
         // retention horizon (never in practice): rebuild from the UTXO set post-commit.
-        let coin_age_needs_rebuild = self.sweep_maturation_queue(&mut batch, new_virtual_state.daa_score, accumulated_diff);
-        self.apply_age_diff(&mut batch, accumulated_diff, new_virtual_state.daa_score);
+        let new_daa_score = new_virtual_state.daa_score;
+        let coin_age_needs_rebuild = self.sweep_maturation_queue(&mut batch, new_daa_score, accumulated_diff);
+        self.apply_age_diff(&mut batch, accumulated_diff, new_daa_score);
 
         // Ratio-reward (Stage 2b-2b): advance the prefix-sum production index along the SAME chain
         // path, in the SAME batch, BEFORE `apply_changes` mutates the selected chain — so the index
@@ -782,6 +787,10 @@ impl VirtualStateProcessor {
         // Shallow drops (routine during IBD catch-up) are demoted in place by the sweep.
         if coin_age_needs_rebuild {
             self.rebuild_age_buckets_index();
+            // Freshly re-derived ⇒ exact by construction; restart the self-check clock.
+            *self.age_selfcheck_last.lock() = Some((new_daa_score, std::time::Instant::now()));
+        } else {
+            self.maybe_selfcheck_age_buckets(new_daa_score);
         }
     }
 
@@ -867,6 +876,135 @@ impl VirtualStateProcessor {
         self.maturation_queue_store.set_watermark_batch(&mut batch, daa_score).unwrap();
         self.db.write(batch).unwrap();
         info!("age-buckets rebuild: done — {} addresses written, {} immature coins queued (split at d−W).", n, queued);
+    }
+
+    /// Periodic gate for `selfcheck_age_buckets_index`: runs it when BOTH the score interval
+    /// (`KERYX_AGE_SELFCHECK_DAA`, default `AGE_SELFCHECK_INTERVAL_DAA`, `0` disables) and a
+    /// minimum wall-clock spacing have elapsed. The wall gate keeps IBD catch-up — where scores
+    /// advance orders of magnitude faster than real time — from degenerating into back-to-back
+    /// full scans. Called at the end of every virtual commit, on the (single) virtual thread.
+    pub(super) fn maybe_selfcheck_age_buckets(&self, daa_score: u64) {
+        const AGE_SELFCHECK_INTERVAL_DAA: u64 = 72_000; // ~2h at 10 BPS
+        const AGE_SELFCHECK_MIN_WALL_SPACING: std::time::Duration = std::time::Duration::from_secs(600);
+        static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let interval = *INTERVAL.get_or_init(|| {
+            std::env::var("KERYX_AGE_SELFCHECK_DAA").ok().and_then(|v| v.parse().ok()).unwrap_or(AGE_SELFCHECK_INTERVAL_DAA)
+        });
+        if interval == 0 || !self.coin_age_activation.is_active(daa_score) {
+            return;
+        }
+        {
+            let mut last = self.age_selfcheck_last.lock();
+            match *last {
+                // First commit after startup: the startup rebuild just ran ⇒ exact; arm the clock.
+                None => {
+                    *last = Some((daa_score, std::time::Instant::now()));
+                    return;
+                }
+                Some((last_daa, last_at)) => {
+                    if daa_score.saturating_sub(last_daa) < interval || last_at.elapsed() < AGE_SELFCHECK_MIN_WALL_SPACING {
+                        return;
+                    }
+                    *last = Some((daa_score, std::time::Instant::now()));
+                }
+            }
+        }
+        self.selfcheck_age_buckets_index();
+    }
+
+    /// Coin-age self-check: re-derives the bucket aggregates from the virtual UTXO set (the
+    /// authoritative source — the exact computation of `rebuild_age_buckets_index`) and compares
+    /// them to the committed index. The two are comparable only when the committed split sits at
+    /// the current virtual score, which holds right after a commit (the sweep pins the watermark
+    /// there); any other caller is skipped, not failed.
+    ///
+    /// On divergence: the mismatching aggregates are logged per SPK (stored vs derived — the
+    /// forensic record an operator should report), then the index is re-derived in place via
+    /// `rebuild_age_buckets_index`. Same discipline as the utxoindex resync-on-inconsistency:
+    /// a derived index must never be allowed to silently disagree with its source — a divergent
+    /// numerator makes this node compute a different coinbase than the rest of the network, which
+    /// is a block-rejection (chain-split) hazard once ratio verification enforcement is active.
+    pub(crate) fn selfcheck_age_buckets_index(&self) {
+        let started = std::time::Instant::now();
+        let virtual_read = self.virtual_stores.read();
+        let Some(state) = virtual_read.state.get().optional().unwrap() else {
+            return;
+        };
+        let daa_score = state.daa_score;
+        let watermark = self.maturation_queue_store.get_watermark().unwrap().unwrap_or(daa_score);
+        if watermark != daa_score {
+            // Committed split not at the virtual score (mid-oscillation POV) — not comparable.
+            debug!("coin-age self-check: skipped (watermark {} != virtual {})", watermark, daa_score);
+            return;
+        }
+        let mature_bound = daa_score.saturating_sub(self.coin_age_maturity_w);
+        let mut derived: HashMap<ScriptPublicKey, AgeBuckets> = HashMap::new();
+        for item in virtual_read.utxo_set.iterator() {
+            let (_, entry) = item.unwrap();
+            let b = derived.entry(entry.script_public_key.clone()).or_default();
+            if entry.effective_daa <= mature_bound {
+                b.b_mat = b.b_mat.saturating_add(entry.amount);
+            } else {
+                b.b_imm = b.b_imm.saturating_add(entry.amount);
+                b.a_imm = b.a_imm.saturating_add(entry.amount as u128 * entry.effective_daa as u128);
+            }
+        }
+        drop(virtual_read);
+        // Zero-valued aggregates are deleted on write, so both sides hold non-empty entries only.
+        let stored = self.age_buckets_store.collect();
+        const MAX_LOGGED: usize = 50;
+        let mut divergent = 0usize;
+        for (spk, truth) in derived.iter() {
+            let s = stored.get(spk).copied().unwrap_or_default();
+            if s != *truth {
+                divergent += 1;
+                if divergent <= MAX_LOGGED {
+                    let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
+                    warn!(
+                        "coin-age self-check DIVERGENCE daa={} spk={} stored=({},{},{}) derived=({},{},{}) delta=({},{},{})",
+                        daa_score,
+                        spk_hex,
+                        s.b_mat,
+                        s.b_imm,
+                        s.a_imm,
+                        truth.b_mat,
+                        truth.b_imm,
+                        truth.a_imm,
+                        truth.b_mat as i128 - s.b_mat as i128,
+                        truth.b_imm as i128 - s.b_imm as i128,
+                        truth.a_imm as i128 - s.a_imm as i128,
+                    );
+                }
+            }
+        }
+        // Stored entries with no backing coins at all (address fully spent but aggregate left behind).
+        for (spk, s) in stored.iter() {
+            if !derived.contains_key(spk) {
+                divergent += 1;
+                if divergent <= MAX_LOGGED {
+                    let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
+                    warn!(
+                        "coin-age self-check DIVERGENCE daa={} spk={} stored=({},{},{}) derived=(0,0,0) — no backing coins",
+                        daa_score, spk_hex, s.b_mat, s.b_imm, s.a_imm,
+                    );
+                }
+            }
+        }
+        if divergent == 0 {
+            info!(
+                "coin-age self-check: OK — {} addresses verified against the UTXO set in {:.1}s",
+                derived.len(),
+                started.elapsed().as_secs_f64()
+            );
+        } else {
+            warn!(
+                "coin-age self-check: {} divergent address(es) (first {} logged above) — re-deriving the index from the UTXO set NOW. Please report these lines.",
+                divergent,
+                divergent.min(MAX_LOGGED),
+            );
+            self.rebuild_age_buckets_index();
+            *self.age_selfcheck_last.lock() = Some((daa_score, std::time::Instant::now()));
+        }
     }
 
     /// One-time from-chain build of the gold-standard prefix-sum production index (run at startup when
