@@ -664,3 +664,282 @@ async fn ratio_reward_balance_index_reconstruction_matches_incremental() {
     let incremental = vp.address_balance_store.collect();
     assert_eq!(incremental, reconstructed, "balance index and UTXO-set reconstruction must match exactly");
 }
+
+/// Adversarial harness for the coin-age write path: drives `sweep_maturation_queue` +
+/// `apply_age_diff` directly — in the exact order and batching of `commit_virtual_state` —
+/// through score advances, tip re-anchors (score drops) and interleaved spends/re-adds, and
+/// after EVERY commit asserts the self-check invariant: the stored buckets must equal the
+/// reclassification of the shadow UTXO set at the committed score. Any sequence that breaks
+/// equality is a deterministic reproduction of the production coin-age drift (the network-wide
+/// `coin-age self-check DIVERGENCE` events: b_mat/b_imm split off while the sum stays exact).
+#[tokio::test]
+async fn coin_age_maturation_choreography_adversarial() {
+    use crate::model::stores::age_buckets::AgeBuckets;
+    use keryx_consensus_core::tx::{TransactionOutpoint, UtxoEntry};
+    use keryx_consensus_core::utxo::utxo_diff::UtxoDiff;
+    use keryx_database::{create_temp_db, prelude::ConnBuilder};
+    use rocksdb::WriteBatch;
+    use std::collections::HashMap;
+
+    const W: u64 = 864_000; // asserted against params below so a fork change fails loudly
+    const B: u64 = 10 * W; // base score: far enough that `score - W` never saturates
+    const DUE1: u64 = B + W; // maturity score of a coin anchored at B
+
+    // One commit of a scenario: (virtual score, coins added as (id, spk byte, amount, effective_daa),
+    // coin ids spent). Re-add = same id in adds after a spend; re-anchor = same id in adds AND spends.
+    type CommitSpec = (u64, Vec<(u64, u8, u64, u64)>, Vec<u64>);
+
+    fn spk_n(byte: u8) -> ScriptPublicKey {
+        ScriptPublicKey::new(0, ScriptVec::from_slice(&[byte; 34]))
+    }
+    fn op(id: u64) -> TransactionOutpoint {
+        TransactionOutpoint::new(Hash::from_u64_word(id), 0)
+    }
+
+    fn run(name: &str, commits: &[CommitSpec]) {
+        let config = ConfigBuilder::new(MAINNET_PARAMS).skip_proof_of_work().build();
+        let (_life, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let (sender, _receiver) = async_channel::unbounded();
+        let tc = TestConsensus::with_db(db.clone(), &config, sender);
+        let vp = tc.virtual_processor().clone();
+        assert_eq!(vp.coin_age_maturity_w, W, "test constants assume the mainnet maturity window");
+
+        let mut shadow: HashMap<TransactionOutpoint, UtxoEntry> = HashMap::new();
+        for (i, (score, adds, spends)) in commits.iter().enumerate() {
+            let mut diff = UtxoDiff { add: Default::default(), remove: Default::default() };
+            for id in spends {
+                let e = shadow.remove(&op(*id)).expect("scenario spends a coin absent from the shadow set");
+                diff.remove.insert(op(*id), e);
+            }
+            for (id, spk_byte, amount, eda) in adds {
+                assert!(*eda <= *score, "scenario adds a coin anchored in the future");
+                let e = UtxoEntry {
+                    amount: *amount,
+                    script_public_key: spk_n(*spk_byte),
+                    block_daa_score: *eda,
+                    is_coinbase: true,
+                    effective_daa: *eda,
+                };
+                diff.add.insert(op(*id), e.clone());
+                shadow.insert(op(*id), e);
+            }
+
+            // Mirror of commit_virtual_state: sweep FIRST, then the diff, one batch, one write.
+            let mut batch = WriteBatch::default();
+            let needs_rebuild = vp.sweep_maturation_queue(&mut batch, *score, &diff);
+            assert!(!needs_rebuild, "{name}: commit {i} dropped beyond the retention horizon — keep scenario drops shallow");
+            vp.apply_age_diff(&mut batch, &diff, *score);
+            db.write(batch).unwrap();
+
+            // Self-check invariant at the committed score (the sweep pinned the watermark there).
+            let bound = score.saturating_sub(W);
+            let mut expected: HashMap<ScriptPublicKey, AgeBuckets> = HashMap::new();
+            for e in shadow.values() {
+                let b = expected.entry(e.script_public_key.clone()).or_default();
+                if e.effective_daa <= bound {
+                    b.b_mat += e.amount;
+                } else {
+                    b.b_imm += e.amount;
+                    b.a_imm += e.amount as u128 * e.effective_daa as u128;
+                }
+            }
+            expected.retain(|_, b| !b.is_empty());
+            let stored = vp.age_buckets_store.collect();
+            if stored != expected {
+                // Deterministic repro: dump the exact commit sequence that led here so the
+                // failing path can be minimized by hand.
+                eprintln!("=== {name}: FAILING SEQUENCE (commits 0..={i}) ===");
+                for (j, (s, a, r)) in commits.iter().enumerate().take(i + 1) {
+                    eprintln!("  commit {j}: score={s} adds={a:?} spends={r:?}");
+                }
+                assert_eq!(
+                    stored, expected,
+                    "{name}: coin-age buckets diverged from the UTXO reclassification after commit {i} (score {score})"
+                );
+            }
+        }
+    }
+
+    // S1 — baseline: deposit, ride to maturity, promote exactly at the due boundary.
+    run(
+        "s1_baseline_promotion",
+        &[(B, vec![(1, 0xA1, 1_000, B)], vec![]), (DUE1 - 1, vec![], vec![]), (DUE1, vec![], vec![]), (DUE1 + 500, vec![], vec![])],
+    );
+
+    // S2 — pure tip oscillation: promote, re-anchor below the due (demote), re-advance (re-promote).
+    run(
+        "s2_demote_repromote",
+        &[
+            (B, vec![(1, 0xA1, 1_000, B)], vec![]),
+            (DUE1 + 100, vec![], vec![]),
+            (DUE1 - 50, vec![], vec![]),
+            (DUE1 + 200, vec![], vec![]),
+        ],
+    );
+
+    // S3 — score drop with the matured coin spent in the SAME commit (demote + immature remove).
+    run(
+        "s3_drop_with_inflight_spend",
+        &[(B, vec![(1, 0xA1, 1_000, B)], vec![]), (DUE1 + 100, vec![], vec![]), (DUE1 - 50, vec![], vec![1])],
+    );
+
+    // S4 — spent after maturing, then a reorg restores the coin below its due (the skip-rule case),
+    // then maturity again.
+    run(
+        "s4_spent_after_maturing_reorg_restore",
+        &[
+            (B, vec![(1, 0xA1, 1_000, B)], vec![]),
+            (DUE1 + 100, vec![], vec![]),
+            (DUE1 + 200, vec![], vec![1]),
+            (DUE1 - 50, vec![(1, 0xA1, 1_000, B)], vec![]),
+            (DUE1 + 300, vec![], vec![]),
+        ],
+    );
+
+    // S5 — re-anchor during a drop: same outpoint removed (old anchor) AND re-added (new anchor)
+    // in the demotion commit, then maturity at the NEW due.
+    run(
+        "s5_reanchor_same_outpoint_in_drop",
+        &[
+            (B, vec![(1, 0xA1, 1_000, B)], vec![]),
+            (DUE1 + 100, vec![], vec![]),
+            (DUE1 - 50, vec![(1, 0xA1, 1_000, DUE1 - 60)], vec![1]),
+            (DUE1 - 60 + W + 10, vec![], vec![]),
+        ],
+    );
+
+    // S6 — due and spent in the same commit: the sweep must promote first, the diff then removes
+    // on the mature side (the ordering contract stated on `sweep_maturation_queue`).
+    run("s6_due_and_spend_same_commit", &[(B, vec![(1, 0xA1, 1_000, B)], vec![]), (DUE1, vec![], vec![1])]);
+
+    // S7 — several SPKs with staggered dues, a drop across a subset of them with an in-flight
+    // spend, a fresh deposit while re-advancing.
+    run(
+        "s7_multi_spk_interleaved_oscillation",
+        &[
+            (
+                B + 90,
+                vec![(1, 0xA1, 500, B), (2, 0xA1, 600, B + 40), (3, 0xB2, 700, B + 20), (4, 0xB2, 800, B + 70), (5, 0xC3, 900, B + 90)],
+                vec![],
+            ),
+            (B + W + 50, vec![], vec![]),
+            (B + W + 30, vec![], vec![2]),
+            (B + W + 60, vec![(6, 0xA1, 700, B + W + 55)], vec![]),
+            (B + W + 100, vec![], vec![]),
+        ],
+    );
+
+    // S8 — oscillation hammer: a due-dense cluster (20 coins, 10 DAA apart, 2 SPKs), then a dozen
+    // advance/drop cycles walking through the cluster, each drop carrying a spend and a deposit —
+    // the closest static approximation of a busy pool under routine tip re-anchors.
+    let mut s8: Vec<CommitSpec> = Vec::new();
+    let mut cluster: Vec<(u64, u8, u64, u64)> = Vec::new();
+    for i in 0..20u64 {
+        cluster.push((100 + i, if i % 2 == 0 { 0xE1 } else { 0xE2 }, 500 + i, B + 10 * i));
+    }
+    s8.push((B + 200, cluster, vec![]));
+    let mut alive: Vec<u64> = (100..120).collect();
+    let mut next_id = 200u64;
+    for k in 0..12u64 {
+        let hi = B + W + 15 * k + 20;
+        let lo = B + W + 15 * k + 5;
+        s8.push((hi, vec![], vec![]));
+        let victim = alive.remove((k as usize * 7) % alive.len());
+        s8.push((lo, vec![(next_id, 0xE1, 333 + k, lo - 3)], vec![victim]));
+        alive.push(next_id);
+        next_id += 1;
+    }
+    s8.push((B + W + 400, vec![], vec![]));
+    run("s8_oscillation_hammer", &s8);
+
+    // S9 — deterministic fuzz walk: thousands of commits mixing score oscillations, fresh and
+    // INHERITED anchors (effective_daa far in the past, including exactly at the `score − W`
+    // boundary — the consolidation-keeps-age path the static scenarios above cannot reach),
+    // spends of barely-mature coins during drops, and same-outpoint re-anchors. The sequence is
+    // fully determined by SEED — a failure prints the commit index, so the exact minimal replay
+    // can be reconstructed by truncating the generated script.
+    for seed in 1u64..=8 {
+    let mut rng = 0x5EED_C014_A6E0_0000 + seed;
+    let mut next = move || {
+        // SplitMix64: deterministic, dependency-free.
+        rng = rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut s9: Vec<CommitSpec> = Vec::new();
+    let mut score = B + W; // start beyond one full window so inherited anchors can be mature
+    let mut floor = score; // never drop below the highest rebuild-free depth we allow
+    let mut alive: Vec<u64> = Vec::new();
+    let mut next_id = 1_000u64;
+    for _ in 0..1_500 {
+        // Score walk: mostly forward, ~1/4 shallow re-anchors (bounded well under retention).
+        if next() % 4 == 0 && score > floor + 2 {
+            let max_drop = (score - floor).min(400);
+            score -= 1 + next() % max_drop;
+        } else {
+            score += 1 + next() % 300;
+            if score > floor + 5_000 {
+                floor = score - 5_000;
+            }
+        }
+        let mut adds: Vec<(u64, u8, u64, u64)> = Vec::new();
+        let mut spends: Vec<u64> = Vec::new();
+        // 0..=2 spends of random alive coins.
+        for _ in 0..next() % 3 {
+            if !alive.is_empty() {
+                let idx = (next() % alive.len() as u64) as usize;
+                spends.push(alive.swap_remove(idx));
+            }
+        }
+        // ~1/10 commits re-anchor an alive coin: same outpoint spent AND re-added, new anchor.
+        // Selected BEFORE the fresh deposits below, so a coin added this very commit can never be
+        // picked (the runner folds spends before adds).
+        if next() % 10 == 0 && !alive.is_empty() {
+            let idx = (next() % alive.len() as u64) as usize;
+            let id = alive[idx];
+            spends.push(id);
+            let eda = score.saturating_sub(next() % (W + 100));
+            adds.push((id, 0xD0 + (next() % 12) as u8, 100 + next() % 900, eda.min(score)));
+        }
+        // 0..=2 deposits over a 12-SPK pool, anchors mixing fresh / inherited / boundary-exact.
+        for _ in 0..next() % 3 {
+            let spk_byte = 0xD0 + (next() % 12) as u8;
+            let eda = match next() % 4 {
+                0 => score - next() % 50,                        // fresh (immature)
+                1 => score.saturating_sub(W + next() % 300),     // inherited, already mature
+                2 => score.saturating_sub(W) + next() % 11,      // exactly around the split bound
+                _ => score.saturating_sub(next() % (W + 200)),   // anywhere in (and past) the window
+            };
+            adds.push((next_id, spk_byte, 100 + next() % 900, eda.min(score)));
+            alive.push(next_id);
+            next_id += 1;
+        }
+        s9.push((score, adds, spends));
+    }
+    run(&format!("s9_fuzz_walk_seed_{seed}"), &s9);
+    }
+
+    // S10 — the POOLARIS / izzback hypothesis: a tx re-accepted by a different chain block during
+    // a shallow reorg yields the SAME outpoint in diff.add AND diff.remove with the SAME inherited
+    // effective_daa (block_daa_score differs, so the pair survives diff algebra). apply_age_diff's
+    // add loop inserts the maturation-queue entry, then its remove loop deletes the SAME key in the
+    // same batch — the coin survives in the UTXO set, the buckets stay net-consistent (silent), but
+    // the queue entry is gone: when the due passes, the promotion never fires. Expected failure at
+    // the LAST commit (b_imm keeps the coin the reclassification calls mature) until the loop order
+    // is fixed (removes before adds).
+    run(
+        "s10_readd_same_anchor_kills_queue_entry",
+        &[
+            (B, vec![(1, 0xA1, 1_000, B)], vec![]),
+            // Shallow re-anchor: same outpoint spent AND re-added with the SAME effective_daa
+            // (the runner rebuilds the entry from the add tuple — block_daa_score differing in
+            // production is what lets this pair reach apply_age_diff; the queue key only depends
+            // on (effective_daa + W, outpoint), which is what collides).
+            (B + 50, vec![(1, 0xA1, 1_000, B)], vec![1]),
+            (DUE1 - 10, vec![], vec![]),
+            (DUE1 + 100, vec![], vec![]),
+        ],
+    );
+}
