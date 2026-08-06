@@ -234,12 +234,12 @@ pub enum PomVerifyError {
 }
 
 #[inline]
-fn blake(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn blake(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
 #[inline]
-fn mix64(mut x: u64) -> u64 {
+pub(crate) fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58476d1ce4e5b9);
     x ^= x >> 27;
@@ -415,7 +415,7 @@ fn trace_leaf(state: u64) -> [u8; 32] {
     blake(&state.to_le_bytes())
 }
 
-fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(left);
     buf[32..].copy_from_slice(right);
@@ -435,7 +435,7 @@ fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     true
 }
 
-fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
+pub(crate) fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
     // Bound the path to the u64 index bit-width: any Merkle tree addressable by a u64 index has at
     // most 64 levels, so every honest inclusion path is <= 64 siblings. Rejecting longer paths early
     // caps verification work — a malicious proof cannot force an unbounded hashing loop — and changes
