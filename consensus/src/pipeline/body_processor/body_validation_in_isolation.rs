@@ -16,6 +16,7 @@ use keryx_consensus_core::{
         PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_pow_value, pom_pow_value_h3,
         verify_pom_proof, verify_pom_proof_v2,
     },
+    pom_v3::verify_pom_proof_v3_container,
     tx::TransactionOutpoint,
 };
 use keryx_database::prelude::StoreError;
@@ -245,6 +246,27 @@ impl BlockBodyProcessor {
         };
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
         let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
+
+        // H6: matrix-walk witness (pom_v3). The verifier NEVER re-walks (that would be
+        // K * D^3 = 4.3 GMACs per block — IBD in days, the H3 lesson): it re-derives the offset
+        // chain from the listed snippets, recomputes S_0 from the seed, and re-checks 32
+        // PRF-sampled single entries against the per-step state commitments and the UNCHANGED
+        // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
+        // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
+        // later), so the pin check above already ran.
+        if self.pom_v3_activation.is_active(header.daa_score) {
+            return verify_pom_proof_v3_container(
+                &pre_pow_hash,
+                header.nonce,
+                seed,
+                proof,
+                tier.chunks,
+                &tier.root,
+                &target,
+                final_hash,
+            )
+            .map_err(RuleError::BadPomProofV3);
+        }
 
         // H4: recompute-from-chunks verifier (all K transitions re-walked, `final_state` derived).
         // Replaces the 32/256 spot-check, which accepted a forged `final_state` ~88% of the time.

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use keryx_consensus_core::BlockHasher;
-use keryx_consensus_core::pom::{PomProof, PomProofPreH4};
+use keryx_consensus_core::pom::{PomProof, PomProofPreH4, PomProofPreV3};
 use keryx_database::prelude::CachePolicy;
 use keryx_database::prelude::DB;
 use keryx_database::prelude::StoreError;
@@ -52,10 +52,15 @@ impl DbPomProofStore {
 
 impl PomProofStoreReader for DbPomProofStore {
     fn get(&self, hash: Hash) -> Result<PomProof, StoreError> {
-        // Records written before the H4 `steps_v2` field existed are the pre-H4 positional layout
-        // (`PomProofPreH4`); the grown `PomProof` under-flows on their bytes, so decode falls back
-        // to the old layout and backfills `steps_v2 = None`. Same mechanism as the utxoset store.
-        self.access.read_with_decode_fallback::<PomProofPreH4>(hash)
+        // Records written before the H6 `v3` field existed are the pre-V3 positional layout;
+        // before the H4 `steps_v2` field, the pre-H4 one. The grown `PomProof` under-flows on
+        // their bytes, so decode falls back down the era chain (same mechanism as the utxoset
+        // store, one more era deep). KeyNotFound short-circuits — only decode shapes chain.
+        match self.access.read_with_decode_fallback::<PomProofPreV3>(hash) {
+            Err(e @ StoreError::KeyNotFound(_)) => Err(e),
+            Err(_) => self.access.read_with_decode_fallback::<PomProofPreH4>(hash),
+            ok => ok,
+        }
     }
 
     fn has(&self, hash: Hash) -> Result<bool, StoreError> {

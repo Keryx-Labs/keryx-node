@@ -1079,6 +1079,14 @@ pub struct Params {
     /// score. Driven by `H5_2_ACTIVATION_DAA`. `never()` on nets where H5.2 does not apply.
     pub h5_2_activation: ForkActivation,
 
+    /// H6 matrix-walk activation (PoM proof v3), keyed on the block's own DAA score. At/after
+    /// this score `check_pom_proof` requires the `PomProofV3` witness (spot-checked matrix
+    /// walk, `pom_v3`); `Header::pom_final_state` carries `pom_v3::fold64(roots[K])` so every
+    /// header-only mechanism is unchanged. `never()` until H6 is scheduled — a hard fork that
+    /// MUST ship with its own difficulty reset (the v3 walk is ~3 orders of magnitude slower
+    /// per nonce than the v2 hash walk).
+    pub pom_v3_activation: ForkActivation,
+
     /// Chain-anchor checkpoint `(hash, daa_score)` — local peering policy, see `CHAIN_ANCHOR_HASH`.
     /// `None` disables enforcement (all nets but mainnet).
     pub chain_anchor: Option<(Hash, u64)>,
@@ -1316,6 +1324,7 @@ impl Params {
             h5_activation: self.h5_activation,
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
+            pom_v3_activation: self.pom_v3_activation,
 
             chain_anchor: self.chain_anchor,
 
@@ -1503,6 +1512,9 @@ pub const MAINNET_PARAMS: Params = Params {
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
     h5_1_activation: ForkActivation::new(H5_1_ACTIVATION_DAA),
     h5_2_activation: ForkActivation::new(H5_2_ACTIVATION_DAA),
+    // H6 matrix walk: UNSCHEDULED on mainnet (study + testnet first; needs its own
+    // difficulty-reset companion when armed).
+    pom_v3_activation: ForkActivation::never(),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1610,6 +1622,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // H5.1 mirrors the H5 testnet gate so both eras cross together in one E2E run.
     h5_1_activation: ForkActivation::new(3_000),
     h5_2_activation: ForkActivation::new(4_000),
+    // H6 matrix walk ACTIVE on testnet past the H5.x gates, so one E2E run crosses every era
+    // in order: bootstrap → 3000 (H4/H5) → 4000 (H5.2) → 5000 (v3 walk).
+    pom_v3_activation: ForkActivation::new(5_000),
     chain_anchor: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
@@ -1690,6 +1705,7 @@ pub const SIMNET_PARAMS: Params = Params {
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
+    pom_v3_activation: ForkActivation::never(),
     chain_anchor: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1761,6 +1777,7 @@ pub const DEVNET_PARAMS: Params = Params {
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
+    pom_v3_activation: ForkActivation::never(),
     chain_anchor: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,

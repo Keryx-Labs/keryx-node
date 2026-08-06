@@ -143,6 +143,20 @@ pub enum PomV3VerifyError {
     TransitionMismatch,
     /// The blob is too small to hold a single tile.
     BlobTooSmall,
+    // --- container-level (verify_pom_proof_v3_container) ---
+    /// Post-v3-gate proof without the `v3` witness.
+    MissingV3,
+    /// Post-v3-gate proof still carries legacy trace/openings/steps content (must be
+    /// canonically empty).
+    NonCanonicalLegacyFields,
+    /// Container `tier` differs from the v3 witness `tier`.
+    TierMismatch,
+    /// Container `final_state` differs from `fold64(roots[K])` (breaks the H3 header pin).
+    FinalStateMismatch,
+    /// Container `pow_value` differs from the era pow fold of `final_state`.
+    PowValueMismatch,
+    /// The era pow fold of `final_state` does not meet the tier target.
+    TargetNotMet,
 }
 
 // --- walk primitives (the miner kernel must reproduce these byte-for-byte) ---
@@ -487,6 +501,62 @@ pub fn verify_pom_proof_v3(
     Ok(())
 }
 
+/// 64-bit header fold of the final-state commitment: `Header::pom_final_state` carries this at
+/// and after the v3 gate, so every header-only mechanism (H3 pin, `pom_pow_value_h3` header PoW,
+/// block levels, pruning proofs) works unchanged. The full 256-bit binding lives in the proof:
+/// re-rolling any committed byte re-rolls `roots[K]`, and colliding this 64-bit fold on purpose
+/// costs ~2^64 walks — far beyond the lottery it would cheat.
+#[inline]
+pub fn fold64(root: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(root[..8].try_into().unwrap())
+}
+
+/// Full v3 validation of a container `PomProof`, mirroring `verify_pom_proof_v2`'s role in
+/// `check_pom_proof`: canonical-shape checks on the legacy fields, header-pin consistency
+/// (`final_state`/`pow_value`), the tier target, and the structural spot-check verification.
+/// `final_hash` is the same era pow fold the header-only path uses (H3-salted).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_pom_proof_v3_container<Hf: Fn(u64) -> [u8; 32]>(
+    pre_pow_hash: &[u8; 32],
+    nonce: u64,
+    seed: u64,
+    proof: &crate::pom::PomProof,
+    n_chunks: u64,
+    r_t: &[u8; 32],
+    target: &[u8; 32],
+    final_hash: Hf,
+) -> Result<(), PomV3VerifyError> {
+    let v3 = proof.v3.as_ref().ok_or(PomV3VerifyError::MissingV3)?;
+    // Legacy fields must be canonical placeholders: a v3 proof that also smuggles v1/v2
+    // content has no meaning and only inflates relay/storage.
+    if proof.trace_root != [0u8; 32]
+        || !proof.initial_trace_path.is_empty()
+        || !proof.final_trace_path.is_empty()
+        || !proof.openings.is_empty()
+        || proof.steps_v2.is_some()
+    {
+        return Err(PomV3VerifyError::NonCanonicalLegacyFields);
+    }
+    if proof.tier != v3.tier {
+        return Err(PomV3VerifyError::TierMismatch);
+    }
+    // Structure + offsets + S_0 + all spot-checks (validates shapes before we index roots[K]).
+    verify_pom_proof_v3(pre_pow_hash, nonce, seed, v3, r_t, n_chunks)?;
+    // Header pin: final_state is the 64-bit fold of the final-state commitment.
+    if proof.final_state != fold64(&v3.roots[POM_V3_K]) {
+        return Err(PomV3VerifyError::FinalStateMismatch);
+    }
+    // Lottery: same era fold and target comparison as the header-only PoW path.
+    let pv = final_hash(proof.final_state);
+    if pv != proof.pow_value {
+        return Err(PomV3VerifyError::PowValueMismatch);
+    }
+    if !crate::pom::le_leq(&pv, target) {
+        return Err(PomV3VerifyError::TargetNotMet);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +745,56 @@ mod tests {
         let mut bad = proof.clone();
         bad.snippets.pop();
         assert_eq!(verify_pom_proof_v3(&PPH, NONCE, SEED, &bad, &root, n_chunks), Err(PomV3VerifyError::WrongShape));
+    }
+
+    #[test]
+    fn container_verifies_and_round_trips_wire() {
+        use crate::pom::PomProof;
+        let (_, _, root, n_chunks, v3) = honest_setup();
+        let final_state = fold64(&v3.roots[POM_V3_K]);
+        let final_hash = |s: u64| blake(&s.to_le_bytes());
+        let container = PomProof {
+            tier: v3.tier,
+            trace_root: [0u8; 32],
+            pow_value: final_hash(final_state),
+            final_state,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: None,
+            v3: Some(v3),
+        };
+        let target = [0xFFu8; 32]; // trivial target: this test is not about the lottery
+        assert_eq!(
+            verify_pom_proof_v3_container(&PPH, NONCE, SEED, &container, n_chunks, &root, &target, final_hash),
+            Ok(())
+        );
+        // Era-exact wire round-trip: a v3-bearing proof survives encode/decode; the decoded
+        // struct is identical (same verify result).
+        let decoded = PomProof::from_wire_bytes(&container.to_wire_bytes()).unwrap();
+        assert_eq!(
+            verify_pom_proof_v3_container(&PPH, NONCE, SEED, &decoded, n_chunks, &root, &target, final_hash),
+            Ok(())
+        );
+        // A v3-era proof with impossible target is rejected.
+        assert_eq!(
+            verify_pom_proof_v3_container(&PPH, NONCE, SEED, &container, n_chunks, &root, &[0u8; 32], final_hash),
+            Err(PomV3VerifyError::TargetNotMet)
+        );
+        // Smuggled legacy content is rejected.
+        let mut smuggled = container.clone();
+        smuggled.trace_root = [1u8; 32];
+        assert_eq!(
+            verify_pom_proof_v3_container(&PPH, NONCE, SEED, &smuggled, n_chunks, &root, &target, final_hash),
+            Err(PomV3VerifyError::NonCanonicalLegacyFields)
+        );
+        // A proof without the v3 witness is rejected at the gate.
+        let mut naked = container.clone();
+        naked.v3 = None;
+        assert_eq!(
+            verify_pom_proof_v3_container(&PPH, NONCE, SEED, &naked, n_chunks, &root, &target, final_hash),
+            Err(PomV3VerifyError::MissingV3)
+        );
     }
 
     #[test]

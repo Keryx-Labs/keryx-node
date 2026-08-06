@@ -109,6 +109,13 @@ pub struct PomProof {
     /// peers; in the node-local bincode DB, old records (written before this field existed)
     /// decode via the `PomProofPreH4` fallback in `DbPomProofStore`.
     pub steps_v2: Option<Vec<PomStep>>,
+    /// H6 matrix-walk witness (`verify_pom_proof_v3`). When present the legacy fields above
+    /// are canonical placeholders (`trace_root` zeroed, empty paths/openings, `steps_v2 =
+    /// None`) except `tier` (mirrored), `final_state` (= `pom_v3::fold64(roots[K])`, keeping
+    /// the H3 header pin and the header-only pow/level folds unchanged) and `pow_value`
+    /// (= the era pow fold of `final_state`). Trailing field with the same era-exact wire
+    /// mechanism as `steps_v2`: proofs without it re-encode through `PomProofPreV3`.
+    pub v3: Option<crate::pom_v3::PomProofV3>,
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`). Decode-fallback target for legacy
@@ -127,6 +134,53 @@ pub struct PomProofPreH4 {
     pub openings: Vec<PomOpening>,
 }
 
+/// Exact pre-H6 layout of `PomProof` (no `v3`). Decode-fallback target for H4/H5-era wire/DB
+/// bytes and byte-identical encode source for proofs without the v3 extension — same
+/// mechanism as `PomProofPreH4` one era earlier.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PomProofPreV3 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+}
+
+impl From<PomProofPreV3> for PomProof {
+    fn from(p: PomProofPreV3) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: None,
+        }
+    }
+}
+
+impl From<&PomProof> for PomProofPreV3 {
+    fn from(p: &PomProof) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path.clone(),
+            final_trace_path: p.final_trace_path.clone(),
+            openings: p.openings.clone(),
+            steps_v2: p.steps_v2.clone(),
+        }
+    }
+}
+
 impl From<PomProofPreH4> for PomProof {
     fn from(p: PomProofPreH4) -> Self {
         Self {
@@ -138,6 +192,7 @@ impl From<PomProofPreH4> for PomProof {
             final_trace_path: p.final_trace_path,
             openings: p.openings,
             steps_v2: None,
+            v3: None,
         }
     }
 }
@@ -172,26 +227,32 @@ impl PomProof {
             .sum();
         let steps: usize =
             self.steps_v2.as_ref().map_or(0, |steps| steps.iter().map(|s| 32 + path_bytes(&s.weight_path)).sum());
-        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps
+        let v3: usize = self.v3.as_ref().map_or(0, |v3| v3.approx_bytes());
+        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps + v3
     }
 
-    /// Canonical wire (borsh) encoding, era-exact: a proof without the v2 extension encodes
-    /// byte-identically to the pre-H4 layout, so re-served pre-H4 blocks stay readable by
-    /// not-yet-updated peers. ALL borsh encode sites MUST use this instead of `borsh::to_vec`.
+    /// Canonical wire (borsh) encoding, era-exact: a proof without the v3 extension encodes
+    /// byte-identically to the pre-H6 layout (and without the v2 extension, to the pre-H4
+    /// layout), so re-served older blocks stay readable by not-yet-updated peers. ALL borsh
+    /// encode sites MUST use this instead of `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        if self.steps_v2.is_none() {
-            borsh::to_vec(&PomProofPreH4::from(self)).expect("PomProof borsh serialize")
-        } else {
+        if self.v3.is_some() {
             borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.steps_v2.is_some() {
+            borsh::to_vec(&PomProofPreV3::from(self)).expect("PomProof borsh serialize")
+        } else {
+            borsh::to_vec(&PomProofPreH4::from(self)).expect("PomProof borsh serialize")
         }
     }
 
-    /// Decode the canonical wire (borsh) encoding, either era. A pre-H4 stream ends exactly
-    /// where the `steps_v2` option tag would sit, so the full decode fails cleanly and the
-    /// legacy fallback applies; a v2 stream fails the legacy decode (trailing bytes), so the
-    /// two layouts can never be confused. ALL borsh decode sites MUST use this.
+    /// Decode the canonical wire (borsh) encoding, any era. Each older stream ends exactly
+    /// where the next era's option tag would sit, so the newer decode fails cleanly and the
+    /// fallback chain applies; a newer stream fails every older decode (trailing bytes), so
+    /// the layouts can never be confused. ALL borsh decode sites MUST use this.
     pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
-        borsh::from_slice::<PomProof>(bytes).or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
+        borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
+            .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
 }
 
@@ -423,7 +484,7 @@ pub(crate) fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 }
 
 /// Little-endian 256-bit `a <= b`.
-fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub(crate) fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     for i in (0..32).rev() {
         if a[i] < b[i] {
             return true;
@@ -732,6 +793,7 @@ mod verify_tests {
             final_trace_path: merkle_proof(&trace_leaves, k as usize),
             openings,
             steps_v2: None,
+            v3: None,
         };
         (proof, r_t, seed)
     }
@@ -761,6 +823,7 @@ mod verify_tests {
             final_trace_path: vec![],
             openings: vec![],
             steps_v2: Some(steps),
+            v3: None,
         };
         (proof, r_t)
     }

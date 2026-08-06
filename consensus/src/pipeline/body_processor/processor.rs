@@ -84,6 +84,11 @@ pub struct BlockBodyProcessor {
     /// H5.2 chain anchoring: walk seed derives from the v3-salted pph words at/after the gate
     /// (`POM_H5_2_PPH_SALT`). Seed only — the header pow fold stays on the H3 salt.
     pub(super) h5_2_activation: ForkActivation,
+    /// H6 gate — when active at a block's daa_score, `check_pom_proof` requires the v3
+    /// matrix-walk witness and verifies it with `verify_pom_proof_v3_container` (spot-checked
+    /// state commitments; the verifier never re-walks). Same seed/target/final_hash inputs as
+    /// the v2 path; `header.pom_final_state` carries `pom_v3::fold64(roots[K])`.
+    pub(super) pom_v3_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -149,6 +154,7 @@ impl BlockBodyProcessor {
             h5_activation: params.h5_activation,
             h5_1_activation: params.h5_1_activation,
             h5_2_activation: params.h5_2_activation,
+            pom_v3_activation: params.pom_v3_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
