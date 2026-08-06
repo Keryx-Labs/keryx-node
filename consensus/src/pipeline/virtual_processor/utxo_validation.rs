@@ -1017,15 +1017,22 @@ impl VirtualStateProcessor {
         // (b_mat delta, b_imm delta, a_imm delta) per SPK. i128 accommodates sompi × DAA products.
         let mut deltas: std::collections::HashMap<ScriptPublicKey, (i128, i128, i128)> = std::collections::HashMap::new();
         let mature_bound = pov_daa_score.saturating_sub(self.coin_age_maturity_w);
-        // ORDER MATTERS for the maturation queue: removes MUST be processed before adds. A tx
-        // re-accepted by a different chain block during a shallow reorg puts the SAME outpoint in
-        // diff.remove AND diff.add with the SAME inherited `effective_daa` (only `block_daa_score`
-        // differs, so the pair survives diff algebra) — same queue key on both sides. With adds
-        // first, the remove's delete lands after the add's insert in the batch and silently kills
-        // the re-added coin's maturation entry: the coin then sits in `b_imm` forever (its
-        // promotion never fires), which is exactly the network-wide coin-age drift signature.
-        // Removes-first makes the add's insert land last, so the surviving coin keeps its entry.
-        // The bucket deltas are order-independent (accumulated in the map, applied once below).
+        for (outpoint, entry) in diff.add.iter() {
+            let d = deltas.entry(entry.script_public_key.clone()).or_default();
+            if entry.effective_daa <= mature_bound {
+                d.0 += entry.amount as i128;
+            } else {
+                d.1 += entry.amount as i128;
+                d.2 += (entry.amount as i128) * (entry.effective_daa as i128);
+                // Immature coin: enqueue at its maturity score so the sweep promotes it in time.
+                let queued = MaturationEntry {
+                    script_public_key: entry.script_public_key.clone(),
+                    amount: entry.amount,
+                    anchor: entry.effective_daa,
+                };
+                self.maturation_queue_store.insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued).unwrap();
+            }
+        }
         for (outpoint, entry) in diff.remove.iter() {
             let d = deltas.entry(entry.script_public_key.clone()).or_default();
             if entry.effective_daa <= mature_bound {
@@ -1042,34 +1049,6 @@ impl VirtualStateProcessor {
                 d.2 -= (entry.amount as i128) * (entry.effective_daa as i128);
                 // Spent while immature: drop its pending promotion.
                 self.maturation_queue_store.delete_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint).unwrap();
-            }
-        }
-        for (outpoint, entry) in diff.add.iter() {
-            let d = deltas.entry(entry.script_public_key.clone()).or_default();
-            if entry.effective_daa <= mature_bound {
-                d.0 += entry.amount as i128;
-                // Inserted already mature (inherited anchor — consolidation keeps its age): enqueue
-                // it anyway, in the RETAINED role (due is in the past, so forward sweeps skip it).
-                // Without an entry the coin is invisible to the demotion sweep: a virtual re-anchor
-                // crossing its maturity boundary desyncs the store from the `d − W` classification,
-                // and a spend inside that window then drains the WRONG bucket (silently, on any
-                // address whose immature mass covers the amount).
-                let queued = MaturationEntry {
-                    script_public_key: entry.script_public_key.clone(),
-                    amount: entry.amount,
-                    anchor: entry.effective_daa,
-                };
-                self.maturation_queue_store.insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued).unwrap();
-            } else {
-                d.1 += entry.amount as i128;
-                d.2 += (entry.amount as i128) * (entry.effective_daa as i128);
-                // Immature coin: enqueue at its maturity score so the sweep promotes it in time.
-                let queued = MaturationEntry {
-                    script_public_key: entry.script_public_key.clone(),
-                    amount: entry.amount,
-                    anchor: entry.effective_daa,
-                };
-                self.maturation_queue_store.insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued).unwrap();
             }
         }
         deltas.retain(|_, d| *d != (0, 0, 0));
