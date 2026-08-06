@@ -25,7 +25,8 @@ use crate::{
     model::{
         services::reachability::MTReachabilityService,
         stores::{
-            DB, ghostdag::DbGhostdagStore, headers::HeaderStoreReader, reachability::DbReachabilityStore, virtual_state::VirtualStores,
+            DB, ghostdag::DbGhostdagStore, headers::HeaderStoreReader, pom_tier::DbPomTierStore, reachability::DbReachabilityStore,
+            virtual_state::VirtualStores,
         },
     },
     params::Params,
@@ -250,6 +251,10 @@ impl TestConsensus {
 
     pub fn block_body_processor(&self) -> &Arc<BlockBodyProcessor> {
         &self.consensus.body_processor
+    }
+
+    pub fn pom_tier_store(&self) -> &Arc<DbPomTierStore> {
+        self.consensus.body_processor.pom_tier_store()
     }
 
     pub fn virtual_processor(&self) -> &Arc<VirtualStateProcessor> {

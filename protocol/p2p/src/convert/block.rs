@@ -153,6 +153,19 @@ mod tests {
     }
 
     #[test]
+    fn proofless_forged_tier_survives_p2p_roundtrip() {
+        let block = Block::from_precomputed_hash(Hash::from_bytes([4u8; 32]), vec![]).with_pom_tier(Some(4));
+        let msg: protowire::BlockMessage = (HeaderFormat::Legacy, &block).into();
+
+        assert!(msg.pom_proof.is_none());
+        assert_eq!(msg.pom_tier, Some(4));
+
+        let back: Block = Versioned(HeaderFormat::Legacy, msg).try_into().unwrap();
+        assert!(back.pom_proof.is_none());
+        assert_eq!(back.pom_tier, Some(4));
+    }
+
+    #[test]
     fn v2_proof_survives_p2p_roundtrip() {
         let block = Block::from_precomputed_hash(Hash::from_bytes([3u8; 32]), vec![]).with_pom_proof(dummy_proof_v2());
         let msg: protowire::BlockMessage = (HeaderFormat::Legacy, &block).into();
