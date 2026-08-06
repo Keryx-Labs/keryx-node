@@ -858,24 +858,37 @@ impl VirtualStateProcessor {
         for (spk, b) in buckets {
             self.age_buckets_store.set_batch(&mut batch, &spk, b).unwrap();
         }
-        // Reseed the maturation queue (immature coins only) and pin the watermark at the score
-        // the classification was taken at — the sweep resumes incrementally from here.
+        // Reseed the maturation queue and pin the watermark at the score the classification was
+        // taken at — the sweep resumes incrementally from here. Two entry kinds: every immature
+        // coin (pending promotion), plus every mature coin whose maturity is within the retention
+        // horizon (the RETAINED role — without it, a post-rebuild score drop cannot demote coins
+        // that matured recently, recreating the very desync the rebuild just repaired).
+        let retained_bound = daa_score.saturating_sub(self.coin_age_retention);
         let mut queued = 0u64;
+        let mut retained = 0u64;
         for item in virtual_read.utxo_set.iterator() {
             let (outpoint, entry) = item.unwrap();
+            let due = entry.effective_daa + self.coin_age_maturity_w;
             if entry.effective_daa > mature_bound {
-                let e = MaturationEntry {
-                    script_public_key: entry.script_public_key.clone(),
-                    amount: entry.amount,
-                    anchor: entry.effective_daa,
-                };
-                self.maturation_queue_store.insert_batch(&mut batch, entry.effective_daa + self.coin_age_maturity_w, &outpoint, e).unwrap();
                 queued += 1;
+            } else if due > retained_bound {
+                retained += 1;
+            } else {
+                continue;
             }
+            let e = MaturationEntry {
+                script_public_key: entry.script_public_key.clone(),
+                amount: entry.amount,
+                anchor: entry.effective_daa,
+            };
+            self.maturation_queue_store.insert_batch(&mut batch, due, &outpoint, e).unwrap();
         }
         self.maturation_queue_store.set_watermark_batch(&mut batch, daa_score).unwrap();
         self.db.write(batch).unwrap();
-        info!("age-buckets rebuild: done — {} addresses written, {} immature coins queued (split at d−W).", n, queued);
+        info!(
+            "age-buckets rebuild: done — {} addresses written, {} immature coins queued, {} retained maturities kept (split at d−W).",
+            n, queued, retained
+        );
     }
 
     /// Periodic gate for `selfcheck_age_buckets_index`: runs it when BOTH the score interval
