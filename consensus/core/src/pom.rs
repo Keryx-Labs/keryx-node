@@ -254,6 +254,14 @@ impl PomProof {
             .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
+
+    /// Identity of this witness for negative caching: blake3 of the era-exact wire
+    /// encoding. The witness travels outside the block hash, so a failed verification
+    /// must be remembered per (block, witness) — never per block, or a single crafted
+    /// witness would poison a valid hash permanently.
+    pub fn wire_digest(&self) -> [u8; 32] {
+        *blake3::hash(&self.to_wire_bytes()).as_bytes()
+    }
 }
 
 impl MemSizeEstimator for PomProof {

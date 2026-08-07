@@ -96,6 +96,9 @@ pub enum RuleError {
     #[error("PoM possession proof missing")]
     PomProofMissing,
 
+    #[error("PoM witness already failed verification for this block (negative cache)")]
+    KnownBadPomWitness,
+
     #[error("PoM possession proof references unknown tier {0}")]
     PomUnknownTier(u8),
 

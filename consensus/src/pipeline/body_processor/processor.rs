@@ -44,6 +44,7 @@ use keryx_notify::notifier::Notify;
 use parking_lot::RwLock;
 use rayon::ThreadPool;
 use rocksdb::WriteBatch;
+use std::collections::HashSet;
 use std::sync::{Arc, atomic::Ordering};
 
 pub struct BlockBodyProcessor {
@@ -120,6 +121,88 @@ pub struct BlockBodyProcessor {
 
     // Counters
     counters: Arc<ProcessingCounters>,
+
+    /// Negative cache of PoM witnesses that failed verification, keyed by
+    /// (block hash, witness wire digest). The witness travels OUTSIDE the block
+    /// hash, so a bad witness must never invalidate the hash (witness poisoning) — but
+    /// without this cache, dropping the invalidation would let a peer force
+    /// unbounded re-verification of the same bad witness. Bounded two-generation
+    /// set; see `BadWitnessCache`.
+    bad_witness_cache: RwLock<BadWitnessCache>,
+}
+
+/// Bounded two-generation set: inserts go to the current generation; when it
+/// fills up, generations rotate and the oldest entries fall away. Membership
+/// checks look at both generations, so an entry lives for at least one and at
+/// most two generation lifetimes. No LRU bookkeeping, O(1) everything.
+#[derive(Default)]
+pub(super) struct BadWitnessCache {
+    current: HashSet<(Hash, [u8; 32])>,
+    previous: HashSet<(Hash, [u8; 32])>,
+}
+
+impl BadWitnessCache {
+    /// Per-generation capacity: 4096 entries × 40 bytes ≈ 160 KiB per generation.
+    /// An attacker cannot use rotation to flush their own entry usefully: filling
+    /// a generation costs 4096 distinct failed verifications.
+    const GENERATION_CAP: usize = 4096;
+
+    pub(super) fn contains(&self, block_hash: Hash, witness_digest: &[u8; 32]) -> bool {
+        let key = (block_hash, *witness_digest);
+        self.current.contains(&key) || self.previous.contains(&key)
+    }
+
+    pub(super) fn insert(&mut self, block_hash: Hash, witness_digest: [u8; 32]) {
+        if self.current.len() >= Self::GENERATION_CAP {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert((block_hash, witness_digest));
+    }
+}
+
+/// True when a body-validation error is scoped to the PoM WITNESS rather than the
+/// block itself. The witness travels outside the block hash (transport attachment),
+/// so none of these may ever mark the HASH invalid: the same block can arrive later
+/// with its honest witness. Marking the hash would let a single crafted witness
+/// poison a valid block permanently, reject every descendant and wedge the node
+/// (witness poisoning). The delivery is still rejected — and the relay flow still drops the
+/// peer that served it.
+pub(super) fn witness_scoped_error(e: &RuleError) -> bool {
+    matches!(
+        e,
+        RuleError::BadPomProof(_)
+            | RuleError::BadPomProofV3(_)
+            | RuleError::PomFinalStateMismatch(_, _)
+            | RuleError::PomUnknownTier(_)
+    )
+}
+
+/// Whether a body-validation failure persists `StatusInvalid` for the block hash.
+/// Base exemptions (every era):
+/// - MissingParents: the block may become valid once its parents arrive.
+/// - BadMerkleRoot: a later delivery may carry the transactions matching the root.
+/// - PrunedBlock: rejects this body delivery, not the block as a whole.
+/// - PomProofMissing: the proof is a transport-level attachment (stripped by IBD
+///   beyond the retention window, garbage-collected, or dropped by a lagging peer);
+///   its absence only rejects this delivery.
+/// - KnownBadPomWitness: cache short-circuit, only ever produced when the fix is active.
+///
+/// With `bad_witness_rejects_delivery` (H6 gate, keyed on the block's own daa_score)
+/// every witness-scoped error is exempted as well — see `witness_scoped_error`.
+/// Pre-gate blocks keep the historical behavior: a present-but-wrong witness marks
+/// invalid.
+pub(super) fn marks_block_invalid(e: &RuleError, bad_witness_rejects_delivery: bool) -> bool {
+    if matches!(
+        e,
+        RuleError::BadMerkleRoot(_, _)
+            | RuleError::MissingParents(_)
+            | RuleError::PrunedBlock
+            | RuleError::PomProofMissing
+            | RuleError::KnownBadPomWitness
+    ) {
+        return false;
+    }
+    !(bad_witness_rejects_delivery && witness_scoped_error(e))
 }
 
 impl BlockBodyProcessor {
@@ -174,6 +257,7 @@ impl BlockBodyProcessor {
             task_manager: BlockTaskDependencyManager::new(),
             notification_root,
             counters,
+            bad_witness_cache: RwLock::new(BadWitnessCache::default()),
         }
     }
 
@@ -230,29 +314,32 @@ impl BlockBodyProcessor {
             _ => panic!("unexpected block status {status:?}"),
         }
 
+        // Witness-poisoning fix, gated at the H6 (pom_v3) fork by the block's OWN daa_score — the same
+        // deterministic key the proof-era selection uses, so every updated node applies the
+        // same policy to the same block. Pre-gate behavior is byte-identical to the previous
+        // release (a present-but-wrong witness still marks StatusInvalid below).
+        let bad_witness_rejects_delivery = self.pom_v3_activation.is_active(block.header.daa_score);
+
+        // Negative witness cache: a witness that already failed for this block is rejected
+        // without re-verification (pre-v3 verifiers re-walk all K transitions — unbounded
+        // re-verification would be a cheap CPU DoS).
+        let witness_digest = if bad_witness_rejects_delivery { block.pom_proof.as_ref().map(|p| p.wire_digest()) } else { None };
+        if let Some(digest) = witness_digest {
+            if self.bad_witness_cache.read().contains(block.hash(), &digest) {
+                return Err(RuleError::KnownBadPomWitness);
+            }
+        }
+
         let mass = match self.validate_body(block, is_trusted, skip_pom_proof) {
             Ok(mass) => mass,
             Err(e) => {
-                // We mark invalid blocks with status StatusInvalid except in the
-                // case of the following errors:
-                // MissingParents - If we got MissingParents the block shouldn't be
-                // considered as invalid because it could be added later on when its
-                // parents are present.
-                // BadMerkleRoot - if we get BadMerkleRoot we shouldn't mark the
-                // block as invalid because later on we can get the block with
-                // transactions that fits the merkle root.
-                // PrunedBlock - PrunedBlock is an error that rejects a block body and
-                // not the block as a whole, so we shouldn't mark it as invalid.
-                // PomProofMissing - the proof is a transport-level attachment (stripped by IBD
-                // beyond the retention window, garbage-collected, or dropped by a lagging peer),
-                // so its absence only rejects this delivery; the same block can arrive later WITH
-                // its proof. Marking it invalid here poisons all descendants permanently
-                // ("parent is invalid") and wedges the node. A present-but-wrong proof still
-                // marks invalid below.
-                if !matches!(
-                    e,
-                    RuleError::BadMerkleRoot(_, _) | RuleError::MissingParents(_) | RuleError::PrunedBlock | RuleError::PomProofMissing
-                ) {
+                // Remember failed witnesses per (block, witness) — see the cache above.
+                if witness_scoped_error(&e) {
+                    if let Some(digest) = witness_digest {
+                        self.bad_witness_cache.write().insert(block.hash(), digest);
+                    }
+                }
+                if marks_block_invalid(&e, bad_witness_rejects_delivery) {
                     self.statuses_store.write().set(block.hash(), BlockStatus::StatusInvalid).unwrap();
                 }
                 return Err(e);
@@ -353,5 +440,63 @@ impl BlockBodyProcessor {
 
         // Write the genesis body
         self.commit_body(self.genesis.hash, &[], Arc::new(self.genesis.build_genesis_transactions()), None, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_consensus_core::pom::PomVerifyError;
+    use keryx_consensus_core::pom_v3::PomV3VerifyError;
+
+    #[test]
+    fn test_witness_errors_never_mark_the_block_invalid_post_gate() {
+        // Post-gate (witness-poisoning fix active): witness-scoped errors reject the delivery,
+        // never persist StatusInvalid.
+        let witness_scoped = [
+            RuleError::BadPomProof(PomVerifyError::TargetNotMet),
+            RuleError::BadPomProofV3(PomV3VerifyError::MissingV3),
+            RuleError::PomFinalStateMismatch(1, 2),
+            RuleError::PomUnknownTier(7),
+        ];
+        for e in &witness_scoped {
+            assert!(!marks_block_invalid(e, true), "{e:?} must not poison the block hash post-gate");
+            // Pre-gate: historical behavior is preserved byte-identically — a
+            // present-but-wrong witness still marks invalid.
+            assert!(marks_block_invalid(e, false), "{e:?} must keep marking invalid pre-gate");
+        }
+        // Era-independent exemptions.
+        for e in [RuleError::PomProofMissing, RuleError::KnownBadPomWitness] {
+            assert!(!marks_block_invalid(&e, true));
+            assert!(!marks_block_invalid(&e, false));
+        }
+        // Genuine block defects still mark invalid in both eras.
+        assert!(marks_block_invalid(&RuleError::DuplicateTransactions(Default::default()), true));
+        assert!(marks_block_invalid(&RuleError::DuplicateTransactions(Default::default()), false));
+    }
+
+    #[test]
+    fn test_bad_witness_cache_membership_and_rotation() {
+        let mut cache = BadWitnessCache::default();
+        let block = Hash::from_u64_word(1);
+        let witness_a = [0xaa; 32];
+        let witness_b = [0xbb; 32];
+
+        assert!(!cache.contains(block, &witness_a));
+        cache.insert(block, witness_a);
+        assert!(cache.contains(block, &witness_a), "failed witness must be remembered");
+        // Same witness on another block, and another witness on the same block, are distinct.
+        assert!(!cache.contains(Hash::from_u64_word(2), &witness_a));
+        assert!(!cache.contains(block, &witness_b), "an honest replacement witness must not be blocked");
+
+        // Rotation: an entry survives one full generation, dies after two.
+        for i in 0..BadWitnessCache::GENERATION_CAP as u64 {
+            cache.insert(Hash::from_u64_word(1000 + i), [0x11; 32]);
+        }
+        assert!(cache.contains(block, &witness_a), "entry must survive the first rotation (previous generation)");
+        for i in 0..BadWitnessCache::GENERATION_CAP as u64 {
+            cache.insert(Hash::from_u64_word(100_000 + i), [0x22; 32]);
+        }
+        assert!(!cache.contains(block, &witness_a), "entry must age out after two rotations");
     }
 }
