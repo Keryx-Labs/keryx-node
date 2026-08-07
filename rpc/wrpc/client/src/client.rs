@@ -627,6 +627,7 @@ impl RpcApi for KaspaRpcClient {
             EstimateNetworkHashesPerSecond,
             GetBalanceByAddress,
             GetBalancesByAddresses,
+            GetUtxoCountByAddress,
             GetBlock,
             GetBlockCount,
             GetBlockDagInfo,

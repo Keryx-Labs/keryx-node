@@ -140,6 +140,8 @@ pub enum RpcApiOps {
     GetUtxoReturnAddress = 150,
     /// Get Virtual Chain from Block V2
     GetVirtualChainFromBlockV2 = 151,
+    /// Get the number of UTXOs of a given address, without streaming the set
+    GetUtxoCountByAddress = 152,
 }
 
 impl RpcApiOps {

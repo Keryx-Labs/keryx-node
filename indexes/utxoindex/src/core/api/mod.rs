@@ -146,6 +146,27 @@ impl UtxoIndexProxy {
         .unwrap()
     }
 
+    /// Count the UTXOs of one script public key without materializing the set,
+    /// walking the bucket in bounded-lock chunks like the retrieval methods.
+    pub async fn get_utxo_count_by_script_public_key(self, script_public_key: ScriptPublicKey) -> StoreResult<u64> {
+        spawn_blocking(move || {
+            let mut count: u64 = 0;
+            let mut resume_after: Option<TransactionOutpoint> = None;
+            loop {
+                let chunk =
+                    self.inner.read().get_utxos_by_script_public_key_chunk(&script_public_key, resume_after, UTXO_SCAN_CHUNK)?;
+                count += chunk.len() as u64;
+                if chunk.len() < UTXO_SCAN_CHUNK {
+                    break;
+                }
+                resume_after = chunk.last().map(|(outpoint, _)| *outpoint);
+            }
+            Ok(count)
+        })
+        .await
+        .unwrap()
+    }
+
     pub async fn update(self, utxo_diff: Arc<UtxoDiff>, tips: Arc<Vec<Hash>>) -> UtxoIndexResult<UtxoChanges> {
         spawn_blocking(move || self.inner.write().update(utxo_diff, tips)).await.unwrap()
     }

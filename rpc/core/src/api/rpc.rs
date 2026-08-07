@@ -325,6 +325,15 @@ pub trait RpcApi: Sync + Send + AnySync {
     /// Returns the total balance in unspent transactions towards a given address.
     ///
     /// This call is only available when this node was started with `--utxoindex`.
+    async fn get_utxo_count_by_address(&self, address: RpcAddress) -> RpcResult<u64> {
+        Ok(self.get_utxo_count_by_address_call(None, GetUtxoCountByAddressRequest::new(address)).await?.count)
+    }
+    async fn get_utxo_count_by_address_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetUtxoCountByAddressRequest,
+    ) -> RpcResult<GetUtxoCountByAddressResponse>;
+
     async fn get_balance_by_address(&self, address: RpcAddress) -> RpcResult<u64> {
         Ok(self.get_balance_by_address_call(None, GetBalanceByAddressRequest::new(address)).await?.balance)
     }

@@ -39,6 +39,7 @@ impl Router {
                 EstimateNetworkHashesPerSecond,
                 GetBalanceByAddress,
                 GetBalancesByAddresses,
+                GetUtxoCountByAddress,
                 GetBlock,
                 GetBlockCount,
                 GetBlockDagInfo,

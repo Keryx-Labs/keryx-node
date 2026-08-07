@@ -1349,6 +1349,66 @@ impl Deserializer for GetBalanceByAddressResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetUtxoCountByAddressRequest {
+    pub address: RpcAddress,
+}
+
+impl GetUtxoCountByAddressRequest {
+    pub fn new(address: RpcAddress) -> Self {
+        Self { address }
+    }
+}
+
+impl Serializer for GetUtxoCountByAddressRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcAddress, &self.address, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoCountByAddressRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let address = load!(RpcAddress, reader)?;
+
+        Ok(Self { address })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxoCountByAddressResponse {
+    pub count: u64,
+}
+
+impl GetUtxoCountByAddressResponse {
+    pub fn new(count: u64) -> Self {
+        Self { count }
+    }
+}
+
+impl Serializer for GetUtxoCountByAddressResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.count, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoCountByAddressResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let count = load!(u64, reader)?;
+
+        Ok(Self { count })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetBalancesByAddressesRequest {
     pub addresses: Vec<RpcAddress>,
 }

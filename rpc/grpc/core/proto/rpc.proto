@@ -584,6 +584,18 @@ message GetBalanceByAddressRequestMessage {
   string address = 1;
 }
 
+// Count the UTXOs of an address inside the node's utxoindex, without
+// serializing the set. Requires the node to be started with --utxoindex.
+message GetUtxoCountByAddressRequestMessage {
+  string address = 1;
+}
+
+message GetUtxoCountByAddressResponseMessage {
+  uint64 count = 1;
+
+  RPCError error = 1000;
+}
+
 message GetBalanceByAddressResponseMessage {
   uint64 balance = 1;
 
