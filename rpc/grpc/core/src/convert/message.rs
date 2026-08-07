@@ -347,6 +347,13 @@ from!(item: RpcResult<&keryx_rpc_core::GetBalanceByAddressResponse>, protowire::
     Self { balance: item.balance, error: None }
 });
 
+from!(item: &keryx_rpc_core::GetUtxoEntriesByOutpointsRequest, protowire::GetUtxoEntriesByOutpointsRequestMessage, {
+    Self { outpoints: item.outpoints.iter().map(|x| x.into()).collect() }
+});
+from!(item: RpcResult<&keryx_rpc_core::GetUtxoEntriesByOutpointsResponse>, protowire::GetUtxoEntriesByOutpointsResponseMessage, {
+    Self { entries: item.entries.iter().map(|x| x.into()).collect(), error: None }
+});
+
 from!(item: &keryx_rpc_core::GetUtxoCountByAddressRequest, protowire::GetUtxoCountByAddressRequestMessage, {
     Self { address: (&item.address).into() }
 });
@@ -877,6 +884,13 @@ try_from!(item: &protowire::GetBalanceByAddressRequestMessage, keryx_rpc_core::G
 });
 try_from!(item: &protowire::GetBalanceByAddressResponseMessage, RpcResult<keryx_rpc_core::GetBalanceByAddressResponse>, {
     Self { balance: item.balance }
+});
+
+try_from!(item: &protowire::GetUtxoEntriesByOutpointsRequestMessage, keryx_rpc_core::GetUtxoEntriesByOutpointsRequest, {
+    Self { outpoints: item.outpoints.iter().map(|x| x.try_into()).collect::<Result<Vec<_>, _>>()? }
+});
+try_from!(item: &protowire::GetUtxoEntriesByOutpointsResponseMessage, RpcResult<keryx_rpc_core::GetUtxoEntriesByOutpointsResponse>, {
+    Self { entries: item.entries.iter().map(|x| x.try_into()).collect::<Result<Vec<_>, _>>()? }
 });
 
 try_from!(item: &protowire::GetUtxoCountByAddressRequestMessage, keryx_rpc_core::GetUtxoCountByAddressRequest, {

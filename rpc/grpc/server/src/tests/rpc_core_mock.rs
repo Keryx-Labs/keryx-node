@@ -290,6 +290,14 @@ impl RpcApi for RpcCoreMock {
         Err(RpcError::NotImplemented)
     }
 
+    async fn get_utxo_entries_by_outpoints_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetUtxoEntriesByOutpointsRequest,
+    ) -> RpcResult<GetUtxoEntriesByOutpointsResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
     async fn get_balances_by_addresses_call(
         &self,
         _connection: Option<&DynRpcConnection>,

@@ -232,6 +232,12 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Point-lookup of specific outpoints in the virtual UTXO set. Only live
+    /// outpoints are returned; a missing outpoint is spent or never existed.
+    fn get_utxos_by_outpoints(&self, outpoints: Vec<TransactionOutpoint>) -> Vec<(TransactionOutpoint, UtxoEntry)> {
+        unimplemented!()
+    }
+
     fn get_tips(&self) -> Vec<Hash> {
         unimplemented!()
     }

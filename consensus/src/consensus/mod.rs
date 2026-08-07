@@ -1059,6 +1059,14 @@ impl ConsensusApi for Consensus {
         iter.map(|item| item.unwrap()).collect()
     }
 
+    fn get_utxos_by_outpoints(&self, outpoints: Vec<TransactionOutpoint>) -> Vec<(TransactionOutpoint, UtxoEntry)> {
+        let virtual_stores = self.virtual_stores.read();
+        outpoints
+            .into_iter()
+            .filter_map(|outpoint| virtual_stores.utxo_set.get(&outpoint).ok().map(|entry| (outpoint, (*entry).clone())))
+            .collect()
+    }
+
     fn get_tips(&self) -> Vec<Hash> {
         self.body_tips_store.read().get().unwrap().read().iter().copied().collect_vec()
     }

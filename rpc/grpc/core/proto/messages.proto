@@ -68,6 +68,7 @@ message KaspadRequest {
     GetUtxoReturnAddressRequestMessage getUtxoReturnAddressRequest = 1112;
     GetVirtualChainFromBlockV2RequestMessage getVirtualChainFromBlockV2Request = 1114;
     GetUtxoCountByAddressRequestMessage getUtxoCountByAddressRequest = 1116;
+    GetUtxoEntriesByOutpointsRequestMessage getUtxoEntriesByOutpointsRequest = 1118;
   }
 }
 
@@ -136,6 +137,7 @@ message KaspadResponse {
     GetUtxoReturnAddressResponseMessage getUtxoReturnAddressResponse = 1113;
     GetVirtualChainFromBlockV2ResponseMessage getVirtualChainFromBlockV2Response = 1115;
     GetUtxoCountByAddressResponseMessage getUtxoCountByAddressResponse = 1117;
+    GetUtxoEntriesByOutpointsResponseMessage getUtxoEntriesByOutpointsResponse = 1119;
   }
 }
 

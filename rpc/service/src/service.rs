@@ -831,6 +831,30 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetUtxosByAddressesResponse::new(self.index_converter.get_utxos_by_addresses_entries(&entry_map)))
     }
 
+    async fn get_utxo_entries_by_outpoints_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetUtxoEntriesByOutpointsRequest,
+    ) -> RpcResult<GetUtxoEntriesByOutpointsResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        // do not read the virtual utxo set while in unstable ibd state.
+        if session.async_is_consensus_in_transitional_ibd_state().await {
+            return Err(RpcError::ConsensusInTransitionalIbdState);
+        }
+        let outpoints = request.outpoints.into_iter().map(|outpoint| outpoint.into()).collect();
+        let entries = session
+            .async_get_utxos_by_outpoints(outpoints)
+            .await
+            .into_iter()
+            .map(|(outpoint, entry)| RpcUtxosByAddressesEntry {
+                address: extract_script_pub_key_address(&entry.script_public_key, self.config.prefix()).ok(),
+                outpoint: outpoint.into(),
+                utxo_entry: entry.into(),
+            })
+            .collect();
+        Ok(GetUtxoEntriesByOutpointsResponse::new(entries))
+    }
+
     async fn get_utxo_count_by_address_call(
         &self,
         _connection: Option<&DynRpcConnection>,

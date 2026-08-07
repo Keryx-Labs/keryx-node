@@ -64,6 +64,7 @@ impl Factory {
                 GetHeaders,
                 GetUtxosByAddresses,
                 GetUtxoCountByAddress,
+                GetUtxoEntriesByOutpoints,
                 GetBalanceByAddress,
                 GetBalancesByAddresses,
                 GetSinkBlueScore,

@@ -1349,6 +1349,68 @@ impl Deserializer for GetBalanceByAddressResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetUtxoEntriesByOutpointsRequest {
+    pub outpoints: Vec<RpcTransactionOutpoint>,
+}
+
+impl GetUtxoEntriesByOutpointsRequest {
+    pub fn new(outpoints: Vec<RpcTransactionOutpoint>) -> Self {
+        Self { outpoints }
+    }
+}
+
+impl Serializer for GetUtxoEntriesByOutpointsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcTransactionOutpoint>, &self.outpoints, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoEntriesByOutpointsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let outpoints = deserialize!(Vec<RpcTransactionOutpoint>, reader)?;
+
+        Ok(Self { outpoints })
+    }
+}
+
+/// Entries of the queried outpoints that are live in the virtual UTXO set.
+/// An outpoint absent from `entries` is spent or never existed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxoEntriesByOutpointsResponse {
+    pub entries: Vec<RpcUtxosByAddressesEntry>,
+}
+
+impl GetUtxoEntriesByOutpointsResponse {
+    pub fn new(entries: Vec<RpcUtxosByAddressesEntry>) -> Self {
+        Self { entries }
+    }
+}
+
+impl Serializer for GetUtxoEntriesByOutpointsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcUtxosByAddressesEntry>, &self.entries, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoEntriesByOutpointsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let entries = deserialize!(Vec<RpcUtxosByAddressesEntry>, reader)?;
+
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetUtxoCountByAddressRequest {
     pub address: RpcAddress,
 }

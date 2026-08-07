@@ -142,6 +142,8 @@ pub enum RpcApiOps {
     GetVirtualChainFromBlockV2 = 151,
     /// Get the number of UTXOs of a given address, without streaming the set
     GetUtxoCountByAddress = 152,
+    /// Get the live UTXO entries of specific outpoints; absence means spent or never existed
+    GetUtxoEntriesByOutpoints = 153,
 }
 
 impl RpcApiOps {

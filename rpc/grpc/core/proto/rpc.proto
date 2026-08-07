@@ -586,6 +586,18 @@ message GetBalanceByAddressRequestMessage {
 
 // Count the UTXOs of an address inside the node's utxoindex, without
 // serializing the set. Requires the node to be started with --utxoindex.
+// Live UTXO entries of specific outpoints, read from the virtual UTXO set.
+// An outpoint absent from the response is spent or never existed.
+message GetUtxoEntriesByOutpointsRequestMessage {
+  repeated RpcOutpoint outpoints = 1;
+}
+
+message GetUtxoEntriesByOutpointsResponseMessage {
+  repeated RpcUtxosByAddressesEntry entries = 1;
+
+  RPCError error = 1000;
+}
+
 message GetUtxoCountByAddressRequestMessage {
   string address = 1;
 }
