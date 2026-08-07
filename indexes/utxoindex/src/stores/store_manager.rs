@@ -2,11 +2,11 @@ use std::{collections::HashSet, sync::Arc};
 
 use keryx_consensus_core::{
     BlockHashSet,
-    tx::{ScriptPublicKeys, TransactionOutpoint},
+    tx::{ScriptPublicKey, ScriptPublicKeys, TransactionOutpoint},
 };
 use keryx_core::trace;
 use keryx_database::prelude::{CachePolicy, DB, StoreResult};
-use keryx_index_core::indexed_utxos::BalanceByScriptPublicKey;
+use keryx_index_core::indexed_utxos::{BalanceByScriptPublicKey, CompactUtxoEntry};
 
 use crate::{
     IDENT,
@@ -40,6 +40,15 @@ impl Store {
 
     pub fn get_balance_by_script_public_key(&self, script_public_keys: ScriptPublicKeys) -> StoreResult<BalanceByScriptPublicKey> {
         self.utxos_by_script_public_key_store.get_balance_from_script_public_keys(script_public_keys)
+    }
+
+    pub fn get_utxos_by_script_public_key_chunk(
+        &self,
+        script_public_key: &ScriptPublicKey,
+        resume_after: Option<TransactionOutpoint>,
+        limit: usize,
+    ) -> StoreResult<Vec<(TransactionOutpoint, CompactUtxoEntry)>> {
+        self.utxos_by_script_public_key_store.get_utxos_from_script_public_key_chunk(script_public_key, resume_after, limit)
     }
 
     // This can have a big memory footprint, so it should be used only for tests.

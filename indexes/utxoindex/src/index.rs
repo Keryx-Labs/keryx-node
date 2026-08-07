@@ -2,11 +2,15 @@ use crate::{
     IDENT,
     api::UtxoIndexApi,
     errors::{UtxoIndexError, UtxoIndexResult},
-    model::{CirculatingSupply, UtxoChanges, UtxoSetByScriptPublicKey},
+    model::{CirculatingSupply, CompactUtxoEntry, UtxoChanges, UtxoSetByScriptPublicKey},
     stores::store_manager::Store,
     update_container::UtxoIndexChanges,
 };
-use keryx_consensus_core::{BlockHashSet, tx::ScriptPublicKeys, utxo::utxo_diff::UtxoDiff};
+use keryx_consensus_core::{
+    BlockHashSet,
+    tx::{ScriptPublicKey, ScriptPublicKeys, TransactionOutpoint},
+    utxo::utxo_diff::UtxoDiff,
+};
 use keryx_consensusmanager::{ConsensusManager, ConsensusResetHandler};
 use keryx_core::{info, trace};
 use keryx_database::prelude::{DB, StoreError, StoreResult};
@@ -69,6 +73,19 @@ impl UtxoIndexApi for UtxoIndex {
         trace!("[{0}] retrieving utxos from {1} script public keys", IDENT, script_public_keys.len());
 
         self.store.get_balance_by_script_public_key(script_public_keys)
+    }
+
+    /// Retrieve up to `limit` utxos of one script public key from the utxoindex db,
+    /// resuming strictly after `resume_after` when provided.
+    fn get_utxos_by_script_public_key_chunk(
+        &self,
+        script_public_key: &ScriptPublicKey,
+        resume_after: Option<TransactionOutpoint>,
+        limit: usize,
+    ) -> StoreResult<Vec<(TransactionOutpoint, CompactUtxoEntry)>> {
+        trace!("[{0}] retrieving a chunk of at most {1} utxos from one script public key", IDENT, limit);
+
+        self.store.get_utxos_by_script_public_key_chunk(script_public_key, resume_after, limit)
     }
 
     /// Retrieve the stored tips of the utxoindex.
