@@ -57,7 +57,6 @@ pub const POM_V3_OFFSET_FIRST_SALT: u64 = 0x3F1F886D659E316A;
 /// sha256("keryx-h6-offset-step-salt")
 pub const POM_V3_OFFSET_STEP_SALT: u64 = 0xD4C194F3ADB3B1C7;
 /// Domain prefixes for the blake3-based derivations.
-const POW_DOMAIN: &[u8] = b"keryx-h6-pow-v3";
 const CHECKS_DOMAIN: &[u8] = b"keryx-h6-checks-v3";
 
 /// One walk state: a D x D int8 matrix, row-major (`state[row * D + col]`).
@@ -93,7 +92,8 @@ pub struct PomProofV3 {
     /// openings only verify against the claimed tier's root).
     pub tier: u8,
     /// Per-step state commitments `root(S_0) ..= root(S_K)` (K+1 entries). `roots[K]` is the
-    /// lottery binding: `pom_v3_pow_value` folds it and must meet the target.
+    /// lottery binding: the container pins `final_state = fold64(roots[K])` and the era pow
+    /// fold of `final_state` must meet the tier target (header-only verifiable, H3 pin intact).
     pub roots: Vec<[u8; 32]>,
     /// The K offset-chain snippets: `snippets[t-1]` = first 32 B of the tile read at step t.
     /// The verifier derives EVERY tile offset from this list (never link-by-link).
@@ -263,17 +263,6 @@ fn v3_state_row_path(state: &V3State, x: usize) -> Vec<[u8; 32]> {
     path
 }
 
-/// Lottery value binding the ticket to the full final state: blake3-fold of the era-salted
-/// pre_pow_hash, the nonce and `root(S_K)`. Compared little-endian against the tier target.
-pub fn pom_v3_pow_value(pre_pow_hash: &[u8; 32], nonce: u64, root_k: &[u8; 32]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(POW_DOMAIN.len() + 32 + 8 + 32);
-    buf.extend_from_slice(POW_DOMAIN);
-    buf.extend_from_slice(pre_pow_hash);
-    buf.extend_from_slice(&nonce.to_le_bytes());
-    buf.extend_from_slice(root_k);
-    blake(&buf)
-}
-
 /// The PRF deriving the spot-check triples (t, x, j). Binds the header (pre_pow_hash, nonce)
 /// and the ENTIRE deterministic commitment (all roots, all snippets) — no salt, no prover
 /// freedom (A5): re-rolling any committed byte re-rolls root_K, i.e. the lottery.
@@ -436,8 +425,8 @@ pub fn v3_prove(
 /// Deterministically verify a v3 proof against the tier root `r_t` (existing R_T, unchanged)
 /// and its canonical chunk count. Cost: K+2 mix64 chains for the offsets, one S_0 tree
 /// (~256 row hashes), and per check ~2 row paths + 1 range proof + 1 snippet path + D MACs.
-/// The caller checks `pom_v3_pow_value(pre_pow_hash, nonce, roots[K]) <= target` and the
-/// header binding separately (same split as v1/v2).
+/// The caller checks the lottery (`era_pow_fold(fold64(roots[K])) <= target`) and the
+/// header binding separately — see `verify_pom_proof_v3_container`.
 pub fn verify_pom_proof_v3(
     pre_pow_hash: &[u8; 32],
     nonce: u64,
@@ -797,12 +786,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pow_value_binds_root_k() {
-        let (_, _, _, _, proof) = honest_setup();
-        let a = pom_v3_pow_value(&PPH, NONCE, &proof.roots[POM_V3_K]);
-        let mut other = proof.roots[POM_V3_K];
-        other[31] ^= 1;
-        assert_ne!(a, pom_v3_pow_value(&PPH, NONCE, &other));
-    }
 }
