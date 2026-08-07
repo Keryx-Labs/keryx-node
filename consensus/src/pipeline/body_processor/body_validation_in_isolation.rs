@@ -219,7 +219,9 @@ impl BlockBodyProcessor {
         // coin_age_verification) > H2 (5-tier, very_light) > legacy 4-tier. Chosen from this block's
         // own daa_score so archival/IBD recomputation stays canonical. H4 co-activates with the
         // recompute-from-chunks verifier; H5 rides the same v2 verifier with the non-foldable walk.
+        let pom_v3 = self.pom_v3_activation.is_active(header.daa_score);
         let tiers = pom_tiers(
+            pom_v3,
             self.h5_activation.is_active(header.daa_score),
             self.coin_age_verification_activation.is_active(header.daa_score),
             self.very_light_activation.is_active(header.daa_score),
@@ -254,7 +256,7 @@ impl BlockBodyProcessor {
         // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
         // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
         // later), so the pin check above already ran.
-        if self.pom_v3_activation.is_active(header.daa_score) {
+        if pom_v3 {
             return verify_pom_proof_v3_container(
                 &pre_pow_hash,
                 header.nonce,

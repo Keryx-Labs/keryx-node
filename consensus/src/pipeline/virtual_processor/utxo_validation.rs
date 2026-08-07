@@ -32,7 +32,7 @@ use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -453,7 +453,9 @@ impl VirtualStateProcessor {
     /// OPoI v2 introduced the uncensored lineup. Resolved in one place so the pre-UTXO fast path,
     /// the full block check and mempool admission cannot read different tables for the same score.
     pub(super) fn ai_reward_minimums(&self, daa_score: u64) -> &[([u8; 32], u64)] {
-        if self.coin_age_activation.is_active(daa_score) {
+        if self.pom_v3_activation.is_active(daa_score) {
+            INFERENCE_REWARD_MINIMUMS_V2_H6
+        } else if self.coin_age_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_V2_H4
         } else if self.inference_min_h2_activation.is_active(daa_score) {
             self.inference_reward_minimums_v2_h2

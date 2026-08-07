@@ -242,6 +242,8 @@ pub struct VirtualStateProcessor {
     // FIFO-inherited `effective_daa` anchors (see `UtxoDiff::add_transaction`) and the ratio
     // numerator switches to the per-coin-capped effective balance. Dormant (`never()`) until H4.
     pub(super) coin_age_activation: ForkActivation,
+    // H6 gate — selects the H6 inference-minimum table in `ai_reward_minimums`.
+    pub(super) pom_v3_activation: ForkActivation,
     pub(super) difficulty_reset_activation_h5_3: ForkActivation,
     pub(super) difficulty_reset_activation_h5_4: ForkActivation,
     // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
@@ -379,6 +381,7 @@ impl VirtualStateProcessor {
             ratio_reward_window: params.ratio_reward_window,
             ratio_reward_window_daa: params.ratio_reward_window_daa,
             coin_age_activation: params.coin_age_activation,
+            pom_v3_activation: params.pom_v3_activation,
             difficulty_reset_activation_h5_3: params.difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4: params.difficulty_reset_activation_h5_4,
             coin_age_maturity_w: params.coin_age_maturity_w,
