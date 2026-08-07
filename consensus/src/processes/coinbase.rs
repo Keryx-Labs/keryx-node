@@ -3,7 +3,7 @@ use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
     collateral::CHALLENGE_WINDOW_BLOCKS,
-    config::params::{RATIO_REWARD_BPS_DIVISOR, TIER_REWARD_BPS_DIVISOR},
+    config::params::{ForkActivation, RATIO_REWARD_BPS_DIVISOR, TIER_REWARD_BPS_DIVISOR},
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
@@ -188,6 +188,11 @@ pub struct CoinbaseManager {
     rd_allocation_script_public_key: ScriptPublicKey,
     /// Provably-unspendable burn SPK — receives the 20% escrow cut of standard miners.
     burn_script_public_key: ScriptPublicKey,
+    /// H6 gate — at/after this DAA the subsidy of a merged DAA-red block is BURNED instead of
+    /// paid to the merging miner (like red fees already are). Removes the economic incentive to
+    /// induce other miners' blocks to go red — a connectivity edge no longer transfers their
+    /// subsidy into the merger's pocket. Keyed on the merging block's own daa_score.
+    pom_v3_activation: ForkActivation,
 }
 
 /// Struct used to streamline payload parsing
@@ -215,6 +220,7 @@ impl CoinbaseManager {
         emission_start_daa_score: u64,
         pre_emission_base_subsidy: u64,
         bps: u64,
+        pom_v3_activation: ForkActivation,
     ) -> Self {
         let emission_schedule = build_emission_schedule(bps);
         let tail_emission_per_block = KRX_TAIL_EMISSION_PER_SECOND.div_ceil(bps);
@@ -237,6 +243,7 @@ impl CoinbaseManager {
             tail_emission_per_block,
             rd_allocation_script_public_key,
             burn_script_public_key,
+            pom_v3_activation,
         }
     }
 
@@ -303,9 +310,12 @@ impl CoinbaseManager {
             }
         }
 
-        // Collect all rewards from mergeset reds ∩ DAA window and create a
-        // single output rewarding the subsidy to the current block (the "merging" block).
-        // Fees from red blocks are burned like all other fees.
+        // Collect all rewards from mergeset reds ∩ DAA window.
+        // Fees from red blocks are always burned. The subsidy of a DAA-red block goes to the
+        // merging miner pre-H6, and is BURNED at/after the H6 gate: paying it out rewards
+        // inducing other miners' blocks to go red (see `pom_v3_activation` doc), so past the
+        // gate it joins the red fees in the burn output.
+        let burn_red_subsidy = self.pom_v3_activation.is_active(daa_score);
         let mut red_subsidy = 0u64;
         let mut red_fees = 0u64;
 
@@ -314,8 +324,11 @@ impl CoinbaseManager {
             if mergeset_non_daa.contains(red) {
                 // Non-DAA red: subsidy forfeited, fees burned.
                 red_fees += reward_data.total_fees;
+            } else if burn_red_subsidy {
+                // DAA red, post-H6: both subsidy and fees burned.
+                red_fees += reward_data.subsidy + reward_data.total_fees;
             } else {
-                // DAA red: subsidy goes to merging miner, fees burned.
+                // DAA red, pre-H6: subsidy goes to merging miner, fees burned.
                 red_subsidy += reward_data.subsidy;
                 red_fees += reward_data.total_fees;
             }
@@ -551,6 +564,7 @@ mod tests {
             params.deflationary_phase_daa_score,
             params.pre_deflationary_phase_base_subsidy,
             params.bps_history().after(),
+            params.pom_v3_activation,
         )
     }
 
@@ -884,5 +898,76 @@ mod tests {
         let deserialized_data = cbm.deserialize_coinbase_payload(&payload).unwrap();
 
         assert_eq!(data2, deserialized_data);
+    }
+
+    /// A `GhostdagData` with one blue (selected parent) and one DAA-red block in the mergeset.
+    fn ghostdag_with_red(blue: Hash, red: Hash) -> GhostdagData {
+        GhostdagData::new(
+            0,
+            Default::default(),
+            blue,
+            BlockHashes::new(vec![blue]),
+            BlockHashes::new(vec![red]),
+            HashKTypeMap::new(BlockHashMap::new()),
+        )
+    }
+
+    /// A merging block carrying one DAA-red: pre-H6 the red subsidy is paid to the merging miner
+    /// (minus the R&D cut); post-H6 it is burned like the red fees. Total supply is conserved in
+    /// both eras — this is a pure redistribution.
+    #[test]
+    fn red_subsidy_burned_post_h6() {
+        let subsidy = 1_000_000_000u64;
+        let red_fees = 7_000_000u64;
+        let (blue, red): (Hash, Hash) = (1.into(), 2.into());
+        let miner_spk = ScriptPublicKey::from_vec(0, vec![0xcc]);
+        let burn_spk = super::burn_script_public_key();
+
+        let build = |gate: ForkActivation| {
+            let cbm = CoinbaseManager::new(
+                MAINNET_PARAMS.coinbase_payload_script_public_key_max_len,
+                MAINNET_PARAMS.max_coinbase_payload_len,
+                MAINNET_PARAMS.deflationary_phase_daa_score,
+                MAINNET_PARAMS.pre_deflationary_phase_base_subsidy,
+                MAINNET_PARAMS.bps_history().after(),
+                gate,
+            );
+            let mut mergeset_rewards = BlockHashMap::new();
+            // Blue with no subsidy (isolate the red), red with subsidy + fees.
+            mergeset_rewards.insert(blue, BlockRewardData::new(0, 0, miner_spk.clone()));
+            mergeset_rewards.insert(red, BlockRewardData::new(subsidy, red_fees, ScriptPublicKey::from_vec(0, vec![0xdd])));
+            let ghostdag = ghostdag_with_red(blue, red);
+            let miner_data = MinerData::new(miner_spk.clone(), vec![]);
+            cbm.expected_coinbase_transaction(
+                0,
+                miner_data,
+                &ghostdag,
+                &mergeset_rewards,
+                &BlockHashSet::new(),
+                &BlockHashMap::new(),
+                &BlockHashMap::new(),
+            )
+            .unwrap()
+            .tx
+        };
+
+        let value_to = |tx: &Transaction, spk: &ScriptPublicKey| {
+            tx.outputs.iter().filter(|o| &o.script_public_key == spk).map(|o| o.value).sum::<u64>()
+        };
+        let rd_cut = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+
+        // Pre-H6: the merging miner is paid the red subsidy minus the R&D cut; red fees are burned.
+        let pre = build(ForkActivation::never());
+        assert_eq!(value_to(&pre, &miner_spk), subsidy - rd_cut, "pre-H6: merger keeps the red subsidy");
+        assert_eq!(value_to(&pre, &burn_spk), red_fees, "pre-H6: only red fees are burned");
+
+        // Post-H6: the merging miner gets nothing from the red; subsidy AND fees are burned.
+        let post = build(ForkActivation::new(0));
+        assert_eq!(value_to(&post, &miner_spk), 0, "post-H6: merger gets nothing from the red");
+        assert_eq!(value_to(&post, &burn_spk), subsidy + red_fees, "post-H6: red subsidy joins the burn");
+
+        // Total distributed is identical across eras — no supply created or destroyed by the switch.
+        let total = |tx: &Transaction| tx.outputs.iter().map(|o| o.value).sum::<u64>();
+        assert_eq!(total(&pre), total(&post), "the burn switch is a pure redistribution");
     }
 }

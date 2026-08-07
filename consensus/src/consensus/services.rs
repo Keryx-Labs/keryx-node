@@ -133,6 +133,7 @@ impl ConsensusServices {
             params.deflationary_phase_daa_score,
             params.pre_deflationary_phase_base_subsidy,
             params.bps_history().after(),
+            params.pom_v3_activation,
         );
 
         let mass_calculator = MassCalculator::new(
