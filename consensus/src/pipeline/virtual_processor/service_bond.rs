@@ -5,15 +5,17 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    assign_index, draw_assignment, eligible_miners, miner_key, ServiceLedger, SERVICE_ELIGIBILITY_WINDOW_DAA,
-    SERVICE_LEDGER_HORIZON_DAA,
+    assign_index, draw_assignment, eligible_miners, miner_key, EscrowClaim, ServiceLedger,
+    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
+use keryx_consensus_core::tx::TransactionOutpoint;
 use keryx_consensus_core::ChainPath;
 use keryx_core::info;
 use keryx_database::prelude::StoreResultExt;
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
+use keryx_txscript::script_class::ScriptClass;
 
 /// Retained per-chain-block ledger snapshots; reorgs deeper than this fall back to a horizon refold.
 const SERVICE_SNAPSHOT_CAP: usize = 4_096;
@@ -122,40 +124,96 @@ impl VirtualStateProcessor {
         (requests, responses)
     }
 
+    /// The current service-ledger escrow claims of `miner` — future RPC surface, test-read today.
+    #[allow(dead_code)]
+    pub(crate) fn service_vault_claims(&self, miner: &Hash) -> Vec<EscrowClaim> {
+        self.service_ledger.lock().ledger.vault_claims(miner)
+    }
+
+    /// Escrow claims created by committed chain block `hash`'s coinbase, keyed by producing miner:
+    /// for each paid mergeset blue, the CSV escrow output that follows the blue's miner payout
+    /// output. Standard miners (escrow burned at emission) contribute none.
+    fn service_escrows_of_chain_block(&self, hash: Hash) -> Vec<(Hash, EscrowClaim)> {
+        let daa = self.headers_store.get_daa_score(hash).unwrap();
+        let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
+        let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
+        let txs = self.block_transactions_store.get(hash).unwrap();
+        let coinbase = &txs[0];
+        let coinbase_id = coinbase.id();
+        let mut claims = Vec::new();
+        // Walk the coinbase outputs in lockstep with the paid blues: per blue with a subsidy the
+        // validated layout is [fee burn?, miner payout, escrow/burn], so the escrow candidate is
+        // the output right after the first output at/past the cursor paying the blue's SPK.
+        let mut cursor = 0usize;
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|b| !non_daa.contains(b)) {
+            let blue_txs = self.block_transactions_store.get(*blue).unwrap();
+            let blue_coinbase = self.coinbase_manager.deserialize_coinbase_payload(&blue_txs[0].payload).unwrap();
+            if blue_coinbase.subsidy == 0 {
+                continue;
+            }
+            let spk = blue_coinbase.miner_data.script_public_key;
+            let Some(miner_idx) = (cursor..coinbase.outputs.len()).find(|&i| coinbase.outputs[i].script_public_key == spk)
+            else {
+                continue;
+            };
+            let escrow_idx = miner_idx + 1;
+            cursor = escrow_idx + 1;
+            if let Some(escrow_out) = coinbase.outputs.get(escrow_idx) {
+                if escrow_out.value > 0 && ScriptClass::is_csv_pay_to_pubkey(escrow_out.script_public_key.script()) {
+                    claims.push((
+                        miner_key(&spk),
+                        EscrowClaim {
+                            outpoint: TransactionOutpoint::new(coinbase_id, escrow_idx as u32),
+                            value: escrow_out.value,
+                            daa,
+                        },
+                    ));
+                }
+            }
+        }
+        claims
+    }
+
     /// Folds one committed chain block into `ledger`. No-op before `pom_v3_activation` (a per-block
     /// property, so the fold is canonical across nodes and IBD). Misses are observe-only for now:
-    /// logged, no penalty applied.
+    /// logged with the concrete escrow claims they burn, no penalty applied.
     fn fold_service_chain_block(&self, ledger: &mut ServiceLedger, sc: &impl SelectedChainStoreReader, hash: Hash) {
         let daa = self.headers_store.get_daa_score(hash).unwrap();
         if !self.pom_v3_activation.is_active(daa) {
             return;
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
+        let escrows = self.service_escrows_of_chain_block(hash);
         let seed = hash.as_bytes();
-        let misses = ledger.on_chain_block(daa, &requests, &responses, |tier, excluded| {
+        let misses = ledger.on_chain_block(daa, &requests, &responses, &escrows, |tier, excluded| {
             let eligible = self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA);
             draw_assignment(&eligible, excluded, &seed)
         });
         for miss in misses {
+            let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
             info!(
-                "service-bond: miss #{} by miner {} on request {} → {:?} (observe-only)",
+                "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (observe-only)",
                 miss.consecutive_misses,
                 miss.miner,
                 hex::encode(miss.request_hash),
-                miss.penalty
+                miss.penalty,
+                miss.burned.len(),
+                burned_total
             );
         }
     }
 
-    /// Rebuilds the ledger up to chain index `to` by folding the last [`SERVICE_LEDGER_HORIZON_DAA`]
-    /// of the committed chain from an empty state — the cold-start and deep-reorg path. Exact:
-    /// state older than the horizon is forgotten by construction.
+    /// Rebuilds the ledger up to chain index `to` by folding the committed chain from an empty
+    /// state — the cold-start and deep-reorg path. The fold spans TWICE the ledger horizon: state
+    /// readable at `to` (strikes, vault) derives from misses up to one horizon back, which derive
+    /// from requests registered up to one horizon before that. A single-horizon fold would drop
+    /// requests straddling the boundary and diverge from the incremental fold.
     fn refold_service_ledger(&self, sc: &impl SelectedChainStoreReader, to: u64, pruning_point: Hash) -> ServiceLedger {
         let mut ledger = ServiceLedger::default();
         let Ok(to_hash) = sc.get_by_index(to) else {
             return ledger;
         };
-        let daa_bound = self.headers_store.get_daa_score(to_hash).unwrap().saturating_sub(SERVICE_LEDGER_HORIZON_DAA);
+        let daa_bound = self.headers_store.get_daa_score(to_hash).unwrap().saturating_sub(2 * SERVICE_LEDGER_HORIZON_DAA);
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx).max(pruning_idx);
         for i in (bottom + 1)..=to {

@@ -464,7 +464,12 @@ async fn service_assignment_draws_from_recent_tier_producers() {
     let handles = tc.init();
     let genesis = config.genesis.hash;
 
-    let m1 = new_miner_data();
+    // m1 announces an escrow pubkey (real CSV escrow outputs → vault claims); m2 does not (his
+    // 20 % burns at emission, no claim).
+    let mut m1 = new_miner_data();
+    let mut extra = m1.extra_data.to_vec();
+    extra.extend_from_slice(format!("/escrow:{}", "11".repeat(32)).as_bytes());
+    m1.extra_data = extra.into();
     let m2 = new_miner_data();
     let k1 = miner_key(&m1.script_public_key);
     let k2 = miner_key(&m2.script_public_key);
@@ -507,6 +512,13 @@ async fn service_assignment_draws_from_recent_tier_producers() {
 
     // A non-chain seed yields no eligible set at all.
     assert!(vp.service_eligible_miners(Hash::from_bytes([0xEE; 32]), 0).is_empty());
+
+    // Escrow vault: m1's blues b1 and b4 were merged by committed chain blocks (b2, b5), each
+    // leaving one CSV escrow claim; m2 announced no escrow pubkey, so his cut burned unclaimed.
+    let claims = vp.service_vault_claims(&k1);
+    assert_eq!(claims.len(), 2);
+    assert!(claims.iter().all(|c| c.value > 0));
+    assert!(vp.service_vault_claims(&k2).is_empty());
 
     tc.shutdown(handles);
 }

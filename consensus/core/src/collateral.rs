@@ -126,13 +126,25 @@ pub fn draw_assignment(eligible: &[Hash], excluded: &[Hash], seed: &[u8; 32]) ->
     assign_index(seed, pool.len()).map(|i| pool[i])
 }
 
-/// A missed service assignment: the request's window closed with no accepted response.
+/// One escrow claim of a miner: a CSV-locked coinbase escrow output he can claim after the lock,
+/// unless burned by a service penalty first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EscrowClaim {
+    pub outpoint: crate::tx::TransactionOutpoint,
+    pub value: u64,
+    pub daa: u64,
+}
+
+/// A missed service assignment: the request's window closed with no accepted response. `burned`
+/// lists the concrete escrow claims the penalty takes, newest first (the freshest claims have the
+/// most CSV lock left, so they are the ones guaranteed still unclaimed).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceMiss {
     pub request_hash: [u8; 32],
     pub miner: Hash,
     pub consecutive_misses: u32,
     pub penalty: ServicePenalty,
+    pub burned: Vec<EscrowClaim>,
 }
 
 #[derive(Clone, Debug)]
@@ -164,13 +176,16 @@ struct StrikeEntry {
 pub struct ServiceLedger {
     pending: std::collections::BTreeMap<[u8; 32], PendingRequest>,
     strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
+    /// Per-miner still-locked escrow claims, chain order (newest at the back).
+    vault: std::collections::BTreeMap<Hash, std::collections::VecDeque<EscrowClaim>>,
 }
 
 impl ServiceLedger {
     /// Folds one selected-chain block into the ledger and returns the misses it closes.
     ///
     /// `requests` are the block's accepted AiRequests as `(request_hash, tier)`; `responses` the
-    /// request hashes its accepted AiResponses answer; `draw` resolves `(tier, excluded)` to the
+    /// request hashes its accepted AiResponses answer; `escrows` the escrow claims this block's
+    /// coinbase creates, keyed by producing miner; `draw` resolves `(tier, excluded)` to the
     /// responsible miner using this block as the assignment seed. Responses are applied before
     /// window closes, so a response landing in the closing block still cancels the miss.
     pub fn on_chain_block(
@@ -178,8 +193,19 @@ impl ServiceLedger {
         daa: u64,
         requests: &[([u8; 32], u8)],
         responses: &[[u8; 32]],
+        escrows: &[(Hash, EscrowClaim)],
         mut draw: impl FnMut(u8, &[Hash]) -> Option<Hash>,
     ) -> Vec<ServiceMiss> {
+        for (miner, claim) in escrows {
+            self.vault.entry(*miner).or_default().push_back(*claim);
+        }
+        for claims in self.vault.values_mut() {
+            while claims.front().is_some_and(|c| c.daa + SERVICE_LEDGER_HORIZON_DAA <= daa) {
+                claims.pop_front();
+            }
+        }
+        self.vault.retain(|_, claims| !claims.is_empty());
+
         for rh in responses {
             if let Some(req) = self.pending.remove(rh) {
                 if let Some(a) = req.assignment {
@@ -198,11 +224,13 @@ impl ServiceLedger {
                 Some(a) if daa > a.window_end_daa => {
                     let count = self.consecutive_misses(&a.miner, daa) + 1;
                     self.strikes.insert(a.miner, StrikeEntry { count, last_daa: daa });
+                    let burned = self.burn(&a.miner, strike_penalty(count));
                     misses.push(ServiceMiss {
                         request_hash: rh,
                         miner: a.miner,
                         consecutive_misses: count,
                         penalty: strike_penalty(count),
+                        burned,
                     });
                     let req = self.pending.get_mut(&rh).unwrap();
                     req.excluded.push(a.miner);
@@ -228,6 +256,30 @@ impl ServiceLedger {
         }
 
         misses
+    }
+
+    /// Takes the escrow claims a penalty burns out of the miner's vault: the `n` newest for
+    /// `BurnClaims(n)`, everything still locked for `SlashAllPending` — and for `BanIp` too, so
+    /// claims re-accumulated past the second strike stay burnable while the streak lasts.
+    fn burn(&mut self, miner: &Hash, penalty: ServicePenalty) -> Vec<EscrowClaim> {
+        let Some(claims) = self.vault.get_mut(miner) else {
+            return Vec::new();
+        };
+        let take = match penalty {
+            ServicePenalty::None => 0,
+            ServicePenalty::BurnClaims(n) => (n as usize).min(claims.len()),
+            ServicePenalty::SlashAllPending | ServicePenalty::BanIp => claims.len(),
+        };
+        let burned: Vec<EscrowClaim> = (0..take).map(|_| claims.pop_back().unwrap()).collect();
+        if claims.is_empty() {
+            self.vault.remove(miner);
+        }
+        burned
+    }
+
+    /// The miner's still-locked escrow claims, chain order (newest last).
+    pub fn vault_claims(&self, miner: &Hash) -> Vec<EscrowClaim> {
+        self.vault.get(miner).map(|claims| claims.iter().copied().collect()).unwrap_or_default()
     }
 
     /// The miner's consecutive-miss count as of `daa`; entries older than the ledger horizon read
@@ -274,12 +326,12 @@ mod tests {
     fn served_before_assignment_never_misses() {
         let mut ledger = ServiceLedger::default();
         let rh = [7u8; 32];
-        assert!(ledger.on_chain_block(100, &[(rh, 0)], &[], no_draw).is_empty());
+        assert!(ledger.on_chain_block(100, &[(rh, 0)], &[], &[], no_draw).is_empty());
         // response lands in the next chain block: applied before the assignment step, so the
         // draw is never consulted and nothing is ever pending
-        assert!(ledger.on_chain_block(101, &[], &[rh], no_draw).is_empty());
+        assert!(ledger.on_chain_block(101, &[], &[rh], &[], no_draw).is_empty());
         assert_eq!(ledger.pending_len(), 0);
-        assert!(ledger.on_chain_block(102, &[], &[], no_draw).is_empty());
+        assert!(ledger.on_chain_block(102, &[], &[], &[], no_draw).is_empty());
     }
 
     #[test]
@@ -293,22 +345,22 @@ mod tests {
 
         // r1 accepted at 100, assigned to a at 101, window closes after 101 + w
         let r1 = [1u8; 32];
-        assert!(ledger.on_chain_block(100, &[(r1, 0)], &[], draw).is_empty());
-        assert!(ledger.on_chain_block(101, &[], &[], draw).is_empty());
-        let misses = ledger.on_chain_block(102 + w, &[], &[], draw);
+        assert!(ledger.on_chain_block(100, &[(r1, 0)], &[], &[], draw).is_empty());
+        assert!(ledger.on_chain_block(101, &[], &[], &[], draw).is_empty());
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], draw);
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].miner, a);
         assert_eq!(misses[0].consecutive_misses, 1);
         assert_eq!(misses[0].penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
 
         // cascade: r1 re-drawn to b (a excluded); b misses too → his own strike 1
-        let misses = ledger.on_chain_block(103 + 2 * w, &[], &[], draw);
+        let misses = ledger.on_chain_block(103 + 2 * w, &[], &[], &[], draw);
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].miner, b);
         assert_eq!(misses[0].consecutive_misses, 1);
 
         // exclusion now empties the set → fallback re-draws a; a misses r1 again → strike 2
-        let misses = ledger.on_chain_block(104 + 3 * w, &[], &[], draw);
+        let misses = ledger.on_chain_block(104 + 3 * w, &[], &[], &[], draw);
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].miner, a);
         assert_eq!(misses[0].consecutive_misses, 2);
@@ -318,15 +370,15 @@ mod tests {
         // r1 is finally served here too — an unserved request keeps bouncing forever.
         let daa = 105 + 3 * w;
         let r2 = [2u8; 32];
-        assert!(ledger.on_chain_block(daa, &[(r2, 0)], &[r1], draw).is_empty());
-        assert!(ledger.on_chain_block(daa + 1, &[], &[], draw).is_empty()); // assigns a
-        assert!(ledger.on_chain_block(daa + 2, &[], &[r2], draw).is_empty()); // served in window
+        assert!(ledger.on_chain_block(daa, &[(r2, 0)], &[r1], &[], draw).is_empty());
+        assert!(ledger.on_chain_block(daa + 1, &[], &[], &[], draw).is_empty()); // assigns a
+        assert!(ledger.on_chain_block(daa + 2, &[], &[r2], &[], draw).is_empty()); // served in window
         assert_eq!(ledger.consecutive_misses(&a, daa + 2), 0);
 
         let r3 = [3u8; 32];
-        assert!(ledger.on_chain_block(daa + 3, &[(r3, 0)], &[], draw).is_empty());
-        assert!(ledger.on_chain_block(daa + 4, &[], &[], draw).is_empty());
-        let misses = ledger.on_chain_block(daa + 5 + w, &[], &[], draw);
+        assert!(ledger.on_chain_block(daa + 3, &[(r3, 0)], &[], &[], draw).is_empty());
+        assert!(ledger.on_chain_block(daa + 4, &[], &[], &[], draw).is_empty());
+        let misses = ledger.on_chain_block(daa + 5 + w, &[], &[], &[], draw);
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].miner, a);
         assert_eq!(misses[0].consecutive_misses, 1);
@@ -341,11 +393,59 @@ mod tests {
         let draw = |_tier: u8, excluded: &[Hash]| draw_assignment(&eligible, excluded, &[0u8; 32]);
 
         let rh = [9u8; 32];
-        ledger.on_chain_block(100, &[(rh, 0)], &[], draw);
-        ledger.on_chain_block(101, &[], &[], draw);
+        ledger.on_chain_block(100, &[(rh, 0)], &[], &[], draw);
+        ledger.on_chain_block(101, &[], &[], &[], draw);
         // window is past, but the same chain block carries the response: served, no miss
-        assert!(ledger.on_chain_block(200 + w, &[], &[rh], draw).is_empty());
+        assert!(ledger.on_chain_block(200 + w, &[], &[rh], &[], draw).is_empty());
         assert_eq!(ledger.pending_len(), 0);
+    }
+
+    #[test]
+    fn penalties_burn_newest_claims_then_drain() {
+        use super::EscrowClaim;
+        use crate::tx::TransactionOutpoint;
+
+        let a = Hash::from_bytes([1u8; 32]);
+        let eligible = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0);
+        let draw = |_tier: u8, excluded: &[Hash]| draw_assignment(&eligible, excluded, &[0u8; 32]);
+        let claim = |n: u64, daa: u64| EscrowClaim { outpoint: TransactionOutpoint::new(n.into(), 1), value: n, daa };
+
+        // six claims accumulated, then r1 assigned to a and missed: strike 1 burns the 5 NEWEST
+        let escrows: Vec<(Hash, EscrowClaim)> = (1..=6).map(|n| (a, claim(n, 100))).collect();
+        let r1 = [1u8; 32];
+        ledger.on_chain_block(100, &[(r1, 0)], &[], &escrows, draw);
+        ledger.on_chain_block(101, &[], &[], &[], draw);
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], draw);
+        assert_eq!(misses.len(), 1);
+        assert_eq!(misses[0].penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
+        assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![6, 5, 4, 3, 2]);
+
+        // strike 2 (still unserved, a re-drawn by fallback): SlashAllPending drains the leftover
+        // claim plus one accumulated meanwhile
+        let fresh = [(a, claim(7, 102 + w))];
+        ledger.on_chain_block(102 + w, &[], &[], &fresh, draw);
+        let misses = ledger.on_chain_block(103 + 2 * w, &[], &[], &[], draw);
+        assert_eq!(misses.len(), 1);
+        assert_eq!(misses[0].penalty, ServicePenalty::SlashAllPending);
+        assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![7, 1]);
+
+        // strike 3 (BanIp): claims re-accumulated past the full slash burn too
+        let fresh = [(a, claim(8, 103 + 2 * w))];
+        ledger.on_chain_block(103 + 2 * w, &[], &[], &fresh, draw);
+        let misses = ledger.on_chain_block(104 + 3 * w, &[], &[], &[], draw);
+        assert_eq!(misses.len(), 1);
+        assert_eq!(misses[0].penalty, ServicePenalty::BanIp);
+        assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![8]);
+
+        // a miner with an empty vault yields an empty burn list, never a panic
+        let r2 = [2u8; 32];
+        ledger.on_chain_block(200 + 4 * w, &[(r2, 0)], &[], &[], draw);
+        ledger.on_chain_block(201 + 4 * w, &[], &[], &[], draw);
+        let misses = ledger.on_chain_block(202 + 5 * w, &[], &[], &[], draw);
+        assert_eq!(misses.len(), 2); // r1 still bouncing + r2
+        assert!(misses.iter().all(|m| m.burned.is_empty()));
     }
 
     #[test]
@@ -357,16 +457,16 @@ mod tests {
         let draw = |_tier: u8, excluded: &[Hash]| draw_assignment(&eligible, excluded, &[0u8; 32]);
 
         let rh = [9u8; 32];
-        ledger.on_chain_block(100, &[(rh, 0)], &[], draw);
-        ledger.on_chain_block(101, &[], &[], draw);
-        let misses = ledger.on_chain_block(102 + w, &[], &[], draw);
+        ledger.on_chain_block(100, &[(rh, 0)], &[], &[], draw);
+        ledger.on_chain_block(101, &[], &[], &[], draw);
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], draw);
         assert_eq!(misses.len(), 1);
         assert_eq!(ledger.consecutive_misses(&a, 102 + w), 1);
 
         // beyond the horizon the strike reads zero and the request has expired
         let far = 102 + w + SERVICE_LEDGER_HORIZON_DAA;
         assert_eq!(ledger.consecutive_misses(&a, far), 0);
-        ledger.on_chain_block(far, &[], &[], draw);
+        ledger.on_chain_block(far, &[], &[], &[], draw);
         assert_eq!(ledger.pending_len(), 0);
     }
 
