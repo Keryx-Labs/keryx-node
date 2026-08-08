@@ -111,7 +111,7 @@ impl Default for Args {
             async_threads: num_cpus::get(),
             utxoindex: false,
             reset_db: false,
-            outbound_target: 8,
+            outbound_target: 16,
             inbound_limit: 128,
             rpc_max_clients: 128,
             max_tracked_addresses: 0,
@@ -311,7 +311,7 @@ pub fn cli() -> Command {
                 .value_name("outpeers")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(usize))
-                .help("Target number of outbound peers (default: 8)."),
+                .help("Target number of outbound peers (default: 16)."),
         )
         .arg(
             Arg::new("maxinpeers")
