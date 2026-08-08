@@ -81,6 +81,9 @@ pub enum TxRuleError {
     #[error("outpoints corresponding to some transaction inputs are missing from current utxo context")]
     MissingTxOutpoints,
 
+    #[error("transaction spends a burned escrow outpoint")]
+    SpendOfBurnedEscrow,
+
     #[error("failed to verify the signature script: {0}")]
     SignatureInvalid(TxScriptError),
 

@@ -88,6 +88,7 @@ pub struct ConsensusStorage {
     // OPoI slash stores (Phase 3 A4)
     pub ai_response_store: Arc<DbAiResponseStore>,
     pub ai_slashed_store: Arc<DbAiSlashedStore>,
+    pub service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
 
 
     // Block window caches
@@ -269,6 +270,8 @@ impl ConsensusStorage {
         // OPoI slash stores
         let ai_response_store = Arc::new(DbAiResponseStore::new(db.clone(), header_data_builder.build()));
         let ai_slashed_store = Arc::new(DbAiSlashedStore::new(db.clone(), header_data_builder.build()));
+        let service_burn_store =
+            Arc::new(crate::model::stores::service_burn::DbServiceBurnStore::new(db.clone(), header_data_builder.build()));
 
         // Tips
         let headers_selected_tip_store = Arc::new(RwLock::new(DbHeadersSelectedTipStore::new(db.clone())));
@@ -311,6 +314,7 @@ impl ConsensusStorage {
             windowed_production_prefix_store,
             ai_response_store,
             ai_slashed_store,
+            service_burn_store,
             past_pruning_points_store,
             daa_excluded_store,
             depth_store,

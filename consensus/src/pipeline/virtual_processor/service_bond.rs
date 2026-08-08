@@ -5,7 +5,7 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    assign_index, draw_assignment, eligible_miners, miner_key, EscrowClaim, ServiceLedger,
+    assign_index, draw_assignment, eligible_miners, miner_key, EscrowClaim, ServiceLedger, ServiceMiss,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
@@ -28,6 +28,11 @@ pub(super) struct ServiceLedgerSync {
     snapshots: std::collections::BTreeMap<u64, ServiceLedger>,
     /// Chain index the ledger is folded up to.
     tip: Option<u64>,
+    /// Misses awaiting finality depth, in chain order as (chain index, daa, miss). Truncated on
+    /// reorg like the chain itself; entries deeper than finality are written to the burn store.
+    queue: std::collections::VecDeque<(u64, u64, ServiceMiss)>,
+    /// Highest miss daa already persisted to the burn store.
+    deep_cursor_daa: u64,
 }
 
 impl VirtualStateProcessor {
@@ -174,13 +179,18 @@ impl VirtualStateProcessor {
         claims
     }
 
-    /// Folds one committed chain block into `ledger`. No-op before `pom_v3_activation` (a per-block
-    /// property, so the fold is canonical across nodes and IBD). Misses are observe-only for now:
-    /// logged with the concrete escrow claims they burn, no penalty applied.
-    fn fold_service_chain_block(&self, ledger: &mut ServiceLedger, sc: &impl SelectedChainStoreReader, hash: Hash) {
+    /// Folds one committed chain block into `ledger` and returns its misses. No-op before
+    /// `pom_v3_activation` (a per-block property, so the fold is canonical across nodes and IBD).
+    /// Misses only become enforceable once finality-deep (see `advance_service_ledger`).
+    fn fold_service_chain_block(
+        &self,
+        ledger: &mut ServiceLedger,
+        sc: &impl SelectedChainStoreReader,
+        hash: Hash,
+    ) -> Vec<ServiceMiss> {
         let daa = self.headers_store.get_daa_score(hash).unwrap();
         if !self.pom_v3_activation.is_active(daa) {
-            return;
+            return Vec::new();
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
         let escrows = self.service_escrows_of_chain_block(hash);
@@ -189,10 +199,10 @@ impl VirtualStateProcessor {
             let eligible = self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA);
             draw_assignment(&eligible, excluded, &seed)
         });
-        for miss in misses {
+        for miss in misses.iter() {
             let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
             info!(
-                "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (observe-only)",
+                "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (awaiting finality)",
                 miss.consecutive_misses,
                 miss.miner,
                 hex::encode(miss.request_hash),
@@ -201,6 +211,7 @@ impl VirtualStateProcessor {
                 burned_total
             );
         }
+        misses
     }
 
     /// Rebuilds the ledger up to chain index `to` by folding the committed chain from an empty
@@ -208,16 +219,32 @@ impl VirtualStateProcessor {
     /// readable at `to` (strikes, vault) derives from misses up to one horizon back, which derive
     /// from requests registered up to one horizon before that. A single-horizon fold would drop
     /// requests straddling the boundary and diverge from the incremental fold.
-    fn refold_service_ledger(&self, sc: &impl SelectedChainStoreReader, to: u64, pruning_point: Hash) -> ServiceLedger {
+    fn refold_service_ledger(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        to: u64,
+        pruning_point: Hash,
+        cursor_daa: u64,
+        queue: &mut std::collections::VecDeque<(u64, u64, ServiceMiss)>,
+    ) -> ServiceLedger {
         let mut ledger = ServiceLedger::default();
         let Ok(to_hash) = sc.get_by_index(to) else {
             return ledger;
         };
-        let daa_bound = self.headers_store.get_daa_score(to_hash).unwrap().saturating_sub(2 * SERVICE_LEDGER_HORIZON_DAA);
+        let to_daa = self.headers_store.get_daa_score(to_hash).unwrap();
+        // Span 2× the ledger horizon, extended back to the burn-store cursor so misses that became
+        // finality-deep while the node was down are recomputed and persisted.
+        let daa_bound = to_daa.saturating_sub(2 * SERVICE_LEDGER_HORIZON_DAA).min(cursor_daa.saturating_sub(2 * SERVICE_LEDGER_HORIZON_DAA));
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx).max(pruning_idx);
         for i in (bottom + 1)..=to {
-            self.fold_service_chain_block(&mut ledger, sc, sc.get_by_index(i).unwrap());
+            let hash = sc.get_by_index(i).unwrap();
+            let daa = self.headers_store.get_daa_score(hash).unwrap();
+            for miss in self.fold_service_chain_block(&mut ledger, sc, hash) {
+                if daa > cursor_daa {
+                    queue.push_back((i, daa, miss));
+                }
+            }
         }
         ledger
     }
@@ -232,21 +259,74 @@ impl VirtualStateProcessor {
         if !self.pom_v3_activation.is_active(self.headers_store.get_daa_score(tip_hash).unwrap()) {
             return;
         }
+        let tip_daa = self.headers_store.get_daa_score(tip_hash).unwrap();
         let common = tip_idx - chain_path.added.len() as u64;
         let mut sync = self.service_ledger.lock();
+        // A reorg (or restore) drops queued misses above the common ancestor with the chain.
+        sync.queue.retain(|(idx, _, _)| *idx <= common);
         if sync.tip != Some(common) {
             let restored = sync.snapshots.get(&common).cloned();
-            sync.ledger = restored.unwrap_or_else(|| self.refold_service_ledger(&*sc, common, pruning_point));
+            sync.ledger = match restored {
+                Some(ledger) => ledger,
+                None => {
+                    let cursor = sync.deep_cursor_daa;
+                    let mut queue = std::mem::take(&mut sync.queue);
+                    queue.clear();
+                    let ledger = self.refold_service_ledger(&*sc, common, pruning_point, cursor, &mut queue);
+                    sync.queue = queue;
+                    ledger
+                }
+            };
         }
         sync.snapshots.split_off(&(common + 1));
         for (k, h) in chain_path.added.iter().enumerate() {
-            self.fold_service_chain_block(&mut sync.ledger, &*sc, *h);
+            let idx = common + 1 + k as u64;
+            let daa = self.headers_store.get_daa_score(*h).unwrap();
+            let misses = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h);
+            for miss in misses {
+                sync.queue.push_back((idx, daa, miss));
+            }
             let snapshot = sync.ledger.clone();
-            sync.snapshots.insert(common + 1 + k as u64, snapshot);
+            sync.snapshots.insert(idx, snapshot);
         }
         while sync.snapshots.len() > SERVICE_SNAPSHOT_CAP {
             sync.snapshots.pop_first();
         }
         sync.tip = Some(tip_idx);
+        // Misses now deeper than finality are reorg-immune on every acceptable POV: persist their
+        // burned outpoints and arm the spend rule.
+        while sync.queue.front().is_some_and(|(_, daa, _)| daa + self.finality_depth <= tip_daa) {
+            let (_, daa, miss) = sync.queue.pop_front().unwrap();
+            for claim in miss.burned.iter() {
+                let key = crate::model::stores::ai_slash::OutpointKey::new(claim.outpoint.transaction_id, claim.outpoint.index);
+                self.service_burn_store.set(key, daa).unwrap();
+                self.service_burned.write().insert(claim.outpoint);
+            }
+            if !miss.burned.is_empty() {
+                info!(
+                    "service-bond: burn FINAL for miner {} — {} claims, miss daa {}",
+                    miss.miner,
+                    miss.burned.len(),
+                    daa
+                );
+            }
+            sync.deep_cursor_daa = sync.deep_cursor_daa.max(daa);
+        }
+    }
+
+    /// Boot-time load of the persisted burned outpoints into the RAM set consulted by transaction
+    /// validation, and of the deep cursor bounding the cold-start refold.
+    pub(crate) fn load_service_burned(&self) {
+        let mut set = self.service_burned.write();
+        let mut cursor = 0u64;
+        for entry in self.service_burn_store.iterator() {
+            let (key, daa) = entry.unwrap();
+            let tx_id_bytes: [u8; 32] = key[..32].try_into().unwrap();
+            let index = u32::from_le_bytes(key[32..36].try_into().unwrap());
+            set.insert(TransactionOutpoint::new(tx_id_bytes.into(), index));
+            cursor = cursor.max(daa);
+        }
+        drop(set);
+        self.service_ledger.lock().deep_cursor_daa = cursor;
     }
 }

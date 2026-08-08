@@ -1311,6 +1311,12 @@ impl VirtualStateProcessor {
 
         let mut entries = Vec::with_capacity(transaction.inputs.len());
         for input in transaction.inputs.iter() {
+            // Service-bond (H6): a finality-deep miss burns the miner's escrow claims — spending
+            // one is invalid forever. The set only ever contains reorg-immune entries, so every
+            // POV reaches the same verdict.
+            if self.service_burned.read().contains(&input.previous_outpoint) {
+                return Err(TxRuleError::SpendOfBurnedEscrow);
+            }
             if let Some(entry) = utxo_view.get(&input.previous_outpoint) {
                 entries.push(entry);
             } else {
@@ -1364,6 +1370,11 @@ impl VirtualStateProcessor {
         args: &TransactionValidationArgs,
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
+        for input in mutable_tx.tx.inputs.iter() {
+            if self.service_burned.read().contains(&input.previous_outpoint) {
+                return Err(TxRuleError::SpendOfBurnedEscrow);
+            }
+        }
 
         // Calc the contextual storage mass
         let contextual_mass = self

@@ -431,6 +431,51 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
     assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
 }
 
+/// A transaction spending a burned escrow outpoint is rejected in the UTXO context, before any
+/// entry lookup — the spend-level enforcement of a finality-deep service miss.
+#[tokio::test]
+async fn burned_escrow_outpoint_spend_is_rejected() {
+    use crate::processes::transaction_validator::{errors::TxRuleError, tx_validation_in_utxo_context::TxValidationFlags};
+    use keryx_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+    use keryx_consensus_core::tx::{TransactionInput, TransactionOutpoint};
+    use keryx_consensus_core::utxo::utxo_collection::UtxoCollection;
+
+    let config = opoi_config();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let vp = tc.virtual_processor().clone();
+
+    let outpoint = TransactionOutpoint::new(7u64.into(), 1);
+    vp.service_burned.write().insert(outpoint);
+    let tx = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(outpoint, vec![], 0, 0)],
+        vec![],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+    let res = vp.validate_transaction_in_utxo_context(&tx, &UtxoCollection::default(), 1, TxValidationFlags::Full);
+    assert!(matches!(res, Err(TxRuleError::SpendOfBurnedEscrow)));
+
+    // An untouched outpoint still fails only on the missing entry, proving the set is selective.
+    let other = TransactionOutpoint::new(8u64.into(), 1);
+    let tx2 = Transaction::new(
+        TX_VERSION,
+        vec![TransactionInput::new(other, vec![], 0, 0)],
+        vec![],
+        0,
+        SUBNETWORK_ID_NATIVE,
+        0,
+        vec![],
+    );
+    let res2 = vp.validate_transaction_in_utxo_context(&tx2, &UtxoCollection::default(), 1, TxValidationFlags::Full);
+    assert!(matches!(res2, Err(TxRuleError::MissingTxOutpoints)));
+
+    tc.shutdown(handles);
+}
+
 /// Service-bond eligibility walk E2E: the eligible set for a tier, seen from a committed chain
 /// block, is the distinct producers of proven blocks of that tier merged inside the DAA window,
 /// the assignment draws one of them deterministically, and a shorter window truncates the set.

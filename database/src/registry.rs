@@ -133,6 +133,8 @@ pub enum DatabaseStorePrefixes {
     /// be re-served (relay/IBD) with its proof; otherwise `get_block` returns `pom_proof: None` and
     /// peers reject the served block (`PoM possession proof missing`).
     PomProof = 195,
+    /// Service-bond burned escrow outpoints (finality-deep misses): outpoint → miss daa.
+    ServiceBurn = 196,
 
     // ---- Separator ----
     /// Reserved as a separator

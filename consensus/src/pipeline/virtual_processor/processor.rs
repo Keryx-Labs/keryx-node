@@ -134,6 +134,10 @@ pub struct VirtualStateProcessor {
     pub(super) pom_tier_store: Arc<DbPomTierStore>,
     /// RAM-only service-bond ledger (H6), folded along the committed selected chain.
     pub(super) service_ledger: parking_lot::Mutex<super::service_bond::ServiceLedgerSync>,
+    /// Burned escrow outpoints (finality-deep misses), persisted counterpart in `service_burn_store`.
+    pub(super) service_burned: parking_lot::RwLock<std::collections::HashSet<keryx_consensus_core::tx::TransactionOutpoint>>,
+    pub(super) service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
+    pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
@@ -325,6 +329,9 @@ impl VirtualStateProcessor {
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
             service_ledger: Default::default(),
+            service_burned: Default::default(),
+            service_burn_store: storage.service_burn_store.clone(),
+            finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
@@ -1631,6 +1638,7 @@ impl VirtualStateProcessor {
 
     /// Make sure pruning point-related stores are initialized
     pub fn init(self: &Arc<Self>) {
+        self.load_service_burned();
         let pruning_point_read = self.pruning_point_store.upgradable_read();
         if pruning_point_read.pruning_point().optional().unwrap().is_none() {
             let mut pruning_point_write = RwLockUpgradableReadGuard::upgrade(pruning_point_read);
