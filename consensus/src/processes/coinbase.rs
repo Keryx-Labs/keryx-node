@@ -2,7 +2,7 @@ use keryx_addresses::{Address, Prefix, Version};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
-    collateral::CHALLENGE_WINDOW_BLOCKS,
+    collateral::{CHALLENGE_WINDOW_BLOCKS, SERVICE_BOND_CSV_WINDOW_BLOCKS},
     config::params::{ForkActivation, RATIO_REWARD_BPS_DIVISOR, TIER_REWARD_BPS_DIVISOR},
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
@@ -115,16 +115,14 @@ const KRX_TAIL_EMISSION_PER_SECOND: u64 = 10;
 
 /// Builds a CSV-timelocked P2PK script for the OPoI escrow output.
 ///
-/// Script: `<CHALLENGE_WINDOW_BLOCKS> OP_CSV OP_DROP <pubkey_32> OP_CHECKSIG`
+/// Script: `<csv_blocks> OP_CSV <pubkey_32> OP_CHECKSIG`
 ///
 /// The output cannot be spent until the spending transaction's input sequence
-/// satisfies the relative lock (>= CHALLENGE_WINDOW_BLOCKS deep), giving the
-/// network the full challenge window to submit a fraud proof before the miner
-/// claims their collateral.
-fn build_escrow_script(pubkey_bytes: &[u8]) -> Option<ScriptPublicKey> {
+/// satisfies the relative lock (>= csv_blocks deep).
+fn build_escrow_script(pubkey_bytes: &[u8], csv_blocks: u64) -> Option<ScriptPublicKey> {
     // Keryx's OP_CSV pops its argument — no OP_DROP needed after it.
     let script = ScriptBuilder::new()
-        .add_sequence(CHALLENGE_WINDOW_BLOCKS)
+        .add_sequence(csv_blocks)
         .ok()?
         .add_op(OpCheckSequenceVerify)
         .ok()?
@@ -443,7 +441,9 @@ impl CoinbaseManager {
     /// Looks for `/escrow:` followed by exactly 64 hex chars (32-byte Schnorr pubkey).
     /// Returns `None` if the marker is absent or the key is malformed — treated as a
     /// standard miner whose escrow cut is sent to the burn address instead.
-    pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8]) -> Option<ScriptPublicKey> {
+    /// The CSV lock is gated by the rewarding block's own daa score: the service-bond lock
+    /// (~13 h) at/after `pom_v3_activation`, the legacy challenge window (~1 h) before.
+    pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8], daa_score: u64) -> Option<ScriptPublicKey> {
         let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
         let hex_start = marker_pos + ESCROW_MARKER.len();
         let hex_end = hex_start + ESCROW_PUBKEY_HEX_LEN;
@@ -455,7 +455,12 @@ impl CoinbaseManager {
             .map(|i| u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16))
             .collect::<Result<Vec<_>, _>>()
             .ok()?;
-        build_escrow_script(&pubkey_bytes)
+        let csv_blocks = if self.pom_v3_activation.is_active(daa_score) {
+            SERVICE_BOND_CSV_WINDOW_BLOCKS
+        } else {
+            CHALLENGE_WINDOW_BLOCKS
+        };
+        build_escrow_script(&pubkey_bytes, csv_blocks)
     }
 
     pub fn deserialize_coinbase_payload<'a>(&self, payload: &'a [u8]) -> CoinbaseResult<CoinbaseData<&'a [u8]>> {
@@ -566,6 +571,31 @@ mod tests {
             params.bps_history().after(),
             params.pom_v3_activation,
         )
+    }
+
+    /// The escrow CSV lock is era-gated on the rewarding block's daa score: legacy challenge
+    /// window before `pom_v3_activation`, service-bond lock at/after. Both eras must classify as
+    /// the same structural CsvPubKey (spend paths and escrow detection are value-agnostic).
+    #[test]
+    fn escrow_csv_lock_is_era_gated() {
+        use keryx_consensus_core::config::params::ForkActivation;
+        use keryx_txscript::script_class::ScriptClass;
+
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::new(1_000);
+        let manager = create_manager(&params);
+        let extra = format!("/miner/escrow:{}", "11".repeat(32)).into_bytes();
+
+        let legacy = manager.parse_escrow_from_extra_data(&extra, 999).unwrap();
+        let bonded = manager.parse_escrow_from_extra_data(&extra, 1_000).unwrap();
+        assert_ne!(legacy.script(), bonded.script(), "the CSV lock must change at the gate");
+        assert!(ScriptClass::is_csv_pay_to_pubkey(legacy.script()));
+        assert!(ScriptClass::is_csv_pay_to_pubkey(bonded.script()));
+
+        let expected_legacy = build_escrow_script(&[0x11u8; 32], CHALLENGE_WINDOW_BLOCKS).unwrap();
+        let expected_bonded = build_escrow_script(&[0x11u8; 32], SERVICE_BOND_CSV_WINDOW_BLOCKS).unwrap();
+        assert_eq!(legacy, expected_legacy);
+        assert_eq!(bonded, expected_bonded);
     }
 
     #[test]

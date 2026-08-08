@@ -13,6 +13,12 @@ pub const COLLATERAL_RATE_BPS: u64 = 2_000;
 /// a challenge, while keeping the escrow lock reasonable for honest miners.
 pub const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
 
+/// Escrow CSV lock at/after the service-bond gate: ledger horizon (36 000) + finality depth
+/// (432 000), ≈ 13 h at 10 BPS. A claim created at C is burnable by misses up to C + horizon,
+/// enforceable at most finality later — this lock guarantees the burn is always in force before
+/// the claim unlocks.
+pub const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 468_000;
+
 /// Per-miner collateral balance tracked on-chain.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct CollateralEntry {
