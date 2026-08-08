@@ -132,6 +132,8 @@ pub struct VirtualStateProcessor {
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, read to scale the tier-reward coinbase split.
     pub(super) pom_tier_store: Arc<DbPomTierStore>,
+    /// RAM-only service-bond ledger (H6), folded along the committed selected chain.
+    pub(super) service_ledger: parking_lot::Mutex<super::service_bond::ServiceLedgerSync>,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
@@ -322,6 +324,7 @@ impl VirtualStateProcessor {
             daa_excluded_store: storage.daa_excluded_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
+            service_ledger: Default::default(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
@@ -496,6 +499,8 @@ impl VirtualStateProcessor {
                 &chain_path,
             )
             .expect("all possible rule errors are unexpected here");
+
+        self.advance_service_ledger(&chain_path, pruning_point);
 
         let compact_sink_ghostdag_data = if let Some(sink_ghostdag_data) = Lazy::get(&sink_ghostdag_data) {
             // If we had to retrieve the full data, we convert it to compact

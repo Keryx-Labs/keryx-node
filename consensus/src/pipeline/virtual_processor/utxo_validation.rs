@@ -935,7 +935,7 @@ impl VirtualStateProcessor {
     /// indices below `hi_idx`; `floor_idx` (the pruning clamp) keeps every probe inside retained,
     /// consensus-shared history. If even the floor's daa exceeds the bound (window truncated by
     /// pruning), the floor itself is returned — the caller clamps to it anyway.
-    fn chain_index_at_or_below_daa(
+    pub(super) fn chain_index_at_or_below_daa(
         &self,
         sc: &impl SelectedChainStoreReader,
         bound_daa: u64,

@@ -431,6 +431,86 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
     assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
 }
 
+/// Service-bond eligibility walk E2E: the eligible set for a tier, seen from a committed chain
+/// block, is the distinct producers of proven blocks of that tier merged inside the DAA window,
+/// the assignment draws one of them deterministically, and a shorter window truncates the set.
+#[tokio::test]
+async fn service_assignment_draws_from_recent_tier_producers() {
+    use keryx_consensus_core::collateral::miner_key;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::pom::PomProof;
+
+    fn proof_with_tier(tier: u8) -> PomProof {
+        PomProof {
+            tier,
+            trace_root: [0; 32],
+            pow_value: [0; 32],
+            final_state: 0,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: None,
+            v3: None,
+        }
+    }
+
+    let mut params = MAINNET_PARAMS;
+    params.pom_activation = ForkActivation::always();
+    // Active v3 gate: the service ledger folds every committed chain block through the real
+    // `resolve_virtual` path (empty request stream — the lifecycle itself is unit-tested).
+    params.pom_v3_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let genesis = config.genesis.hash;
+
+    let m1 = new_miner_data();
+    let m2 = new_miner_data();
+    let k1 = miner_key(&m1.script_public_key);
+    let k2 = miner_key(&m2.script_public_key);
+
+    // Single-parent chain b1..b5; each block's tier is proven at its own body commit and paid
+    // (hence walked) once merged by the next chain block. b5 is the seed, so the walk sees b1..b4:
+    // tier 0 ← {m1 (b1, b4), m2 (b3)}, tier 1 ← {m2 (b2)}. b3 also carries an AiResponse to an
+    // unknown request, folded into the ledger as a no-op.
+    let stray_response = make_ai_response_tx([0x42u8; 32], [0u8; 32]);
+    let plan = [(1u64, &m1, 0u8), (2, &m2, 1), (3, &m2, 0), (4, &m1, 0), (5, &m1, 1)];
+    let mut parent = genesis;
+    for (n, miner, tier) in plan {
+        let hash: Hash = n.into();
+        let txs = if n == 3 { vec![stray_response.clone()] } else { vec![] };
+        let block = tc
+            .build_utxo_valid_block_with_parents(hash, vec![parent], miner.clone(), txs)
+            .to_immutable()
+            .with_pom_proof(proof_with_tier(tier));
+        tc.validate_and_insert_block(block).virtual_state_task.await.unwrap();
+        parent = hash;
+    }
+
+    let vp = tc.virtual_processor().clone();
+    let seed: Hash = 5u64.into();
+
+    let mut expected_tier0 = vec![k1, k2];
+    expected_tier0.sort_unstable();
+    assert_eq!(vp.service_eligible_miners(seed, 0), expected_tier0);
+    assert_eq!(vp.service_eligible_miners(seed, 1), vec![k2]);
+    assert!(vp.service_eligible_miners(seed, 4).is_empty());
+
+    let assigned = vp.service_assigned_miner(seed, 0).unwrap();
+    assert!(assigned == k1 || assigned == k2);
+    assert_eq!(vp.service_assigned_miner(seed, 0), Some(assigned), "assignment must be deterministic");
+    assert_eq!(vp.service_assigned_miner(seed, 4), None);
+
+    // A 1-DAA window covers b5 alone, whose only merged blue is b4 (m1, tier 0).
+    assert_eq!(vp.service_eligible_miners_windowed(seed, 0, 1), vec![k1]);
+    assert!(vp.service_eligible_miners_windowed(seed, 1, 1).is_empty());
+
+    // A non-chain seed yields no eligible set at all.
+    assert!(vp.service_eligible_miners(Hash::from_bytes([0xEE; 32]), 0).is_empty());
+
+    tc.shutdown(handles);
+}
+
 /// Gold-standard prefix-sum production index E2E: maintained in lockstep through the real
 /// `commit_virtual_state` path, its windowed value at the sink (Case A of
 /// `windowed_production_for_block`) accumulates one base miner cut per in-window selected-chain block

@@ -1,5 +1,6 @@
 pub mod errors;
 mod processor;
+mod service_bond;
 mod utxo_inquirer;
 mod utxo_validation;
 pub use processor::*;
