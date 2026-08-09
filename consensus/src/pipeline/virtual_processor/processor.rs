@@ -1367,13 +1367,19 @@ impl VirtualStateProcessor {
             check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score))
                 .map_err(|e| TxRuleError::AiRequestPayloadRule(e.to_string()))?;
         }
-        // Same admission rule as the block check: signed (v2) AiResponses only after the
-        // service-bond gate.
-        if !self.pom_v3_activation.is_active(virtual_daa_score)
-            && mutable_tx.tx.is_ai_response()
-            && mutable_tx.tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN
-        {
-            return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN));
+        // Same admission rules as the block check: signed (v2) AiResponses only after the
+        // service-bond gate, and the max_tokens cap after it.
+        if !self.pom_v3_activation.is_active(virtual_daa_score) {
+            if mutable_tx.tx.is_ai_response() && mutable_tx.tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
+                return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN));
+            }
+        } else if mutable_tx.tx.is_ai_request() {
+            if let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload) {
+                let cap = keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
+                if req.max_tokens > cap {
+                    return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
+                }
+            }
         }
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())

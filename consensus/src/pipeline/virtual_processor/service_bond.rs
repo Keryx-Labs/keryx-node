@@ -5,8 +5,8 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    assign_index, draw_assignment, eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss,
-    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA,
+    eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss, SERVICE_ELIGIBILITY_WINDOW_DAA,
+    SERVICE_LEDGER_HORIZON_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
@@ -120,19 +120,11 @@ impl VirtualStateProcessor {
         self.service_eligible_miners_windowed(seed, target_tier, SERVICE_ELIGIBILITY_WINDOW_DAA)
     }
 
-    /// The single responsible miner drawn by seed block `seed` for a `target_tier` request; `None`
-    /// when no eligible producer exists in the window.
-    #[allow(dead_code)]
-    pub(crate) fn service_assigned_miner(&self, seed: Hash, target_tier: u8) -> Option<Hash> {
-        let set = self.service_eligible_miners(seed, target_tier);
-        assign_index(&seed.as_bytes(), set.len()).map(|i| set[i])
-    }
-
     /// Accepted AiRequests `(request_hash, tier)` and AiResponses `(request_hash, verified
     /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
     /// Requests for models outside the tier lineup are skipped; a v1 response or an invalid
     /// responder signature yields `None` (a volunteer — never serves the assignment).
-    fn service_events_of_chain_block(&self, hash: Hash) -> (Vec<([u8; 32], u8)>, Vec<([u8; 32], Option<Hash>)>) {
+    fn service_events_of_chain_block(&self, hash: Hash) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], Option<Hash>)>) {
         let mut requests = Vec::new();
         let mut responses = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
@@ -146,7 +138,7 @@ impl VirtualStateProcessor {
                             let digest = blake2b_simd::blake2b(&tx.payload);
                             let mut request_hash = [0u8; 32];
                             request_hash.copy_from_slice(&digest.as_bytes()[..32]);
-                            requests.push((request_hash, tier as u8));
+                            requests.push((request_hash, tier as u8, req.max_tokens));
                         }
                     }
                 } else if tx.is_ai_response() {
@@ -226,10 +218,8 @@ impl VirtualStateProcessor {
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
         let escrows = self.service_escrows_of_chain_block(hash);
-        let seed = hash.as_bytes();
-        let misses = ledger.on_chain_block(daa, &requests, &responses, &escrows, |tier, excluded| {
-            let eligible = self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA);
-            draw_assignment(&eligible, excluded, &seed)
+        let misses = ledger.on_chain_block(daa, &requests, &responses, &escrows, |tier| {
+            self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA)
         });
         for miss in misses.iter() {
             let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();

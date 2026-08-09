@@ -476,11 +476,11 @@ async fn burned_escrow_outpoint_spend_is_rejected() {
     tc.shutdown(handles);
 }
 
-/// Service-bond eligibility walk E2E: the eligible set for a tier, seen from a committed chain
-/// block, is the distinct producers of proven blocks of that tier merged inside the DAA window,
-/// the assignment draws one of them deterministically, and a shorter window truncates the set.
+/// Service-bond eligibility walk E2E: the audit cohort for a tier, seen from a committed chain
+/// block, is the distinct escrow keys of proven blocks of that tier merged inside the DAA window,
+/// and a shorter window truncates the set.
 #[tokio::test]
-async fn service_assignment_draws_from_recent_tier_producers() {
+async fn service_cohort_from_recent_tier_producers() {
     use keryx_consensus_core::collateral::escrow_miner_key;
     use keryx_consensus_core::config::params::ForkActivation;
     use keryx_consensus_core::pom::PomProof;
@@ -543,8 +543,6 @@ async fn service_assignment_draws_from_recent_tier_producers() {
     assert!(vp.service_eligible_miners(seed, 1).is_empty(), "a miner without an escrow bond is never eligible");
     assert!(vp.service_eligible_miners(seed, 4).is_empty());
 
-    assert_eq!(vp.service_assigned_miner(seed, 0), Some(k1));
-    assert_eq!(vp.service_assigned_miner(seed, 4), None);
 
     // A 1-DAA window covers b5 alone, whose only merged blue is b4 (m1, tier 0).
     assert_eq!(vp.service_eligible_miners_windowed(seed, 0, 1), vec![k1]);

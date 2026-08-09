@@ -6,8 +6,8 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction,
-            BadUTXOCommitment, InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
+            AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
+            BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -50,6 +50,7 @@ use keryx_consensus_core::{
 };
 use keryx_core::{debug, info, trace, warn};
 use keryx_hashes::Hash;
+use keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
@@ -409,11 +410,22 @@ impl VirtualStateProcessor {
         }
 
         // Signed (v2) AiResponse payloads only become valid at the service-bond gate; before it
-        // this keeps the fixed 78-byte rule every deployed node enforces.
+        // this keeps the fixed 78-byte rule every deployed node enforces. The gate also brings
+        // the max_tokens cap on AiRequests.
         if !self.pom_v3_activation.is_active(header.daa_score) {
             for tx in txs.iter().skip(1) {
                 if tx.is_ai_response() && tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
                     return Err(AiResponseV2BeforeActivation(tx.id()));
+                }
+            }
+        } else {
+            for tx in txs.iter().skip(1) {
+                if tx.is_ai_request() {
+                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+                        if req.max_tokens > AI_REQUEST_MAX_TOKENS_CAP {
+                            return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
+                        }
+                    }
                 }
             }
         }

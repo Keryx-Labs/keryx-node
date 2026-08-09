@@ -168,6 +168,9 @@ pub enum RuleError {
     #[error("AiResponse tx {0} carries a signed (v2) payload before its activation")]
     AiResponseV2BeforeActivation(TransactionId),
 
+    #[error("AiRequest tx {0} max_tokens {1} exceeds the cap {2}")]
+    AiRequestMaxTokensExceeded(TransactionId, u32, u32),
+
     #[error("AiRequest tx {0} inference_reward {1} sompi is below minimum {2} sompi for model {3}")]
     AiRequestInferenceRewardBelowMinimum(TransactionId, u64, u64, String),
 
