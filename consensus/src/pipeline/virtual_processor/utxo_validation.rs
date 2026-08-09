@@ -6,8 +6,8 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiResponseModelCapMissing, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment,
-            InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
+            AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction,
+            BadUTXOCommitment, InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -406,6 +406,16 @@ impl VirtualStateProcessor {
             info!("  Miners        — unchanged: no walk-seed rotation, existing rigs keep mining");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // Signed (v2) AiResponse payloads only become valid at the service-bond gate; before it
+        // this keeps the fixed 78-byte rule every deployed node enforces.
+        if !self.pom_v3_activation.is_active(header.daa_score) {
+            for tx in txs.iter().skip(1) {
+                if tx.is_ai_response() && tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
+                    return Err(AiResponseV2BeforeActivation(tx.id()));
+                }
+            }
         }
 
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.

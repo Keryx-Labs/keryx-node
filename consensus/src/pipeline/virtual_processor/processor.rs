@@ -1367,6 +1367,14 @@ impl VirtualStateProcessor {
             check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score))
                 .map_err(|e| TxRuleError::AiRequestPayloadRule(e.to_string()))?;
         }
+        // Same admission rule as the block check: signed (v2) AiResponses only after the
+        // service-bond gate.
+        if !self.pom_v3_activation.is_active(virtual_daa_score)
+            && mutable_tx.tx.is_ai_response()
+            && mutable_tx.tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN
+        {
+            return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN));
+        }
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
     }

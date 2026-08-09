@@ -134,6 +134,23 @@ fn build_escrow_script(pubkey_bytes: &[u8], csv_blocks: u64) -> Option<ScriptPub
     Some(ScriptPublicKey::from_vec(0, script))
 }
 
+/// Extracts the 32-byte escrow pubkey announced in a coinbase payload's extra data
+/// (`/escrow:<hex64>` field), if present.
+pub fn parse_escrow_pubkey_from_extra_data(extra_data: &[u8]) -> Option<[u8; 32]> {
+    let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
+    let hex_start = marker_pos + ESCROW_MARKER.len();
+    let hex_end = hex_start + ESCROW_PUBKEY_HEX_LEN;
+    if hex_end > extra_data.len() {
+        return None;
+    }
+    let hex_str = std::str::from_utf8(&extra_data[hex_start..hex_end]).ok()?;
+    let mut pubkey = [0u8; 32];
+    for i in 0..32 {
+        pubkey[i] = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(pubkey)
+}
+
 /// Returns the provably-unspendable burn SPK derived from BURN_SEED.
 ///
 /// Called by the AiChallenge deposit validator to verify that a challenger's
@@ -444,17 +461,7 @@ impl CoinbaseManager {
     /// The CSV lock is gated by the rewarding block's own daa score: the service-bond lock
     /// (~13 h) at/after `pom_v3_activation`, the legacy challenge window (~1 h) before.
     pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8], daa_score: u64) -> Option<ScriptPublicKey> {
-        let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
-        let hex_start = marker_pos + ESCROW_MARKER.len();
-        let hex_end = hex_start + ESCROW_PUBKEY_HEX_LEN;
-        if hex_end > extra_data.len() {
-            return None;
-        }
-        let hex_str = std::str::from_utf8(&extra_data[hex_start..hex_end]).ok()?;
-        let pubkey_bytes: Vec<u8> = (0..32)
-            .map(|i| u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16))
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
+        let pubkey_bytes = parse_escrow_pubkey_from_extra_data(extra_data)?;
         let csv_blocks = if self.pom_v3_activation.is_active(daa_score) {
             SERVICE_BOND_CSV_WINDOW_BLOCKS
         } else {

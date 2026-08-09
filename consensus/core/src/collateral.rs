@@ -42,6 +42,13 @@ pub fn miner_key(spk: &ScriptPublicKey) -> Hash {
     TransactionHash::hash(data)
 }
 
+/// Service-ledger identity of a miner: its announced escrow pubkey, verbatim. The same key
+/// signs V2 AiResponses, receives the CSV escrow outputs, and takes the service penalties —
+/// one identity for eligibility, authentication and slashing.
+pub fn escrow_miner_key(pubkey: &[u8; 32]) -> Hash {
+    Hash::from_bytes(*pubkey)
+}
+
 /// Deterministically select one index in `0..n` from a 32-byte seed (a block hash chosen after
 /// the request). Assigns the single responsible miner for an inference request from the eligible
 /// (recently-active tier) set. `None` for an empty set.
@@ -198,7 +205,7 @@ impl ServiceLedger {
         &mut self,
         daa: u64,
         requests: &[([u8; 32], u8)],
-        responses: &[[u8; 32]],
+        responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         mut draw: impl FnMut(u8, &[Hash]) -> Option<Hash>,
     ) -> Vec<ServiceMiss> {
@@ -212,11 +219,17 @@ impl ServiceLedger {
         }
         self.vault.retain(|_, claims| !claims.is_empty());
 
-        for rh in responses {
-            if let Some(req) = self.pending.remove(rh) {
-                if let Some(a) = req.assignment {
-                    self.strikes.remove(&a.miner);
-                }
+        // Only the currently assigned miner's authenticated response serves the request; anyone
+        // else's is ignored — the assignment is an exclusive audit of one miner. Responses are
+        // applied before misses, so one landing in the closing block still cancels.
+        for (rh, responder) in responses {
+            let served = self
+                .pending
+                .get(rh)
+                .is_some_and(|req| req.assignment.is_some_and(|a| *responder == Some(a.miner)));
+            if served {
+                let req = self.pending.remove(rh).unwrap();
+                self.strikes.remove(&req.assignment.unwrap().miner);
             }
         }
 
@@ -329,15 +342,24 @@ mod tests {
     }
 
     #[test]
-    fn served_before_assignment_never_misses() {
+    fn only_the_assigned_responder_serves() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let eligible = [a];
         let mut ledger = ServiceLedger::default();
+        let draw = |_tier: u8, excluded: &[Hash]| draw_assignment(&eligible, excluded, &[0u8; 32]);
+
         let rh = [7u8; 32];
-        assert!(ledger.on_chain_block(100, &[(rh, 0)], &[], &[], no_draw).is_empty());
-        // response lands in the next chain block: applied before the assignment step, so the
-        // draw is never consulted and nothing is ever pending
-        assert!(ledger.on_chain_block(101, &[], &[rh], &[], no_draw).is_empty());
+        assert!(ledger.on_chain_block(100, &[(rh, 0)], &[], &[], draw).is_empty());
+        // a volunteer response before any assignment serves nothing
+        assert!(ledger.on_chain_block(101, &[], &[(rh, Some(b))], &[], draw).is_empty());
+        assert_eq!(ledger.pending_len(), 1);
+        // now assigned to a; neither an unsigned (v1) response nor b's serves it
+        assert!(ledger.on_chain_block(102, &[], &[(rh, None), (rh, Some(b))], &[], draw).is_empty());
+        assert_eq!(ledger.pending_len(), 1);
+        // the assignee's own signed response does
+        assert!(ledger.on_chain_block(103, &[], &[(rh, Some(a))], &[], draw).is_empty());
         assert_eq!(ledger.pending_len(), 0);
-        assert!(ledger.on_chain_block(102, &[], &[], &[], no_draw).is_empty());
     }
 
     #[test]
@@ -376,9 +398,9 @@ mod tests {
         // r1 is finally served here too — an unserved request keeps bouncing forever.
         let daa = 105 + 3 * w;
         let r2 = [2u8; 32];
-        assert!(ledger.on_chain_block(daa, &[(r2, 0)], &[r1], &[], draw).is_empty());
+        assert!(ledger.on_chain_block(daa, &[(r2, 0)], &[(r1, Some(a))], &[], draw).is_empty());
         assert!(ledger.on_chain_block(daa + 1, &[], &[], &[], draw).is_empty()); // assigns a
-        assert!(ledger.on_chain_block(daa + 2, &[], &[r2], &[], draw).is_empty()); // served in window
+        assert!(ledger.on_chain_block(daa + 2, &[], &[(r2, Some(a))], &[], draw).is_empty()); // served in window
         assert_eq!(ledger.consecutive_misses(&a, daa + 2), 0);
 
         let r3 = [3u8; 32];
@@ -402,7 +424,7 @@ mod tests {
         ledger.on_chain_block(100, &[(rh, 0)], &[], &[], draw);
         ledger.on_chain_block(101, &[], &[], &[], draw);
         // window is past, but the same chain block carries the response: served, no miss
-        assert!(ledger.on_chain_block(200 + w, &[], &[rh], &[], draw).is_empty());
+        assert!(ledger.on_chain_block(200 + w, &[], &[(rh, Some(a))], &[], draw).is_empty());
         assert_eq!(ledger.pending_len(), 0);
     }
 

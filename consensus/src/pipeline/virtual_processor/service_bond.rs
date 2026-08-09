@@ -5,7 +5,7 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    assign_index, draw_assignment, eligible_miners, miner_key, EscrowClaim, ServiceLedger, ServiceMiss,
+    assign_index, draw_assignment, eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
@@ -16,6 +16,32 @@ use keryx_database::prelude::StoreResultExt;
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
 use keryx_txscript::script_class::ScriptClass;
+
+/// Domain separator of the V2 AiResponse responder signature.
+const RESPONDER_SIG_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
+
+/// The escrow pubkey locked by a CSV escrow script, if the script is one.
+fn csv_escrow_pubkey(script: &[u8]) -> Option<[u8; 32]> {
+    if !ScriptClass::is_csv_pay_to_pubkey(script) {
+        return None;
+    }
+    let seq_len = script[0] as usize;
+    script[seq_len + 3..seq_len + 35].try_into().ok()
+}
+
+/// The authenticated responder key of a V2 response: its escrow pubkey, iff the schnorr
+/// signature over the v1 payload bytes verifies. `None` for v1 or a bad signature.
+fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
+    let r = resp.responder.as_ref()?;
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(RESPONDER_SIG_DOMAIN);
+    hasher.update(&resp.signed_bytes());
+    let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+    let pk = secp256k1::XOnlyPublicKey::from_slice(&r.escrow_pubkey).ok()?;
+    let sig = secp256k1::schnorr::Signature::from_slice(&r.signature).ok()?;
+    secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).ok()?;
+    Some(escrow_miner_key(&r.escrow_pubkey))
+}
 
 /// Retained per-chain-block ledger snapshots; reorgs deeper than this fall back to a horizon refold.
 const SERVICE_SNAPSHOT_CAP: usize = 4_096;
@@ -37,7 +63,9 @@ pub(super) struct ServiceLedgerSync {
 
 impl VirtualStateProcessor {
     /// `(miner_key, proven tier)` of each paid mergeset blue of chain block `hash` — the same blue
-    /// set the coinbase rewards. Blues without a stored tier are skipped.
+    /// set the coinbase rewards. The key is the blue's announced escrow pubkey: the identity that
+    /// holds the bond, signs V2 responses and takes the penalties. Blues without a stored tier or
+    /// without an escrow announcement are skipped.
     pub(super) fn service_producers_of_chain_block(&self, hash: Hash) -> Vec<(Hash, u8)> {
         let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
         let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
@@ -48,8 +76,9 @@ impl VirtualStateProcessor {
             .filter_map(|b| {
                 let tier = self.pom_tier_store.get(*b).optional().unwrap()?;
                 let txs = self.block_transactions_store.get(*b).unwrap();
-                let spk = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap().miner_data.script_public_key;
-                Some((miner_key(&spk), tier))
+                let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+                let pubkey = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(coinbase.miner_data.extra_data)?;
+                Some((escrow_miner_key(&pubkey), tier))
             })
             .collect()
     }
@@ -99,10 +128,11 @@ impl VirtualStateProcessor {
         assign_index(&seed.as_bytes(), set.len()).map(|i| set[i])
     }
 
-    /// Accepted AiRequests `(request_hash, tier)` and AiResponse request-hashes of committed chain
-    /// block `hash`, across its whole mergeset acceptance data. Requests for models outside the
-    /// tier lineup are skipped.
-    fn service_events_of_chain_block(&self, hash: Hash) -> (Vec<([u8; 32], u8)>, Vec<[u8; 32]>) {
+    /// Accepted AiRequests `(request_hash, tier)` and AiResponses `(request_hash, verified
+    /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
+    /// Requests for models outside the tier lineup are skipped; a v1 response or an invalid
+    /// responder signature yields `None` (a volunteer — never serves the assignment).
+    fn service_events_of_chain_block(&self, hash: Hash) -> (Vec<([u8; 32], u8)>, Vec<([u8; 32], Option<Hash>)>) {
         let mut requests = Vec::new();
         let mut responses = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
@@ -121,7 +151,7 @@ impl VirtualStateProcessor {
                     }
                 } else if tx.is_ai_response() {
                     if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-                        responses.push(resp.request_hash);
+                        responses.push((resp.request_hash, verified_responder(&resp)));
                     }
                 }
             }
@@ -164,15 +194,17 @@ impl VirtualStateProcessor {
             let escrow_idx = miner_idx + 1;
             cursor = escrow_idx + 1;
             if let Some(escrow_out) = coinbase.outputs.get(escrow_idx) {
-                if escrow_out.value > 0 && ScriptClass::is_csv_pay_to_pubkey(escrow_out.script_public_key.script()) {
-                    claims.push((
-                        miner_key(&spk),
-                        EscrowClaim {
-                            outpoint: TransactionOutpoint::new(coinbase_id, escrow_idx as u32),
-                            value: escrow_out.value,
-                            daa,
-                        },
-                    ));
+                if escrow_out.value > 0 {
+                    if let Some(pubkey) = csv_escrow_pubkey(escrow_out.script_public_key.script()) {
+                        claims.push((
+                            escrow_miner_key(&pubkey),
+                            EscrowClaim {
+                                outpoint: TransactionOutpoint::new(coinbase_id, escrow_idx as u32),
+                                value: escrow_out.value,
+                                daa,
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -328,5 +360,60 @@ impl VirtualStateProcessor {
         }
         drop(set);
         self.service_ledger.lock().deep_cursor_daa = cursor;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_inference::AiResponder;
+
+    fn signed_response(seckey: &[u8; 32], tamper: bool) -> AiResponsePayload {
+        let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, seckey).unwrap();
+        let mut resp = AiResponsePayload::new([7u8; 32], 900_000, [0x12u8; 34], 128);
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(RESPONDER_SIG_DOMAIN);
+        hasher.update(&resp.signed_bytes());
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        let sig = keypair.sign_schnorr(msg);
+        let (xonly, _) = keypair.x_only_public_key();
+        resp.responder = Some(AiResponder { escrow_pubkey: xonly.serialize(), signature: *sig.as_ref() });
+        if tamper {
+            resp.response_length += 1;
+        }
+        resp
+    }
+
+    #[test]
+    fn responder_signature_gates_the_identity() {
+        let seckey = [0xC1u8; 32];
+        let good = signed_response(&seckey, false);
+        let expected = escrow_miner_key(&good.responder.as_ref().unwrap().escrow_pubkey);
+        assert_eq!(verified_responder(&good), Some(expected));
+
+        // v1 payload → no identity
+        let v1 = AiResponsePayload::new([7u8; 32], 900_000, [0x12u8; 34], 128);
+        assert_eq!(verified_responder(&v1), None);
+
+        // signature over different bytes → rejected
+        let tampered = signed_response(&seckey, true);
+        assert_eq!(verified_responder(&tampered), None);
+
+        // stolen signature under someone else's pubkey → rejected
+        let mut stolen = signed_response(&seckey, false);
+        stolen.responder.as_mut().unwrap().escrow_pubkey = [0x55u8; 32];
+        assert_eq!(verified_responder(&stolen), None);
+    }
+
+    #[test]
+    fn csv_escrow_pubkey_extracts_the_locked_key() {
+        // <seq_len=3> <3 seq bytes> OP_CSV OpData32 <key 32> OP_CHECKSIG
+        let mut script = vec![3u8, 0xAA, 0xBB, 0xCC];
+        script.push(keryx_txscript::opcodes::codes::OpCheckSequenceVerify);
+        script.push(keryx_txscript::opcodes::codes::OpData32);
+        script.extend_from_slice(&[0x11u8; 32]);
+        script.push(keryx_txscript::opcodes::codes::OpCheckSig);
+        assert_eq!(csv_escrow_pubkey(&script), Some([0x11u8; 32]));
+        assert_eq!(csv_escrow_pubkey(&[0u8; 10]), None);
     }
 }

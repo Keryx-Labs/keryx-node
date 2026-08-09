@@ -165,6 +165,9 @@ pub enum RuleError {
     #[error("AiResponse tx {0} references model_id {1} not declared in coinbase ai:cap:")]
     AiResponseModelCapMissing(TransactionId, String),
 
+    #[error("AiResponse tx {0} carries a signed (v2) payload before its activation")]
+    AiResponseV2BeforeActivation(TransactionId),
+
     #[error("AiRequest tx {0} inference_reward {1} sompi is below minimum {2} sompi for model {3}")]
     AiRequestInferenceRewardBelowMinimum(TransactionId, u64, u64, String),
 

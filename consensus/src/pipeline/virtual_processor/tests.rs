@@ -481,7 +481,7 @@ async fn burned_escrow_outpoint_spend_is_rejected() {
 /// the assignment draws one of them deterministically, and a shorter window truncates the set.
 #[tokio::test]
 async fn service_assignment_draws_from_recent_tier_producers() {
-    use keryx_consensus_core::collateral::miner_key;
+    use keryx_consensus_core::collateral::escrow_miner_key;
     use keryx_consensus_core::config::params::ForkActivation;
     use keryx_consensus_core::pom::PomProof;
 
@@ -509,20 +509,19 @@ async fn service_assignment_draws_from_recent_tier_producers() {
     let handles = tc.init();
     let genesis = config.genesis.hash;
 
-    // m1 announces an escrow pubkey (real CSV escrow outputs → vault claims); m2 does not (his
-    // 20 % burns at emission, no claim).
+    // m1 announces an escrow pubkey — his service identity (eligibility key, vault key); m2 does
+    // not: his 20 % burns at emission, and without a bond he is not service-eligible at all.
     let mut m1 = new_miner_data();
     let mut extra = m1.extra_data.to_vec();
     extra.extend_from_slice(format!("/escrow:{}", "11".repeat(32)).as_bytes());
     m1.extra_data = extra.into();
     let m2 = new_miner_data();
-    let k1 = miner_key(&m1.script_public_key);
-    let k2 = miner_key(&m2.script_public_key);
+    let k1 = escrow_miner_key(&[0x11u8; 32]);
 
     // Single-parent chain b1..b5; each block's tier is proven at its own body commit and paid
     // (hence walked) once merged by the next chain block. b5 is the seed, so the walk sees b1..b4:
-    // tier 0 ← {m1 (b1, b4), m2 (b3)}, tier 1 ← {m2 (b2)}. b3 also carries an AiResponse to an
-    // unknown request, folded into the ledger as a no-op.
+    // tier 0 ← {m1 (b1, b4), m2 (b3, ignored — no escrow)}, tier 1 ← {m2 (b2, ignored)}. b3 also
+    // carries an AiResponse to an unknown request, folded into the ledger as a no-op.
     let stray_response = make_ai_response_tx([0x42u8; 32], [0u8; 32]);
     let plan = [(1u64, &m1, 0u8), (2, &m2, 1), (3, &m2, 0), (4, &m1, 0), (5, &m1, 1)];
     let mut parent = genesis;
@@ -540,15 +539,11 @@ async fn service_assignment_draws_from_recent_tier_producers() {
     let vp = tc.virtual_processor().clone();
     let seed: Hash = 5u64.into();
 
-    let mut expected_tier0 = vec![k1, k2];
-    expected_tier0.sort_unstable();
-    assert_eq!(vp.service_eligible_miners(seed, 0), expected_tier0);
-    assert_eq!(vp.service_eligible_miners(seed, 1), vec![k2]);
+    assert_eq!(vp.service_eligible_miners(seed, 0), vec![k1]);
+    assert!(vp.service_eligible_miners(seed, 1).is_empty(), "a miner without an escrow bond is never eligible");
     assert!(vp.service_eligible_miners(seed, 4).is_empty());
 
-    let assigned = vp.service_assigned_miner(seed, 0).unwrap();
-    assert!(assigned == k1 || assigned == k2);
-    assert_eq!(vp.service_assigned_miner(seed, 0), Some(assigned), "assignment must be deterministic");
+    assert_eq!(vp.service_assigned_miner(seed, 0), Some(k1));
     assert_eq!(vp.service_assigned_miner(seed, 4), None);
 
     // A 1-DAA window covers b5 alone, whose only merged blue is b4 (m1, tier 0).
@@ -559,11 +554,11 @@ async fn service_assignment_draws_from_recent_tier_producers() {
     assert!(vp.service_eligible_miners(Hash::from_bytes([0xEE; 32]), 0).is_empty());
 
     // Escrow vault: m1's blues b1 and b4 were merged by committed chain blocks (b2, b5), each
-    // leaving one CSV escrow claim; m2 announced no escrow pubkey, so his cut burned unclaimed.
+    // leaving one CSV escrow claim keyed by his escrow pubkey; m2 announced none, so his cut
+    // burned unclaimed and no vault exists under any key of his.
     let claims = vp.service_vault_claims(&k1);
     assert_eq!(claims.len(), 2);
     assert!(claims.iter().all(|c| c.value > 0));
-    assert!(vp.service_vault_claims(&k2).is_empty());
 
     tc.shutdown(handles);
 }
