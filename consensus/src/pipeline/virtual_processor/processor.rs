@@ -137,6 +137,10 @@ pub struct VirtualStateProcessor {
     /// Burned escrow outpoints (finality-deep misses), persisted counterpart in `service_burn_store`.
     pub(super) service_burned: parking_lot::RwLock<std::collections::HashSet<keryx_consensus_core::tx::TransactionOutpoint>>,
     pub(super) service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
+    /// Finality-deep production suspensions (miner escrow key → deadline daa), persisted counterpart
+    /// in `service_suspend_store`. Consulted by block validation.
+    pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, u64>>,
+    pub(super) service_suspend_store: Arc<crate::model::stores::service_suspend::DbServiceSuspendStore>,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -331,6 +335,8 @@ impl VirtualStateProcessor {
             service_ledger: Default::default(),
             service_burned: Default::default(),
             service_burn_store: storage.service_burn_store.clone(),
+            service_suspended: Default::default(),
+            service_suspend_store: storage.service_suspend_store.clone(),
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1592,6 +1598,8 @@ impl VirtualStateProcessor {
             virtual_state.daa_score,
             &[],
         );
+        let suspended_blues =
+            self.suspended_blues(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score);
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1602,6 +1610,7 @@ impl VirtualStateProcessor {
                 &virtual_state.mergeset_non_daa,
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
+                &suspended_blues,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);

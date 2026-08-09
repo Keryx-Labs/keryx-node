@@ -5,8 +5,8 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss, SERVICE_ELIGIBILITY_WINDOW_DAA,
-    SERVICE_LEDGER_HORIZON_DAA,
+    eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss, ServicePenalty,
+    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
@@ -332,12 +332,24 @@ impl VirtualStateProcessor {
                     daa
                 );
             }
+            // A third strike, now reorg-immune, suspends the miner's production. The deadline is
+            // derived from the miss's own daa (deterministic), and the full window bites from
+            // finalization: [daa + finality, daa + finality + SERVICE_SUSPENSION_DAA].
+            if miss.penalty == ServicePenalty::Suspend {
+                let until = daa + self.finality_depth + SERVICE_SUSPENSION_DAA;
+                let prev = self.service_suspended.write().insert(miss.miner, until);
+                if prev.is_none_or(|p| p < until) {
+                    self.service_suspend_store.set(miss.miner, until).unwrap();
+                }
+                info!("service-bond: SUSPENSION FINAL for miner {} until daa {} (miss daa {})", miss.miner, until, daa);
+            }
             sync.deep_cursor_daa = sync.deep_cursor_daa.max(daa);
         }
     }
 
     /// Boot-time load of the persisted burned outpoints into the RAM set consulted by transaction
-    /// validation, and of the deep cursor bounding the cold-start refold.
+    /// validation, of the persisted suspensions into the RAM map consulted by block validation, and
+    /// of the deep cursor bounding the cold-start refold.
     pub(crate) fn load_service_burned(&self) {
         let mut set = self.service_burned.write();
         let mut cursor = 0u64;
@@ -349,7 +361,20 @@ impl VirtualStateProcessor {
             cursor = cursor.max(daa);
         }
         drop(set);
+        let mut suspended = self.service_suspended.write();
+        for entry in self.service_suspend_store.iterator() {
+            let (key, until) = entry.unwrap();
+            let miner: [u8; 32] = key[..32].try_into().unwrap();
+            suspended.insert(Hash::from_bytes(miner), until);
+        }
+        drop(suspended);
         self.service_ledger.lock().deep_cursor_daa = cursor;
+    }
+
+    /// Whether `producer`'s block at `daa_score` is rejected by a finality-deep suspension. A pure
+    /// lookup in the reorg-immune suspended set — cheap and identical on every H6 node.
+    pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64) -> bool {
+        self.service_suspended.read().get(producer).is_some_and(|&until| daa_score < until)
     }
 }
 

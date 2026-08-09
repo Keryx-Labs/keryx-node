@@ -279,6 +279,11 @@ impl CoinbaseManager {
         // (no penalty), so this is a no-op before `ratio_reward_activation`. Compounds
         // multiplicatively with `tier_bps_by_block` (see `ratio_bps_by_block`).
         ratio_bps_by_block: &BlockHashMap<u64>,
+        // Service-bond suspension: blue block hashes whose producer is under a finality-deep
+        // production suspension as of this block. Their entire miner cut is burned (they earn
+        // nothing), the reorg-immune analogue of "this producer's blocks are invalid". Empty
+        // before the suspension can exist, so a no-op pre-H6.
+        suspended_blues: &BlockHashSet,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
         // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D
         // allocation, + 1 for the accumulated tier-reward burn
@@ -314,7 +319,13 @@ impl CoinbaseManager {
                 // own activation. Integer divisions are applied in a fixed order for determinism.
                 let tier_bps = tier_bps_by_block.get(blue).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
                 let ratio_bps = ratio_bps_by_block.get(blue).copied().unwrap_or(RATIO_REWARD_BPS_DIVISOR);
-                let miner_paid = miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * ratio_bps / RATIO_REWARD_BPS_DIVISOR;
+                // A suspended producer earns nothing: his whole miner cut is burned. The escrow and
+                // R&D cuts keep their full-subsidy base, so the total block reward is unchanged.
+                let miner_paid = if suspended_blues.contains(blue) {
+                    0
+                } else {
+                    miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * ratio_bps / RATIO_REWARD_BPS_DIVISOR
+                };
                 reward_burn_total += miner_subsidy - miner_paid;
                 outputs.push(TransactionOutput::new(miner_paid, reward_data.script_public_key.clone()));
                 let escrow_spk = reward_data
@@ -669,7 +680,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps)
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
             .unwrap()
             .tx;
 
@@ -695,6 +706,60 @@ mod tests {
         assert_eq!(total, 2 * subsidy, "tier penalty must not change the total block reward");
     }
 
+    /// A suspended producer earns nothing: his entire miner cut is burned, while the escrow and
+    /// R&D cuts keep their full base and the total block reward is unchanged.
+    #[test]
+    fn suspended_producer_miner_cut_burned() {
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let subsidy = 1_000_000_000u64;
+
+        let (h_a, h_b): (Hash, Hash) = (1.into(), 2.into());
+        let spk_a = ScriptPublicKey::from_vec(0, vec![0xaa]);
+        let spk_b = ScriptPublicKey::from_vec(0, vec![0xbb]);
+        let escrow_a = ScriptPublicKey::from_vec(0, vec![0xa1]);
+        let escrow_b = ScriptPublicKey::from_vec(0, vec![0xb1]);
+
+        let mut mergeset_rewards = BlockHashMap::new();
+        mergeset_rewards.insert(h_a, BlockRewardData::new_with_escrow(subsidy, 0, spk_a.clone(), Some(escrow_a.clone())));
+        mergeset_rewards.insert(h_b, BlockRewardData::new_with_escrow(subsidy, 0, spk_b.clone(), Some(escrow_b.clone())));
+
+        let ghostdag = ghostdag_with_blues(vec![h_a, h_b]);
+        let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![0xcc]), vec![]);
+
+        // A is suspended; B is not.
+        let mut suspended = BlockHashSet::new();
+        suspended.insert(h_a);
+
+        let tx = cbm
+            .expected_coinbase_transaction(
+                0,
+                miner_data,
+                &ghostdag,
+                &mergeset_rewards,
+                &BlockHashSet::new(),
+                &BlockHashMap::new(),
+                &BlockHashMap::new(),
+                &suspended,
+            )
+            .unwrap()
+            .tx;
+
+        let rd = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+        let escrow = subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
+        let full_miner = subsidy - rd - escrow;
+        let value_of = |spk: &ScriptPublicKey| tx.outputs.iter().find(|o| &o.script_public_key == spk).map(|o| o.value);
+
+        // Suspended producer's miner cut is fully burned; the other is paid in full.
+        assert_eq!(value_of(&spk_a), Some(0), "suspended producer must earn no miner cut");
+        assert_eq!(value_of(&spk_b), Some(full_miner), "the un-suspended producer is paid in full");
+        // Escrow cuts untouched for both.
+        assert_eq!(value_of(&escrow_a), Some(escrow), "escrow cut keeps its full base even when suspended");
+        assert_eq!(value_of(&escrow_b), Some(escrow));
+        // Total block reward unchanged — the withheld cut is burned, not removed.
+        let total: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        assert_eq!(total, 2 * subsidy, "suspension must not change the total block reward");
+    }
+
     /// Empty tier map (the pre-`pom_activation` state) is a no-op: the miner cut is paid in full,
     /// the total is unchanged, and no extra burn output is appended.
     #[test]
@@ -718,7 +783,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps)
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
             .unwrap()
             .tx;
 
@@ -759,7 +824,7 @@ mod tests {
         ratio_bps.insert(h_a, RATIO_REWARD_BPS[0]); // floor bracket 40 %
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps)
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
             .unwrap()
             .tx;
 
@@ -983,6 +1048,7 @@ mod tests {
                 &BlockHashSet::new(),
                 &BlockHashMap::new(),
                 &BlockHashMap::new(),
+                &BlockHashSet::new(),
             )
             .unwrap()
             .tx

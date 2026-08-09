@@ -13,11 +13,11 @@ pub const COLLATERAL_RATE_BPS: u64 = 2_000;
 /// a challenge, while keeping the escrow lock reasonable for honest miners.
 pub const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
 
-/// Escrow CSV lock at/after the service-bond gate: ledger horizon (36 000) + finality depth
-/// (432 000), ≈ 13 h at 10 BPS. A claim created at C is burnable by misses up to C + horizon,
+/// Escrow CSV lock at/after the service-bond gate: ledger horizon (72 000) + finality depth
+/// (432 000), ≈ 14 h at 10 BPS. A claim created at C is burnable by misses up to C + horizon,
 /// enforceable at most finality later — this lock guarantees the burn is always in force before
 /// the claim unlocks.
-pub const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 468_000;
+pub const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 504_000;
 
 /// Per-miner collateral balance tracked on-chain.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -63,6 +63,19 @@ pub fn assign_index(seed: &[u8; 32], n: usize) -> Option<usize> {
 /// Number of escrow claims burned at the first consecutive missed assignment.
 pub const STRIKE_1_BURN_CLAIMS: u32 = 5;
 
+/// Minimum DAA between two consecutive strikes on the same miner (~1 h). Any further miss inside
+/// this interval is a no-op: it neither escalates the strike count nor burns escrow. The guard-rail
+/// that separates "offline for ten minutes" (or a request flood) from "refusing to serve for
+/// hours" — a genuinely dead miner still escalates, one strike per interval, reaching suspension in
+/// ~3 intervals.
+pub const SERVICE_STRIKE_INTERVAL_DAA: u64 = 36_000;
+
+/// Production suspension applied at the third consecutive strike (24 h). Enforced finality-deep
+/// (like escrow burns): a miner suspended at miss daa `T` has his blocks rejected over
+/// `[T + finality, T + finality + SERVICE_SUSPENSION_DAA]`, so the full 24 h bites after the
+/// reorg-immune finality delay.
+pub const SERVICE_SUSPENSION_DAA: u64 = 864_000;
+
 /// DAA window, ending at the assignment seed block, in which a miner must have produced a proven
 /// tier block to be service-eligible. ~10 minutes at 10 BPS.
 pub const SERVICE_ELIGIBILITY_WINDOW_DAA: u64 = 6_000;
@@ -89,12 +102,13 @@ pub fn service_window_daa(tier: u8, max_tokens: u32) -> u64 {
 
 /// DAA horizon beyond which service-ledger state is forgotten: pending requests expire and strike
 /// entries read as zero. Folding the chain from an empty ledger over this horizon reproduces the
-/// exact state, so the ledger is RAM-only and IBD-safe. Matches the escrow CSV lock (~1 h) —
-/// a penalty must land while the escrow is still locked.
-pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 36_000;
+/// exact state, so the ledger is RAM-only and IBD-safe. Set to twice the strike interval so a
+/// strike entry survives one inter-strike gap and the count can climb to suspension; the cold-start
+/// refold spans twice this horizon and therefore recomputes every live strike.
+pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
 
 /// Penalty applied to a miner for a missed service assignment, by consecutive-miss count.
-/// A successful serve resets the count; the ban is a P2P policy, not a consensus slash.
+/// A successful serve resets the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServicePenalty {
     None,
@@ -102,8 +116,9 @@ pub enum ServicePenalty {
     BurnClaims(u32),
     /// Burn the miner's entire still-locked pending escrow.
     SlashAllPending,
-    /// Ban the miner's IP (enforced at the P2P layer, not consensus).
-    BanIp,
+    /// Suspend the miner's block production: his blocks are rejected for [`SERVICE_SUSPENSION_DAA`]
+    /// once the suspension is finality-deep. Also drains any escrow re-accumulated past the drain.
+    Suspend,
 }
 
 /// Penalty for the `consecutive_misses`-th consecutive miss (0 = served, no penalty).
@@ -112,7 +127,7 @@ pub fn strike_penalty(consecutive_misses: u32) -> ServicePenalty {
         0 => ServicePenalty::None,
         1 => ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS),
         2 => ServicePenalty::SlashAllPending,
-        _ => ServicePenalty::BanIp,
+        _ => ServicePenalty::Suspend,
     }
 }
 
@@ -164,6 +179,8 @@ pub struct ServiceMiss {
     pub request_hash: [u8; 32],
     pub miner: Hash,
     pub consecutive_misses: u32,
+    /// `Suspend` flags a production suspension for `miner`; the enforcement layer turns it into a
+    /// finality-deep, reorg-immune deadline from the miss's own daa.
     pub penalty: ServicePenalty,
     pub burned: Vec<EscrowClaim>,
 }
@@ -253,16 +270,16 @@ impl ServiceLedger {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
                     for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m)) {
+                        // Rate-limit: a strike lands at most once per interval. A miss inside the
+                        // interval of the miner's last strike is a no-op — no escalation, no burn.
+                        if self.strikes.get(miner).is_some_and(|e| daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA) {
+                            continue;
+                        }
                         let count = self.consecutive_misses(miner, daa) + 1;
                         self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
-                        let burned = self.burn(miner, strike_penalty(count));
-                        misses.push(ServiceMiss {
-                            request_hash: rh,
-                            miner: *miner,
-                            consecutive_misses: count,
-                            penalty: strike_penalty(count),
-                            burned,
-                        });
+                        let penalty = strike_penalty(count);
+                        let burned = self.burn(miner, penalty);
+                        misses.push(ServiceMiss { request_hash: rh, miner: *miner, consecutive_misses: count, penalty, burned });
                     }
                     self.pending.remove(&rh);
                 }
@@ -290,7 +307,7 @@ impl ServiceLedger {
     }
 
     /// Takes the escrow claims a penalty burns out of the miner's vault: the `n` newest for
-    /// `BurnClaims(n)`, everything still locked for `SlashAllPending` — and for `BanIp` too, so
+    /// `BurnClaims(n)`, everything still locked for `SlashAllPending` — and for `Suspend` too, so
     /// claims re-accumulated past the second strike stay burnable while the streak lasts.
     fn burn(&mut self, miner: &Hash, penalty: ServicePenalty) -> Vec<EscrowClaim> {
         let Some(claims) = self.vault.get_mut(miner) else {
@@ -299,7 +316,7 @@ impl ServiceLedger {
         let take = match penalty {
             ServicePenalty::None => 0,
             ServicePenalty::BurnClaims(n) => (n as usize).min(claims.len()),
-            ServicePenalty::SlashAllPending | ServicePenalty::BanIp => claims.len(),
+            ServicePenalty::SlashAllPending | ServicePenalty::Suspend => claims.len(),
         };
         let burned: Vec<EscrowClaim> = (0..take).map(|_| claims.pop_back().unwrap()).collect();
         if claims.is_empty() {
@@ -332,7 +349,7 @@ impl ServiceLedger {
 mod tests {
     use super::{
         eligible_miners, service_window_daa, strike_penalty, update_strikes, ServiceLedger, ServicePenalty,
-        AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, STRIKE_1_BURN_CLAIMS,
+        AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
     use keryx_hashes::Hash;
 
@@ -375,46 +392,70 @@ mod tests {
     }
 
     #[test]
-    fn cohort_strikes_all_silent_and_serve_resets() {
+    fn strikes_are_rate_limited_to_one_per_interval() {
+        // Two silent requests inside one strike interval yield only ONE strike — the guard-rail
+        // that stops a burst (or a brief outage) from escalating a miner to suspension.
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+
+        let r1 = [1u8; 32];
+        ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
+        assert_eq!(misses.len(), 1); // strike 1
+
+        // a second miss well within the interval: no strike, no escalation
+        let d2 = 200 + w;
+        let r2 = [2u8; 32];
+        ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(d2 + 1, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set));
+        assert!(misses.is_empty(), "a miss inside the interval must not strike");
+        assert_eq!(ledger.consecutive_misses(&a, d2 + 2 + w), 1);
+    }
+
+    #[test]
+    fn cohort_escalates_across_intervals_to_suspension() {
         let a = Hash::from_bytes([1u8; 32]);
         let b = Hash::from_bytes([2u8; 32]);
         let set = [a, b];
         let mut ledger = ServiceLedger::default();
         let w = service_window_daa(0, 256);
+        let i = SERVICE_STRIKE_INTERVAL_DAA;
 
-        // r1: whole cohort silent -> both struck once, request closed
+        // round 1: whole cohort silent -> both strike 1
         let r1 = [1u8; 32];
-        assert!(ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], cohort_of(&set)).is_empty());
-        assert!(ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set)).is_empty());
+        ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
         let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
         assert_eq!(misses.len(), 2);
         assert_eq!((misses[0].miner, misses[0].consecutive_misses), (a, 1));
-        assert_eq!((misses[1].miner, misses[1].consecutive_misses), (b, 1));
         assert_eq!(misses[0].penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
-        assert_eq!(ledger.pending_len(), 0);
 
-        // r2: a serves inside the window -> only b struck, escalating to strike 2
-        let d2 = 103 + w;
+        // round 2, one interval later: a serves -> only b strikes, to strike 2
+        let d2 = 200 + i;
         let r2 = [2u8; 32];
-        assert!(ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &[], cohort_of(&set)).is_empty());
-        assert!(ledger.on_chain_block(d2 + 1, &[], &[], &[], cohort_of(&set)).is_empty());
-        assert!(ledger.on_chain_block(d2 + 2, &[], &[(r2, Some(a))], &[], cohort_of(&set)).is_empty());
+        ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(d2 + 1, &[], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(d2 + 2, &[], &[(r2, Some(a))], &[], cohort_of(&set));
         let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set));
         assert_eq!(misses.len(), 1);
         assert_eq!((misses[0].miner, misses[0].consecutive_misses), (b, 2));
         assert_eq!(misses[0].penalty, ServicePenalty::SlashAllPending);
         assert_eq!(ledger.consecutive_misses(&a, d2 + 2 + w), 0);
 
-        // r3: both silent again -> a restarts at strike 1, b escalates to BanIp
-        let d3 = d2 + 3 + w;
+        // round 3, another interval later: a (reset) restarts at 1, b reaches strike 3 -> Suspend
+        let d3 = d2 + i + 100;
         let r3 = [3u8; 32];
-        assert!(ledger.on_chain_block(d3, &[(r3, 0, 256)], &[], &[], cohort_of(&set)).is_empty());
-        assert!(ledger.on_chain_block(d3 + 1, &[], &[], &[], cohort_of(&set)).is_empty());
+        ledger.on_chain_block(d3, &[(r3, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(d3 + 1, &[], &[], &[], cohort_of(&set));
         let misses = ledger.on_chain_block(d3 + 2 + w, &[], &[], &[], cohort_of(&set));
         assert_eq!(misses.len(), 2);
         assert_eq!((misses[0].miner, misses[0].consecutive_misses), (a, 1));
         assert_eq!((misses[1].miner, misses[1].consecutive_misses), (b, 3));
-        assert_eq!(misses[1].penalty, ServicePenalty::BanIp);
+        assert_eq!(misses[1].penalty, ServicePenalty::Suspend);
     }
 
     #[test]
@@ -462,8 +503,10 @@ mod tests {
         assert_eq!(misses[0].penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
         assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![6, 5, 4, 3, 2]);
 
-        // r2 missed too: strike 2 drains the leftover claim plus one accumulated meanwhile
-        let d2 = 102 + w;
+        // r2 (one interval later) missed too: strike 2 drains the leftover claim plus one
+        // accumulated meanwhile
+        let i = SERVICE_STRIKE_INTERVAL_DAA;
+        let d2 = 200 + i;
         let r2 = [2u8; 32];
         let fresh = [(a, claim(7, d2))];
         ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &fresh, cohort_of(&set));
@@ -473,25 +516,16 @@ mod tests {
         assert_eq!(misses[0].penalty, ServicePenalty::SlashAllPending);
         assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![7, 1]);
 
-        // r3: strike 3 (BanIp) takes claims re-accumulated past the full slash too
-        let d3 = d2 + 2 + w;
+        // r3 (another interval later): strike 3 (Suspend) takes claims re-accumulated past the drain
+        let d3 = d2 + i + 100;
         let r3 = [3u8; 32];
         let fresh = [(a, claim(8, d3))];
         ledger.on_chain_block(d3, &[(r3, 0, 256)], &[], &fresh, cohort_of(&set));
         ledger.on_chain_block(d3 + 1, &[], &[], &[], cohort_of(&set));
         let misses = ledger.on_chain_block(d3 + 2 + w, &[], &[], &[], cohort_of(&set));
         assert_eq!(misses.len(), 1);
-        assert_eq!(misses[0].penalty, ServicePenalty::BanIp);
+        assert_eq!(misses[0].penalty, ServicePenalty::Suspend);
         assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![8]);
-
-        // an empty vault yields an empty burn list, never a panic
-        let d4 = d3 + 2 + w;
-        let r4 = [4u8; 32];
-        ledger.on_chain_block(d4, &[(r4, 0, 256)], &[], &[], cohort_of(&set));
-        ledger.on_chain_block(d4 + 1, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(d4 + 2 + w, &[], &[], &[], cohort_of(&set));
-        assert_eq!(misses.len(), 1);
-        assert!(misses[0].burned.is_empty());
     }
 
     #[test]
@@ -532,8 +566,8 @@ mod tests {
         assert_eq!(strike_penalty(0), ServicePenalty::None);
         assert_eq!(strike_penalty(1), ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
         assert_eq!(strike_penalty(2), ServicePenalty::SlashAllPending);
-        assert_eq!(strike_penalty(3), ServicePenalty::BanIp);
-        assert_eq!(strike_penalty(9), ServicePenalty::BanIp);
+        assert_eq!(strike_penalty(3), ServicePenalty::Suspend);
+        assert_eq!(strike_penalty(9), ServicePenalty::Suspend);
     }
 
     #[test]

@@ -135,6 +135,9 @@ pub enum DatabaseStorePrefixes {
     PomProof = 195,
     /// Service-bond burned escrow outpoints (finality-deep misses): outpoint → miss daa.
     ServiceBurn = 196,
+    /// Service-bond production suspensions (finality-deep third strikes): miner escrow key →
+    /// suspension deadline DAA. A miner's blocks are rejected while their daa is below it.
+    ServiceSuspend = 197,
 
     // ---- Separator ----
     /// Reserved as a separator

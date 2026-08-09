@@ -518,6 +518,7 @@ impl VirtualStateProcessor {
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
         let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
+        let suspended_blues = self.suspended_blues(ghostdag_data, mergeset_non_daa, daa_score);
         let expected_coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -528,6 +529,7 @@ impl VirtualStateProcessor {
                 mergeset_non_daa,
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
+                &suspended_blues,
             )
             .unwrap()
             .tx;
@@ -563,6 +565,32 @@ impl VirtualStateProcessor {
     /// before `pom_activation` (⇒ every miner cut paid in full, no penalty, no burn). A blue with no
     /// stored tier (cannot happen for a valid post-fork block — `check_pom_proof` requires the proof)
     /// is simply left out, falling back to the full cut on the coinbase side.
+    /// Blue block hashes whose producer is under a finality-deep service-bond suspension as of this
+    /// block — their miner cut is burned by `expected_coinbase_transaction`. Derived from the
+    /// reorg-immune suspended set (populated in-order during virtual resolution, finality-deep), so
+    /// every H6 node computes the identical set at this block's view. Empty pre-H6.
+    pub(super) fn suspended_blues(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        pov_daa_score: u64,
+    ) -> BlockHashSet {
+        let mut set = BlockHashSet::new();
+        if !self.pom_v3_activation.is_active(pov_daa_score) || self.service_suspended.read().is_empty() {
+            return set;
+        }
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            let txs = self.block_transactions_store.get(*blue).unwrap();
+            let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+            if let Some(pubkey) = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(coinbase.miner_data.extra_data) {
+                if self.is_producer_suspended(&keryx_hashes::Hash::from_bytes(pubkey), pov_daa_score) {
+                    set.insert(*blue);
+                }
+            }
+        }
+        set
+    }
+
     pub(super) fn tier_bps_by_block(
         &self,
         ghostdag_data: &GhostdagData,
