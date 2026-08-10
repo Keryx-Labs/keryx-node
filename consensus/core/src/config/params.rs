@@ -1133,6 +1133,13 @@ pub struct Params {
     /// a live cumulative-weight race. `never()` while H5.4 is unscheduled.
     pub difficulty_reset_activation_h5_4: ForkActivation,
 
+    /// Sixth difficulty-reset window. MUST be set to the same score as `pom_v3_activation`.
+    pub difficulty_reset_activation_h6: ForkActivation,
+
+    /// Target the H6 reset window pins. `None` keeps `genesis.bits`. Read by both the template
+    /// builder and block validation — they MUST agree or every mined block is rejected.
+    pub h6_reset_bits: Option<u32>,
+
     /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
     /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
     /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
@@ -1390,6 +1397,8 @@ impl Params {
             difficulty_reset_activation_h5: self.difficulty_reset_activation_h5,
             difficulty_reset_activation_h5_3: self.difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4: self.difficulty_reset_activation_h5_4,
+            difficulty_reset_activation_h6: self.difficulty_reset_activation_h6,
+            h6_reset_bits: self.h6_reset_bits,
             h5_activation: self.h5_activation,
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
@@ -1576,6 +1585,9 @@ pub const MAINNET_PARAMS: Params = Params {
     // H5.4 relaunch difficulty reset — additive, gate = the frozen virtual daa of the v1.4.2
     // relaunch chain (see H5_4_ACTIVATION_DAA for the placement rule).
     difficulty_reset_activation_h5_4: ForkActivation::new(H5_4_ACTIVATION_DAA),
+    // H6 reset — arm together with `pom_v3_activation`, at the same score.
+    difficulty_reset_activation_h6: ForkActivation::never(),
+    h6_reset_bits: None,
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
@@ -1646,9 +1658,9 @@ pub const TESTNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
     // Testnet mirrors the current mainnet state from genesis: every shipped fork
-    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels)
-    // is active at DAA 0, so the only transition exercised on this testnet is the
-    // coin-age H4 rehearsal below.
+    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels,
+    // coin-age H4, H5/H5.1/H5.2) is active at DAA 0, so the only transition exercised
+    // on this testnet is the H6 crossing at DAA 108_000.
     opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
@@ -1677,23 +1689,20 @@ pub const TESTNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // no corrupted history on testnet — verify all
     // Testnet has no frozen-chain history to relaunch from; the H2 difficulty reset stays disabled.
     difficulty_reset_activation: ForkActivation::never(),
-    // H4 reset ENABLED on testnet (mirrors the coin-age gates at 3_000) so the additive-reset path
-    // is exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
-    difficulty_reset_activation_h4: ForkActivation::new(3_000),
-    // H5 reset ENABLED on testnet at the same gate as the H5 bundle, so the additive-reset path is
-    // exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
-    difficulty_reset_activation_h5: ForkActivation::new(3_000),
-    difficulty_reset_activation_h5_3: ForkActivation::new(5_000),
-    // H5.4 reset ENABLED on testnet, on its own window past the H5.3 one.
-    difficulty_reset_activation_h5_4: ForkActivation::new(6_000),
-    // H5 bundle gate active early on testnet for validation.
-    h5_activation: ForkActivation::new(3_000),
-    // H5.1 mirrors the H5 testnet gate so both eras cross together in one E2E run.
-    h5_1_activation: ForkActivation::new(3_000),
-    h5_2_activation: ForkActivation::new(4_000),
-    // H6 matrix walk ACTIVE on testnet past the H5.x gates, so one E2E run crosses every era
-    // in order: bootstrap → 3000 (H4/H5) → 4000 (H5.2) → 5000 (v3 walk).
-    pom_v3_activation: ForkActivation::new(5_000),
+    // No frozen chain to relaunch from on a fresh testnet — the relaunch resets stay disabled.
+    difficulty_reset_activation_h4: ForkActivation::never(),
+    difficulty_reset_activation_h5: ForkActivation::never(),
+    difficulty_reset_activation_h5_3: ForkActivation::never(),
+    difficulty_reset_activation_h5_4: ForkActivation::never(),
+    // MUST equal pom_v3_activation.
+    difficulty_reset_activation_h6: ForkActivation::new(108_000),
+    h6_reset_bits: Some(0x1f7fffff),
+    h5_activation: ForkActivation::new(0),
+    h5_1_activation: ForkActivation::new(0),
+    h5_2_activation: ForkActivation::new(0),
+    // H6 matrix walk — the only era transition this testnet crosses. ~3 h of mining at 10 BPS,
+    // leaving participants time to join before the gate.
+    pom_v3_activation: ForkActivation::new(108_000),
     chain_anchor: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
@@ -1701,14 +1710,11 @@ pub const TESTNET_PARAMS: Params = Params {
     ratio_reward_window: 1_000,
     ratio_reward_window_daa: 1_000,
 
-    // Coin-age holder-reward (v3): the ONLY mid-chain transition on this testnet — from genesis
-    // the chain is in the current-mainnet state (everything above at 0), then at DAA 3_000 the H4
-    // boundary fires: FIFO anchors start, the per-coin muhash field appears, the ratio numerator
-    // switches to the effective balance, the recalibrated ratio-reward v2 bracket table takes
-    // over, and the shrunk maturity ramp (W=2_000) + queue promotions kick in. Rehearses the
-    // mainnet H4 gate end-to-end.
-    coin_age_activation: ForkActivation::new(3_000),
-    coin_age_verification_activation: ForkActivation::new(3_000),
+    // Coin-age holder-reward (v3): active from genesis with the rest of the mainnet state — FIFO
+    // anchors, per-coin muhash field, effective-balance ratio numerator and the recalibrated
+    // ratio-reward v2 bracket table all apply from block 0, with the shrunk maturity ramp (W=2_000).
+    coin_age_activation: ForkActivation::new(0),
+    coin_age_verification_activation: ForkActivation::new(0),
     coin_age_maturity_w: 2_000,
 };
 
@@ -1771,6 +1777,8 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
+    difficulty_reset_activation_h6: ForkActivation::never(),
+    h6_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
@@ -1843,6 +1851,8 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
+    difficulty_reset_activation_h6: ForkActivation::never(),
+    h6_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
