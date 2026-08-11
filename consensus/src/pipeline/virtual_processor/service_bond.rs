@@ -59,14 +59,20 @@ pub(super) struct ServiceLedgerSync {
     queue: std::collections::VecDeque<(u64, u64, ServiceMiss)>,
     /// Highest miss daa already persisted to the burn store.
     deep_cursor_daa: u64,
-    /// Miss daa keyed by `(miner, request_hash)`, kept across refolds so a miss is logged once.
-    logged: std::collections::HashMap<(Hash, [u8; 32]), u64>,
+    /// Miss daa keyed by `(miner, request_hash, strike count)`, kept across refolds so a miss is
+    /// logged once. The count is part of the key: a request hash repeats whenever an identical
+    /// payload is resubmitted, and its later strike must still be logged.
+    logged: std::collections::HashMap<(Hash, [u8; 32], u32), u64>,
 }
 
 /// Logs the misses of one fold that have not been logged yet.
-fn log_new_service_misses(logged: &mut std::collections::HashMap<(Hash, [u8; 32]), u64>, daa: u64, misses: &[ServiceMiss]) {
+fn log_new_service_misses(
+    logged: &mut std::collections::HashMap<(Hash, [u8; 32], u32), u64>,
+    daa: u64,
+    misses: &[ServiceMiss],
+) {
     for miss in misses.iter() {
-        if logged.insert((miss.miner, miss.request_hash), daa).is_some() {
+        if logged.insert((miss.miner, miss.request_hash, miss.consecutive_misses), daa).is_some() {
             continue;
         }
         let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
@@ -256,7 +262,7 @@ impl VirtualStateProcessor {
         pruning_point: Hash,
         cursor_daa: u64,
         queue: &mut std::collections::VecDeque<(u64, u64, ServiceMiss)>,
-        logged: &mut std::collections::HashMap<(Hash, [u8; 32]), u64>,
+        logged: &mut std::collections::HashMap<(Hash, [u8; 32], u32), u64>,
     ) -> ServiceLedger {
         let mut ledger = ServiceLedger::default();
         let Ok(to_hash) = sc.get_by_index(to) else {
