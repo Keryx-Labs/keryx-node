@@ -1,4 +1,50 @@
-# Keryx Node
+# Keryx Node — NODO-2B Adaptive IBD
+
+> **Performance-focused direct fork of [`Keryx-Labs/keryx-node`](https://github.com/Keryx-Labs/keryx-node).**
+>
+> NODO-2B keeps the Keryx v1.4.4 codebase intact except for adaptive IBD
+> slow-peer arbitration in the protocol flows described below.
+
+## NODO-2B improvements
+
+NODO-2B reduces the chance that Initial Block Download remains attached to a
+persistently slow peer while a materially faster peer is available.
+
+The functional source changes are intentionally limited to:
+
+- `protocol/flows/src/flow_context.rs` — shared per-peer IBD cooldown state and
+  arbitration at the common IBD boundary.
+- `protocol/flows/src/ibd/flow.rs` — bounded throughput probing, voluntary
+  slow-peer yield, and cooldown handoff behavior.
+
+Validated tuning:
+
+| Parameter | Value |
+|---|---:|
+| IBD batch | 99 blocks |
+| Probe activation | 792 blocks |
+| Probe sample | 198 blocks |
+| Slow-peer threshold | 25.0 blocks/s |
+| Shared cooldown | 15 s |
+
+Observed during the production validation run on 2026-08-11:
+
+- slow peer measured at 15.83 blocks/s and yielded;
+- the next IBD acquisition began about 12 ms later;
+- the replacement peer passed the probe at 34.66 blocks/s;
+- IBD completed successfully;
+- mining validation observed 6 found / 6 submitted blocks with 0 rejects.
+
+**Allocator note:** NODO-2B does **not** change the allocator configuration.
+`utils/alloc/Cargo.toml` remains exactly as in the pinned Keryx v1.4.4 base.
+
+The fork does not intentionally change consensus rules, block validity,
+transaction validity, mining validity, or the normal fast-peer path.
+
+See [`NODO2B_TECHNICAL_REPORT.md`](NODO2B_TECHNICAL_REPORT.md) for the
+validation evidence and implementation scope.
+
+---
 
 A lightweight and high-performance node implementation for the **Keryx** network, running at **10 blocks per second (10 BPS)**.
 
@@ -57,7 +103,7 @@ Security Mutation: Re-engineered consensus validation layers to ensure unique bl
       ```
   7. Clone the repo
       ```bash
-      git clone https://github.com/Keryx-labs/keryx-node
+      git clone https://github.com/tonythewizard/keryx-node
       cd keryx-node
       ```
   8. Build the node
@@ -98,7 +144,7 @@ Security Mutation: Re-engineered consensus validation layers to ensure unique bl
       ```
   7. Clone the repo
       ```bash
-      git clone https://github.com/Keryx-labs/keryx-node
+      git clone https://github.com/tonythewizard/keryx-node
       cd keryx-node
       ```
   8. Build the node
@@ -162,7 +208,7 @@ To build WASM on MacOS you need to install `llvm` from homebrew (at the time of 
       ```
   6. Clone the repo
       ```bash
-      git clone https://github.com/Keryx-labs/keryx-node
+      git clone https://github.com/tonythewizard/keryx-node
       cd keryx-node
       ```
   8. Build the node
