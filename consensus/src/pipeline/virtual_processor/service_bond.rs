@@ -238,6 +238,7 @@ impl VirtualStateProcessor {
         ledger: &mut ServiceLedger,
         sc: &impl SelectedChainStoreReader,
         hash: Hash,
+        live: bool,
     ) -> Vec<ServiceMiss> {
         let daa = self.headers_store.get_daa_score(hash).unwrap();
         if !self.pom_v3_activation.is_active(daa) {
@@ -245,8 +246,24 @@ impl VirtualStateProcessor {
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
         let escrows = self.service_escrows_of_chain_block(hash);
+        if live && !requests.is_empty() {
+            for (rh, tier, max_tokens) in requests.iter() {
+                info!(
+                    "service-bond: request {} accepted at daa {}, tier {}, max_tokens {}",
+                    hex::encode(rh),
+                    daa,
+                    tier,
+                    max_tokens
+                );
+            }
+        }
         ledger.on_chain_block(daa, &requests, &responses, &escrows, |tier| {
-            self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA)
+            let set = self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA);
+            // Only the live fold logs: a refold replays the same armings.
+            if live {
+                info!("service-bond: audit armed at daa {}, tier {}, cohort {}", daa, tier, set.len());
+            }
+            set
         })
     }
 
@@ -277,7 +294,7 @@ impl VirtualStateProcessor {
         for i in (bottom + 1)..=to {
             let hash = sc.get_by_index(i).unwrap();
             let daa = self.headers_store.get_daa_score(hash).unwrap();
-            let misses = self.fold_service_chain_block(&mut ledger, sc, hash);
+            let misses = self.fold_service_chain_block(&mut ledger, sc, hash, false);
             log_new_service_misses(logged, daa, &misses);
             for miss in misses {
                 if daa > cursor_daa {
@@ -323,7 +340,7 @@ impl VirtualStateProcessor {
         for (k, h) in chain_path.added.iter().enumerate() {
             let idx = common + 1 + k as u64;
             let daa = self.headers_store.get_daa_score(*h).unwrap();
-            let misses = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h);
+            let misses = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, true);
             log_new_service_misses(&mut sync.logged, daa, &misses);
             for miss in misses {
                 sync.queue.push_back((idx, daa, miss));
