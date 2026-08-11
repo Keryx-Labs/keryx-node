@@ -185,7 +185,7 @@ pub struct ServiceMiss {
     pub burned: Vec<EscrowClaim>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingRequest {
     tier: u8,
     max_tokens: u32,
@@ -195,14 +195,14 @@ struct PendingRequest {
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
 /// closes; the silent ones are struck when it does.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Audit {
     cohort: Vec<Hash>,
     responded: Vec<Hash>,
     window_end_daa: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StrikeEntry {
     count: u32,
     last_daa: u64,
@@ -212,7 +212,7 @@ struct StrikeEntry {
 /// is a pure function of the accepted requests/responses stream and the cohort function, with
 /// BTreeMap ordering; any node folding the last [`SERVICE_LEDGER_HORIZON_DAA`] of chain from an
 /// empty ledger reaches the identical state. Never persisted.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServiceLedger {
     pending: std::collections::BTreeMap<[u8; 32], PendingRequest>,
     strikes: std::collections::BTreeMap<Hash, StrikeEntry>,

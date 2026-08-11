@@ -43,8 +43,13 @@ fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
     Some(escrow_miner_key(&r.escrow_pubkey))
 }
 
-/// Retained per-chain-block ledger snapshots; reorgs deeper than this fall back to a horizon refold.
-const SERVICE_SNAPSHOT_CAP: usize = 4_096;
+/// Sparse checkpoints cover twice the service horizon. Reorgs replay from the nearest checkpoint;
+/// deeper restores fall back to the existing bounded refold.
+#[cfg(not(test))]
+const SERVICE_SNAPSHOT_INTERVAL: u64 = 4_096;
+#[cfg(test)]
+const SERVICE_SNAPSHOT_INTERVAL: u64 = 2;
+const SERVICE_SNAPSHOT_CAP: usize = (2 * SERVICE_LEDGER_HORIZON_DAA / SERVICE_SNAPSHOT_INTERVAL) as usize + 2;
 
 /// RAM-only service-ledger state folded along the committed selected chain.
 #[derive(Default)]
@@ -287,18 +292,28 @@ impl VirtualStateProcessor {
         // A reorg (or restore) drops queued misses above the common ancestor with the chain.
         sync.queue.retain(|(idx, _, _)| *idx <= common);
         if sync.tip != Some(common) {
-            let restored = sync.snapshots.get(&common).cloned();
-            sync.ledger = match restored {
-                Some(ledger) => ledger,
+            let checkpoint = sync.snapshots.range(..=common).next_back().map(|(&idx, ledger)| (idx, ledger.clone()));
+            match checkpoint {
+                Some((checkpoint_idx, ledger)) => {
+                    sync.ledger = ledger;
+                    sync.queue.retain(|(idx, _, _)| *idx <= checkpoint_idx);
+                    for idx in checkpoint_idx + 1..=common {
+                        let h = sc.get_by_index(idx).unwrap();
+                        let daa = self.headers_store.get_daa_score(h).unwrap();
+                        for miss in self.fold_service_chain_block(&mut sync.ledger, &*sc, h) {
+                            sync.queue.push_back((idx, daa, miss));
+                        }
+                    }
+                }
                 None => {
                     let cursor = sync.deep_cursor_daa;
                     let mut queue = std::mem::take(&mut sync.queue);
                     queue.clear();
                     let ledger = self.refold_service_ledger(&*sc, common, pruning_point, cursor, &mut queue);
                     sync.queue = queue;
-                    ledger
+                    sync.ledger = ledger;
                 }
-            };
+            }
         }
         sync.snapshots.split_off(&(common + 1));
         for (k, h) in chain_path.added.iter().enumerate() {
@@ -308,11 +323,13 @@ impl VirtualStateProcessor {
             for miss in misses {
                 sync.queue.push_back((idx, daa, miss));
             }
-            let snapshot = sync.ledger.clone();
-            sync.snapshots.insert(idx, snapshot);
-        }
-        while sync.snapshots.len() > SERVICE_SNAPSHOT_CAP {
-            sync.snapshots.pop_first();
+            if idx % SERVICE_SNAPSHOT_INTERVAL == 0 {
+                let snapshot = sync.ledger.clone();
+                sync.snapshots.insert(idx, snapshot);
+                while sync.snapshots.len() > SERVICE_SNAPSHOT_CAP {
+                    sync.snapshots.pop_first();
+                }
+            }
         }
         sync.tip = Some(tip_idx);
         // Misses now deeper than finality are reorg-immune on every acceptable POV: persist their
@@ -375,6 +392,18 @@ impl VirtualStateProcessor {
     /// lookup in the reorg-immune suspended set — cheap and identical on every H6 node.
     pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64) -> bool {
         self.service_suspended.read().get(producer).is_some_and(|&until| daa_score < until)
+    }
+
+    #[cfg(test)]
+    pub(super) fn service_ledger_for_test(&self) -> ServiceLedger {
+        self.service_ledger.lock().ledger.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_service_ledger_for_checkpoint_test(&self) {
+        let mut sync = self.service_ledger.lock();
+        sync.ledger = ServiceLedger::default();
+        sync.tip = None;
     }
 }
 

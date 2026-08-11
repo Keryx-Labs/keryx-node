@@ -558,6 +558,11 @@ async fn service_cohort_from_recent_tier_producers() {
     assert_eq!(claims.len(), 2);
     assert!(claims.iter().all(|c| c.value > 0));
 
+    let expected = vp.service_ledger_for_test();
+    vp.reset_service_ledger_for_checkpoint_test();
+    vp.advance_service_ledger(&keryx_consensus_core::ChainPath::default(), genesis);
+    assert_eq!(vp.service_ledger_for_test(), expected, "checkpoint replay must reproduce the continuously folded ledger");
+
     tc.shutdown(handles);
 }
 
