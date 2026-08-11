@@ -59,6 +59,27 @@ pub(super) struct ServiceLedgerSync {
     queue: std::collections::VecDeque<(u64, u64, ServiceMiss)>,
     /// Highest miss daa already persisted to the burn store.
     deep_cursor_daa: u64,
+    /// Miss daa keyed by `(miner, request_hash)`, kept across refolds so a miss is logged once.
+    logged: std::collections::HashMap<(Hash, [u8; 32]), u64>,
+}
+
+/// Logs the misses of one fold that have not been logged yet.
+fn log_new_service_misses(logged: &mut std::collections::HashMap<(Hash, [u8; 32]), u64>, daa: u64, misses: &[ServiceMiss]) {
+    for miss in misses.iter() {
+        if logged.insert((miss.miner, miss.request_hash), daa).is_some() {
+            continue;
+        }
+        let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
+        info!(
+            "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (awaiting finality)",
+            miss.consecutive_misses,
+            miss.miner,
+            hex::encode(miss.request_hash),
+            miss.penalty,
+            miss.burned.len(),
+            burned_total
+        );
+    }
 }
 
 impl VirtualStateProcessor {
@@ -218,22 +239,9 @@ impl VirtualStateProcessor {
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
         let escrows = self.service_escrows_of_chain_block(hash);
-        let misses = ledger.on_chain_block(daa, &requests, &responses, &escrows, |tier| {
+        ledger.on_chain_block(daa, &requests, &responses, &escrows, |tier| {
             self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA)
-        });
-        for miss in misses.iter() {
-            let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
-            info!(
-                "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (awaiting finality)",
-                miss.consecutive_misses,
-                miss.miner,
-                hex::encode(miss.request_hash),
-                miss.penalty,
-                miss.burned.len(),
-                burned_total
-            );
-        }
-        misses
+        })
     }
 
     /// Rebuilds the ledger up to chain index `to` by folding the committed chain from an empty
@@ -248,6 +256,7 @@ impl VirtualStateProcessor {
         pruning_point: Hash,
         cursor_daa: u64,
         queue: &mut std::collections::VecDeque<(u64, u64, ServiceMiss)>,
+        logged: &mut std::collections::HashMap<(Hash, [u8; 32]), u64>,
     ) -> ServiceLedger {
         let mut ledger = ServiceLedger::default();
         let Ok(to_hash) = sc.get_by_index(to) else {
@@ -262,7 +271,9 @@ impl VirtualStateProcessor {
         for i in (bottom + 1)..=to {
             let hash = sc.get_by_index(i).unwrap();
             let daa = self.headers_store.get_daa_score(hash).unwrap();
-            for miss in self.fold_service_chain_block(&mut ledger, sc, hash) {
+            let misses = self.fold_service_chain_block(&mut ledger, sc, hash);
+            log_new_service_misses(logged, daa, &misses);
+            for miss in misses {
                 if daa > cursor_daa {
                     queue.push_back((i, daa, miss));
                 }
@@ -288,15 +299,17 @@ impl VirtualStateProcessor {
         sync.queue.retain(|(idx, _, _)| *idx <= common);
         if sync.tip != Some(common) {
             let restored = sync.snapshots.get(&common).cloned();
-            sync.ledger = match restored {
-                Some(ledger) => ledger,
+            match restored {
+                Some(ledger) => sync.ledger = ledger,
                 None => {
                     let cursor = sync.deep_cursor_daa;
                     let mut queue = std::mem::take(&mut sync.queue);
                     queue.clear();
-                    let ledger = self.refold_service_ledger(&*sc, common, pruning_point, cursor, &mut queue);
+                    let mut logged = std::mem::take(&mut sync.logged);
+                    let ledger = self.refold_service_ledger(&*sc, common, pruning_point, cursor, &mut queue, &mut logged);
                     sync.queue = queue;
-                    ledger
+                    sync.logged = logged;
+                    sync.ledger = ledger;
                 }
             };
         }
@@ -305,6 +318,7 @@ impl VirtualStateProcessor {
             let idx = common + 1 + k as u64;
             let daa = self.headers_store.get_daa_score(*h).unwrap();
             let misses = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h);
+            log_new_service_misses(&mut sync.logged, daa, &misses);
             for miss in misses {
                 sync.queue.push_back((idx, daa, miss));
             }
@@ -315,6 +329,8 @@ impl VirtualStateProcessor {
             sync.snapshots.pop_first();
         }
         sync.tip = Some(tip_idx);
+        // Bound the logged set by the deepest span a refold can revisit.
+        sync.logged.retain(|_, daa| *daa + 2 * SERVICE_LEDGER_HORIZON_DAA > tip_daa);
         // Misses now deeper than finality are reorg-immune on every acceptable POV: persist their
         // burned outpoints and arm the spend rule.
         while sync.queue.front().is_some_and(|(_, daa, _)| daa + self.finality_depth <= tip_daa) {
