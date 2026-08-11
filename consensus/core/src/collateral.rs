@@ -299,8 +299,11 @@ impl ServiceLedger {
         }
 
         for (rh, tier, max_tokens) in requests {
+            // A re-accepted hash (identical payload resubmitted) must not reset the running
+            // audit: overwriting would re-arm the window and push the miss out forever.
             self.pending
-                .insert(*rh, PendingRequest { tier: *tier, max_tokens: *max_tokens, accepted_daa: daa, audit: None });
+                .entry(*rh)
+                .or_insert(PendingRequest { tier: *tier, max_tokens: *max_tokens, accepted_daa: daa, audit: None });
         }
 
         misses
@@ -414,6 +417,24 @@ mod tests {
         let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set));
         assert!(misses.is_empty(), "a miss inside the interval must not strike");
         assert_eq!(ledger.consecutive_misses(&a, d2 + 2 + w), 1);
+    }
+
+    #[test]
+    fn reaccepted_request_keeps_its_armed_audit() {
+        // Re-accepting a known hash (identical payload resubmitted) must not reset the
+        // audit clock: the original window still expires and the miss still fires.
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+
+        let r1 = [1u8; 32];
+        ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
+        // the same hash lands again mid-window: the running audit must survive
+        ledger.on_chain_block(102, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
+        assert_eq!(misses.len(), 1, "the original window must still expire");
     }
 
     #[test]
