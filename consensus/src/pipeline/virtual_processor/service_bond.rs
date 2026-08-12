@@ -286,6 +286,32 @@ impl VirtualStateProcessor {
         })
     }
 
+    /// Highest chain index whose daa is at or below `bound_daa`, searched down to `floor_idx`
+    /// only. The ratio-reward variant floors its search at `hi_idx - ratio_reward_window_daa`,
+    /// which silently truncates a service-ledger refold to a window six times too short.
+    fn service_chain_index_at_or_below_daa(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        bound_daa: u64,
+        hi_idx: u64,
+        floor_idx: u64,
+    ) -> u64 {
+        let daa_at = |i: u64| self.headers_store.get_daa_score(sc.get_by_index(i).unwrap()).unwrap();
+        let (mut lo, mut hi) = (floor_idx, hi_idx);
+        if lo >= hi || daa_at(lo) > bound_daa {
+            return lo;
+        }
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if daa_at(mid) <= bound_daa {
+                lo = mid
+            } else {
+                hi = mid - 1
+            }
+        }
+        lo
+    }
+
     /// Rebuilds the ledger up to chain index `to` by folding the committed chain from an empty
     /// state — the cold-start and deep-reorg path. Strikes reset at every epoch multiple, so any
     /// fold starting at or before `epoch_start - horizon` reproduces the incremental state: the
@@ -308,10 +334,12 @@ impl VirtualStateProcessor {
         // re-queued (the burn-store cursor, clamped by `to`): the fold then covers every such
         // miss's full epoch with complete request/vault memory, so replayed misses and the state
         // at `to` both match the incremental fold exactly.
-        let anchor = cursor_daa.min(to_daa);
+        // A pending miss is at most `finality_depth` old — anything older is already persisted —
+        // so the fold never needs to reach further back than that, epoch-aligned.
+        let anchor = cursor_daa.max(to_daa.saturating_sub(self.finality_depth)).min(to_daa);
         let daa_bound = (anchor - anchor % SERVICE_STRIKE_EPOCH_DAA).saturating_sub(SERVICE_LEDGER_HORIZON_DAA);
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
-        let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx).max(pruning_idx);
+        let bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
         for i in (bottom + 1)..=to {
             let hash = sc.get_by_index(i).unwrap();
             let daa = self.headers_store.get_daa_score(hash).unwrap();
