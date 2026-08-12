@@ -501,6 +501,16 @@ async fn sanity_test() {
                 })
             }
 
+            KaspadPayloadOps::GetServiceStrikes => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response = rpc_client.get_service_strikes_call(None, GetServiceStrikesRequest {}).await.unwrap();
+                    assert!(response.strikes.is_empty());
+                    assert!(response.suspended.is_empty());
+                    assert!(response.pending_burns.is_empty());
+                })
+            }
+
             KaspadPayloadOps::GetCoinSupply => {
                 let rpc_client = client.clone();
                 tst!(op, {

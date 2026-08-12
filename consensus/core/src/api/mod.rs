@@ -9,6 +9,7 @@ use crate::{
     block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
     blockstatus::BlockStatus,
     coinbase::MinerData,
+    collateral::ServiceStrikesSnapshot,
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         block::{BlockProcessResult, RuleError},
@@ -116,6 +117,10 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn get_virtual_daa_score(&self) -> u64 {
+        unimplemented!()
+    }
+
+    fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
         unimplemented!()
     }
 

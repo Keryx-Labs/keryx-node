@@ -180,6 +180,67 @@ try_from! ( args: GetBlockDagInfoResponse, IGetBlockDagInfoResponse, {
 // ---
 
 declare! {
+    IGetServiceStrikesRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetServiceStrikesRequest { }
+    "#,
+}
+
+try_from! ( args: IGetServiceStrikesRequest, GetServiceStrikesRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetServiceStrikesResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetServiceStrikesResponse {
+        virtualDaaScore: bigint;
+        strikes: IServiceStrike[];
+        suspended: IServiceSuspension[];
+        pendingBurns: IServicePendingBurn[];
+    }
+
+    /**
+     * @category Node RPC
+     */
+    export interface IServiceStrike {
+        miner: HexString;
+        consecutiveMisses: number;
+        lastStrikeDaaScore: bigint;
+    }
+
+    /**
+     * @category Node RPC
+     */
+    export interface IServiceSuspension {
+        miner: HexString;
+        untilDaaScore: bigint;
+    }
+
+    /**
+     * @category Node RPC
+     */
+    export interface IServicePendingBurn {
+        miner: HexString;
+        missDaaScore: bigint;
+        consecutiveMisses: number;
+        burnedClaims: number;
+        burnedSompi: bigint;
+    }
+    "#,
+}
+
+try_from! ( args: GetServiceStrikesResponse, IGetServiceStrikesResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
     IGetCoinSupplyRequest,
     r#"
     /**

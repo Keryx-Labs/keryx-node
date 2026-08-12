@@ -407,6 +407,39 @@ from!(item: RpcResult<&keryx_rpc_core::GetCoinSupplyResponse>, protowire::GetCoi
     Self { max_sompi: item.max_sompi, circulating_sompi: item.circulating_sompi, error: None }
 });
 
+from!(&keryx_rpc_core::GetServiceStrikesRequest, protowire::GetServiceStrikesRequestMessage);
+from!(item: RpcResult<&keryx_rpc_core::GetServiceStrikesResponse>, protowire::GetServiceStrikesResponseMessage, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        strikes: item
+            .strikes
+            .iter()
+            .map(|s| protowire::ServiceStrikeMessage {
+                miner: s.miner.to_string(),
+                consecutive_misses: s.consecutive_misses,
+                last_strike_daa_score: s.last_strike_daa_score,
+            })
+            .collect(),
+        suspended: item
+            .suspended
+            .iter()
+            .map(|s| protowire::ServiceSuspensionMessage { miner: s.miner.to_string(), until_daa_score: s.until_daa_score })
+            .collect(),
+        pending_burns: item
+            .pending_burns
+            .iter()
+            .map(|b| protowire::ServicePendingBurnMessage {
+                miner: b.miner.to_string(),
+                miss_daa_score: b.miss_daa_score,
+                consecutive_misses: b.consecutive_misses,
+                burned_claims: b.burned_claims,
+                burned_sompi: b.burned_sompi,
+            })
+            .collect(),
+        error: None,
+    }
+});
+
 from!(item: &keryx_rpc_core::GetDaaScoreTimestampEstimateRequest, protowire::GetDaaScoreTimestampEstimateRequestMessage, {
     Self {
         daa_scores: item.daa_scores.clone()
@@ -946,6 +979,42 @@ try_from!(
 try_from!(&protowire::GetCoinSupplyRequestMessage, keryx_rpc_core::GetCoinSupplyRequest);
 try_from!(item: &protowire::GetCoinSupplyResponseMessage, RpcResult<keryx_rpc_core::GetCoinSupplyResponse>, {
     Self { max_sompi: item.max_sompi, circulating_sompi: item.circulating_sompi }
+});
+
+try_from!(&protowire::GetServiceStrikesRequestMessage, keryx_rpc_core::GetServiceStrikesRequest);
+try_from!(item: &protowire::GetServiceStrikesResponseMessage, RpcResult<keryx_rpc_core::GetServiceStrikesResponse>, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        strikes: item
+            .strikes
+            .iter()
+            .map(|s| {
+                Ok(keryx_rpc_core::RpcServiceStrike {
+                    miner: RpcHash::from_str(&s.miner)?,
+                    consecutive_misses: s.consecutive_misses,
+                    last_strike_daa_score: s.last_strike_daa_score,
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+        suspended: item
+            .suspended
+            .iter()
+            .map(|s| Ok(keryx_rpc_core::RpcServiceSuspension { miner: RpcHash::from_str(&s.miner)?, until_daa_score: s.until_daa_score }))
+            .collect::<RpcResult<Vec<_>>>()?,
+        pending_burns: item
+            .pending_burns
+            .iter()
+            .map(|b| {
+                Ok(keryx_rpc_core::RpcServicePendingBurn {
+                    miner: RpcHash::from_str(&b.miner)?,
+                    miss_daa_score: b.miss_daa_score,
+                    consecutive_misses: b.consecutive_misses,
+                    burned_claims: b.burned_claims,
+                    burned_sompi: b.burned_sompi,
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+    }
 });
 
 try_from!(item: &protowire::GetDaaScoreTimestampEstimateRequestMessage, keryx_rpc_core::GetDaaScoreTimestampEstimateRequest , {

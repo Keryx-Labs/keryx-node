@@ -1914,6 +1914,80 @@ impl Deserializer for GetCoinSupplyResponse {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceStrike {
+    pub miner: RpcHash,
+    pub consecutive_misses: u32,
+    pub last_strike_daa_score: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceSuspension {
+    pub miner: RpcHash,
+    pub until_daa_score: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServicePendingBurn {
+    pub miner: RpcHash,
+    pub miss_daa_score: u64,
+    pub consecutive_misses: u32,
+    pub burned_claims: u32,
+    pub burned_sompi: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceStrikesRequest {}
+
+impl Serializer for GetServiceStrikesRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceStrikesRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceStrikesResponse {
+    pub virtual_daa_score: u64,
+    pub strikes: Vec<RpcServiceStrike>,
+    pub suspended: Vec<RpcServiceSuspension>,
+    pub pending_burns: Vec<RpcServicePendingBurn>,
+}
+
+impl Serializer for GetServiceStrikesResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.virtual_daa_score, writer)?;
+        store!(Vec<RpcServiceStrike>, &self.strikes, writer)?;
+        store!(Vec<RpcServiceSuspension>, &self.suspended, writer)?;
+        store!(Vec<RpcServicePendingBurn>, &self.pending_burns, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceStrikesResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let virtual_daa_score = load!(u64, reader)?;
+        let strikes = load!(Vec<RpcServiceStrike>, reader)?;
+        let suspended = load!(Vec<RpcServiceSuspension>, reader)?;
+        let pending_burns = load!(Vec<RpcServicePendingBurn>, reader)?;
+        Ok(Self { virtual_daa_score, strikes, suspended, pending_burns })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PingRequest {}

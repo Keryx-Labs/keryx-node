@@ -451,6 +451,16 @@ pub trait RpcApi: Sync + Send + AnySync {
         request: GetCoinSupplyRequest,
     ) -> RpcResult<GetCoinSupplyResponse>;
 
+    /// Service-bond enforcement state: live strikes, suspensions and misses awaiting finality.
+    async fn get_service_strikes(&self) -> RpcResult<GetServiceStrikesResponse> {
+        self.get_service_strikes_call(None, GetServiceStrikesRequest {}).await
+    }
+    async fn get_service_strikes_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetServiceStrikesRequest,
+    ) -> RpcResult<GetServiceStrikesResponse>;
+
     async fn get_daa_score_timestamp_estimate(&self, daa_scores: Vec<u64>) -> RpcResult<Vec<u64>> {
         Ok(self.get_daa_score_timestamp_estimate_call(None, GetDaaScoreTimestampEstimateRequest { daa_scores }).await?.timestamps)
     }

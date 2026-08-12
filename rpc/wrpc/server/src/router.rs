@@ -41,6 +41,7 @@ impl Router {
                 GetBalancesByAddresses,
                 GetUtxoCountByAddress,
                 GetUtxoEntriesByOutpoints,
+                GetServiceStrikes,
                 GetBlock,
                 GetBlockCount,
                 GetBlockDagInfo,

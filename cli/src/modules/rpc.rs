@@ -239,6 +239,10 @@ impl Rpc {
                 let result = rpc.get_coin_supply_call(None, GetCoinSupplyRequest {}).await?;
                 self.println(&ctx, result);
             }
+            RpcApiOps::GetServiceStrikes => {
+                let result = rpc.get_service_strikes_call(None, GetServiceStrikesRequest {}).await?;
+                self.println(&ctx, result);
+            }
             RpcApiOps::GetDaaScoreTimestampEstimate => {
                 if argv.is_empty() {
                     return Err(Error::custom("Please specify a daa_score"));

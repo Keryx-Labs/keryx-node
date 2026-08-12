@@ -927,6 +927,43 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetBalancesByAddressesResponse::new(entries))
     }
 
+    async fn get_service_strikes_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _: GetServiceStrikesRequest,
+    ) -> RpcResult<GetServiceStrikesResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let snapshot = session.get_service_strikes();
+        Ok(GetServiceStrikesResponse {
+            virtual_daa_score: snapshot.virtual_daa_score,
+            strikes: snapshot
+                .strikes
+                .into_iter()
+                .map(|(miner, consecutive_misses, last_strike_daa_score)| RpcServiceStrike {
+                    miner,
+                    consecutive_misses,
+                    last_strike_daa_score,
+                })
+                .collect(),
+            suspended: snapshot
+                .suspended
+                .into_iter()
+                .map(|(miner, until_daa_score)| RpcServiceSuspension { miner, until_daa_score })
+                .collect(),
+            pending_burns: snapshot
+                .pending_burns
+                .into_iter()
+                .map(|(miner, miss_daa_score, consecutive_misses, burned_claims, burned_sompi)| RpcServicePendingBurn {
+                    miner,
+                    miss_daa_score,
+                    consecutive_misses,
+                    burned_claims,
+                    burned_sompi,
+                })
+                .collect(),
+        })
+    }
+
     async fn get_coin_supply_call(
         &self,
         _connection: Option<&DynRpcConnection>,

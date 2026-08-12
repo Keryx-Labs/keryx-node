@@ -629,6 +629,7 @@ impl RpcApi for KaspaRpcClient {
             GetBalancesByAddresses,
             GetUtxoCountByAddress,
             GetUtxoEntriesByOutpoints,
+            GetServiceStrikes,
             GetBlock,
             GetBlockCount,
             GetBlockDagInfo,

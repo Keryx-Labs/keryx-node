@@ -167,6 +167,18 @@ pub fn draw_assignment(eligible: &[Hash], excluded: &[Hash], seed: &[u8; 32]) ->
     assign_index(seed, pool.len()).map(|i| pool[i])
 }
 
+/// Point-in-time view of the service-bond enforcement state, for RPC monitoring.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceStrikesSnapshot {
+    pub virtual_daa_score: u64,
+    /// Live strike entries: (miner, consecutive misses, last strike daa).
+    pub strikes: Vec<(Hash, u32, u64)>,
+    /// Production suspensions: (miner, suspended-until daa).
+    pub suspended: Vec<(Hash, u64)>,
+    /// Misses awaiting finality: (miner, miss daa, consecutive misses, burned claims, burned sompi).
+    pub pending_burns: Vec<(Hash, u64, u32, u32, u64)>,
+}
+
 /// One escrow claim of a miner: a CSV-locked coinbase escrow output he can claim after the lock,
 /// unless burned by a service penalty first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +369,16 @@ impl ServiceLedger {
     /// Currently pending (accepted, unserved, unexpired) request count.
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Live strike entries as of `daa` as (miner, count, last strike daa); horizon-expired
+    /// entries are excluded.
+    pub fn strike_entries(&self, daa: u64) -> Vec<(Hash, u32, u64)> {
+        self.strikes
+            .iter()
+            .filter(|(_, e)| e.last_daa + SERVICE_LEDGER_HORIZON_DAA > daa)
+            .map(|(m, e)| (*m, e.count, e.last_daa))
+            .collect()
     }
 }
 

@@ -144,6 +144,8 @@ pub enum RpcApiOps {
     GetUtxoCountByAddress = 152,
     /// Get the live UTXO entries of specific outpoints; absence means spent or never existed
     GetUtxoEntriesByOutpoints = 153,
+    /// Service-bond strike, suspension and pending-burn state
+    GetServiceStrikes = 154,
 }
 
 impl RpcApiOps {

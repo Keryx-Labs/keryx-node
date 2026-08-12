@@ -935,6 +935,9 @@ build_wrpc_wasm_bindgen_interface!(
         /// Returns the total current coin supply of Kaspa network.
         /// Returned information: Total coin supply.
         GetCoinSupply,
+        /// Returns the service-bond enforcement state: live strikes,
+        /// production suspensions and misses awaiting finality.
+        GetServiceStrikes,
         /// Retrieves information about the peers connected to the Kaspa node.
         /// Returned information: Peer ID, IP address and port, connection
         /// status, protocol version.

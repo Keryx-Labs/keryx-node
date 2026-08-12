@@ -57,6 +57,7 @@ use keryx_consensus_core::{
     blockhash::BlockHashExtensions,
     blockstatus::BlockStatus,
     coinbase::MinerData,
+    collateral::ServiceStrikesSnapshot,
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         coinbase::CoinbaseResult,
@@ -698,6 +699,10 @@ impl ConsensusApi for Consensus {
 
     fn get_virtual_daa_score(&self) -> u64 {
         self.lkg_virtual_state.load().daa_score
+    }
+
+    fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
+        self.virtual_processor.service_strikes_snapshot(self.lkg_virtual_state.load().daa_score)
     }
 
     fn get_virtual_bits(&self) -> u32 {

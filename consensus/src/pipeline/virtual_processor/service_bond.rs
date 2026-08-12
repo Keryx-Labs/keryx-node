@@ -5,7 +5,7 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss, ServicePenalty,
+    eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss, ServicePenalty, ServiceStrikesSnapshot,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_EPOCH_DAA, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
@@ -182,6 +182,26 @@ impl VirtualStateProcessor {
     #[allow(dead_code)]
     pub(crate) fn service_vault_claims(&self, miner: &Hash) -> Vec<EscrowClaim> {
         self.service_ledger.lock().ledger.vault_claims(miner)
+    }
+
+    /// Point-in-time service-bond enforcement state: live strikes, suspensions and the misses
+    /// still awaiting finality.
+    pub(crate) fn service_strikes_snapshot(&self, virtual_daa_score: u64) -> ServiceStrikesSnapshot {
+        let mut snapshot = ServiceStrikesSnapshot { virtual_daa_score, ..Default::default() };
+        {
+            let sync = self.service_ledger.lock();
+            snapshot.strikes = sync.ledger.strike_entries(virtual_daa_score);
+            snapshot.pending_burns = sync
+                .queue
+                .iter()
+                .map(|(_, daa, miss)| {
+                    (miss.miner, *daa, miss.consecutive_misses, miss.burned.len() as u32, miss.burned.iter().map(|c| c.value).sum())
+                })
+                .collect();
+        }
+        snapshot.suspended = self.service_suspended.read().iter().map(|(m, until)| (*m, *until)).collect();
+        snapshot.suspended.sort_unstable();
+        snapshot
     }
 
     /// Escrow claims created by committed chain block `hash`'s coinbase, keyed by producing miner:

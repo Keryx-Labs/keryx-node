@@ -346,6 +346,14 @@ impl RpcApi for RpcCoreMock {
         Err(RpcError::NotImplemented)
     }
 
+    async fn get_service_strikes_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetServiceStrikesRequest,
+    ) -> RpcResult<GetServiceStrikesResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
     async fn get_coin_supply_call(
         &self,
         _connection: Option<&DynRpcConnection>,

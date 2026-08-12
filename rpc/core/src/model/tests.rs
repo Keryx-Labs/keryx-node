@@ -1121,6 +1121,33 @@ mod mockery {
 
     test!(GetCoinSupplyRequest);
 
+    impl Mock for GetServiceStrikesRequest {
+        fn mock() -> Self {
+            GetServiceStrikesRequest {}
+        }
+    }
+
+    test!(GetServiceStrikesRequest);
+
+    impl Mock for GetServiceStrikesResponse {
+        fn mock() -> Self {
+            GetServiceStrikesResponse {
+                virtual_daa_score: mock(),
+                strikes: vec![RpcServiceStrike { miner: mock(), consecutive_misses: 2, last_strike_daa_score: mock() }],
+                suspended: vec![RpcServiceSuspension { miner: mock(), until_daa_score: mock() }],
+                pending_burns: vec![RpcServicePendingBurn {
+                    miner: mock(),
+                    miss_daa_score: mock(),
+                    consecutive_misses: 1,
+                    burned_claims: 5,
+                    burned_sompi: mock(),
+                }],
+            }
+        }
+    }
+
+    test!(GetServiceStrikesResponse);
+
     impl Mock for GetCoinSupplyResponse {
         fn mock() -> Self {
             GetCoinSupplyResponse { max_sompi: mock(), circulating_sompi: mock() }
