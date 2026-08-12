@@ -205,8 +205,8 @@ impl VirtualStateProcessor {
     }
 
     /// Escrow claims created by committed chain block `hash`'s coinbase, keyed by producing miner:
-    /// for each paid mergeset blue, the CSV escrow output that follows the blue's miner payout
-    /// output. Standard miners (escrow burned at emission) contribute none.
+    /// for each paid mergeset blue, the CSV escrow output locking the escrow key that blue's own
+    /// coinbase announces. Standard miners (escrow burned at emission) contribute none.
     fn service_escrows_of_chain_block(&self, hash: Hash) -> Vec<(Hash, EscrowClaim)> {
         let daa = self.headers_store.get_daa_score(hash).unwrap();
         let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
@@ -215,9 +215,11 @@ impl VirtualStateProcessor {
         let coinbase = &txs[0];
         let coinbase_id = coinbase.id();
         let mut claims = Vec::new();
-        // Walk the coinbase outputs in lockstep with the paid blues: per blue with a subsidy the
-        // validated layout is [fee burn?, miner payout, escrow/burn], so the escrow candidate is
-        // the output right after the first output at/past the cursor paying the blue's SPK.
+        // Walk the coinbase outputs in lockstep with the paid blues, matching each blue to the CSV
+        // output locking its own announced escrow key. Keying on that key rather than on the
+        // position after the miner payout keeps the pairing exact when the payout output is absent
+        // (a suspended producer's burned cut emits none). The cursor keeps two blues of the same
+        // miner in chain order.
         let mut cursor = 0usize;
         for blue in ghostdag_data.mergeset_blues.iter().filter(|b| !non_daa.contains(b)) {
             let blue_txs = self.block_transactions_store.get(*blue).unwrap();
@@ -225,27 +227,24 @@ impl VirtualStateProcessor {
             if blue_coinbase.subsidy == 0 {
                 continue;
             }
-            let spk = blue_coinbase.miner_data.script_public_key;
-            let Some(miner_idx) = (cursor..coinbase.outputs.len()).find(|&i| coinbase.outputs[i].script_public_key == spk)
+            let Some(pubkey) = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(blue_coinbase.miner_data.extra_data)
             else {
                 continue;
             };
-            let escrow_idx = miner_idx + 1;
+            let Some(escrow_idx) = (cursor..coinbase.outputs.len()).find(|&i| {
+                coinbase.outputs[i].value > 0 && csv_escrow_pubkey(coinbase.outputs[i].script_public_key.script()) == Some(pubkey)
+            }) else {
+                continue;
+            };
             cursor = escrow_idx + 1;
-            if let Some(escrow_out) = coinbase.outputs.get(escrow_idx) {
-                if escrow_out.value > 0 {
-                    if let Some(pubkey) = csv_escrow_pubkey(escrow_out.script_public_key.script()) {
-                        claims.push((
-                            escrow_miner_key(&pubkey),
-                            EscrowClaim {
-                                outpoint: TransactionOutpoint::new(coinbase_id, escrow_idx as u32),
-                                value: escrow_out.value,
-                                daa,
-                            },
-                        ));
-                    }
-                }
-            }
+            claims.push((
+                escrow_miner_key(&pubkey),
+                EscrowClaim {
+                    outpoint: TransactionOutpoint::new(coinbase_id, escrow_idx as u32),
+                    value: coinbase.outputs[escrow_idx].value,
+                    daa,
+                },
+            ));
         }
         claims
     }
