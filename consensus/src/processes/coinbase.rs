@@ -327,12 +327,18 @@ impl CoinbaseManager {
                     miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * ratio_bps / RATIO_REWARD_BPS_DIVISOR
                 };
                 reward_burn_total += miner_subsidy - miner_paid;
-                outputs.push(TransactionOutput::new(miner_paid, reward_data.script_public_key.clone()));
-                let escrow_spk = reward_data
-                    .escrow_script_public_key
-                    .clone()
-                    .unwrap_or_else(|| self.burn_script_public_key.clone());
-                outputs.push(TransactionOutput::new(escrow_cut, escrow_spk));
+                // Zero-value outputs are rejected in isolation, so a fully-burned miner cut emits
+                // none: the amount is already in `reward_burn_total`.
+                if miner_paid > 0 {
+                    outputs.push(TransactionOutput::new(miner_paid, reward_data.script_public_key.clone()));
+                }
+                if escrow_cut > 0 {
+                    let escrow_spk = reward_data
+                        .escrow_script_public_key
+                        .clone()
+                        .unwrap_or_else(|| self.burn_script_public_key.clone());
+                    outputs.push(TransactionOutput::new(escrow_cut, escrow_spk));
+                }
             }
         }
 
@@ -749,9 +755,12 @@ mod tests {
         let full_miner = subsidy - rd - escrow;
         let value_of = |spk: &ScriptPublicKey| tx.outputs.iter().find(|o| &o.script_public_key == spk).map(|o| o.value);
 
-        // Suspended producer's miner cut is fully burned; the other is paid in full.
-        assert_eq!(value_of(&spk_a), Some(0), "suspended producer must earn no miner cut");
+        // Suspended producer's miner cut is fully burned; the other is paid in full. The withheld
+        // cut emits NO output at all — a zero-value one would make the coinbase invalid in
+        // isolation, so every block merging a suspended producer's blue would be rejected.
+        assert_eq!(value_of(&spk_a), None, "suspended producer must get no miner output");
         assert_eq!(value_of(&spk_b), Some(full_miner), "the un-suspended producer is paid in full");
+        assert!(tx.outputs.iter().all(|o| o.value > 0), "a zero-value output makes the coinbase invalid in isolation");
         // Escrow cuts untouched for both.
         assert_eq!(value_of(&escrow_a), Some(escrow), "escrow cut keeps its full base even when suspended");
         assert_eq!(value_of(&escrow_b), Some(escrow));
