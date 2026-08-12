@@ -100,12 +100,17 @@ pub fn service_window_daa(tier: u8, max_tokens: u32) -> u64 {
     SERVICE_WINDOW_BASE_DAA + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
-/// DAA horizon beyond which service-ledger state is forgotten: pending requests expire and strike
-/// entries read as zero. Folding the chain from an empty ledger over this horizon reproduces the
-/// exact state, so the ledger is RAM-only and IBD-safe. Set to twice the strike interval so a
-/// strike entry survives one inter-strike gap and the count can climb to suspension; the cold-start
-/// refold spans twice this horizon and therefore recomputes every live strike.
+/// DAA horizon beyond which per-request ledger state is forgotten: pending requests expire, vault
+/// claims drop out and strike entries read as zero. Together with the strike-epoch reset this
+/// bounds the ledger's memory, so it stays RAM-only and IBD-safe. Set to twice the strike
+/// interval so a strike entry survives one inter-strike gap between epoch resets.
 pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
+
+/// Absolute-aligned strike epoch: the strike map resets at every multiple of this DAA span, so
+/// ledger state is a pure function of the chain since `epoch_start - SERVICE_LEDGER_HORIZON_DAA`
+/// and the incremental fold matches any refold starting at or before that point. Four strike
+/// intervals, so an unresponsive miner still escalates to suspension within one epoch.
+pub const SERVICE_STRIKE_EPOCH_DAA: u64 = 2 * SERVICE_LEDGER_HORIZON_DAA;
 
 /// Penalty applied to a miner for a missed service assignment, by consecutive-miss count.
 /// A successful serve resets the count.
@@ -218,6 +223,8 @@ pub struct ServiceLedger {
     strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
     /// Per-miner still-locked escrow claims, chain order (newest at the back).
     vault: std::collections::BTreeMap<Hash, std::collections::VecDeque<EscrowClaim>>,
+    /// Last folded strike epoch (`daa / SERVICE_STRIKE_EPOCH_DAA`).
+    epoch: u64,
 }
 
 impl ServiceLedger {
@@ -237,6 +244,11 @@ impl ServiceLedger {
         escrows: &[(Hash, EscrowClaim)],
         mut cohort: impl FnMut(u8) -> Vec<Hash>,
     ) -> Vec<ServiceMiss> {
+        let epoch = daa / SERVICE_STRIKE_EPOCH_DAA;
+        if epoch != self.epoch {
+            self.strikes.clear();
+            self.epoch = epoch;
+        }
         for (miner, claim) in escrows {
             self.vault.entry(*miner).or_default().push_back(*claim);
         }
@@ -351,8 +363,9 @@ impl ServiceLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        eligible_miners, service_window_daa, strike_penalty, update_strikes, ServiceLedger, ServicePenalty,
-        AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
+        eligible_miners, service_window_daa, strike_penalty, update_strikes, ServiceLedger, ServiceMiss, ServicePenalty,
+        AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_EPOCH_DAA, SERVICE_STRIKE_INTERVAL_DAA,
+        STRIKE_1_BURN_CLAIMS,
     };
     use keryx_hashes::Hash;
 
@@ -568,6 +581,52 @@ mod tests {
         assert_eq!(ledger.consecutive_misses(&a, far), 0);
         ledger.on_chain_block(far, &[], &[], &[], cohort_of(&set));
         assert_eq!(ledger.pending_len(), 0);
+    }
+
+    #[test]
+    fn refold_reproduces_incremental_state_across_epochs() {
+        // A strike chain kept alive by one miss per interval, crossing an epoch boundary, plus
+        // one extra miss inside an interval (a no-op for the live fold). The refold from the
+        // canonical bound must emit the same misses as the incremental fold for every daa at or
+        // after the epoch start, and reach the same final strike count.
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let w = service_window_daa(0, 256);
+        let i = SERVICE_STRIKE_INTERVAL_DAA;
+        let e = SERVICE_STRIKE_EPOCH_DAA;
+
+        let mut accepts: Vec<u64> = (0..6).map(|k| 30_000 + k * (i + 2)).collect();
+        accepts.push(30_000 + i + 2 + 18_000);
+        accepts.sort_unstable();
+        let mut blocks: Vec<(u64, Vec<[u8; 32]>)> = Vec::new();
+        for (n, &d) in accepts.iter().enumerate() {
+            let rh = [n as u8 + 1; 32];
+            blocks.push((d, vec![rh]));
+            blocks.push((d + 1, Vec::new()));
+            blocks.push((d + 2 + w, Vec::new()));
+        }
+        blocks.sort_unstable_by_key(|(d, _)| *d);
+        let to = blocks.last().unwrap().0;
+        let epoch_start = to - to % e;
+
+        let fold = |from: u64| {
+            let mut ledger = ServiceLedger::default();
+            let mut misses: Vec<(u64, ServiceMiss)> = Vec::new();
+            for (d, hashes) in blocks.iter().filter(|(d, _)| *d >= from) {
+                let reqs: Vec<_> = hashes.iter().map(|rh| (*rh, 0u8, 256u32)).collect();
+                misses.extend(ledger.on_chain_block(*d, &reqs, &[], &[], cohort_of(&set)).into_iter().map(|m| (*d, m)));
+            }
+            (ledger, misses)
+        };
+
+        let (inc, inc_misses) = fold(0);
+        let (refolded, ref_misses) = fold(epoch_start.saturating_sub(SERVICE_LEDGER_HORIZON_DAA));
+
+        let recent = |ms: &[(u64, ServiceMiss)]| ms.iter().filter(|(d, _)| *d >= epoch_start).cloned().collect::<Vec<_>>();
+        assert_eq!(recent(&inc_misses), recent(&ref_misses), "misses since the epoch start must be fold-invariant");
+        assert_eq!(inc.consecutive_misses(&a, to), refolded.consecutive_misses(&a, to));
+        // the boundary reset restarted the chain: the post-boundary strikes count from 1
+        assert_eq!(recent(&inc_misses).iter().map(|(_, m)| m.consecutive_misses).collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::model::stores::{
 };
 use keryx_consensus_core::collateral::{
     eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss, ServicePenalty,
-    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_SUSPENSION_DAA,
+    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_EPOCH_DAA, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
@@ -268,10 +268,9 @@ impl VirtualStateProcessor {
     }
 
     /// Rebuilds the ledger up to chain index `to` by folding the committed chain from an empty
-    /// state — the cold-start and deep-reorg path. The fold spans TWICE the ledger horizon: state
-    /// readable at `to` (strikes, vault) derives from misses up to one horizon back, which derive
-    /// from requests registered up to one horizon before that. A single-horizon fold would drop
-    /// requests straddling the boundary and diverge from the incremental fold.
+    /// state — the cold-start and deep-reorg path. Strikes reset at every epoch multiple, so any
+    /// fold starting at or before `epoch_start - horizon` reproduces the incremental state: the
+    /// horizon margin covers the requests and vault claims still readable at the epoch start.
     fn refold_service_ledger(
         &self,
         sc: &impl SelectedChainStoreReader,
@@ -286,9 +285,12 @@ impl VirtualStateProcessor {
             return ledger;
         };
         let to_daa = self.headers_store.get_daa_score(to_hash).unwrap();
-        // Span 2× the ledger horizon, extended back to the burn-store cursor so misses that became
-        // finality-deep while the node was down are recomputed and persisted.
-        let daa_bound = to_daa.saturating_sub(2 * SERVICE_LEDGER_HORIZON_DAA).min(cursor_daa.saturating_sub(2 * SERVICE_LEDGER_HORIZON_DAA));
+        // Start at or before `epoch_start - horizon` of the earliest daa whose misses may be
+        // re-queued (the burn-store cursor, clamped by `to`): the fold then covers every such
+        // miss's full epoch with complete request/vault memory, so replayed misses and the state
+        // at `to` both match the incremental fold exactly.
+        let anchor = cursor_daa.min(to_daa);
+        let daa_bound = (anchor - anchor % SERVICE_STRIKE_EPOCH_DAA).saturating_sub(SERVICE_LEDGER_HORIZON_DAA);
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx).max(pruning_idx);
         for i in (bottom + 1)..=to {
