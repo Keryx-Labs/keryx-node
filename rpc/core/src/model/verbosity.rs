@@ -59,11 +59,14 @@ pub struct RpcHeaderVerbosity {
     /// H6: `service_state_hash` (sealed service-state commitment)
     #[serde(default)]
     pub include_service_state_hash: Option<bool>,
+    /// H6: `pom_tier` (committed proven tier)
+    #[serde(default)]
+    pub include_pom_tier: Option<bool>,
 }
 
 impl Serializer for RpcHeaderVerbosity {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &3, writer)?;
+        store!(u16, &4, writer)?;
 
         store!(Option<bool>, &self.include_hash, writer)?;
         store!(Option<bool>, &self.include_version, writer)?;
@@ -80,6 +83,7 @@ impl Serializer for RpcHeaderVerbosity {
         store!(Option<bool>, &self.include_pruning_point, writer)?;
         store!(Option<bool>, &self.include_pom_final_state, writer)?;
         store!(Option<bool>, &self.include_service_state_hash, writer)?;
+        store!(Option<bool>, &self.include_pom_tier, writer)?;
 
         Ok(())
     }
@@ -106,6 +110,8 @@ impl Deserializer for RpcHeaderVerbosity {
         let include_pom_final_state = if payload_version >= 2 { load!(Option<bool>, reader)? } else { None };
         // Struct-version 3 (H6): include_service_state_hash. Older senders omit it.
         let include_service_state_hash = if payload_version >= 3 { load!(Option<bool>, reader)? } else { None };
+        // Struct-version 4 (H6): include_pom_tier. Older senders omit it.
+        let include_pom_tier = if payload_version >= 4 { load!(Option<bool>, reader)? } else { None };
 
         Ok(Self {
             include_hash,
@@ -123,6 +129,7 @@ impl Deserializer for RpcHeaderVerbosity {
             include_pruning_point,
             include_pom_final_state,
             include_service_state_hash,
+            include_pom_tier,
         })
     }
 }

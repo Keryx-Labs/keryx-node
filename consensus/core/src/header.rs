@@ -162,6 +162,15 @@ pub struct Header {
     /// header. Zero before the fork.
     #[serde(default)]
     pub service_state_hash: Hash,
+    /// The winning walk's proven PoM tier. Consensus at/after the H6 gate: hashed into the block
+    /// hash (but NOT into `pre_pow_hash`, like `pom_final_state` — filled by the miner from the
+    /// winning GPU's walk at submit, so it cannot feed the pre-PoW seed), cross-checked against
+    /// `PomProof::tier` in body validation. The service-bond cohort fold reads the producer tier
+    /// from here: the header is committed and retained deeper than block bodies, so a freshly
+    /// synced node derives the identical cohorts, whereas `pom_tier_store` cannot be populated for
+    /// proofless historical bodies. Zero before the fork.
+    #[serde(default)]
+    pub pom_tier: u8,
 }
 
 impl Header {
@@ -181,6 +190,7 @@ impl Header {
         pruning_point: Hash,
         pom_final_state: u64,
         service_state_hash: Hash,
+        pom_tier: u8,
     ) -> Self {
         let mut header = Self {
             hash: Default::default(), // Temp init before the finalize below
@@ -198,6 +208,7 @@ impl Header {
             pruning_point,
             pom_final_state,
             service_state_hash,
+            pom_tier,
         };
         header.finalize();
         header
@@ -233,6 +244,7 @@ impl Header {
             pruning_point: Default::default(),
             pom_final_state: 0,
             service_state_hash: Default::default(),
+            pom_tier: 0,
         }
     }
 }
@@ -292,6 +304,7 @@ mod tests {
             Default::default(),
             0,
             Default::default(),
+            0,
         );
         let json = serde_json::to_string(&header).unwrap();
         println!("{}", json);

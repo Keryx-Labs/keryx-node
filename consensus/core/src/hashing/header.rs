@@ -10,7 +10,7 @@ use keryx_hashes::{Hash, HasherBase};
 /// so miners' pre-PoW hashing is untouched by the fork.
 #[inline]
 pub fn hash_override_nonce_time(header: &Header, nonce: u64, timestamp: u64) -> Hash {
-    hash_internal(header, nonce, timestamp, None, None)
+    hash_internal(header, nonce, timestamp, None, None, None)
 }
 
 /// Returns the header hash. At/after `pom_level_activation` (gated on the header's own
@@ -21,9 +21,11 @@ pub fn hash_override_nonce_time(header: &Header, nonce: u64, timestamp: u64) -> 
 pub fn hash(header: &Header) -> Hash {
     let pom_final_state =
         if crate::pom::pom_level_active(header.daa_score) { Some(header.pom_final_state) } else { None };
-    let service_state_hash =
-        if crate::pom::service_commit_active(header.daa_score) { Some(header.service_state_hash) } else { None };
-    hash_internal(header, header.nonce, header.timestamp, pom_final_state, service_state_hash)
+    // `service_state_hash` and `pom_tier` both activate at the H6 gate (`service_commit_active`).
+    let h6 = crate::pom::service_commit_active(header.daa_score);
+    let service_state_hash = h6.then_some(header.service_state_hash);
+    let pom_tier = h6.then_some(header.pom_tier);
+    hash_internal(header, header.nonce, header.timestamp, pom_final_state, service_state_hash, pom_tier)
 }
 
 #[inline]
@@ -33,6 +35,7 @@ fn hash_internal(
     timestamp: u64,
     pom_final_state: Option<u64>,
     service_state_hash: Option<Hash>,
+    pom_tier: Option<u8>,
 ) -> Hash {
     let mut hasher = keryx_hashes::BlockHash::new();
     hasher.update(header.version.to_le_bytes()).write_len(header.parents_by_level.expanded_len()); // Write the number of parent levels
@@ -63,6 +66,10 @@ fn hash_internal(
         hasher.update(service_hash);
     }
 
+    if let Some(tier) = pom_tier {
+        hasher.update([tier]);
+    }
+
     hasher.finalize()
 }
 
@@ -88,6 +95,7 @@ mod tests {
             Default::default(),
             0,
             Default::default(),
+            0,
         );
         assert_ne!(blockhash::NONE, header.hash);
     }

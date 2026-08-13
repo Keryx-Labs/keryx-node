@@ -1662,6 +1662,7 @@ impl VirtualStateProcessor {
             header_pruning_point,
             0, // pom_final_state: filled by the miner from the winning walk (H3), like the nonce
             service_state_hash,
+            0, // pom_tier: filled by the miner from the winning walk (H6), like pom_final_state
         );
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();

@@ -53,6 +53,7 @@ impl From<(HeaderFormat, &Header)> for protowire::BlockHeader {
             pruning_point: Some(item.pruning_point.into()),
             pom_final_state: item.pom_final_state,
             service_state_hash: Some(item.service_state_hash.into()),
+            pom_tier: item.pom_tier as u32,
         }
     }
 }
@@ -112,6 +113,7 @@ impl TryFrom<Versioned<protowire::BlockHeader>> for Header {
             item.pom_final_state,
             // Absent from pre-gate senders: the canonical pre-gate value is zero.
             item.service_state_hash.map(Hash::try_from).transpose()?.unwrap_or_default(),
+            item.pom_tier as u8,
         ))
     }
 }

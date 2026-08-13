@@ -89,20 +89,6 @@ pub fn parse_escrow_esig(extra_data: &[u8]) -> Option<[u8; 64]> {
     parse_hex_after_marker::<64>(extra_data, ESIG_MARKER)
 }
 
-/// Marker of the proven-tier declaration in the coinbase extra_data: `/ai:tier:<one digit>`.
-pub const PROVEN_TIER_MARKER: &[u8] = b"/ai:tier:";
-
-/// The proven PoM tier a block declares in its coinbase (`/ai:tier:N`, one ASCII digit). It is
-/// committed via the coinbase merkle root, so it is available and identical on every node for any
-/// block at or above the pruning point — unlike `pom_tier_store`, which a freshly synced node
-/// cannot populate for proofless historical bodies. The service-bond cohort fold reads the tier
-/// from here; live validation binds it to `proof.tier`, so a block on the (anchor-protected)
-/// canonical chain always declares its true tier.
-pub fn parse_declared_tier(extra_data: &[u8]) -> Option<u8> {
-    let pos = extra_data.windows(PROVEN_TIER_MARKER.len()).position(|w| w == PROVEN_TIER_MARKER)?;
-    let digit = *extra_data.get(pos + PROVEN_TIER_MARKER.len())?;
-    digit.is_ascii_digit().then_some(digit - b'0')
-}
 
 /// The message a payout key signs (once, offline) to delegate service duty to an escrow key.
 pub fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
@@ -1064,17 +1050,6 @@ mod tests {
         let misses = ledger.on_chain_block(202 + 2 * w, &[], &[], &[], |_| true, cohort).misses;
         assert_eq!(misses.len(), 2, "both identities must miss");
         assert_eq!((misses[0].miner, misses[1].miner), (id_a, id_b));
-    }
-
-    #[test]
-    fn declared_tier_parses_one_digit() {
-        use super::parse_declared_tier;
-        assert_eq!(parse_declared_tier(b"0.5.0/escrow:aa/ai:tier:3/ai:v1:0011"), Some(3));
-        assert_eq!(parse_declared_tier(b"/ai:tier:0"), Some(0));
-        // absent marker, truncated, and a non-digit all yield None (fold sees no tier)
-        assert_eq!(parse_declared_tier(b"0.5.0/escrow:aa"), None);
-        assert_eq!(parse_declared_tier(b"/ai:tier:"), None);
-        assert_eq!(parse_declared_tier(b"/ai:tier:x"), None);
     }
 
     #[test]

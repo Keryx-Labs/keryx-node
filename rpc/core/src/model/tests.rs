@@ -155,6 +155,7 @@ mod mockery {
                 pruning_point: mock(),
                 pom_final_state: mock(),
                 service_state_hash: mock(),
+                pom_tier: mock(),
             }
         }
     }
@@ -176,6 +177,7 @@ mod mockery {
                 pruning_point: mock(),
                 pom_final_state: mock(),
                 service_state_hash: mock(),
+                pom_tier: mock(),
             }
         }
     }
@@ -428,6 +430,7 @@ mod mockery {
                 pruning_point: mock(),
                 pom_final_state: mock(),
                 service_state_hash: mock(),
+                pom_tier: mock(),
             }
         }
     }

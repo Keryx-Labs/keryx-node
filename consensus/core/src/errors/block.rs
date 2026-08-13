@@ -111,7 +111,7 @@ pub enum RuleError {
     #[error("header pom_final_state {0} does not match the possession proof final state {1}")]
     PomFinalStateMismatch(u64, u64),
 
-    #[error("coinbase declares tier {0} but the possession proof proves tier {1}")]
+    #[error("header commits tier {0} but the possession proof proves tier {1}")]
     PomDeclaredTierMismatch(u8, u8),
 
     #[error("coinbase blue score of {0} is not the expected value of {1}")]

@@ -46,6 +46,8 @@ message RpcBlockHeader {
   // H6: sealed service-state commitment at this header's pruning point, filled by the
   // node at template build. Hex string; empty for pre-gate blocks.
   string serviceStateHash = 17;
+  // H6: the winning walk's proven PoM tier, committed into the block hash.
+  uint32 pomTier = 18;
 }
 
 message RpcBlockLevelParents {
@@ -1039,6 +1041,8 @@ message RpcOptionalHeader {
   optional uint64 pomFinalState = 15;
   // H6: sealed service-state commitment at this header's pruning point (hex).
   optional string serviceStateHash = 16;
+  // H6: the winning walk's proven PoM tier.
+  optional uint32 pomTier = 17;
 }
 
 message RpcOptionalTransactionOutpoint {

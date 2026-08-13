@@ -548,16 +548,11 @@ async fn service_cohort_from_recent_tier_producers() {
     for (n, miner, tier) in plan {
         let hash: Hash = n.into();
         let txs = if n == 3 { vec![stray_response.clone()] } else { vec![] };
-        // The cohort fold reads the proven tier from the coinbase `/ai:tier:` declaration, so
-        // each block must declare it (bound to proof.tier by live validation).
-        let mut md = miner.clone();
-        let mut extra = md.extra_data.to_vec();
-        extra.extend_from_slice(format!("/ai:tier:{tier}").as_bytes());
-        md.extra_data = extra.into();
-        let block = tc
-            .build_utxo_valid_block_with_parents(hash, vec![parent], md, txs)
-            .to_immutable()
-            .with_pom_proof(proof_with_tier(tier));
+        // The cohort fold reads the proven tier from the committed `header.pom_tier` (bound to
+        // proof.tier by live validation), so set it on each block.
+        let mut mutable = tc.build_utxo_valid_block_with_parents(hash, vec![parent], miner.clone(), txs);
+        mutable.header.pom_tier = tier;
+        let block = mutable.to_immutable().with_pom_proof(proof_with_tier(tier));
         tc.validate_and_insert_block(block).virtual_state_task.await.unwrap();
         parent = hash;
     }

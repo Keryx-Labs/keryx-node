@@ -238,6 +238,7 @@ impl ConsensusConverter {
             } else {
                 Default::default()
             },
+            pom_tier: if verbosity.include_pom_tier.unwrap_or(false) { Some(header.pom_tier) } else { Default::default() },
         })
     }
 

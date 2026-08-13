@@ -25,6 +25,7 @@ from!(item: &keryx_rpc_core::RpcHeader, protowire::RpcBlockHeader, {
         hash: item.hash.to_string(),
         pom_final_state: item.pom_final_state,
         service_state_hash: item.service_state_hash.to_string(),
+        pom_tier: item.pom_tier as u32,
     }
 });
 
@@ -45,6 +46,7 @@ from!(item: &keryx_rpc_core::RpcRawHeader, protowire::RpcBlockHeader, {
         pruning_point: item.pruning_point.to_string(),
         pom_final_state: item.pom_final_state,
         service_state_hash: item.service_state_hash.to_string(),
+        pom_tier: item.pom_tier as u32,
     }
 });
 
@@ -72,6 +74,7 @@ try_from!(item: &protowire::RpcBlockHeader, keryx_rpc_core::RpcHeader, {
         item.pom_final_state,
         // Empty from pre-gate senders: the canonical pre-gate value is the zero hash.
         if item.service_state_hash.is_empty() { Default::default() } else { RpcHash::from_str(&item.service_state_hash)? },
+        item.pom_tier as u8,
     );
 
     header.into()
@@ -93,6 +96,7 @@ try_from!(item: &protowire::RpcBlockHeader, keryx_rpc_core::RpcRawHeader, {
         pruning_point: RpcHash::from_str(&item.pruning_point)?,
         pom_final_state: item.pom_final_state,
         service_state_hash: if item.service_state_hash.is_empty() { Default::default() } else { RpcHash::from_str(&item.service_state_hash)? },
+        pom_tier: item.pom_tier as u8,
     }
 });
 
@@ -114,6 +118,7 @@ try_from!(item: &protowire::RpcBlockHeader, keryx_rpc_core::RpcOptionalHeader, {
         item.pom_final_state,
         // Empty from pre-gate senders: the canonical pre-gate value is the zero hash.
         if item.service_state_hash.is_empty() { Default::default() } else { RpcHash::from_str(&item.service_state_hash)? },
+        item.pom_tier as u8,
     );
 
     keryx_rpc_core::RpcOptionalHeader::from(header)
@@ -195,6 +200,7 @@ mod tests {
             new_unique(),
             0,
             new_unique(),
+            0,
         );
         let rpc_header = RpcHeader::from(header);
         let proto_header: protowire::RpcBlockHeader = (&rpc_header).into();
@@ -231,6 +237,7 @@ mod tests {
             new_unique(),
             0,
             new_unique(),
+            0,
         );
         let consensus_block = Block::from_header(header);
         let rpc_block: RpcBlock = (&consensus_block).into();
