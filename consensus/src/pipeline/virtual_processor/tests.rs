@@ -2,7 +2,7 @@ use crate::{
     consensus::test_consensus::TestConsensus,
     model::{
         services::reachability::ReachabilityService,
-        stores::ai_slash::AiResponseStoreReader,
+        stores::{ai_slash::AiResponseStoreReader, pom_tier::PomTierStoreReader},
     },
 };
 use keryx_inference::{self, AiResponsePayload, compute_ai_commitment};
@@ -159,6 +159,25 @@ impl TestContext {
         assert!(self.consensus.body_tips().iter().copied().any(|h| self.consensus.block_status(h) == BlockStatus::StatusUTXOValid));
         self
     }
+}
+
+#[tokio::test]
+async fn ibd_does_not_persist_forged_tier_without_pom_proof() {
+    let mut params = MAINNET_PARAMS;
+    params.pom_activation = keryx_consensus_core::config::params::ForkActivation::always();
+    let config = ConfigBuilder::new(params).build();
+    let ctx = TestContext::new(TestConsensus::new(&config));
+    let timestamp = ctx.simulated_time + ctx.consensus.params().target_time_per_block();
+    let block = ctx.build_block_template(0, timestamp).block.to_immutable().with_pom_tier(Some(4));
+
+    assert!(block.pom_proof.is_none());
+    assert_eq!(block.pom_tier, Some(4));
+    let block_hash = block.hash();
+    let normal = ctx.consensus.validate_and_insert_block(block.clone()).virtual_state_task.await;
+    let ibd = ctx.consensus.validate_and_insert_block_ibd(block).virtual_state_task.await;
+    assert!(matches!(normal, Err(keryx_consensus_core::errors::block::RuleError::PomProofMissing)), "normal={normal:?}");
+    assert!(matches!(ibd, Ok(BlockStatus::StatusUTXOValid)), "ibd={ibd:?}");
+    assert!(!ctx.consensus.pom_tier_store().has(block_hash).unwrap());
 }
 
 #[tokio::test]
