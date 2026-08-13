@@ -327,3 +327,18 @@ message TrustedDataMessage {
   repeated DaaBlockV4 daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
   repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
 }
+
+// H6 sealed service state: a fresh node downloads every finality-flushed service-bond row
+// (escrow burns and strike-log records) up to its new pruning point and verifies the set's
+// MuHash against `serviceStateHash` of an already-validated header referencing that pruning
+// point. Rows are the canonical commitment byte forms (see consensus `service_commit`).
+message RequestServiceStateMessage {
+  Hash pruningPointHash = 1;
+}
+
+message ServiceStateChunkMessage {
+  repeated bytes rows = 1;
+}
+
+message DoneServiceStateChunksMessage {
+}

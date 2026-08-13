@@ -194,6 +194,7 @@ mod tests {
             1928374,
             new_unique(),
             0,
+            new_unique(),
         );
         let rpc_header = RpcHeader::from(header);
         let proto_header: protowire::RpcBlockHeader = (&rpc_header).into();
@@ -229,6 +230,7 @@ mod tests {
             1928374,
             new_unique(),
             0,
+            new_unique(),
         );
         let consensus_block = Block::from_header(header);
         let rpc_block: RpcBlock = (&consensus_block).into();

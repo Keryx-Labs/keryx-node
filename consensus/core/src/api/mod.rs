@@ -120,6 +120,19 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Every finality-flushed service-bond row (canonical commitment byte form) with event daa
+    /// at or below `pruning_point`'s daa — what a fresh node downloads at IBD.
+    fn get_service_state_rows(&self, pruning_point: Hash) -> ConsensusResult<Vec<Vec<u8>>> {
+        unimplemented!()
+    }
+
+    /// Imports a verified service-state row set (canonical byte forms) into the service stores
+    /// and rebuilds the derived RAM state. Rows MUST have been verified against a validated
+    /// header's `service_state_hash` by the caller.
+    fn import_service_state(&self, rows: Vec<Vec<u8>>) -> ConsensusResult<()> {
+        unimplemented!()
+    }
+
     fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
         unimplemented!()
     }
