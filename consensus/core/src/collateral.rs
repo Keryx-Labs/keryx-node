@@ -42,11 +42,74 @@ pub fn miner_key(spk: &ScriptPublicKey) -> Hash {
     TransactionHash::hash(data)
 }
 
-/// Service-ledger identity of a miner: its announced escrow pubkey, verbatim. The same key
-/// signs V2 AiResponses, receives the CSV escrow outputs, and takes the service penalties —
-/// one identity for eligibility, authentication and slashing.
+/// Store key of an announced escrow pubkey, verbatim. The escrow key is the HOT key: it signs
+/// V2 AiResponses and spends the CSV escrow outputs. The service-ledger identity that takes the
+/// penalties is [`miner_key`] of the payout SPK — the escrow key is only bound to it through a
+/// delegation cert.
 pub fn escrow_miner_key(pubkey: &[u8; 32]) -> Hash {
     Hash::from_bytes(*pubkey)
+}
+
+/// Marker of the escrow announcement in the coinbase extra_data:
+/// `/escrow:<64 hex chars of the 32-byte x-only schnorr pubkey>`.
+pub const ESCROW_MARKER: &[u8] = b"/escrow:";
+/// Marker of the escrow delegation cert in the coinbase extra_data:
+/// `/esig:<128 hex chars of the 64-byte schnorr signature>`.
+pub const ESIG_MARKER: &[u8] = b"/esig:";
+
+/// Domain separator of the escrow delegation signature.
+pub const ESCROW_DELEGATION_DOMAIN: &[u8] = b"KeryxEscrowDelegationV1";
+
+fn parse_hex_after_marker<const N: usize>(extra_data: &[u8], marker: &[u8]) -> Option<[u8; N]> {
+    let pos = extra_data.windows(marker.len()).position(|w| w == marker)?;
+    let hex_start = pos + marker.len();
+    if hex_start + N * 2 > extra_data.len() {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = std::str::from_utf8(&extra_data[hex_start + i * 2..hex_start + i * 2 + 2]).ok()?;
+        *byte = u8::from_str_radix(hi, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The announced escrow pubkey in a coinbase extra_data, if any.
+pub fn parse_escrow_pubkey(extra_data: &[u8]) -> Option<[u8; 32]> {
+    parse_hex_after_marker::<32>(extra_data, ESCROW_MARKER)
+}
+
+/// The escrow delegation signature in a coinbase extra_data, if any.
+pub fn parse_escrow_esig(extra_data: &[u8]) -> Option<[u8; 64]> {
+    parse_hex_after_marker::<64>(extra_data, ESIG_MARKER)
+}
+
+/// The message a payout key signs (once, offline) to delegate service duty to an escrow key.
+pub fn escrow_delegation_message(escrow_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(ESCROW_DELEGATION_DOMAIN);
+    hasher.update(escrow_pubkey);
+    let mut msg = [0u8; 32];
+    msg.copy_from_slice(hasher.finalize().as_bytes());
+    msg
+}
+
+/// Verifies an escrow delegation: `sig` must be a schnorr signature over
+/// [`escrow_delegation_message`] by the x-only key inside the standard schnorr P2PK payout
+/// script (`0x20 <key32> OP_CHECKSIG`, version 0). Any other payout script form cannot carry a
+/// delegation and fails.
+pub fn verify_escrow_delegation(payout_version: u16, payout_script: &[u8], escrow_pubkey: &[u8; 32], sig: &[u8; 64]) -> bool {
+    if payout_version != 0 || payout_script.len() != 34 || payout_script[0] != 0x20 || payout_script[33] != 0xac {
+        return false;
+    }
+    let Ok(payout_key) = secp256k1::XOnlyPublicKey::from_slice(&payout_script[1..33]) else {
+        return false;
+    };
+    let msg = secp256k1::Message::from_digest(escrow_delegation_message(escrow_pubkey));
+    let Ok(signature) = secp256k1::schnorr::Signature::from_slice(sig) else {
+        return false;
+    };
+    secp256k1::SECP256K1.verify_schnorr(&signature, &msg, &payout_key).is_ok()
 }
 
 /// Deterministically select one index in `0..n` from a 32-byte seed (a block hash chosen after
@@ -142,11 +205,11 @@ pub fn update_strikes(current: u32, missed: bool) -> u32 {
 }
 
 /// Eligible responsible-miner set for a request targeting `target_tier`'s model: the distinct
-/// miners who produced at least one `target_tier` block in the recent window. Sorted and deduped
-/// so every node derives the same ordering before `assign_index` picks an index into it.
-/// `recent` is `(miner_key, tier)` for the recently-active window (order irrelevant).
-pub fn eligible_miners(recent: &[(Hash, u8)], target_tier: u8) -> Vec<Hash> {
-    let mut set: Vec<Hash> = recent.iter().filter(|(_, t)| *t == target_tier).map(|(m, _)| *m).collect();
+/// `(identity, delegated escrow key)` pairs that produced at least one `target_tier` block in
+/// the recent window. Sorted and deduped so every node derives the identical set. `recent` is
+/// `(identity, tier, escrow key)` for the recently-active window (order irrelevant).
+pub fn eligible_pairs(recent: &[(Hash, u8, Hash)], target_tier: u8) -> Vec<(Hash, Hash)> {
+    let mut set: Vec<(Hash, Hash)> = recent.iter().filter(|(_, t, _)| *t == target_tier).map(|(m, _, e)| (*m, *e)).collect();
     set.sort_unstable();
     set.dedup();
     set
@@ -205,10 +268,13 @@ struct PendingRequest {
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
-/// closes; the silent ones are struck when it does.
+/// closes; the silent ones are struck when it does. `cohort` holds the sorted identities
+/// (payout-SPK keys); `delegations` maps each delegated escrow key back to its identities, so
+/// a response signed by the hot escrow key credits the right identity.
 #[derive(Clone, Debug)]
 struct Audit {
     cohort: Vec<Hash>,
+    delegations: Vec<(Hash, Hash)>,
     responded: Vec<Hash>,
     window_end_daa: u64,
 }
@@ -268,7 +334,7 @@ impl ServiceLedger {
         requests: &[([u8; 32], u8, u32)],
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
-        cohort: impl FnMut(u8) -> Vec<Hash>,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
         self.fold_inner(daa, requests, responses, escrows, None, cohort)
     }
@@ -284,7 +350,7 @@ impl ServiceLedger {
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
-        cohort: impl FnMut(u8) -> Vec<Hash>,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
         self.fold_inner(daa, requests, responses, escrows, Some(is_burned), cohort);
     }
@@ -296,7 +362,7 @@ impl ServiceLedger {
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
-        mut cohort: impl FnMut(u8) -> Vec<Hash>,
+        mut cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
         let warmup = warmup_burned.is_some();
         for (miner, claim) in escrows {
@@ -314,19 +380,28 @@ impl ServiceLedger {
 
         let mut outcome = FoldOutcome::default();
 
-        // An authenticated response from a cohort member marks him as having served this audit
-        // and resets his streak. Anyone else's response is ignored by the ledger.
+        // An authenticated response (signed by a delegated escrow key) marks every cohort
+        // identity that delegated to it as having served this audit and resets their streak.
+        // Anyone else's response is ignored by the ledger.
         for (rh, responder) in responses {
-            let Some(req) = self.pending.get_mut(rh) else { continue };
-            let Some(audit) = req.audit.as_mut() else { continue };
-            if let Some(r) = responder {
-                if audit.cohort.binary_search(r).is_ok() && !audit.responded.contains(r) {
-                    audit.responded.push(*r);
-                    // A warmup fold leaves strikes alone: the baseline already carries this reset.
-                    if !warmup && self.strike_state(r).is_some_and(|e| e.count > 0) {
-                        self.strikes.insert(*r, StrikeEntry { count: 0, last_daa: 0 });
-                        outcome.resets.push(*r);
+            let Some(r) = responder else { continue };
+            let mut served: Vec<Hash> = Vec::new();
+            {
+                let Some(req) = self.pending.get_mut(rh) else { continue };
+                let Some(audit) = req.audit.as_mut() else { continue };
+                let matched: Vec<Hash> = audit.delegations.iter().filter(|(e, _)| e == r).map(|(_, id)| *id).collect();
+                for identity in matched {
+                    if audit.cohort.binary_search(&identity).is_ok() && !audit.responded.contains(&identity) {
+                        audit.responded.push(identity);
+                        served.push(identity);
                     }
+                }
+            }
+            for identity in served {
+                // A warmup fold leaves strikes alone: the baseline already carries this reset.
+                if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
+                    self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: 0 });
+                    outcome.resets.push(identity);
                 }
             }
         }
@@ -377,9 +452,15 @@ impl ServiceLedger {
                     if set.is_empty() {
                         self.pending.remove(&rh);
                     } else {
+                        let mut ids: Vec<Hash> = set.iter().map(|(id, _)| *id).collect();
+                        ids.sort_unstable();
+                        ids.dedup();
+                        let mut delegations: Vec<(Hash, Hash)> = set.iter().map(|(id, esc)| (*esc, *id)).collect();
+                        delegations.sort_unstable();
+                        delegations.dedup();
                         let window = service_window_daa(req.tier, req.max_tokens);
                         self.pending.get_mut(&rh).unwrap().audit =
-                            Some(Audit { cohort: set, responded: Vec::new(), window_end_daa: daa + window });
+                            Some(Audit { cohort: ids, delegations, responded: Vec::new(), window_end_daa: daa + window });
                     }
                 }
                 None => {}
@@ -457,13 +538,15 @@ impl ServiceLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        eligible_miners, service_window_daa, strike_penalty, update_strikes, FoldOutcome, ServiceLedger, ServicePenalty,
+        eligible_pairs, service_window_daa, strike_penalty, update_strikes, FoldOutcome, ServiceLedger, ServicePenalty,
         StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
     use keryx_hashes::Hash;
 
-    fn cohort_of(set: &[Hash]) -> impl FnMut(u8) -> Vec<Hash> + '_ {
-        move |_tier| set.to_vec()
+    // Identity == escrow key in most tests; the delegation mapping itself is covered by
+    // `response_credits_the_delegating_identity`.
+    fn cohort_of(set: &[Hash]) -> impl FnMut(u8) -> Vec<(Hash, Hash)> + '_ {
+        move |_tier| set.iter().map(|m| (*m, *m)).collect()
     }
 
     #[test]
@@ -826,15 +909,83 @@ mod tests {
     }
 
     #[test]
-    fn eligible_miners_distinct_sorted_by_tier() {
+    fn eligible_pairs_distinct_sorted_by_tier() {
         let a = Hash::from_bytes([1u8; 32]);
         let b = Hash::from_bytes([2u8; 32]);
         let c = Hash::from_bytes([3u8; 32]);
-        // a: tier 0 (twice), b: tier 0, c: tier 1
-        let recent = [(a, 0u8), (c, 1u8), (a, 0u8), (b, 0u8)];
-        assert_eq!(eligible_miners(&recent, 0), vec![a, b]);
-        assert_eq!(eligible_miners(&recent, 1), vec![c]);
-        assert!(eligible_miners(&recent, 4).is_empty());
+        let e = Hash::from_bytes([9u8; 32]);
+        // a: tier 0 (twice, same delegation), b: tier 0, c: tier 1
+        let recent = [(a, 0u8, e), (c, 1u8, e), (a, 0u8, e), (b, 0u8, b)];
+        assert_eq!(eligible_pairs(&recent, 0), vec![(a, e), (b, b)]);
+        assert_eq!(eligible_pairs(&recent, 1), vec![(c, e)]);
+        assert!(eligible_pairs(&recent, 4).is_empty());
+    }
+
+    #[test]
+    fn response_credits_the_delegating_identity() {
+        // Identity (payout SPK key) and escrow (hot) key are distinct: a response signed by the
+        // escrow key must credit the delegating identity — and every identity sharing that key.
+        let id_a = Hash::from_bytes([1u8; 32]);
+        let id_b = Hash::from_bytes([2u8; 32]);
+        let esc = Hash::from_bytes([0xEEu8; 32]);
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+        let pairs = [(id_a, esc), (id_b, esc)];
+        let cohort = |_tier: u8| pairs.to_vec();
+
+        let rh = [7u8; 32];
+        ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], cohort);
+        ledger.on_chain_block(101, &[], &[], &[], cohort);
+        // the hot key's response serves BOTH delegating identities
+        assert!(ledger.on_chain_block(102, &[], &[(rh, Some(esc))], &[], cohort).misses.is_empty());
+        assert!(ledger.on_chain_block(102 + w, &[], &[], &[], cohort).misses.is_empty());
+        assert_eq!(ledger.pending_len(), 0);
+
+        // a response by a key nobody delegated to never counts
+        let r2 = [8u8; 32];
+        let stranger = Hash::from_bytes([0x55u8; 32]);
+        ledger.on_chain_block(200 + w, &[(r2, 0, 256)], &[], &[], cohort);
+        ledger.on_chain_block(201 + w, &[], &[], &[], cohort);
+        ledger.on_chain_block(202 + w, &[], &[(r2, Some(stranger))], &[], cohort);
+        let misses = ledger.on_chain_block(202 + 2 * w, &[], &[], &[], cohort).misses;
+        assert_eq!(misses.len(), 2, "both identities must miss");
+        assert_eq!((misses[0].miner, misses[1].miner), (id_a, id_b));
+    }
+
+    #[test]
+    fn escrow_delegation_cert_roundtrip() {
+        use super::{escrow_delegation_message, parse_escrow_esig, parse_escrow_pubkey, verify_escrow_delegation};
+
+        let payout = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, &[0xA1u8; 32]).unwrap();
+        let escrow = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, &[0xB2u8; 32]).unwrap();
+        let escrow_pubkey = escrow.x_only_public_key().0.serialize();
+        let msg = secp256k1::Message::from_digest(escrow_delegation_message(&escrow_pubkey));
+        let sig = *payout.sign_schnorr(msg).as_ref();
+
+        // standard schnorr P2PK payout script: 0x20 <key32> OP_CHECKSIG
+        let mut script = vec![0x20u8];
+        script.extend_from_slice(&payout.x_only_public_key().0.serialize());
+        script.push(0xac);
+
+        assert!(verify_escrow_delegation(0, &script, &escrow_pubkey, &sig));
+        // wrong version, tampered escrow key, wrong signer, malformed script — all rejected
+        assert!(!verify_escrow_delegation(1, &script, &escrow_pubkey, &sig));
+        assert!(!verify_escrow_delegation(0, &script, &[0x11u8; 32], &sig));
+        let mut other_script = vec![0x20u8];
+        other_script.extend_from_slice(&escrow.x_only_public_key().0.serialize());
+        other_script.push(0xac);
+        assert!(!verify_escrow_delegation(0, &other_script, &escrow_pubkey, &sig));
+        assert!(!verify_escrow_delegation(0, &script[..33], &escrow_pubkey, &sig));
+
+        // extra_data wire form: both segments parse back to the same bytes
+        let extra = format!(
+            "0.5.0/2608131047/escrow:{}/esig:{}/ai:v1:0011223344556677",
+            faster_hex::hex_string(&escrow_pubkey),
+            faster_hex::hex_string(&sig)
+        );
+        assert_eq!(parse_escrow_pubkey(extra.as_bytes()), Some(escrow_pubkey));
+        assert_eq!(parse_escrow_esig(extra.as_bytes()), Some(sig));
+        assert_eq!(parse_escrow_esig(b"0.5.0/escrow:aabb"), None);
     }
 
     #[test]

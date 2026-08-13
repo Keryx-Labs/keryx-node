@@ -596,10 +596,11 @@ impl VirtualStateProcessor {
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let txs = self.block_transactions_store.get(*blue).unwrap();
             let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
-            if let Some(pubkey) = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(coinbase.miner_data.extra_data) {
-                if self.is_producer_suspended(&keryx_hashes::Hash::from_bytes(pubkey), pov_daa_score) {
-                    set.insert(*blue);
-                }
+            // Identity is the payout SPK key: rotating the hot escrow key does not shed a
+            // suspension.
+            let identity = keryx_consensus_core::collateral::miner_key(&coinbase.miner_data.script_public_key);
+            if self.is_producer_suspended(&identity, pov_daa_score) {
+                set.insert(*blue);
             }
         }
         set

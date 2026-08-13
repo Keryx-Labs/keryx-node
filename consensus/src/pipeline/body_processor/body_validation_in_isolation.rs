@@ -36,6 +36,7 @@ impl BlockBodyProcessor {
         self.check_block_double_spends(block)?;
         self.check_no_chained_transactions(block)?;
         self.check_opoi_tag(block)?;
+        self.check_escrow_delegation(block)?;
         // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
         if !skip_pom_proof {
@@ -152,6 +153,28 @@ impl BlockBodyProcessor {
             if block_created_outpoints.contains(&input.previous_outpoint) {
                 return Err(RuleError::ChainedTransaction(input.previous_outpoint));
             }
+        }
+        Ok(())
+    }
+
+    /// H6: every block must announce an escrow key AND a valid delegation cert — a schnorr
+    /// signature by the payout key over the escrow key. There is no opt-out: a coinbase without
+    /// both is invalid past the gate. Skipped alongside PoW (simnet / tests).
+    fn check_escrow_delegation(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if self.skip_opoi || !self.pom_v3_activation.is_active(block.header.daa_score) {
+            return Ok(());
+        }
+        let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&block.transactions[0].payload).map_err(RuleError::BadCoinbasePayload)?;
+        let extra_data = coinbase.miner_data.extra_data;
+        let (Some(escrow_pubkey), Some(esig)) = (
+            keryx_consensus_core::collateral::parse_escrow_pubkey(extra_data),
+            keryx_consensus_core::collateral::parse_escrow_esig(extra_data),
+        ) else {
+            return Err(RuleError::MissingEscrowDelegation);
+        };
+        let spk = &coinbase.miner_data.script_public_key;
+        if !self.coinbase_manager.verify_escrow_delegation_cached(spk.version(), spk.script(), &escrow_pubkey, &esig) {
+            return Err(RuleError::BadEscrowDelegation);
         }
         Ok(())
     }

@@ -31,10 +31,6 @@ const RD_ALLOCATION_BPS_DIVISOR: u64 = 10_000;
 const ESCROW_RATE_BPS: u64 = 2_000;
 const ESCROW_RATE_BPS_DIVISOR: u64 = 10_000;
 
-/// Marker searched in coinbase extra_data to locate the escrow public key.
-/// Format: `/escrow:<64-hex-chars-of-32-byte-schnorr-pubkey>`
-const ESCROW_MARKER: &[u8] = b"/escrow:";
-const ESCROW_PUBKEY_HEX_LEN: usize = 64;
 
 /// Seed used to derive the provably-unspendable burn address.
 /// `TransactionHash("KERYX_PROOF_OF_BURN_V1")` is not a valid EC point →
@@ -135,20 +131,10 @@ fn build_escrow_script(pubkey_bytes: &[u8], csv_blocks: u64) -> Option<ScriptPub
 }
 
 /// Extracts the 32-byte escrow pubkey announced in a coinbase payload's extra data
-/// (`/escrow:<hex64>` field), if present.
+/// (`/escrow:<hex64>` field), if present. Canonical implementation lives in
+/// `keryx_consensus_core::collateral` (shared with the RPC template guard).
 pub fn parse_escrow_pubkey_from_extra_data(extra_data: &[u8]) -> Option<[u8; 32]> {
-    let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
-    let hex_start = marker_pos + ESCROW_MARKER.len();
-    let hex_end = hex_start + ESCROW_PUBKEY_HEX_LEN;
-    if hex_end > extra_data.len() {
-        return None;
-    }
-    let hex_str = std::str::from_utf8(&extra_data[hex_start..hex_end]).ok()?;
-    let mut pubkey = [0u8; 32];
-    for i in 0..32 {
-        pubkey[i] = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).ok()?;
-    }
-    Some(pubkey)
+    keryx_consensus_core::collateral::parse_escrow_pubkey(extra_data)
 }
 
 /// Returns the provably-unspendable burn SPK derived from BURN_SEED.
@@ -208,6 +194,9 @@ pub struct CoinbaseManager {
     /// induce other miners' blocks to go red — a connectivity edge no longer transfers their
     /// subsidy into the merger's pocket. Keyed on the merging block's own daa_score.
     pom_v3_activation: ForkActivation,
+    /// Escrow-delegation verification cache: certs are static per miner, so the schnorr verify
+    /// runs once per (payout SPK, escrow key, sig) triple. Shared across manager clones.
+    delegation_cache: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, bool>>>,
 }
 
 /// Struct used to streamline payload parsing
@@ -259,7 +248,28 @@ impl CoinbaseManager {
             rd_allocation_script_public_key,
             burn_script_public_key,
             pom_v3_activation,
+            delegation_cache: Default::default(),
         }
+    }
+
+    /// Cached escrow-delegation verification (see `collateral::verify_escrow_delegation`).
+    pub fn verify_escrow_delegation_cached(&self, version: u16, script: &[u8], escrow_pubkey: &[u8; 32], sig: &[u8; 64]) -> bool {
+        let mut data = Vec::with_capacity(2 + script.len() + 96);
+        data.extend_from_slice(&version.to_le_bytes());
+        data.extend_from_slice(script);
+        data.extend_from_slice(escrow_pubkey);
+        data.extend_from_slice(sig);
+        let key = TransactionHash::hash(data);
+        if let Some(&ok) = self.delegation_cache.read().get(&key) {
+            return ok;
+        }
+        let ok = keryx_consensus_core::collateral::verify_escrow_delegation(version, script, escrow_pubkey, sig);
+        let mut cache = self.delegation_cache.write();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, ok);
+        ok
     }
 
     pub fn expected_coinbase_transaction<T: AsRef<[u8]>>(

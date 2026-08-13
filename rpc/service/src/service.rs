@@ -400,6 +400,25 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         }
         let script_public_key = keryx_txscript::pay_to_address_script(&request.pay_address);
         let extra_data_bytes = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
+        // H6: a block without a valid escrow delegation is INVALID, so refuse the template
+        // loudly instead of letting a misconfigured miner mine into the void. The cert is a
+        // schnorr signature by the pay-address key over the announced escrow key.
+        if self.config.pom_v3_activation.is_active(session.get_virtual_daa_score()) {
+            use keryx_consensus_core::collateral::{parse_escrow_esig, parse_escrow_pubkey, verify_escrow_delegation};
+            let (Some(escrow_pubkey), Some(esig)) = (parse_escrow_pubkey(&extra_data_bytes), parse_escrow_esig(&extra_data_bytes))
+            else {
+                return Err(RpcError::General(
+                    "H6: mining requires an escrow delegation — announce `/escrow:<pubkey>` and `/esig:<cert>` (see delegate-escrow)"
+                        .to_string(),
+                ));
+            };
+            if !verify_escrow_delegation(script_public_key.version(), script_public_key.script(), &escrow_pubkey, &esig) {
+                return Err(RpcError::General(
+                    "H6: escrow delegation cert does not verify against the pay address — regenerate it with delegate-escrow"
+                        .to_string(),
+                ));
+            }
+        }
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data_bytes);
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 

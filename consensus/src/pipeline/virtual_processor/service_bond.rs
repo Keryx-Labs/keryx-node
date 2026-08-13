@@ -6,7 +6,7 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_miners, escrow_miner_key, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss, ServicePenalty,
+    eligible_pairs, escrow_miner_key, miner_key, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss, ServicePenalty,
     ServiceStrikesSnapshot, StrikeEntry, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
@@ -98,11 +98,12 @@ fn log_new_service_misses(
 }
 
 impl VirtualStateProcessor {
-    /// `(miner_key, proven tier)` of each paid mergeset blue of chain block `hash` — the same blue
-    /// set the coinbase rewards. The key is the blue's announced escrow pubkey: the identity that
-    /// holds the bond, signs V2 responses and takes the penalties. Blues without a stored tier or
-    /// without an escrow announcement are skipped.
-    pub(super) fn service_producers_of_chain_block(&self, hash: Hash) -> Vec<(Hash, u8)> {
+    /// `(identity, proven tier, delegated escrow key)` of each paid mergeset blue of chain block
+    /// `hash` — the same blue set the coinbase rewards. The identity is [`miner_key`] of the
+    /// blue's payout SPK: the identity that holds the bond and takes the penalties; the escrow
+    /// key is the hot key it delegated to (cert enforced by block validity past the gate). Blues
+    /// without a stored tier or without an escrow announcement are skipped.
+    pub(super) fn service_producers_of_chain_block(&self, hash: Hash) -> Vec<(Hash, u8, Hash)> {
         let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
         let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
         ghostdag_data
@@ -114,7 +115,7 @@ impl VirtualStateProcessor {
                 let txs = self.block_transactions_store.get(*b).unwrap();
                 let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
                 let pubkey = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(coinbase.miner_data.extra_data)?;
-                Some((escrow_miner_key(&pubkey), tier))
+                Some((miner_key(&coinbase.miner_data.script_public_key), tier, escrow_miner_key(&pubkey)))
             })
             .collect()
     }
@@ -125,7 +126,7 @@ impl VirtualStateProcessor {
     /// committed pruning point. A pure function of the chain, so every node derives the identical
     /// set. Empty if `seed` is not a committed chain block.
     #[allow(dead_code)] // consumed by the coming penalty/RPC layer; exercised by tests today
-    pub(crate) fn service_eligible_miners_windowed(&self, seed: Hash, target_tier: u8, window_daa: u64) -> Vec<Hash> {
+    pub(crate) fn service_eligible_miners_windowed(&self, seed: Hash, target_tier: u8, window_daa: u64) -> Vec<(Hash, Hash)> {
         let sc = self.selected_chain_store.read();
         self.service_eligible_miners_in(&*sc, seed, target_tier, window_daa)
     }
@@ -136,7 +137,7 @@ impl VirtualStateProcessor {
         seed: Hash,
         target_tier: u8,
         window_daa: u64,
-    ) -> Vec<Hash> {
+    ) -> Vec<(Hash, Hash)> {
         let Ok(seed_idx) = sc.get_by_hash(seed) else {
             return vec![];
         };
@@ -148,11 +149,11 @@ impl VirtualStateProcessor {
         for i in (bottom + 1)..=seed_idx {
             recent.extend(self.service_producers_of_chain_block(sc.get_by_index(i).unwrap()));
         }
-        eligible_miners(&recent, target_tier)
+        eligible_pairs(&recent, target_tier)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn service_eligible_miners(&self, seed: Hash, target_tier: u8) -> Vec<Hash> {
+    pub(crate) fn service_eligible_miners(&self, seed: Hash, target_tier: u8) -> Vec<(Hash, Hash)> {
         self.service_eligible_miners_windowed(seed, target_tier, SERVICE_ELIGIBILITY_WINDOW_DAA)
     }
 
@@ -254,7 +255,7 @@ impl VirtualStateProcessor {
             };
             cursor = escrow_idx + 1;
             claims.push((
-                escrow_miner_key(&pubkey),
+                miner_key(&blue_coinbase.miner_data.script_public_key),
                 EscrowClaim {
                     outpoint: TransactionOutpoint::new(coinbase_id, escrow_idx as u32),
                     value: coinbase.outputs[escrow_idx].value,

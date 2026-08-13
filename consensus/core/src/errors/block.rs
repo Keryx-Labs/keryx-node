@@ -159,6 +159,12 @@ pub enum RuleError {
     #[error("block {0} service-state commitment is invalid - block header indicates {1}, but the sealed state at its pruning point is {2}")]
     BadServiceStateCommitment(Hash, Hash, Hash),
 
+    #[error("coinbase announces no escrow delegation (`/escrow:` + `/esig:`), mandatory at/after the H6 gate")]
+    MissingEscrowDelegation,
+
+    #[error("coinbase escrow delegation signature does not verify against the payout key")]
+    BadEscrowDelegation,
+
     #[error("coinbase transaction is not built as expected")]
     BadCoinbaseTransaction,
 

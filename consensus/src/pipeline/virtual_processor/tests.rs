@@ -481,7 +481,7 @@ async fn burned_escrow_outpoint_spend_is_rejected() {
 /// and a shorter window truncates the set.
 #[tokio::test]
 async fn service_cohort_from_recent_tier_producers() {
-    use keryx_consensus_core::collateral::escrow_miner_key;
+    use keryx_consensus_core::collateral::{escrow_miner_key, miner_key};
     use keryx_consensus_core::config::params::ForkActivation;
     use keryx_consensus_core::pom::PomProof;
 
@@ -516,7 +516,8 @@ async fn service_cohort_from_recent_tier_producers() {
     extra.extend_from_slice(format!("/escrow:{}", "11".repeat(32)).as_bytes());
     m1.extra_data = extra.into();
     let m2 = new_miner_data();
-    let k1 = escrow_miner_key(&[0x11u8; 32]);
+    let id1 = miner_key(&m1.script_public_key);
+    let e1 = escrow_miner_key(&[0x11u8; 32]);
 
     // Single-parent chain b1..b5; each block's tier is proven at its own body commit and paid
     // (hence walked) once merged by the next chain block. b5 is the seed, so the walk sees b1..b4:
@@ -539,13 +540,13 @@ async fn service_cohort_from_recent_tier_producers() {
     let vp = tc.virtual_processor().clone();
     let seed: Hash = 5u64.into();
 
-    assert_eq!(vp.service_eligible_miners(seed, 0), vec![k1]);
+    assert_eq!(vp.service_eligible_miners(seed, 0), vec![(id1, e1)]);
     assert!(vp.service_eligible_miners(seed, 1).is_empty(), "a miner without an escrow bond is never eligible");
     assert!(vp.service_eligible_miners(seed, 4).is_empty());
 
 
     // A 1-DAA window covers b5 alone, whose only merged blue is b4 (m1, tier 0).
-    assert_eq!(vp.service_eligible_miners_windowed(seed, 0, 1), vec![k1]);
+    assert_eq!(vp.service_eligible_miners_windowed(seed, 0, 1), vec![(id1, e1)]);
     assert!(vp.service_eligible_miners_windowed(seed, 1, 1).is_empty());
 
     // A non-chain seed yields no eligible set at all.
@@ -554,7 +555,7 @@ async fn service_cohort_from_recent_tier_producers() {
     // Escrow vault: m1's blues b1 and b4 were merged by committed chain blocks (b2, b5), each
     // leaving one CSV escrow claim keyed by his escrow pubkey; m2 announced none, so his cut
     // burned unclaimed and no vault exists under any key of his.
-    let claims = vp.service_vault_claims(&k1);
+    let claims = vp.service_vault_claims(&id1);
     assert_eq!(claims.len(), 2);
     assert!(claims.iter().all(|c| c.value > 0));
 
