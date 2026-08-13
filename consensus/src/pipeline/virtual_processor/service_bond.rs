@@ -63,8 +63,10 @@ enum ServiceEvent {
 #[derive(Default)]
 pub(super) struct StandingIndex {
     first_seen: std::collections::HashMap<Hash, u64>,
-    /// (event daa, count) per identity, ascending by daa (flush order).
-    history: std::collections::HashMap<Hash, Vec<(u64, u32)>>,
+    /// (event daa, count, last_daa) per identity, ascending by daa (flush order). `last_daa` is
+    /// mirrored so a served reset `{0, 0}` stays distinguishable from an executed suspension
+    /// `{0, daa}` — both carry a zero count, but only the second is a strike.
+    history: std::collections::HashMap<Hash, Vec<(u64, u32, u64)>>,
 }
 
 impl StandingIndex {
@@ -80,14 +82,28 @@ impl StandingIndex {
     }
 
     /// Records a strike-log row; false if that (identity, daa) row is already mirrored.
-    fn record_strike(&mut self, id: Hash, daa: u64, count: u32) -> bool {
+    fn record_strike(&mut self, id: Hash, daa: u64, count: u32, last_daa: u64) -> bool {
         let rows = self.history.entry(id).or_default();
-        if rows.iter().rev().any(|(d, _)| *d == daa) {
+        if rows.iter().rev().any(|(d, _, _)| *d == daa) {
             return false;
         }
-        rows.push((daa, count));
-        rows.sort_unstable_by_key(|(d, _)| *d);
+        rows.push((daa, count, last_daa));
+        rows.sort_unstable_by_key(|(d, _, _)| *d);
         true
+    }
+
+    /// Strikes an identity has taken over the whole retained log, suspensions included. Display
+    /// only: the live counter resets on a served response and on an executed suspension, so it
+    /// cannot answer "how often has this miner failed". Derived from the mirror, so no extra
+    /// state and no disk read.
+    fn lifetime_strikes(&self) -> Vec<(Hash, u32)> {
+        self.history
+            .iter()
+            .filter_map(|(id, rows)| {
+                let n = rows.iter().filter(|(_, count, last)| *count > 0 || *last > 0).count() as u32;
+                (n > 0).then_some((*id, n))
+            })
+            .collect()
     }
 
     /// Whether the identity is in standing at `pov`: sighted at or before the lagged anchor,
@@ -100,7 +116,7 @@ impl StandingIndex {
         match self.history.get(id) {
             None => true,
             Some(rows) => {
-                let at = rows.partition_point(|(d, _)| *d <= anchor);
+                let at = rows.partition_point(|(d, _, _)| *d <= anchor);
                 at == 0 || rows[at - 1].1 == 0
             }
         }
@@ -282,6 +298,8 @@ impl VirtualStateProcessor {
                 })
                 .collect();
         }
+        snapshot.lifetime_strikes = self.service_standing.read().lifetime_strikes();
+        snapshot.lifetime_strikes.sort_unstable();
         snapshot.suspended = self.service_suspended.read().iter().map(|(m, until)| (*m, *until)).collect();
         snapshot.suspended.sort_unstable();
         snapshot
@@ -588,7 +606,7 @@ impl VirtualStateProcessor {
                     }
                 }
                 ServiceEvent::Reset(miner) => {
-                    if self.service_standing.write().record_strike(miner, daa, 0) {
+                    if self.service_standing.write().record_strike(miner, daa, 0, 0) {
                         self.service_strike_store.set(daa, miner, StrikeEntry { count: 0, last_daa: 0 }).unwrap();
                         self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miner, 0, 0));
                     }
@@ -622,7 +640,7 @@ impl VirtualStateProcessor {
                     } else {
                         StrikeEntry { count: miss.consecutive_misses, last_daa: daa }
                     };
-                    if self.service_standing.write().record_strike(miss.miner, daa, record.count) {
+                    if self.service_standing.write().record_strike(miss.miner, daa, record.count, record.last_daa) {
                         self.service_strike_store.set(daa, miss.miner, record).unwrap();
                         self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miss.miner, record.count, record.last_daa));
                     }
@@ -669,7 +687,7 @@ impl VirtualStateProcessor {
             let (event_daa, miner) = crate::model::stores::service_strike::StrikeLogKey::parse(&key);
             cursor = cursor.max(event_daa);
             rows.push((event_daa, service_commit::strike_row_bytes(event_daa, miner, record.count, record.last_daa).to_vec()));
-            standing.record_strike(miner, event_daa, record.count);
+            standing.record_strike(miner, event_daa, record.count, record.last_daa);
             // `{0, daa > 0}` is an executed suspension; the log is in event order, so the last
             // (largest) deadline per miner wins.
             if record.count == 0 && record.last_daa > 0 {

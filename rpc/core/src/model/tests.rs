@@ -1148,6 +1148,7 @@ mod mockery {
                     burned_claims: 5,
                     burned_sompi: mock(),
                 }],
+                lifetime_strikes: vec![RpcServiceStrikeTotal { miner: mock(), strikes: 7 }],
             }
         }
     }

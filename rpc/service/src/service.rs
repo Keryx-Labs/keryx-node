@@ -980,6 +980,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                     burned_sompi,
                 })
                 .collect(),
+            lifetime_strikes: snapshot
+                .lifetime_strikes
+                .into_iter()
+                .map(|(miner, strikes)| RpcServiceStrikeTotal { miner, strikes })
+                .collect(),
         })
     }
 

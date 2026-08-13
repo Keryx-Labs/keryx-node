@@ -1939,6 +1939,16 @@ pub struct RpcServicePendingBurn {
     pub burned_sompi: u64,
 }
 
+/// Strikes a miner has taken over the whole retained log. The live counter in `RpcServiceStrike`
+/// resets on a served response and on an executed suspension, so only this one answers "how often
+/// has this miner failed". Display only — nothing in consensus reads it.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceStrikeTotal {
+    pub miner: RpcHash,
+    pub strikes: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetServiceStrikesRequest {}
@@ -1964,27 +1974,32 @@ pub struct GetServiceStrikesResponse {
     pub strikes: Vec<RpcServiceStrike>,
     pub suspended: Vec<RpcServiceSuspension>,
     pub pending_burns: Vec<RpcServicePendingBurn>,
+    pub lifetime_strikes: Vec<RpcServiceStrikeTotal>,
 }
 
 impl Serializer for GetServiceStrikesResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(u64, &self.virtual_daa_score, writer)?;
         store!(Vec<RpcServiceStrike>, &self.strikes, writer)?;
         store!(Vec<RpcServiceSuspension>, &self.suspended, writer)?;
         store!(Vec<RpcServicePendingBurn>, &self.pending_burns, writer)?;
+        store!(Vec<RpcServiceStrikeTotal>, &self.lifetime_strikes, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetServiceStrikesResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let virtual_daa_score = load!(u64, reader)?;
         let strikes = load!(Vec<RpcServiceStrike>, reader)?;
         let suspended = load!(Vec<RpcServiceSuspension>, reader)?;
         let pending_burns = load!(Vec<RpcServicePendingBurn>, reader)?;
-        Ok(Self { virtual_daa_score, strikes, suspended, pending_burns })
+        // v1 clients and v1 payloads predate the lifetime tally: absent means unknown, not zero.
+        let lifetime_strikes =
+            if version >= 2 { load!(Vec<RpcServiceStrikeTotal>, reader)? } else { Vec::new() };
+        Ok(Self { virtual_daa_score, strikes, suspended, pending_burns, lifetime_strikes })
     }
 }
 

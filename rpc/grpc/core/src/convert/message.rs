@@ -436,6 +436,11 @@ from!(item: RpcResult<&keryx_rpc_core::GetServiceStrikesResponse>, protowire::Ge
                 burned_sompi: b.burned_sompi,
             })
             .collect(),
+        lifetime_strikes: item
+            .lifetime_strikes
+            .iter()
+            .map(|t| protowire::ServiceStrikeTotalMessage { miner: t.miner.to_string(), strikes: t.strikes })
+            .collect(),
         error: None,
     }
 });
@@ -1013,6 +1018,11 @@ try_from!(item: &protowire::GetServiceStrikesResponseMessage, RpcResult<keryx_rp
                     burned_sompi: b.burned_sompi,
                 })
             })
+            .collect::<RpcResult<Vec<_>>>()?,
+        lifetime_strikes: item
+            .lifetime_strikes
+            .iter()
+            .map(|t| Ok(keryx_rpc_core::RpcServiceStrikeTotal { miner: RpcHash::from_str(&t.miner)?, strikes: t.strikes }))
             .collect::<RpcResult<Vec<_>>>()?,
     }
 });

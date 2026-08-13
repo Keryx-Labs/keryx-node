@@ -253,6 +253,10 @@ pub struct ServiceStrikesSnapshot {
     pub suspended: Vec<(Hash, u64)>,
     /// Misses awaiting finality: (miner, miss daa, consecutive misses, burned claims, burned sompi).
     pub pending_burns: Vec<(Hash, u64, u32, u32, u64)>,
+    /// Strikes taken over the whole retained log: (miner, count). Unlike `strikes`, this never
+    /// resets — a served response and an executed suspension both clear the live counter, so it
+    /// is the only figure that answers "how often has this miner failed". Display only.
+    pub lifetime_strikes: Vec<(Hash, u32)>,
 }
 
 /// One escrow claim of a miner: a CSV-locked coinbase escrow output he can claim after the lock,
