@@ -48,11 +48,65 @@ fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
 const SERVICE_SNAPSHOT_CAP: usize = 4_096;
 
 /// One strike-affecting event awaiting finality: a miss (burns, strike record, possibly a
-/// suspension) or a served-response streak reset — both persisted to the strike log so the
-/// refold baseline carries them.
+/// suspension), a served-response streak reset, or an identity's first sighting — all persisted
+/// so the refold baseline and the standing clock carry them.
 enum ServiceEvent {
     Miss(ServiceMiss),
     Reset(Hash),
+    Sighting(Hash),
+}
+
+/// RAM mirror of the persisted standing state: first sightings and the full strike history per
+/// identity, in event order. Standing is evaluated at a lagged anchor (`pov − STANDING_LAG`), so
+/// every row the evaluation reads is finality-flushed on every node long before any POV that
+/// reads it — the answer is a pure function of reorg-immune data, identical live, on catch-up
+/// and on refold. Also the flush's idempotency source: a row already mirrored is never
+/// re-persisted nor re-committed.
+#[derive(Default)]
+pub(super) struct StandingIndex {
+    first_seen: std::collections::HashMap<Hash, u64>,
+    /// (event daa, count) per identity, ascending by daa (flush order).
+    history: std::collections::HashMap<Hash, Vec<(u64, u32)>>,
+}
+
+impl StandingIndex {
+    /// Records a sighting; false if the identity was already sighted.
+    fn record_sighting(&mut self, id: Hash, daa: u64) -> bool {
+        match self.first_seen.entry(id) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(daa);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Records a strike-log row; false if that (identity, daa) row is already mirrored.
+    fn record_strike(&mut self, id: Hash, daa: u64, count: u32) -> bool {
+        let rows = self.history.entry(id).or_default();
+        if rows.iter().rev().any(|(d, _)| *d == daa) {
+            return false;
+        }
+        rows.push((daa, count));
+        rows.sort_unstable_by_key(|(d, _)| *d);
+        true
+    }
+
+    /// Whether the identity is in standing at `pov`: sighted at or before the lagged anchor,
+    /// with a zero (or absent) strike count as of that anchor.
+    fn standing(&self, id: &Hash, pov: u64) -> bool {
+        let anchor = pov.saturating_sub(keryx_consensus_core::collateral::SERVICE_STANDING_LAG_DAA);
+        if !self.first_seen.get(id).is_some_and(|&f| f <= anchor) {
+            return false;
+        }
+        match self.history.get(id) {
+            None => true,
+            Some(rows) => {
+                let at = rows.partition_point(|(d, _)| *d <= anchor);
+                at == 0 || rows[at - 1].1 == 0
+            }
+        }
+    }
 }
 
 /// RAM-only service-ledger state folded along the committed selected chain.
@@ -212,7 +266,7 @@ impl VirtualStateProcessor {
                         miss.burned.len() as u32,
                         miss.burned.iter().map(|c| c.value).sum(),
                     )),
-                    ServiceEvent::Reset(_) => None,
+                    ServiceEvent::Reset(_) | ServiceEvent::Sighting(_) => None,
                 })
                 .collect();
         }
@@ -284,7 +338,13 @@ impl VirtualStateProcessor {
             return FoldOutcome::default();
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
-        let escrows = self.service_escrows_of_chain_block(hash);
+        // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
+        // live claims never are, and the frontier-daa refold must not resurrect a claim whose
+        // burning miss is rate-limit-absorbed by the baseline.
+        let escrows: Vec<(Hash, EscrowClaim)> = {
+            let burned = self.service_burned.read();
+            self.service_escrows_of_chain_block(hash).into_iter().filter(|(_, c)| !burned.contains(&c.outpoint)).collect()
+        };
         if live && !requests.is_empty() {
             for (rh, tier, max_tokens) in requests.iter() {
                 info!(
@@ -309,8 +369,14 @@ impl VirtualStateProcessor {
             ledger.on_chain_block_warmup(daa, &requests, &responses, &escrows, &|op| burned.contains(op), cohort);
             FoldOutcome::default()
         } else {
-            ledger.on_chain_block(daa, &requests, &responses, &escrows, cohort)
+            ledger.on_chain_block(daa, &requests, &responses, &escrows, |id| self.service_standing_at(id, daa), cohort)
         }
+    }
+
+    /// Whether `identity` is in standing at `pov_daa` — sighted and strike-free at the lagged
+    /// anchor. Pure function of finality-flushed rows; identical on every node at every POV.
+    pub(super) fn service_standing_at(&self, identity: &Hash, pov_daa: u64) -> bool {
+        self.service_standing.read().standing(identity, pov_daa)
     }
 
     /// Highest chain index whose daa is at or below `bound_daa`, searched down to `floor_idx`
@@ -360,6 +426,9 @@ impl VirtualStateProcessor {
         };
         let to_daa = self.headers_store.get_daa_score(to_hash).unwrap();
         ledger.set_base(std::sync::Arc::new(self.load_strike_base()));
+        ledger.set_first_seen_base(std::sync::Arc::new(
+            self.service_standing.read().first_seen.iter().map(|(k, v)| (*k, *v)).collect(),
+        ));
         // One horizon below the persisted frontier keeps every pending request and vault claim
         // readable at the frontier warm. A frontier of zero (nothing persisted yet) falls back
         // to the finality anchor: everything above it is re-derived.
@@ -379,10 +448,18 @@ impl VirtualStateProcessor {
         for i in (bottom + 1)..=to {
             let hash = sc.get_by_index(i).unwrap();
             let daa = self.headers_store.get_daa_score(hash).unwrap();
-            let warmup = daa <= cursor_daa;
+            // Strictly below the frontier: fully persisted. AT the frontier: re-derived and
+            // re-queued — a crash may have flushed that daa partially, and the flush itself is
+            // idempotent (already-mirrored rows are skipped).
+            let warmup = daa < cursor_daa;
             let outcome = self.fold_service_chain_block(&mut ledger, sc, hash, false, warmup);
             log_new_service_misses(logged, daa, &outcome.misses);
-            if daa > cursor_daa {
+            if daa >= cursor_daa {
+                // Sightings first: a partially flushed daa must never persist a claim's burn
+                // before its identity's sighting.
+                for miner in outcome.sightings {
+                    queue.push_back((i, daa, ServiceEvent::Sighting(miner)));
+                }
                 for miss in outcome.misses {
                     queue.push_back((i, daa, ServiceEvent::Miss(miss)));
                 }
@@ -443,6 +520,9 @@ impl VirtualStateProcessor {
             let daa = self.headers_store.get_daa_score(*h).unwrap();
             let outcome = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, true, false);
             log_new_service_misses(&mut sync.logged, daa, &outcome.misses);
+            for miner in outcome.sightings {
+                sync.queue.push_back((idx, daa, ServiceEvent::Sighting(miner)));
+            }
             for miss in outcome.misses {
                 sync.queue.push_back((idx, daa, ServiceEvent::Miss(miss)));
             }
@@ -472,16 +552,26 @@ impl VirtualStateProcessor {
             }
             sealing_daa = Some(daa);
             match event {
+                ServiceEvent::Sighting(miner) => {
+                    if self.service_standing.write().record_sighting(miner, daa) {
+                        self.service_first_seen_store.set(miner, daa).unwrap();
+                        self.service_commit_index.add_row(&service_commit::first_seen_row_bytes(miner, daa));
+                    }
+                }
                 ServiceEvent::Reset(miner) => {
-                    self.service_strike_store.set(daa, miner, StrikeEntry { count: 0, last_daa: 0 }).unwrap();
-                    self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miner, 0, 0));
+                    if self.service_standing.write().record_strike(miner, daa, 0) {
+                        self.service_strike_store.set(daa, miner, StrikeEntry { count: 0, last_daa: 0 }).unwrap();
+                        self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miner, 0, 0));
+                    }
                 }
                 ServiceEvent::Miss(miss) => {
                     for claim in miss.burned.iter() {
+                        if !self.service_burned.write().insert(claim.outpoint) {
+                            continue;
+                        }
                         let key =
                             crate::model::stores::ai_slash::OutpointKey::new(claim.outpoint.transaction_id, claim.outpoint.index);
                         self.service_burn_store.set(key, daa).unwrap();
-                        self.service_burned.write().insert(claim.outpoint);
                         self.service_commit_index.add_row(&service_commit::burn_row_bytes(
                             claim.outpoint.transaction_id,
                             claim.outpoint.index,
@@ -503,8 +593,10 @@ impl VirtualStateProcessor {
                     } else {
                         StrikeEntry { count: miss.consecutive_misses, last_daa: daa }
                     };
-                    self.service_strike_store.set(daa, miss.miner, record).unwrap();
-                    self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miss.miner, record.count, record.last_daa));
+                    if self.service_standing.write().record_strike(miss.miner, daa, record.count) {
+                        self.service_strike_store.set(daa, miss.miner, record).unwrap();
+                        self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miss.miner, record.count, record.last_daa));
+                    }
                     // A third strike, now reorg-immune, suspends the miner's production. The
                     // deadline is derived from the miss's own daa (deterministic), and the full
                     // window bites from finalization:
@@ -540,12 +632,15 @@ impl VirtualStateProcessor {
             cursor = cursor.max(daa);
         }
         drop(set);
+        let mut standing = self.service_standing.write();
+        *standing = StandingIndex::default();
         let mut suspended = self.service_suspended.write();
         for entry in self.service_strike_store.iterator() {
             let (key, record) = entry.unwrap();
             let (event_daa, miner) = crate::model::stores::service_strike::StrikeLogKey::parse(&key);
             cursor = cursor.max(event_daa);
             rows.push((event_daa, service_commit::strike_row_bytes(event_daa, miner, record.count, record.last_daa).to_vec()));
+            standing.record_strike(miner, event_daa, record.count);
             // `{0, daa > 0}` is an executed suspension; the log is in event order, so the last
             // (largest) deadline per miner wins.
             if record.count == 0 && record.last_daa > 0 {
@@ -553,14 +648,28 @@ impl VirtualStateProcessor {
             }
         }
         drop(suspended);
+        for entry in self.service_first_seen_store.iterator() {
+            let (key, daa) = entry.unwrap();
+            let miner: [u8; 32] = key[..32].try_into().unwrap();
+            standing.record_sighting(Hash::from_bytes(miner), daa);
+            rows.push((daa, service_commit::first_seen_row_bytes(Hash::from_bytes(miner), daa).to_vec()));
+            cursor = cursor.max(daa);
+        }
+        drop(standing);
         self.service_commit_index.rebuild(rows);
         self.service_ledger.lock().deep_cursor_daa = cursor;
     }
 
-    /// Whether `producer`'s block at `daa_score` is rejected by a finality-deep suspension. A pure
-    /// lookup in the reorg-immune suspended set — cheap and identical on every H6 node.
+    /// Whether `producer` is under a finality-deep suspension at `daa_score`. The window is
+    /// derived from the record itself (`[until − SERVICE_SUSPENSION_DAA, until)`), NOT from when
+    /// this node learned it: a catch-up or fresh node re-validating an old POV must reach the
+    /// exact verdict a live node reached — an unbounded lower edge would apply the suspension to
+    /// POVs before its finalization.
     pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64) -> bool {
-        self.service_suspended.read().get(producer).is_some_and(|&until| daa_score < until)
+        self.service_suspended
+            .read()
+            .get(producer)
+            .is_some_and(|&until| until.saturating_sub(SERVICE_SUSPENSION_DAA) <= daa_score && daa_score < until)
     }
 }
 

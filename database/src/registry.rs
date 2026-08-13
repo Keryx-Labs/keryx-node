@@ -140,6 +140,9 @@ pub enum DatabaseStorePrefixes {
     /// per miner; counts only reset on a served response or an executed suspension, never by
     /// time. Suspensions are the `{0, daa > 0}` rows. (197 was the retired suspend store.)
     ServiceStrike = 198,
+    /// Service-bond first sightings (finality-deep, append-once): miner identity → daa of its
+    /// first certified block. The standing/probation clock.
+    ServiceFirstSeen = 199,
 
     // ---- Separator ----
     /// Reserved as a separator

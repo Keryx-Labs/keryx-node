@@ -730,6 +730,14 @@ impl ConsensusApi for Consensus {
             }
             rows.push(crate::processes::service_commit::strike_row_bytes(daa, miner, record.count, record.last_daa).to_vec());
         }
+        for entry in self.storage.service_first_seen_store.iterator() {
+            let (key, daa) = entry.unwrap();
+            if daa > pp_daa {
+                continue;
+            }
+            let miner: [u8; 32] = key[..32].try_into().unwrap();
+            rows.push(crate::processes::service_commit::first_seen_row_bytes(Hash::from_bytes(miner), daa).to_vec());
+        }
         Ok(rows)
     }
 
@@ -740,6 +748,7 @@ impl ConsensusApi for Consensus {
         enum Row {
             Burn { tx_id: Hash, index: u32, daa: u64 },
             Strike { daa: u64, miner: Hash, entry: StrikeEntry },
+            Sighting { miner: Hash, daa: u64 },
         }
         let mut parsed = Vec::with_capacity(rows.len());
         for row in rows.iter() {
@@ -757,6 +766,11 @@ impl ConsensusApi for Consensus {
                     let last_daa = u64::from_le_bytes(row[45..53].try_into().unwrap());
                     parsed.push(Row::Strike { daa, miner: Hash::from_bytes(miner), entry: StrikeEntry { count, last_daa } });
                 }
+                (Some(0x03), 41) => {
+                    let miner: [u8; 32] = row[1..33].try_into().unwrap();
+                    let daa = u64::from_le_bytes(row[33..41].try_into().unwrap());
+                    parsed.push(Row::Sighting { miner: Hash::from_bytes(miner), daa });
+                }
                 _ => return Err(ConsensusError::General("malformed service-state row")),
             }
         }
@@ -766,6 +780,7 @@ impl ConsensusApi for Consensus {
                     self.storage.service_burn_store.set(OutpointKey::new(tx_id, index), daa).unwrap()
                 }
                 Row::Strike { daa, miner, entry } => self.storage.service_strike_store.set(daa, miner, entry).unwrap(),
+                Row::Sighting { miner, daa } => self.storage.service_first_seen_store.set(miner, daa).unwrap(),
             }
         }
         // Rebuild every derived RAM view (burned set, suspensions, commitment index, cursor).

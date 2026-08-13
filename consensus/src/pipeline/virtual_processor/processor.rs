@@ -144,6 +144,10 @@ pub struct VirtualStateProcessor {
     pub(super) service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
     /// Sealed service-state commitment index (see `processes::service_commit`).
     pub(super) service_commit_index: Arc<crate::processes::service_commit::ServiceCommitIndex>,
+    /// First sightings (append-once), the standing/probation clock.
+    pub(super) service_first_seen_store: Arc<crate::model::stores::service_first_seen::DbServiceFirstSeenStore>,
+    /// Standing state mirror (see `service_bond::StandingIndex`).
+    pub(super) service_standing: parking_lot::RwLock<super::service_bond::StandingIndex>,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -341,6 +345,8 @@ impl VirtualStateProcessor {
             service_suspended: Default::default(),
             service_strike_store: storage.service_strike_store.clone(),
             service_commit_index: storage.service_commit_index.clone(),
+            service_first_seen_store: storage.service_first_seen_store.clone(),
+            service_standing: Default::default(),
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
