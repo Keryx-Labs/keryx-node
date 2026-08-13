@@ -486,7 +486,7 @@ impl CoinbaseManager {
     /// Returns `None` if the marker is absent or the key is malformed — treated as a
     /// standard miner whose escrow cut is sent to the burn address instead.
     /// The CSV lock is gated by the rewarding block's own daa score: the service-bond lock
-    /// (~13 h) at/after `pom_v3_activation`, the legacy challenge window (~1 h) before.
+    /// (~22 h) at/after `pom_v3_activation`, the legacy challenge window (~1 h) before.
     pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8], daa_score: u64) -> Option<ScriptPublicKey> {
         let pubkey_bytes = parse_escrow_pubkey_from_extra_data(extra_data)?;
         let csv_blocks = if self.pom_v3_activation.is_active(daa_score) {
