@@ -13,11 +13,16 @@ pub const COLLATERAL_RATE_BPS: u64 = 2_000;
 /// a challenge, while keeping the escrow lock reasonable for honest miners.
 pub const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
 
-/// Escrow CSV lock at/after the service-bond gate: ledger horizon (72 000) + finality depth
-/// (432 000), ≈ 14 h at 10 BPS. A claim created at C is burnable by misses up to C + horizon,
-/// enforceable at most finality later — this lock guarantees the burn is always in force before
-/// the claim unlocks.
-pub const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 504_000;
+/// DAA window during which a claim stays burnable (~10 h at 10 BPS): a disposable identity
+/// leaves this much production on the table. Bounded by the cold-refold reach — the vault must
+/// be rebuildable from the chain a pruned node retains (see the boot assert).
+pub const SERVICE_BURNABLE_WINDOW_DAA: u64 = 360_000;
+
+/// Escrow CSV lock at/after the service-bond gate: burnable window (360 000) + finality depth
+/// (432 000), ≈ 22 h at 10 BPS. A claim created at C is burnable by misses up to
+/// C + SERVICE_BURNABLE_WINDOW_DAA, enforceable at most finality later — this lock guarantees
+/// the burn is always in force before the claim unlocks.
+pub const SERVICE_BOND_CSV_WINDOW_BLOCKS: u64 = 792_000;
 
 /// Per-miner collateral balance tracked on-chain.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -313,6 +318,19 @@ pub struct FoldOutcome {
     pub resets: Vec<Hash>,
     /// Identities sighted (first certified block) in this fold, new relative to the baseline.
     pub sightings: Vec<Hash>,
+    /// Claims dropped by the burnable-window purge in this fold, in pop order — the undo log
+    /// needs them to reverse the block.
+    pub expired: Vec<(Hash, EscrowClaim)>,
+}
+
+/// Reorg-restore state of everything but the vault (see [`ServiceLedger::light_snapshot`]).
+#[derive(Clone, Debug)]
+pub struct LightSnapshot {
+    pending: std::collections::BTreeMap<[u8; 32], PendingRequest>,
+    strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
+    first_seen: std::collections::BTreeMap<Hash, u64>,
+    base: std::sync::Arc<std::collections::BTreeMap<Hash, StrikeEntry>>,
+    first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -385,6 +403,7 @@ impl ServiceLedger {
     ) -> FoldOutcome {
         let warmup = warmup_burned.is_some();
         let mut sightings: Vec<Hash> = Vec::new();
+        let mut expired: Vec<(Hash, EscrowClaim)> = Vec::new();
         for (miner, claim) in escrows {
             // First certified block of this identity: report it once for persistence. A warmup
             // fold skips — its sightings are already in the baseline.
@@ -397,15 +416,16 @@ impl ServiceLedger {
             }
             self.vault.entry(*miner).or_default().push_back(*claim);
         }
-        for claims in self.vault.values_mut() {
-            while claims.front().is_some_and(|c| c.daa + SERVICE_LEDGER_HORIZON_DAA <= daa) {
-                claims.pop_front();
+        for (miner, claims) in self.vault.iter_mut() {
+            while claims.front().is_some_and(|c| c.daa + SERVICE_BURNABLE_WINDOW_DAA <= daa) {
+                expired.push((*miner, claims.pop_front().unwrap()));
             }
         }
         self.vault.retain(|_, claims| !claims.is_empty());
 
         let mut outcome = FoldOutcome::default();
         outcome.sightings = sightings;
+        outcome.expired = expired;
 
         // An authenticated response (signed by a delegated escrow key) marks every cohort
         // identity that delegated to it as having served this audit and resets their streak.
@@ -538,6 +558,50 @@ impl ServiceLedger {
     /// Installs the persisted first-sighting baseline (dedup source for sighting events).
     pub fn set_first_seen_base(&mut self, base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>) {
         self.first_seen_base = base;
+    }
+
+    /// The small reorg-restore state: everything but the vault (whose restore goes through the
+    /// per-block undo log — cloning a full burnable window per chain block does not scale).
+    pub fn light_snapshot(&self) -> LightSnapshot {
+        LightSnapshot {
+            pending: self.pending.clone(),
+            strikes: self.strikes.clone(),
+            first_seen: self.first_seen.clone(),
+            base: self.base.clone(),
+            first_seen_base: self.first_seen_base.clone(),
+        }
+    }
+
+    /// Restores everything but the vault from a light snapshot.
+    pub fn restore_light(&mut self, snap: &LightSnapshot) {
+        self.pending = snap.pending.clone();
+        self.strikes = snap.strikes.clone();
+        self.first_seen = snap.first_seen.clone();
+        self.base = snap.base.clone();
+        self.first_seen_base = snap.first_seen_base.clone();
+    }
+
+    /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
+    /// (adds at the back, then window-expiry pops at the front, then burn pops at the back):
+    /// burns are re-pushed first (newest last), then expired claims re-enter at the front
+    /// (oldest first), then the block's own adds pop off the back.
+    pub fn undo_vault(&mut self, added: &[(Hash, EscrowClaim)], misses: &[ServiceMiss], expired: &[(Hash, EscrowClaim)]) {
+        for miss in misses.iter().rev() {
+            for claim in miss.burned.iter().rev() {
+                self.vault.entry(miss.miner).or_default().push_back(*claim);
+            }
+        }
+        for (miner, claim) in expired.iter().rev() {
+            self.vault.entry(*miner).or_default().push_front(*claim);
+        }
+        for (miner, claim) in added.iter().rev() {
+            let claims = self.vault.get_mut(miner).expect("undo of an add requires the deque to exist");
+            let popped = claims.pop_back().expect("undo of an add requires the claim to be present");
+            debug_assert_eq!(popped, *claim);
+            if claims.is_empty() {
+                self.vault.remove(miner);
+            }
+        }
     }
 
     /// The miner's strike state: the folded delta, falling back to the persisted baseline.
@@ -1018,6 +1082,42 @@ mod tests {
         assert_eq!(parse_escrow_pubkey(extra.as_bytes()), Some(escrow_pubkey));
         assert_eq!(parse_escrow_esig(extra.as_bytes()), Some(sig));
         assert_eq!(parse_escrow_esig(b"0.5.0/escrow:aabb"), None);
+    }
+
+    #[test]
+    fn vault_undo_reverses_a_folded_block() {
+        use super::{EscrowClaim, SERVICE_BURNABLE_WINDOW_DAA};
+        use crate::tx::TransactionOutpoint;
+
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+        let claim = |n: u64, daa: u64| EscrowClaim { outpoint: TransactionOutpoint::new(n.into(), 1), value: n, daa };
+
+        // block 1: six claims land
+        let adds1: Vec<(Hash, EscrowClaim)> = (1..=6).map(|n| (a, claim(n, 100))).collect();
+        let r1 = [1u8; 32];
+        ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &adds1, |_| true, cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, cohort_of(&set));
+        let before_burn = ledger.vault_claims(&a);
+
+        // block 2: the audit closes — strike 1 burns the 5 newest; undo restores them exactly
+        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(out.misses.len(), 1);
+        assert_eq!(ledger.vault_claims(&a).len(), 1);
+        ledger.undo_vault(&[], &out.misses, &out.expired);
+        assert_eq!(ledger.vault_claims(&a), before_burn);
+
+        // block 3, one burnable-window later: one add, the six old claims expire — undo restores
+        // both sides of the mutation
+        let far = 100 + SERVICE_BURNABLE_WINDOW_DAA;
+        let adds3 = [(a, claim(7, far))];
+        let out = ledger.on_chain_block(far, &[], &[], &adds3, |_| true, cohort_of(&set));
+        assert_eq!(out.expired.len(), 6, "the window purge must report what it dropped");
+        assert_eq!(ledger.vault_claims(&a).iter().map(|c| c.value).collect::<Vec<_>>(), vec![7]);
+        ledger.undo_vault(&adds3, &out.misses, &out.expired);
+        assert_eq!(ledger.vault_claims(&a), before_burn);
     }
 
     #[test]

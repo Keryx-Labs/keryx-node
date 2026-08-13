@@ -7,7 +7,7 @@ use crate::model::stores::{
 };
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss, ServicePenalty,
-    ServiceStrikesSnapshot, StrikeEntry, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_SUSPENSION_DAA,
+    ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
@@ -109,12 +109,23 @@ impl StandingIndex {
     }
 }
 
+/// Everything needed to reverse one folded chain block's vault mutations. All fields are pure
+/// functions of the chain, so entries stay valid across refolds.
+struct VaultUndo {
+    added: Vec<(Hash, EscrowClaim)>,
+    misses: Vec<ServiceMiss>,
+    expired: Vec<(Hash, EscrowClaim)>,
+}
+
 /// RAM-only service-ledger state folded along the committed selected chain.
 #[derive(Default)]
 pub(super) struct ServiceLedgerSync {
     ledger: ServiceLedger,
-    /// Ledger state as of each folded chain-block index, for reorg restore.
-    snapshots: std::collections::BTreeMap<u64, ServiceLedger>,
+    /// Light (vault-less) ledger state as of each folded chain-block index. The vault itself is
+    /// restored through `undo` — cloning a full burnable window per chain block does not scale.
+    snapshots: std::collections::BTreeMap<u64, keryx_consensus_core::collateral::LightSnapshot>,
+    /// Per-block vault undo entries, keyed like `snapshots`.
+    undo: std::collections::BTreeMap<u64, VaultUndo>,
     /// Chain index the ledger is folded up to.
     tip: Option<u64>,
     /// Events awaiting finality depth, in chain order as (chain index, daa, event). Truncated on
@@ -332,10 +343,10 @@ impl VirtualStateProcessor {
         hash: Hash,
         live: bool,
         warmup: bool,
-    ) -> FoldOutcome {
+    ) -> (FoldOutcome, Vec<(Hash, EscrowClaim)>) {
         let daa = self.headers_store.get_daa_score(hash).unwrap();
         if !self.pom_v3_activation.is_active(daa) {
-            return FoldOutcome::default();
+            return (FoldOutcome::default(), Vec::new());
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -367,9 +378,11 @@ impl VirtualStateProcessor {
         if warmup {
             let burned = self.service_burned.read();
             ledger.on_chain_block_warmup(daa, &requests, &responses, &escrows, &|op| burned.contains(op), cohort);
-            FoldOutcome::default()
+            (FoldOutcome::default(), escrows)
         } else {
-            ledger.on_chain_block(daa, &requests, &responses, &escrows, |id| self.service_standing_at(id, daa), cohort)
+            let outcome =
+                ledger.on_chain_block(daa, &requests, &responses, &escrows, |id| self.service_standing_at(id, daa), cohort);
+            (outcome, escrows)
         }
     }
 
@@ -429,11 +442,11 @@ impl VirtualStateProcessor {
         ledger.set_first_seen_base(std::sync::Arc::new(
             self.service_standing.read().first_seen.iter().map(|(k, v)| (*k, *v)).collect(),
         ));
-        // One horizon below the persisted frontier keeps every pending request and vault claim
-        // readable at the frontier warm. A frontier of zero (nothing persisted yet) falls back
-        // to the finality anchor: everything above it is re-derived.
+        // One burnable window below the persisted frontier keeps every pending request and vault
+        // claim readable at the frontier warm. A frontier of zero (nothing persisted yet) falls
+        // back to the finality anchor: everything above it is re-derived.
         let start = if cursor_daa > 0 { cursor_daa } else { to_daa.saturating_sub(self.finality_depth) };
-        let daa_bound = start.saturating_sub(SERVICE_LEDGER_HORIZON_DAA);
+        let daa_bound = start.saturating_sub(SERVICE_BURNABLE_WINDOW_DAA);
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
         let bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
         if bottom == pruning_idx && pruning_idx > 0 {
@@ -452,7 +465,7 @@ impl VirtualStateProcessor {
             // re-queued — a crash may have flushed that daa partially, and the flush itself is
             // idempotent (already-mirrored rows are skipped).
             let warmup = daa < cursor_daa;
-            let outcome = self.fold_service_chain_block(&mut ledger, sc, hash, false, warmup);
+            let (outcome, _added) = self.fold_service_chain_block(&mut ledger, sc, hash, false, warmup);
             log_new_service_misses(logged, daa, &outcome.misses);
             if daa >= cursor_daa {
                 // Sightings first: a partially flushed daa must never persist a claim's burn
@@ -499,27 +512,39 @@ impl VirtualStateProcessor {
         // A reorg (or restore) drops queued misses above the common ancestor with the chain.
         sync.queue.retain(|(idx, _, _)| *idx <= common);
         if sync.tip != Some(common) {
-            let restored = sync.snapshots.get(&common).cloned();
-            match restored {
-                Some(ledger) => sync.ledger = ledger,
-                None => {
-                    let cursor = sync.deep_cursor_daa;
-                    let mut queue = std::mem::take(&mut sync.queue);
-                    queue.clear();
-                    let mut logged = std::mem::take(&mut sync.logged);
-                    let ledger = self.refold_service_ledger(&*sc, common, pruning_point, cursor, &mut queue, &mut logged);
-                    sync.queue = queue;
-                    sync.logged = logged;
-                    sync.ledger = ledger;
+            // A reorg walks the vault back through the per-block undo log and restores the rest
+            // from the light snapshot; anything deeper (or a cold start) refolds.
+            let undoable = sync.tip.is_some_and(|tip| {
+                common <= tip && sync.snapshots.contains_key(&common) && ((common + 1)..=tip).all(|i| sync.undo.contains_key(&i))
+            });
+            if undoable {
+                let tip = sync.tip.unwrap();
+                for i in ((common + 1)..=tip).rev() {
+                    let VaultUndo { added, misses, expired } = sync.undo.get(&i).unwrap();
+                    let (added, misses, expired) = (added.clone(), misses.clone(), expired.clone());
+                    sync.ledger.undo_vault(&added, &misses, &expired);
                 }
-            };
+                let snap = sync.snapshots.get(&common).unwrap().clone();
+                sync.ledger.restore_light(&snap);
+            } else {
+                let cursor = sync.deep_cursor_daa;
+                let mut queue = std::mem::take(&mut sync.queue);
+                queue.clear();
+                let mut logged = std::mem::take(&mut sync.logged);
+                let ledger = self.refold_service_ledger(&*sc, common, pruning_point, cursor, &mut queue, &mut logged);
+                sync.queue = queue;
+                sync.logged = logged;
+                sync.ledger = ledger;
+            }
         }
         sync.snapshots.split_off(&(common + 1));
+        sync.undo.split_off(&(common + 1));
         for (k, h) in chain_path.added.iter().enumerate() {
             let idx = common + 1 + k as u64;
             let daa = self.headers_store.get_daa_score(*h).unwrap();
-            let outcome = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, true, false);
+            let (outcome, added) = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, true, false);
             log_new_service_misses(&mut sync.logged, daa, &outcome.misses);
+            sync.undo.insert(idx, VaultUndo { added, misses: outcome.misses.clone(), expired: outcome.expired });
             for miner in outcome.sightings {
                 sync.queue.push_back((idx, daa, ServiceEvent::Sighting(miner)));
             }
@@ -529,16 +554,19 @@ impl VirtualStateProcessor {
             for miner in outcome.resets {
                 sync.queue.push_back((idx, daa, ServiceEvent::Reset(miner)));
             }
-            let snapshot = sync.ledger.clone();
+            let snapshot = sync.ledger.light_snapshot();
             sync.snapshots.insert(idx, snapshot);
         }
         while sync.snapshots.len() > SERVICE_SNAPSHOT_CAP {
             sync.snapshots.pop_first();
         }
+        while sync.undo.len() > SERVICE_SNAPSHOT_CAP {
+            sync.undo.pop_first();
+        }
         sync.tip = Some(tip_idx);
         // Bound the logged set by the deepest span a refold can revisit (the finality anchor
         // plus the warmup horizon).
-        let logged_span = self.finality_depth + SERVICE_LEDGER_HORIZON_DAA;
+        let logged_span = self.finality_depth + SERVICE_BURNABLE_WINDOW_DAA;
         sync.logged.retain(|_, daa| *daa + logged_span > tip_daa);
         // Events now deeper than finality are reorg-immune on every acceptable POV: persist the
         // burned outpoints, the strike records and the suspensions, in chain order, and advance

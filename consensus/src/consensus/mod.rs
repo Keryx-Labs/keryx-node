@@ -343,6 +343,19 @@ impl Consensus {
             this.config.params.ratio_reward_window,
             this.config.pruning_depth()
         );
+        // Same invariant class for the service-bond cold refold: its deepest reach (the finality
+        // anchor plus the burnable-window warmup) must stay above the pruning floor, or a fresh
+        // node would silently rebuild a truncated vault → divergent burns.
+        assert!(
+            this.config.params.finality_depth()
+                + keryx_consensus_core::collateral::SERVICE_BURNABLE_WINDOW_DAA
+                <= this.config.pruning_depth(),
+            "finality_depth ({}) + SERVICE_BURNABLE_WINDOW_DAA ({}) must not exceed pruning_depth ({}) — the \
+             service-bond cold refold requires its whole window to stay above the pruning floor",
+            this.config.params.finality_depth(),
+            keryx_consensus_core::collateral::SERVICE_BURNABLE_WINDOW_DAA,
+            this.config.pruning_depth()
+        );
 
         // Gold-standard prefix-sum production index: one-time from-chain build when the store is empty
         // (a datadir predating it, or a fresh prefix). Once populated it is kept current by lockstep
