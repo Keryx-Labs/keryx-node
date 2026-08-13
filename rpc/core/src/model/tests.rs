@@ -154,6 +154,7 @@ mod mockery {
                 blue_work: mock(),
                 pruning_point: mock(),
                 pom_final_state: mock(),
+                service_state_hash: mock(),
             }
         }
     }
@@ -174,6 +175,7 @@ mod mockery {
                 blue_work: mock(),
                 pruning_point: mock(),
                 pom_final_state: mock(),
+                service_state_hash: mock(),
             }
         }
     }
@@ -425,6 +427,7 @@ mod mockery {
                 blue_work: mock(),
                 pruning_point: mock(),
                 pom_final_state: mock(),
+                service_state_hash: mock(),
             }
         }
     }

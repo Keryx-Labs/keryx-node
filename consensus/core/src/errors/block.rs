@@ -156,6 +156,9 @@ pub enum RuleError {
     #[error("block {0} accepted ID merkle root is invalid - block header indicates {1}, but calculated value is {2}")]
     BadAcceptedIDMerkleRoot(Hash, Hash, Hash),
 
+    #[error("block {0} service-state commitment is invalid - block header indicates {1}, but the sealed state at its pruning point is {2}")]
+    BadServiceStateCommitment(Hash, Hash, Hash),
+
     #[error("coinbase transaction is not built as expected")]
     BadCoinbaseTransaction,
 

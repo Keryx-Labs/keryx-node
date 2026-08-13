@@ -1,4 +1,5 @@
 use super::VirtualStateProcessor;
+use crate::processes::service_commit;
 use crate::model::stores::{
     acceptance_data::AcceptanceDataStoreReader, block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader,
     ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, pom_tier::PomTierStoreReader,
@@ -459,12 +460,20 @@ impl VirtualStateProcessor {
         let logged_span = self.finality_depth + SERVICE_LEDGER_HORIZON_DAA;
         sync.logged.retain(|_, daa| *daa + logged_span > tip_daa);
         // Events now deeper than finality are reorg-immune on every acceptable POV: persist the
-        // burned outpoints, the strike records and the suspensions, in chain order.
+        // burned outpoints, the strike records and the suspensions, in chain order, and advance
+        // the sealed commitment (one seal per flushed event daa — all events of a daa qualify
+        // together, so a daa is never split across flushes).
+        let mut sealing_daa: Option<u64> = None;
         while sync.queue.front().is_some_and(|(_, daa, _)| daa + self.finality_depth <= tip_daa) {
             let (_, daa, event) = sync.queue.pop_front().unwrap();
+            if sealing_daa.is_some_and(|d| d != daa) {
+                self.service_commit_index.seal(sealing_daa.unwrap());
+            }
+            sealing_daa = Some(daa);
             match event {
                 ServiceEvent::Reset(miner) => {
                     self.service_strike_store.set(daa, miner, StrikeEntry { count: 0, last_daa: 0 }).unwrap();
+                    self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miner, 0, 0));
                 }
                 ServiceEvent::Miss(miss) => {
                     for claim in miss.burned.iter() {
@@ -472,6 +481,11 @@ impl VirtualStateProcessor {
                             crate::model::stores::ai_slash::OutpointKey::new(claim.outpoint.transaction_id, claim.outpoint.index);
                         self.service_burn_store.set(key, daa).unwrap();
                         self.service_burned.write().insert(claim.outpoint);
+                        self.service_commit_index.add_row(&service_commit::burn_row_bytes(
+                            claim.outpoint.transaction_id,
+                            claim.outpoint.index,
+                            daa,
+                        ));
                     }
                     if !miss.burned.is_empty() {
                         info!(
@@ -489,6 +503,7 @@ impl VirtualStateProcessor {
                         StrikeEntry { count: miss.consecutive_misses, last_daa: daa }
                     };
                     self.service_strike_store.set(daa, miss.miner, record).unwrap();
+                    self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miss.miner, record.count, record.last_daa));
                     // A third strike, now reorg-immune, suspends the miner's production. The
                     // deadline is derived from the miss's own daa (deterministic), and the full
                     // window bites from finalization:
@@ -502,6 +517,9 @@ impl VirtualStateProcessor {
             }
             sync.deep_cursor_daa = sync.deep_cursor_daa.max(daa);
         }
+        if let Some(daa) = sealing_daa {
+            self.service_commit_index.seal(daa);
+        }
     }
 
     /// Boot-time load of the persisted burned outpoints into the RAM set consulted by transaction
@@ -509,6 +527,7 @@ impl VirtualStateProcessor {
     /// by block validation, and of the deep cursor — the persisted event frontier bounding the
     /// cold-start refold.
     pub(crate) fn load_service_burned(&self) {
+        let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut set = self.service_burned.write();
         let mut cursor = 0u64;
         for entry in self.service_burn_store.iterator() {
@@ -516,6 +535,7 @@ impl VirtualStateProcessor {
             let tx_id_bytes: [u8; 32] = key[..32].try_into().unwrap();
             let index = u32::from_le_bytes(key[32..36].try_into().unwrap());
             set.insert(TransactionOutpoint::new(tx_id_bytes.into(), index));
+            rows.push((daa, service_commit::burn_row_bytes(tx_id_bytes.into(), index, daa).to_vec()));
             cursor = cursor.max(daa);
         }
         drop(set);
@@ -524,6 +544,7 @@ impl VirtualStateProcessor {
             let (key, record) = entry.unwrap();
             let (event_daa, miner) = crate::model::stores::service_strike::StrikeLogKey::parse(&key);
             cursor = cursor.max(event_daa);
+            rows.push((event_daa, service_commit::strike_row_bytes(event_daa, miner, record.count, record.last_daa).to_vec()));
             // `{0, daa > 0}` is an executed suspension; the log is in event order, so the last
             // (largest) deadline per miner wins.
             if record.count == 0 && record.last_daa > 0 {
@@ -531,6 +552,7 @@ impl VirtualStateProcessor {
             }
         }
         drop(suspended);
+        self.service_commit_index.rebuild(rows);
         self.service_ledger.lock().deep_cursor_daa = cursor;
     }
 

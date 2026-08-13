@@ -142,6 +142,8 @@ pub struct VirtualStateProcessor {
     pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, u64>>,
     /// Strike log: the finality-anchored baseline the ledger folds over.
     pub(super) service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
+    /// Sealed service-state commitment index (see `processes::service_commit`).
+    pub(super) service_commit_index: Arc<crate::processes::service_commit::ServiceCommitIndex>,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -338,6 +340,7 @@ impl VirtualStateProcessor {
             service_burn_store: storage.service_burn_store.clone(),
             service_suspended: Default::default(),
             service_strike_store: storage.service_strike_store.clone(),
+            service_commit_index: storage.service_commit_index.clone(),
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1630,6 +1633,14 @@ impl VirtualStateProcessor {
         // mineable; it validates under the same rule in `calculate_difficulty_bits`, and its insertion
         // re-resolves the virtual normally. Outside the window this is a no-op (uses `virtual_state.bits`).
         let template_bits = self.window_manager.reset_difficulty_bits(virtual_state.daa_score).unwrap_or(virtual_state.bits);
+        // Sealed service-state commitment at the template's own pruning point — a node-side
+        // value (unlike pom_final_state, the miner never touches it).
+        let service_state_hash = if keryx_consensus_core::pom::service_commit_active(virtual_state.daa_score) {
+            let pp_daa = self.headers_store.get_daa_score(header_pruning_point).unwrap();
+            self.service_commit_index.commitment_at(pp_daa)
+        } else {
+            Default::default()
+        };
         let header = Header::new_finalized(
             version,
             parents_by_level,
@@ -1644,6 +1655,7 @@ impl VirtualStateProcessor {
             virtual_state.ghostdag_data.blue_score,
             header_pruning_point,
             0, // pom_final_state: filled by the miner from the winning walk (H3), like the nonce
+            service_state_hash,
         );
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();

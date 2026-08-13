@@ -98,6 +98,9 @@ message BlockHeader{
   // into the block hash — the header-only PoW value / block level derive from it.
   // 0 (proto default, absent on the wire) for pre-fork blocks.
   uint64 pomFinalState = 15;
+  // H6: sealed service-state commitment at this header's pruning point, committed into
+  // the block hash. Absent (zero) for pre-gate blocks.
+  Hash serviceStateHash = 16;
 }
 
 message BlockLevelParents {

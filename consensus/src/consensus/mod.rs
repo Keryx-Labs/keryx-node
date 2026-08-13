@@ -182,6 +182,9 @@ impl Consensus {
         // Same pattern for the PoM block-level fork (H3): header hashing commits to
         // `pom_final_state` from this score on and has no access to Params.
         keryx_consensus_core::pom::init_pom_level_activation(params.pom_level_activation.daa_score());
+        // Same pattern for the sealed service-state commitment (H6): header hashing commits
+        // to `service_state_hash` from the H6 gate on.
+        keryx_consensus_core::pom::init_service_commit_activation(params.pom_v3_activation.daa_score());
 
         //
         // Storage layer

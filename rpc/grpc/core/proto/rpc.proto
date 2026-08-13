@@ -43,6 +43,9 @@ message RpcBlockHeader {
   // into the block hash. Miners MUST fill it on submit_block (from the walk that solved
   // the block), exactly like the nonce. 0 (absent) for pre-fork blocks.
   uint64 pomFinalState = 16;
+  // H6: sealed service-state commitment at this header's pruning point, filled by the
+  // node at template build. Hex string; empty for pre-gate blocks.
+  string serviceStateHash = 17;
 }
 
 message RpcBlockLevelParents {
@@ -1034,6 +1037,8 @@ message RpcOptionalHeader {
   optional string pruningPoint = 14;
   // H3 (pom_level_activation): final state of the winning PoM possession walk.
   optional uint64 pomFinalState = 15;
+  // H6: sealed service-state commitment at this header's pruning point (hex).
+  optional string serviceStateHash = 16;
 }
 
 message RpcOptionalTransactionOutpoint {

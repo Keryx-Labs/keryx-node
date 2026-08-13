@@ -233,6 +233,11 @@ impl ConsensusConverter {
             } else {
                 Default::default()
             },
+            service_state_hash: if verbosity.include_service_state_hash.unwrap_or(false) {
+                Some(header.service_state_hash)
+            } else {
+                Default::default()
+            },
         })
     }
 

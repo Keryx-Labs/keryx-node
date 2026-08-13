@@ -7,7 +7,8 @@ use crate::{
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
             AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
-            BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
+            BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext,
+            WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -296,6 +297,19 @@ impl VirtualStateProcessor {
             &[sp_diff, &ctx.mergeset_diff],
             enforce,
         )?;
+
+        // Sealed service-state commitment: the header must commit the canonical service state
+        // at its own pruning point. This runs in chain order (the local flush frontier is at
+        // least finality-deep past the pruning point), and is skipped in the same trust windows
+        // as the coinbase check — a node that cannot yet reproduce the fold trusts the
+        // utxo-commitment-pinned chain instead.
+        if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase() {
+            let pp_daa = self.headers_store.get_daa_score(header.pruning_point).unwrap();
+            let expected = self.service_commit_index.commitment_at(pp_daa);
+            if header.service_state_hash != expected {
+                return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
+            }
+        }
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;

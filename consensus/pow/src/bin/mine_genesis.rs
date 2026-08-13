@@ -41,6 +41,7 @@ fn main() {
         0,
         ZERO_HASH,
         0, // pom_final_state: genesis predates pom_level_activation
+        Default::default(), // service_state_hash: genesis predates the H6 gate
     );
 
     let state = State::new(&template);
@@ -99,6 +100,7 @@ fn main() {
         0,
         ZERO_HASH,
         0, // pom_final_state: genesis predates pom_level_activation
+        Default::default(), // service_state_hash: genesis predates the H6 gate
     );
 
     let block_hash = hashing::header::hash(&final_header);

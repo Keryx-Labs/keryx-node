@@ -24,6 +24,7 @@ from!(item: &keryx_rpc_core::RpcHeader, protowire::RpcBlockHeader, {
         pruning_point: item.pruning_point.to_string(),
         hash: item.hash.to_string(),
         pom_final_state: item.pom_final_state,
+        service_state_hash: item.service_state_hash.to_string(),
     }
 });
 
@@ -43,6 +44,7 @@ from!(item: &keryx_rpc_core::RpcRawHeader, protowire::RpcBlockHeader, {
         blue_score: item.blue_score,
         pruning_point: item.pruning_point.to_string(),
         pom_final_state: item.pom_final_state,
+        service_state_hash: item.service_state_hash.to_string(),
     }
 });
 
@@ -68,6 +70,8 @@ try_from!(item: &protowire::RpcBlockHeader, keryx_rpc_core::RpcHeader, {
         item.blue_score,
         RpcHash::from_str(&item.pruning_point)?,
         item.pom_final_state,
+        // Empty from pre-gate senders: the canonical pre-gate value is the zero hash.
+        if item.service_state_hash.is_empty() { Default::default() } else { RpcHash::from_str(&item.service_state_hash)? },
     );
 
     header.into()
@@ -88,6 +92,7 @@ try_from!(item: &protowire::RpcBlockHeader, keryx_rpc_core::RpcRawHeader, {
         blue_score: item.blue_score,
         pruning_point: RpcHash::from_str(&item.pruning_point)?,
         pom_final_state: item.pom_final_state,
+        service_state_hash: if item.service_state_hash.is_empty() { Default::default() } else { RpcHash::from_str(&item.service_state_hash)? },
     }
 });
 
@@ -107,6 +112,8 @@ try_from!(item: &protowire::RpcBlockHeader, keryx_rpc_core::RpcOptionalHeader, {
         item.blue_score,
         RpcHash::from_str(&item.pruning_point)?,
         item.pom_final_state,
+        // Empty from pre-gate senders: the canonical pre-gate value is the zero hash.
+        if item.service_state_hash.is_empty() { Default::default() } else { RpcHash::from_str(&item.service_state_hash)? },
     );
 
     keryx_rpc_core::RpcOptionalHeader::from(header)

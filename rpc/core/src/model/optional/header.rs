@@ -39,6 +39,7 @@ pub struct RpcOptionalHeader {
     /// walk, committed into the block hash. None/0 for pre-fork blocks.
     #[serde(default)]
     pub pom_final_state: Option<u64>,
+    pub service_state_hash: Option<Hash>,
 }
 
 impl RpcOptionalHeader {
@@ -83,6 +84,7 @@ impl From<Header> for RpcOptionalHeader {
             blue_score: Some(header.blue_score),
             pruning_point: Some(header.pruning_point),
             pom_final_state: Some(header.pom_final_state),
+            service_state_hash: Some(header.service_state_hash),
         }
     }
 }
@@ -104,6 +106,7 @@ impl From<&Header> for RpcOptionalHeader {
             blue_score: Some(header.blue_score),
             pruning_point: Some(header.pruning_point),
             pom_final_state: Some(header.pom_final_state),
+            service_state_hash: Some(header.service_state_hash),
         }
     }
 }
@@ -139,6 +142,7 @@ impl TryFrom<RpcOptionalHeader> for Header {
             // Optional: absent on pre-H3 headers and verbosity-filtered responses (the cached
             // `hash` above is carried verbatim, so the block identity cannot be corrupted).
             pom_final_state: header.pom_final_state.unwrap_or_default(),
+            service_state_hash: header.service_state_hash.unwrap_or_default(),
         })
     }
 }
@@ -175,13 +179,14 @@ impl TryFrom<&RpcOptionalHeader> for Header {
             // Optional: absent on pre-H3 headers and verbosity-filtered responses (the cached
             // `hash` above is carried verbatim, so the block identity cannot be corrupted).
             pom_final_state: header.pom_final_state.unwrap_or_default(),
+            service_state_hash: header.service_state_hash.unwrap_or_default(),
         })
     }
 }
 
 impl Serializer for RpcOptionalHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
 
         store!(Option<Hash>, &self.hash, writer)?;
         store!(Option<u16>, &self.version, writer)?;
@@ -197,6 +202,7 @@ impl Serializer for RpcOptionalHeader {
         store!(Option<u64>, &self.blue_score, writer)?;
         store!(Option<Hash>, &self.pruning_point, writer)?;
         store!(Option<u64>, &self.pom_final_state, writer)?;
+        store!(Option<Hash>, &self.service_state_hash, writer)?;
 
         Ok(())
     }
@@ -221,6 +227,8 @@ impl Deserializer for RpcOptionalHeader {
         let pruning_point = load!(Option<Hash>, reader)?;
         // Struct-version 2 (H3): pom_final_state. Older senders (v1) simply omit it.
         let pom_final_state = if payload_version >= 2 { load!(Option<u64>, reader)? } else { None };
+        // Struct-version 3 (H6): service_state_hash. Older senders omit it.
+        let service_state_hash = if payload_version >= 3 { load!(Option<Hash>, reader)? } else { None };
 
         Ok(Self {
             hash,
@@ -237,6 +245,7 @@ impl Deserializer for RpcOptionalHeader {
             blue_score,
             pruning_point,
             pom_final_state,
+            service_state_hash,
         })
     }
 }

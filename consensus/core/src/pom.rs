@@ -34,6 +34,24 @@ pub fn pom_level_active(daa_score: u64) -> bool {
     daa_score >= POM_LEVEL_ACTIVATION_DAA.load(Ordering::Relaxed)
 }
 
+/// DAA score at which `Header::service_state_hash` becomes consensus (hashed into the block
+/// hash and validated against the local sealed service state). u64::MAX means "never" —
+/// initialised at startup from `Params::pom_v3_activation` (the single H6 gate), same
+/// pattern as the PoM level activation above.
+static SERVICE_COMMIT_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::pom_v3_activation`. Header hashing
+/// has no access to `Params`, so the activation is published through this global.
+pub fn init_service_commit_activation(daa_score: u64) {
+    SERVICE_COMMIT_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Whether the sealed service-state commitment is active for a block at `daa_score`.
+#[inline(always)]
+pub fn service_commit_active(daa_score: u64) -> bool {
+    daa_score >= SERVICE_COMMIT_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
+
 /// A PoM tier binding: the model whose possession this tier proves, plus its canonical
 /// 32 B-chunk Merkle root `R_T` and chunk count `N` (from the offline `pom-rt-builder`).
 /// Pinned per network in `config::params` (`POM_TIERS`); the tier index is the slice
