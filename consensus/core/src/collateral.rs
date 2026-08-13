@@ -154,9 +154,11 @@ pub const STRIKE_1_BURN_CLAIMS: u32 = 5;
 pub const SERVICE_STRIKE_INTERVAL_DAA: u64 = 36_000;
 
 /// Production suspension applied at the third consecutive strike (24 h). Enforced finality-deep
-/// (like escrow burns): a miner suspended at miss daa `T` has his blocks rejected over
+/// (like escrow burns): a miner suspended at miss daa `T` has his miner cut burned — his blocks
+/// are still valid and merged, he is simply paid nothing — over
 /// `[T + finality, T + finality + SERVICE_SUSPENSION_DAA]`, so the full 24 h bites after the
-/// reorg-immune finality delay.
+/// reorg-immune finality delay. (Blocks are NOT rejected: rejecting a suspended producer's blue
+/// would strand the honest miner that merges it — see `coinbase.rs` zero-output guard.)
 pub const SERVICE_SUSPENSION_DAA: u64 = 864_000;
 
 /// DAA window, ending at the assignment seed block, in which a miner must have produced a proven
@@ -206,8 +208,9 @@ pub enum ServicePenalty {
     BurnClaims(u32),
     /// Burn the miner's entire still-locked pending escrow.
     SlashAllPending,
-    /// Suspend the miner's block production: his blocks are rejected for [`SERVICE_SUSPENSION_DAA`]
-    /// once the suspension is finality-deep. Also drains any escrow re-accumulated past the drain.
+    /// Suspend the miner: his miner cut is burned (blocks stay valid and merged, he is paid
+    /// nothing) for [`SERVICE_SUSPENSION_DAA`] once the suspension is finality-deep. Also drains
+    /// any escrow re-accumulated past the drain.
     Suspend,
 }
 
