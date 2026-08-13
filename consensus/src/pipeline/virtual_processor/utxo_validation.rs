@@ -73,6 +73,22 @@ use std::{
 static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_3_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_4_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H6_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a hardfork banner should print for the block crossing `activation`. Latching alone is
+/// not enough: IBD re-validates the historical crossing block, and a network whose gate is active
+/// from genesis (`daa_score() == 0`, e.g. H4 on the testnet) keeps every young chain inside the
+/// lag window — both re-printed the banner on every sync. A banner announces a LIVE crossing:
+/// the gate must be a real fork (score > 0), the block must sit inside the lag window past it,
+/// and its timestamp must be recent wall-clock (a replayed historical crossing is old news).
+fn banner_should_fire(activation: keryx_consensus_core::config::params::ForkActivation, header: &Header) -> bool {
+    /// Max wall-clock age (ms) of a crossing block for its banner to count as live.
+    const BANNER_LIVE_WINDOW_MS: u64 = 3_600_000;
+    activation.is_active(header.daa_score)
+        && activation.daa_score() > 0
+        && header.daa_score < activation.daa_score() + BANNER_MAX_LAG
+        && keryx_core::time::unix_now().saturating_sub(header.timestamp) < BANNER_LIVE_WINDOW_MS
+}
 
 /// Max DAA a block may sit past the H4 gate and still trigger the activation banner. The gate uses
 /// an at-or-after match (an exact-equality banner would be skipped at 10 BPS), which alone is true
@@ -372,8 +388,7 @@ impl VirtualStateProcessor {
         // the gate (BANNER_MAX_LAG) so a node booting already synced far beyond H4 no longer
         // re-prints it on every restart. `compare_exchange` keeps it to one print per process (the
         // first post-gate block within the window, whether reached live or during IBD).
-        if self.coin_age_activation.is_active(header.daa_score)
-            && header.daa_score < self.coin_age_activation.daa_score() + BANNER_MAX_LAG
+        if banner_should_fire(self.coin_age_activation, header)
             && COIN_AGE_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             // Header carries the GATE score (the fork's identity, always exact), not this block's —
@@ -394,8 +409,7 @@ impl VirtualStateProcessor {
         // the gate, never on strict equality: the DAA score is a cumulative count and routinely
         // skips the exact activation value at 10 BPS, so an equality test would leave the banner
         // silent and its absence would read as "the fork did not activate".
-        if self.difficulty_reset_activation_h5_3.is_active(header.daa_score)
-            && header.daa_score < self.difficulty_reset_activation_h5_3.daa_score() + BANNER_MAX_LAG
+        if banner_should_fire(self.difficulty_reset_activation_h5_3, header)
             && H5_3_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             info!("════════════════ KERYX HARDFORK H5.3 · DAA {} ════════════════", self.difficulty_reset_activation_h5_3.daa_score());
@@ -410,8 +424,7 @@ impl VirtualStateProcessor {
         // H5.4 relaunch banner. Same latching shape as H4/H5.3 — fires on the first block at or
         // AFTER the gate, never on strict equality (the DAA score routinely skips the exact
         // activation value at 10 BPS).
-        if self.difficulty_reset_activation_h5_4.is_active(header.daa_score)
-            && header.daa_score < self.difficulty_reset_activation_h5_4.daa_score() + BANNER_MAX_LAG
+        if banner_should_fire(self.difficulty_reset_activation_h5_4, header)
             && H5_4_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             info!("════════════════ KERYX HARDFORK H5.4 · DAA {} ════════════════", self.difficulty_reset_activation_h5_4.daa_score());
@@ -419,6 +432,24 @@ impl VirtualStateProcessor {
             info!("  Difficulty    — reset window open: blocks build at genesis bits until the DAA re-converges");
             info!("  Separation    — un-upgraded nodes expect the inherited (decayed) bits and are cut off from here on");
             info!("  Miners        — unchanged: no walk-seed rotation, existing rigs keep mining");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // H6 banner. Same latching shape as the others — fires once, on the first block at or
+        // after the gate, only for a live crossing (see `banner_should_fire`).
+        if banner_should_fire(self.pom_v3_activation, header)
+            && H6_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H6 · DAA {} ════════════════", self.pom_v3_activation.daa_score());
+            info!("  PoM v3        — matrix-walk possession proof; new model lineup (Qwen3.5-9B tier 0)");
+            info!("  Escrow        — MANDATORY: blocks without `/escrow:` + a valid `/esig:` delegation cert are invalid");
+            info!("  Identity      — strikes, suspensions and standing follow the payout address, not the hot escrow key");
+            info!("  Sealed state  — burns/strikes/sightings committed in headers, downloaded and verified at IBD");
+            info!("  Standing      — fresh identities mine at the floor tier rate for the probation window");
+            info!("  Service-bond  — silent cohort members escalate: burn → slash-all → suspension; serving resets");
+            info!("  Escrow lock   — CSV extended to ~22h; ~10h of claims stay burnable");
+            info!("  Difficulty    — reset window open at the gate");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
