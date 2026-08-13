@@ -118,6 +118,11 @@ pub struct BlockBodyProcessor {
 }
 
 impl BlockBodyProcessor {
+    #[cfg(test)]
+    pub(crate) fn pom_tier_store(&self) -> &Arc<DbPomTierStore> {
+        &self.pom_tier_store
+    }
+
     pub fn new(
         receiver: Receiver<BlockProcessingMessage>,
         sender: Sender<VirtualStateProcessingMessage>,
@@ -279,7 +284,10 @@ impl BlockBodyProcessor {
         } else {
             block.pom_proof.clone()
         };
-        self.commit_body(block.hash(), block.header.direct_parents(), block.transactions.clone(), pom_proof, block.pom_tier);
+        // IBD may accept bodies without a carried proof, but their tier is not authenticated.
+        // Never persist an unverified tier claim for later coinbase reward calculation.
+        let pom_tier = if skip_pom_proof && pom_proof.is_none() { None } else { block.pom_tier };
+        self.commit_body(block.hash(), block.header.direct_parents(), block.transactions.clone(), pom_proof, pom_tier);
 
         // Send a BlockAdded notification
         self.notification_root
