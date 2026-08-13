@@ -89,7 +89,7 @@ pub struct ConsensusStorage {
     pub ai_response_store: Arc<DbAiResponseStore>,
     pub ai_slashed_store: Arc<DbAiSlashedStore>,
     pub service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
-    pub service_suspend_store: Arc<crate::model::stores::service_suspend::DbServiceSuspendStore>,
+    pub service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
 
 
     // Block window caches
@@ -273,8 +273,8 @@ impl ConsensusStorage {
         let ai_slashed_store = Arc::new(DbAiSlashedStore::new(db.clone(), header_data_builder.build()));
         let service_burn_store =
             Arc::new(crate::model::stores::service_burn::DbServiceBurnStore::new(db.clone(), header_data_builder.build()));
-        let service_suspend_store =
-            Arc::new(crate::model::stores::service_suspend::DbServiceSuspendStore::new(db.clone(), header_data_builder.build()));
+        let service_strike_store =
+            Arc::new(crate::model::stores::service_strike::DbServiceStrikeStore::new(db.clone(), header_data_builder.build()));
 
         // Tips
         let headers_selected_tip_store = Arc::new(RwLock::new(DbHeadersSelectedTipStore::new(db.clone())));
@@ -318,7 +318,7 @@ impl ConsensusStorage {
             ai_response_store,
             ai_slashed_store,
             service_burn_store,
-            service_suspend_store,
+            service_strike_store,
             past_pruning_points_store,
             daa_excluded_store,
             depth_store,

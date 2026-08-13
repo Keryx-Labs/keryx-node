@@ -5,13 +5,13 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_miners, escrow_miner_key, EscrowClaim, ServiceLedger, ServiceMiss, ServicePenalty, ServiceStrikesSnapshot,
-    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_EPOCH_DAA, SERVICE_SUSPENSION_DAA,
+    eligible_miners, escrow_miner_key, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss, ServicePenalty,
+    ServiceStrikesSnapshot, StrikeEntry, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_LEDGER_HORIZON_DAA, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
 use keryx_consensus_core::ChainPath;
-use keryx_core::info;
+use keryx_core::{info, warn};
 use keryx_database::prelude::StoreResultExt;
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
@@ -46,6 +46,14 @@ fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
 /// Retained per-chain-block ledger snapshots; reorgs deeper than this fall back to a horizon refold.
 const SERVICE_SNAPSHOT_CAP: usize = 4_096;
 
+/// One strike-affecting event awaiting finality: a miss (burns, strike record, possibly a
+/// suspension) or a served-response streak reset — both persisted to the strike log so the
+/// refold baseline carries them.
+enum ServiceEvent {
+    Miss(ServiceMiss),
+    Reset(Hash),
+}
+
 /// RAM-only service-ledger state folded along the committed selected chain.
 #[derive(Default)]
 pub(super) struct ServiceLedgerSync {
@@ -54,10 +62,10 @@ pub(super) struct ServiceLedgerSync {
     snapshots: std::collections::BTreeMap<u64, ServiceLedger>,
     /// Chain index the ledger is folded up to.
     tip: Option<u64>,
-    /// Misses awaiting finality depth, in chain order as (chain index, daa, miss). Truncated on
-    /// reorg like the chain itself; entries deeper than finality are written to the burn store.
-    queue: std::collections::VecDeque<(u64, u64, ServiceMiss)>,
-    /// Highest miss daa already persisted to the burn store.
+    /// Events awaiting finality depth, in chain order as (chain index, daa, event). Truncated on
+    /// reorg like the chain itself; entries deeper than finality are written to the stores.
+    queue: std::collections::VecDeque<(u64, u64, ServiceEvent)>,
+    /// Highest event daa already persisted to the stores.
     deep_cursor_daa: u64,
     /// Miss daa keyed by `(miner, request_hash, strike count)`, kept across refolds so a miss is
     /// logged once. The count is part of the key: a request hash repeats whenever an identical
@@ -190,12 +198,19 @@ impl VirtualStateProcessor {
         let mut snapshot = ServiceStrikesSnapshot { virtual_daa_score, ..Default::default() };
         {
             let sync = self.service_ledger.lock();
-            snapshot.strikes = sync.ledger.strike_entries(virtual_daa_score);
+            snapshot.strikes = sync.ledger.strike_entries();
             snapshot.pending_burns = sync
                 .queue
                 .iter()
-                .map(|(_, daa, miss)| {
-                    (miss.miner, *daa, miss.consecutive_misses, miss.burned.len() as u32, miss.burned.iter().map(|c| c.value).sum())
+                .filter_map(|(_, daa, event)| match event {
+                    ServiceEvent::Miss(miss) => Some((
+                        miss.miner,
+                        *daa,
+                        miss.consecutive_misses,
+                        miss.burned.len() as u32,
+                        miss.burned.iter().map(|c| c.value).sum(),
+                    )),
+                    ServiceEvent::Reset(_) => None,
                 })
                 .collect();
         }
@@ -249,19 +264,22 @@ impl VirtualStateProcessor {
         claims
     }
 
-    /// Folds one committed chain block into `ledger` and returns its misses. No-op before
+    /// Folds one committed chain block into `ledger` and returns its outcome. No-op before
     /// `pom_v3_activation` (a per-block property, so the fold is canonical across nodes and IBD).
-    /// Misses only become enforceable once finality-deep (see `advance_service_ledger`).
+    /// `warmup` folds a block whose strike events are already persisted: request/vault memory only,
+    /// burned claims dropped through the burn set. Events only become enforceable once
+    /// finality-deep (see `advance_service_ledger`).
     fn fold_service_chain_block(
         &self,
         ledger: &mut ServiceLedger,
         sc: &impl SelectedChainStoreReader,
         hash: Hash,
         live: bool,
-    ) -> Vec<ServiceMiss> {
+        warmup: bool,
+    ) -> FoldOutcome {
         let daa = self.headers_store.get_daa_score(hash).unwrap();
         if !self.pom_v3_activation.is_active(daa) {
-            return Vec::new();
+            return FoldOutcome::default();
         }
         let (requests, responses) = self.service_events_of_chain_block(hash);
         let escrows = self.service_escrows_of_chain_block(hash);
@@ -276,14 +294,21 @@ impl VirtualStateProcessor {
                 );
             }
         }
-        ledger.on_chain_block(daa, &requests, &responses, &escrows, |tier| {
+        let cohort = |tier: u8| {
             let set = self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA);
             // Only the live fold logs: a refold replays the same armings.
             if live {
                 info!("service-bond: audit armed at daa {}, tier {}, cohort {}", daa, tier, set.len());
             }
             set
-        })
+        };
+        if warmup {
+            let burned = self.service_burned.read();
+            ledger.on_chain_block_warmup(daa, &requests, &responses, &escrows, &|op| burned.contains(op), cohort);
+            FoldOutcome::default()
+        } else {
+            ledger.on_chain_block(daa, &requests, &responses, &escrows, cohort)
+        }
     }
 
     /// Highest chain index whose daa is at or below `bound_daa`, searched down to `floor_idx`
@@ -313,16 +338,18 @@ impl VirtualStateProcessor {
     }
 
     /// Rebuilds the ledger up to chain index `to` by folding the committed chain from an empty
-    /// state — the cold-start and deep-reorg path. Strikes reset at every epoch multiple, so any
-    /// fold starting at or before `epoch_start - horizon` reproduces the incremental state: the
-    /// horizon margin covers the requests and vault claims still readable at the epoch start.
+    /// state — the cold-start and deep-reorg path. The strike baseline is reloaded from the
+    /// store (the exact state at the persisted frontier `cursor_daa`), blocks at or below the
+    /// frontier warm up request/vault memory only (their strike events already live in the
+    /// baseline, their burns in the burn set), and blocks above it fold normally and re-queue
+    /// their events.
     fn refold_service_ledger(
         &self,
         sc: &impl SelectedChainStoreReader,
         to: u64,
         pruning_point: Hash,
         cursor_daa: u64,
-        queue: &mut std::collections::VecDeque<(u64, u64, ServiceMiss)>,
+        queue: &mut std::collections::VecDeque<(u64, u64, ServiceEvent)>,
         logged: &mut std::collections::HashMap<(Hash, [u8; 32], u32), u64>,
     ) -> ServiceLedger {
         let mut ledger = ServiceLedger::default();
@@ -330,28 +357,51 @@ impl VirtualStateProcessor {
             return ledger;
         };
         let to_daa = self.headers_store.get_daa_score(to_hash).unwrap();
-        // Start at or before `epoch_start - horizon` of the earliest daa whose misses may be
-        // re-queued (the burn-store cursor, clamped by `to`): the fold then covers every such
-        // miss's full epoch with complete request/vault memory, so replayed misses and the state
-        // at `to` both match the incremental fold exactly.
-        // A pending miss is at most `finality_depth` old — anything older is already persisted —
-        // so the fold never needs to reach further back than that, epoch-aligned.
-        let anchor = cursor_daa.max(to_daa.saturating_sub(self.finality_depth)).min(to_daa);
-        let daa_bound = (anchor - anchor % SERVICE_STRIKE_EPOCH_DAA).saturating_sub(SERVICE_LEDGER_HORIZON_DAA);
+        ledger.set_base(std::sync::Arc::new(self.load_strike_base()));
+        // One horizon below the persisted frontier keeps every pending request and vault claim
+        // readable at the frontier warm. A frontier of zero (nothing persisted yet) falls back
+        // to the finality anchor: everything above it is re-derived.
+        let start = if cursor_daa > 0 { cursor_daa } else { to_daa.saturating_sub(self.finality_depth) };
+        let daa_bound = start.saturating_sub(SERVICE_LEDGER_HORIZON_DAA);
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
         let bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
+        if bottom == pruning_idx && pruning_idx > 0 {
+            let bottom_daa = self.headers_store.get_daa_score(sc.get_by_index(bottom).unwrap()).unwrap();
+            if bottom_daa > daa_bound {
+                warn!(
+                    "service-bond: cold refold clamped at the pruning point (daa {} > bound {}) — events below it cannot be re-derived",
+                    bottom_daa, daa_bound
+                );
+            }
+        }
         for i in (bottom + 1)..=to {
             let hash = sc.get_by_index(i).unwrap();
             let daa = self.headers_store.get_daa_score(hash).unwrap();
-            let misses = self.fold_service_chain_block(&mut ledger, sc, hash, false);
-            log_new_service_misses(logged, daa, &misses);
-            for miss in misses {
-                if daa > cursor_daa {
-                    queue.push_back((i, daa, miss));
+            let warmup = daa <= cursor_daa;
+            let outcome = self.fold_service_chain_block(&mut ledger, sc, hash, false, warmup);
+            log_new_service_misses(logged, daa, &outcome.misses);
+            if daa > cursor_daa {
+                for miss in outcome.misses {
+                    queue.push_back((i, daa, ServiceEvent::Miss(miss)));
+                }
+                for miner in outcome.resets {
+                    queue.push_back((i, daa, ServiceEvent::Reset(miner)));
                 }
             }
         }
         ledger
+    }
+
+    /// The refold baseline: the last log record per miner. The log iterates in event order
+    /// (daa-BE-prefixed keys), so a plain insert keeps the latest.
+    fn load_strike_base(&self) -> std::collections::BTreeMap<Hash, StrikeEntry> {
+        let mut base = std::collections::BTreeMap::new();
+        for entry in self.service_strike_store.iterator() {
+            let (key, record) = entry.unwrap();
+            let (_, miner) = crate::model::stores::service_strike::StrikeLogKey::parse(&key);
+            base.insert(miner, record);
+        }
+        base
     }
 
     /// Advances the service ledger along the committed `chain_path` — called from `resolve_virtual`
@@ -389,10 +439,13 @@ impl VirtualStateProcessor {
         for (k, h) in chain_path.added.iter().enumerate() {
             let idx = common + 1 + k as u64;
             let daa = self.headers_store.get_daa_score(*h).unwrap();
-            let misses = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, true);
-            log_new_service_misses(&mut sync.logged, daa, &misses);
-            for miss in misses {
-                sync.queue.push_back((idx, daa, miss));
+            let outcome = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, true, false);
+            log_new_service_misses(&mut sync.logged, daa, &outcome.misses);
+            for miss in outcome.misses {
+                sync.queue.push_back((idx, daa, ServiceEvent::Miss(miss)));
+            }
+            for miner in outcome.resets {
+                sync.queue.push_back((idx, daa, ServiceEvent::Reset(miner)));
             }
             let snapshot = sync.ledger.clone();
             sync.snapshots.insert(idx, snapshot);
@@ -401,43 +454,60 @@ impl VirtualStateProcessor {
             sync.snapshots.pop_first();
         }
         sync.tip = Some(tip_idx);
-        // Bound the logged set by the deepest span a refold can revisit.
-        sync.logged.retain(|_, daa| *daa + 2 * SERVICE_LEDGER_HORIZON_DAA > tip_daa);
-        // Misses now deeper than finality are reorg-immune on every acceptable POV: persist their
-        // burned outpoints and arm the spend rule.
+        // Bound the logged set by the deepest span a refold can revisit (the finality anchor
+        // plus the warmup horizon).
+        let logged_span = self.finality_depth + SERVICE_LEDGER_HORIZON_DAA;
+        sync.logged.retain(|_, daa| *daa + logged_span > tip_daa);
+        // Events now deeper than finality are reorg-immune on every acceptable POV: persist the
+        // burned outpoints, the strike records and the suspensions, in chain order.
         while sync.queue.front().is_some_and(|(_, daa, _)| daa + self.finality_depth <= tip_daa) {
-            let (_, daa, miss) = sync.queue.pop_front().unwrap();
-            for claim in miss.burned.iter() {
-                let key = crate::model::stores::ai_slash::OutpointKey::new(claim.outpoint.transaction_id, claim.outpoint.index);
-                self.service_burn_store.set(key, daa).unwrap();
-                self.service_burned.write().insert(claim.outpoint);
-            }
-            if !miss.burned.is_empty() {
-                info!(
-                    "service-bond: burn FINAL for miner {} — {} claims, miss daa {}",
-                    miss.miner,
-                    miss.burned.len(),
-                    daa
-                );
-            }
-            // A third strike, now reorg-immune, suspends the miner's production. The deadline is
-            // derived from the miss's own daa (deterministic), and the full window bites from
-            // finalization: [daa + finality, daa + finality + SERVICE_SUSPENSION_DAA].
-            if miss.penalty == ServicePenalty::Suspend {
-                let until = daa + self.finality_depth + SERVICE_SUSPENSION_DAA;
-                let prev = self.service_suspended.write().insert(miss.miner, until);
-                if prev.is_none_or(|p| p < until) {
-                    self.service_suspend_store.set(miss.miner, until).unwrap();
+            let (_, daa, event) = sync.queue.pop_front().unwrap();
+            match event {
+                ServiceEvent::Reset(miner) => {
+                    self.service_strike_store.set(daa, miner, StrikeEntry { count: 0, last_daa: 0 }).unwrap();
                 }
-                info!("service-bond: SUSPENSION FINAL for miner {} until daa {} (miss daa {})", miss.miner, until, daa);
+                ServiceEvent::Miss(miss) => {
+                    for claim in miss.burned.iter() {
+                        let key =
+                            crate::model::stores::ai_slash::OutpointKey::new(claim.outpoint.transaction_id, claim.outpoint.index);
+                        self.service_burn_store.set(key, daa).unwrap();
+                        self.service_burned.write().insert(claim.outpoint);
+                    }
+                    if !miss.burned.is_empty() {
+                        info!(
+                            "service-bond: burn FINAL for miner {} — {} claims, miss daa {}",
+                            miss.miner,
+                            miss.burned.len(),
+                            daa
+                        );
+                    }
+                    // Mirror the fold: an executed suspension logs as `{0, daa}` — the streak
+                    // restarts, the daa keeps the rate-limit armed and re-derives the deadline.
+                    let record = if miss.penalty == ServicePenalty::Suspend {
+                        StrikeEntry { count: 0, last_daa: daa }
+                    } else {
+                        StrikeEntry { count: miss.consecutive_misses, last_daa: daa }
+                    };
+                    self.service_strike_store.set(daa, miss.miner, record).unwrap();
+                    // A third strike, now reorg-immune, suspends the miner's production. The
+                    // deadline is derived from the miss's own daa (deterministic), and the full
+                    // window bites from finalization:
+                    // [daa + finality, daa + finality + SERVICE_SUSPENSION_DAA].
+                    if miss.penalty == ServicePenalty::Suspend {
+                        let until = daa + self.finality_depth + SERVICE_SUSPENSION_DAA;
+                        self.service_suspended.write().insert(miss.miner, until);
+                        info!("service-bond: SUSPENSION FINAL for miner {} until daa {} (miss daa {})", miss.miner, until, daa);
+                    }
+                }
             }
             sync.deep_cursor_daa = sync.deep_cursor_daa.max(daa);
         }
     }
 
     /// Boot-time load of the persisted burned outpoints into the RAM set consulted by transaction
-    /// validation, of the persisted suspensions into the RAM map consulted by block validation, and
-    /// of the deep cursor bounding the cold-start refold.
+    /// validation, of the suspensions (re-derived from the strike log) into the RAM map consulted
+    /// by block validation, and of the deep cursor — the persisted event frontier bounding the
+    /// cold-start refold.
     pub(crate) fn load_service_burned(&self) {
         let mut set = self.service_burned.write();
         let mut cursor = 0u64;
@@ -450,10 +520,15 @@ impl VirtualStateProcessor {
         }
         drop(set);
         let mut suspended = self.service_suspended.write();
-        for entry in self.service_suspend_store.iterator() {
-            let (key, until) = entry.unwrap();
-            let miner: [u8; 32] = key[..32].try_into().unwrap();
-            suspended.insert(Hash::from_bytes(miner), until);
+        for entry in self.service_strike_store.iterator() {
+            let (key, record) = entry.unwrap();
+            let (event_daa, miner) = crate::model::stores::service_strike::StrikeLogKey::parse(&key);
+            cursor = cursor.max(event_daa);
+            // `{0, daa > 0}` is an executed suspension; the log is in event order, so the last
+            // (largest) deadline per miner wins.
+            if record.count == 0 && record.last_daa > 0 {
+                suspended.insert(miner, record.last_daa + self.finality_depth + SERVICE_SUSPENSION_DAA);
+            }
         }
         drop(suspended);
         self.service_ledger.lock().deep_cursor_daa = cursor;

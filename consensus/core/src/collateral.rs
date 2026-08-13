@@ -100,17 +100,11 @@ pub fn service_window_daa(tier: u8, max_tokens: u32) -> u64 {
     SERVICE_WINDOW_BASE_DAA + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
-/// DAA horizon beyond which per-request ledger state is forgotten: pending requests expire, vault
-/// claims drop out and strike entries read as zero. Together with the strike-epoch reset this
-/// bounds the ledger's memory, so it stays RAM-only and IBD-safe. Set to twice the strike
-/// interval so a strike entry survives one inter-strike gap between epoch resets.
+/// DAA horizon beyond which per-request ledger state is forgotten: pending requests expire and
+/// vault claims drop out. This bounds the request/vault memory a fold must warm up; strike
+/// counts are NOT horizon-bound — they persist in the strike log and only reset on a served
+/// response or an executed suspension.
 pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
-
-/// Absolute-aligned strike epoch: the strike map resets at every multiple of this DAA span, so
-/// ledger state is a pure function of the chain since `epoch_start - SERVICE_LEDGER_HORIZON_DAA`
-/// and the incremental fold matches any refold starting at or before that point. Four strike
-/// intervals, so an unresponsive miner still escalates to suspension within one epoch.
-pub const SERVICE_STRIKE_EPOCH_DAA: u64 = 2 * SERVICE_LEDGER_HORIZON_DAA;
 
 /// Penalty applied to a miner for a missed service assignment, by consecutive-miss count.
 /// A successful serve resets the count.
@@ -219,24 +213,44 @@ struct Audit {
     window_end_daa: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct StrikeEntry {
-    count: u32,
-    last_daa: u64,
+/// One miner's strike state: consecutive-miss count and the daa of the last actual strike.
+/// Also the persisted strike-log record: `{0, 0}` marks a served-response reset, `{0, daa}` an
+/// executed suspension (the daa keeps the rate-limit window armed and re-derives the suspension
+/// deadline: `daa + finality + SERVICE_SUSPENSION_DAA`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrikeEntry {
+    pub count: u32,
+    pub last_daa: u64,
 }
 
-/// RAM-only request-lifecycle ledger, folded once per selected-chain block. Deterministic: state
-/// is a pure function of the accepted requests/responses stream and the cohort function, with
-/// BTreeMap ordering; any node folding the last [`SERVICE_LEDGER_HORIZON_DAA`] of chain from an
-/// empty ledger reaches the identical state. Never persisted.
+impl MemSizeEstimator for StrikeEntry {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+/// The strike-affecting outcomes of folding one chain block: the misses it closes and the miners
+/// whose streak a served response reset. Both are persisted to the strike log once finality-deep.
+#[derive(Clone, Debug, Default)]
+pub struct FoldOutcome {
+    pub misses: Vec<ServiceMiss>,
+    pub resets: Vec<Hash>,
+}
+
+/// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
+/// function of the accepted requests/responses stream, the cohort function and the persisted
+/// baseline, with BTreeMap ordering. The strike map is a delta over `base` — the persisted
+/// records at the fold anchor — and only the request/vault memory is window-bounded.
 #[derive(Clone, Debug, Default)]
 pub struct ServiceLedger {
     pending: std::collections::BTreeMap<[u8; 32], PendingRequest>,
+    /// Strike delta folded since the anchor; overlays `base` (delta wins, `count: 0` tombstones).
     strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
     /// Per-miner still-locked escrow claims, chain order (newest at the back).
     vault: std::collections::BTreeMap<Hash, std::collections::VecDeque<EscrowClaim>>,
-    /// Last folded strike epoch (`daa / SERVICE_STRIKE_EPOCH_DAA`).
-    epoch: u64,
+    /// Finality-anchored strike baseline (the persisted records at the fold anchor). Shared so
+    /// per-chain-block snapshots stay cheap to clone.
+    base: std::sync::Arc<std::collections::BTreeMap<Hash, StrikeEntry>>,
 }
 
 impl ServiceLedger {
@@ -254,14 +268,41 @@ impl ServiceLedger {
         requests: &[([u8; 32], u8, u32)],
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
+        cohort: impl FnMut(u8) -> Vec<Hash>,
+    ) -> FoldOutcome {
+        self.fold_inner(daa, requests, responses, escrows, None, cohort)
+    }
+
+    /// Folds a chain block whose strike events are already persisted (daa at or below the store
+    /// frontier): request and vault memory evolve normally, escrow claims already burned are
+    /// dropped through `is_burned` (the exact historical truth from the burn store), and the
+    /// strike map is left untouched — the baseline already carries those events.
+    pub fn on_chain_block_warmup(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
+        cohort: impl FnMut(u8) -> Vec<Hash>,
+    ) {
+        self.fold_inner(daa, requests, responses, escrows, Some(is_burned), cohort);
+    }
+
+    fn fold_inner(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
         mut cohort: impl FnMut(u8) -> Vec<Hash>,
-    ) -> Vec<ServiceMiss> {
-        let epoch = daa / SERVICE_STRIKE_EPOCH_DAA;
-        if epoch != self.epoch {
-            self.strikes.clear();
-            self.epoch = epoch;
-        }
+    ) -> FoldOutcome {
+        let warmup = warmup_burned.is_some();
         for (miner, claim) in escrows {
+            if warmup_burned.is_some_and(|is_burned| is_burned(&claim.outpoint)) {
+                continue;
+            }
             self.vault.entry(*miner).or_default().push_back(*claim);
         }
         for claims in self.vault.values_mut() {
@@ -271,6 +312,8 @@ impl ServiceLedger {
         }
         self.vault.retain(|_, claims| !claims.is_empty());
 
+        let mut outcome = FoldOutcome::default();
+
         // An authenticated response from a cohort member marks him as having served this audit
         // and resets his streak. Anyone else's response is ignored by the ledger.
         for (rh, responder) in responses {
@@ -279,14 +322,17 @@ impl ServiceLedger {
             if let Some(r) = responder {
                 if audit.cohort.binary_search(r).is_ok() && !audit.responded.contains(r) {
                     audit.responded.push(*r);
-                    self.strikes.remove(r);
+                    // A warmup fold leaves strikes alone: the baseline already carries this reset.
+                    if !warmup && self.strike_state(r).is_some_and(|e| e.count > 0) {
+                        self.strikes.insert(*r, StrikeEntry { count: 0, last_daa: 0 });
+                        outcome.resets.push(*r);
+                    }
                 }
             }
         }
 
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
 
-        let mut misses = Vec::new();
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
         for rh in hashes {
             let req = self.pending.get(&rh).unwrap();
@@ -294,16 +340,34 @@ impl ServiceLedger {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
                     for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m)) {
-                        // Rate-limit: a strike lands at most once per interval. A miss inside the
-                        // interval of the miner's last strike is a no-op — no escalation, no burn.
-                        if self.strikes.get(miner).is_some_and(|e| daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA) {
+                        if warmup {
+                            // The miss is already persisted: its burns came in through `is_burned`
+                            // and its strike lives in the baseline.
                             continue;
                         }
-                        let count = self.consecutive_misses(miner, daa) + 1;
+                        // Rate-limit: a strike lands at most once per interval. A miss inside the
+                        // interval of the miner's last strike is a no-op — no escalation, no burn.
+                        if self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
+                        {
+                            continue;
+                        }
+                        let count = self.consecutive_misses(miner) + 1;
                         self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
                         let penalty = strike_penalty(count);
                         let burned = self.burn(miner, penalty);
-                        misses.push(ServiceMiss { request_hash: rh, miner: *miner, consecutive_misses: count, penalty, burned });
+                        if penalty == ServicePenalty::Suspend {
+                            // The third strike executes the full drain and the suspension; the
+                            // streak restarts so a later miss escalates from one instead of
+                            // re-suspending forever. The strike daa keeps the rate-limit armed.
+                            self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: daa });
+                        }
+                        outcome.misses.push(ServiceMiss {
+                            request_hash: rh,
+                            miner: *miner,
+                            consecutive_misses: count,
+                            penalty,
+                            burned,
+                        });
                     }
                     self.pending.remove(&rh);
                 }
@@ -330,7 +394,7 @@ impl ServiceLedger {
                 .or_insert(PendingRequest { tier: *tier, max_tokens: *max_tokens, accepted_daa: daa, audit: None });
         }
 
-        misses
+        outcome
     }
 
     /// Takes the escrow claims a penalty burns out of the miner's vault: the `n` newest for
@@ -357,13 +421,21 @@ impl ServiceLedger {
         self.vault.get(miner).map(|claims| claims.iter().copied().collect()).unwrap_or_default()
     }
 
-    /// The miner's consecutive-miss count as of `daa`; entries older than the ledger horizon read
-    /// as zero.
-    pub fn consecutive_misses(&self, miner: &Hash, daa: u64) -> u32 {
-        match self.strikes.get(miner) {
-            Some(e) if e.last_daa + SERVICE_LEDGER_HORIZON_DAA > daa => e.count,
-            _ => 0,
-        }
+    /// Installs the persisted strike baseline the delta folds over (the store content at the
+    /// fold anchor).
+    pub fn set_base(&mut self, base: std::sync::Arc<std::collections::BTreeMap<Hash, StrikeEntry>>) {
+        self.base = base;
+    }
+
+    /// The miner's strike state: the folded delta, falling back to the persisted baseline.
+    fn strike_state(&self, miner: &Hash) -> Option<StrikeEntry> {
+        self.strikes.get(miner).or_else(|| self.base.get(miner)).copied()
+    }
+
+    /// The miner's consecutive-miss count. Never expires by time: only a served response or an
+    /// executed suspension resets it.
+    pub fn consecutive_misses(&self, miner: &Hash) -> u32 {
+        self.strike_state(miner).map(|e| e.count).unwrap_or(0)
     }
 
     /// Currently pending (accepted, unserved, unexpired) request count.
@@ -371,23 +443,22 @@ impl ServiceLedger {
         self.pending.len()
     }
 
-    /// Live strike entries as of `daa` as (miner, count, last strike daa); horizon-expired
-    /// entries are excluded.
-    pub fn strike_entries(&self, daa: u64) -> Vec<(Hash, u32, u64)> {
-        self.strikes
-            .iter()
-            .filter(|(_, e)| e.last_daa + SERVICE_LEDGER_HORIZON_DAA > daa)
-            .map(|(m, e)| (*m, e.count, e.last_daa))
-            .collect()
+    /// Live strike entries as (miner, count, last strike daa): the baseline and the delta merged
+    /// (delta wins), zero counts excluded.
+    pub fn strike_entries(&self) -> Vec<(Hash, u32, u64)> {
+        let mut merged = self.base.as_ref().clone();
+        for (m, e) in self.strikes.iter() {
+            merged.insert(*m, *e);
+        }
+        merged.into_iter().filter(|(_, e)| e.count > 0).map(|(m, e)| (m, e.count, e.last_daa)).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        eligible_miners, service_window_daa, strike_penalty, update_strikes, ServiceLedger, ServiceMiss, ServicePenalty,
-        AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_EPOCH_DAA, SERVICE_STRIKE_INTERVAL_DAA,
-        STRIKE_1_BURN_CLAIMS,
+        eligible_miners, service_window_daa, strike_penalty, update_strikes, FoldOutcome, ServiceLedger, ServicePenalty,
+        StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
     use keryx_hashes::Hash;
 
@@ -417,15 +488,15 @@ mod tests {
         let w = service_window_daa(0, 256);
 
         let rh = [7u8; 32];
-        assert!(ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], cohort_of(&set)).is_empty());
+        assert!(ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], cohort_of(&set)).misses.is_empty());
         // response in the audit-opening block is applied before the cohort exists: ignored
-        assert!(ledger.on_chain_block(101, &[], &[(rh, Some(a))], &[], cohort_of(&set)).is_empty());
+        assert!(ledger.on_chain_block(101, &[], &[(rh, Some(a))], &[], cohort_of(&set)).misses.is_empty());
         // a v1 (unsigned) response and a non-member response never count
-        assert!(ledger.on_chain_block(102, &[], &[(rh, None), (rh, Some(b))], &[], cohort_of(&set)).is_empty());
+        assert!(ledger.on_chain_block(102, &[], &[(rh, None), (rh, Some(b))], &[], cohort_of(&set)).misses.is_empty());
         assert_eq!(ledger.pending_len(), 1);
         // the member's signed response does; the audit closes clean at its window end
-        assert!(ledger.on_chain_block(103, &[], &[(rh, Some(a))], &[], cohort_of(&set)).is_empty());
-        assert!(ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).is_empty());
+        assert!(ledger.on_chain_block(103, &[], &[(rh, Some(a))], &[], cohort_of(&set)).misses.is_empty());
+        assert!(ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).misses.is_empty());
         assert_eq!(ledger.pending_len(), 0);
     }
 
@@ -441,7 +512,7 @@ mod tests {
         let r1 = [1u8; 32];
         ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
         ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1); // strike 1
 
         // a second miss well within the interval: no strike, no escalation
@@ -449,9 +520,9 @@ mod tests {
         let r2 = [2u8; 32];
         ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &[], cohort_of(&set));
         ledger.on_chain_block(d2 + 1, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert!(misses.is_empty(), "a miss inside the interval must not strike");
-        assert_eq!(ledger.consecutive_misses(&a, d2 + 2 + w), 1);
+        assert_eq!(ledger.consecutive_misses(&a), 1);
     }
 
     #[test]
@@ -468,7 +539,7 @@ mod tests {
         ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
         // the same hash lands again mid-window: the running audit must survive
         ledger.on_chain_block(102, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1, "the original window must still expire");
     }
 
@@ -485,7 +556,7 @@ mod tests {
         let r1 = [1u8; 32];
         ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
         ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 2);
         assert_eq!((misses[0].miner, misses[0].consecutive_misses), (a, 1));
         assert_eq!(misses[0].penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
@@ -495,19 +566,20 @@ mod tests {
         let r2 = [2u8; 32];
         ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &[], cohort_of(&set));
         ledger.on_chain_block(d2 + 1, &[], &[], &[], cohort_of(&set));
-        ledger.on_chain_block(d2 + 2, &[], &[(r2, Some(a))], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set));
+        let outcome = ledger.on_chain_block(d2 + 2, &[], &[(r2, Some(a))], &[], cohort_of(&set));
+        assert_eq!(outcome.resets, vec![a], "a's serve must reset (and report) his streak");
+        let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1);
         assert_eq!((misses[0].miner, misses[0].consecutive_misses), (b, 2));
         assert_eq!(misses[0].penalty, ServicePenalty::SlashAllPending);
-        assert_eq!(ledger.consecutive_misses(&a, d2 + 2 + w), 0);
+        assert_eq!(ledger.consecutive_misses(&a), 0);
 
         // round 3, another interval later: a (reset) restarts at 1, b reaches strike 3 -> Suspend
         let d3 = d2 + i + 100;
         let r3 = [3u8; 32];
         ledger.on_chain_block(d3, &[(r3, 0, 256)], &[], &[], cohort_of(&set));
         ledger.on_chain_block(d3 + 1, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(d3 + 2 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(d3 + 2 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 2);
         assert_eq!((misses[0].miner, misses[0].consecutive_misses), (a, 1));
         assert_eq!((misses[1].miner, misses[1].consecutive_misses), (b, 3));
@@ -525,7 +597,7 @@ mod tests {
         ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], cohort_of(&set));
         ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
         // window is past, but the closing block itself carries the response: no miss
-        assert!(ledger.on_chain_block(200 + w, &[], &[(rh, Some(a))], &[], cohort_of(&set)).is_empty());
+        assert!(ledger.on_chain_block(200 + w, &[], &[(rh, Some(a))], &[], cohort_of(&set)).misses.is_empty());
         assert_eq!(ledger.pending_len(), 0);
     }
 
@@ -533,8 +605,8 @@ mod tests {
     fn empty_cohort_drops_the_request() {
         let mut ledger = ServiceLedger::default();
         let rh = [5u8; 32];
-        assert!(ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], |_tier| Vec::new()).is_empty());
-        assert!(ledger.on_chain_block(101, &[], &[], &[], |_tier| Vec::new()).is_empty());
+        assert!(ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], |_tier| Vec::new()).misses.is_empty());
+        assert!(ledger.on_chain_block(101, &[], &[], &[], |_tier| Vec::new()).misses.is_empty());
         assert_eq!(ledger.pending_len(), 0);
     }
 
@@ -554,7 +626,7 @@ mod tests {
         let r1 = [1u8; 32];
         ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &escrows, cohort_of(&set));
         ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
         assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![6, 5, 4, 3, 2]);
@@ -567,7 +639,7 @@ mod tests {
         let fresh = [(a, claim(7, d2))];
         ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &fresh, cohort_of(&set));
         ledger.on_chain_block(d2 + 1, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].penalty, ServicePenalty::SlashAllPending);
         assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![7, 1]);
@@ -578,14 +650,14 @@ mod tests {
         let fresh = [(a, claim(8, d3))];
         ledger.on_chain_block(d3, &[(r3, 0, 256)], &[], &fresh, cohort_of(&set));
         ledger.on_chain_block(d3 + 1, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(d3 + 2 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(d3 + 2 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1);
         assert_eq!(misses[0].penalty, ServicePenalty::Suspend);
         assert_eq!(misses[0].burned.iter().map(|c| c.value).collect::<Vec<_>>(), vec![8]);
     }
 
     #[test]
-    fn horizon_expires_pendings_and_strikes() {
+    fn horizon_expires_pendings_but_strikes_persist() {
         let a = Hash::from_bytes([1u8; 32]);
         let set = [a];
         let mut ledger = ServiceLedger::default();
@@ -594,61 +666,163 @@ mod tests {
         let rh = [9u8; 32];
         ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], cohort_of(&set));
         ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
-        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1);
-        assert_eq!(ledger.consecutive_misses(&a, 102 + w), 1);
+        assert_eq!(ledger.consecutive_misses(&a), 1);
 
-        // beyond the horizon the strike reads zero and nothing lingers
-        let far = 102 + w + SERVICE_LEDGER_HORIZON_DAA;
-        assert_eq!(ledger.consecutive_misses(&a, far), 0);
+        // far beyond the horizon: request/vault memory is gone, the strike count is not
+        let far = 102 + w + 4 * SERVICE_LEDGER_HORIZON_DAA;
         ledger.on_chain_block(far, &[], &[], &[], cohort_of(&set));
         assert_eq!(ledger.pending_len(), 0);
+        assert_eq!(ledger.consecutive_misses(&a), 1);
+        assert_eq!(ledger.strike_entries().len(), 1);
     }
 
     #[test]
-    fn refold_reproduces_incremental_state_across_epochs() {
-        // A strike chain kept alive by one miss per interval, crossing an epoch boundary, plus
-        // one extra miss inside an interval (a no-op for the live fold). The refold from the
-        // canonical bound must emit the same misses as the incremental fold for every daa at or
-        // after the epoch start, and reach the same final strike count.
+    fn strikes_reset_only_on_serve() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+
+        let r1 = [1u8; 32];
+        ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], cohort_of(&set));
+        assert_eq!(ledger.on_chain_block(102 + w, &[], &[], &[], cohort_of(&set)).misses.len(), 1);
+
+        // only a served response resets — and the reset is reported for persistence
+        let far = 102 + w + 4 * SERVICE_LEDGER_HORIZON_DAA;
+        let r2 = [2u8; 32];
+        ledger.on_chain_block(far, &[(r2, 0, 256)], &[], &[], cohort_of(&set));
+        ledger.on_chain_block(far + 1, &[], &[], &[], cohort_of(&set));
+        let outcome = ledger.on_chain_block(far + 2, &[], &[(r2, Some(a))], &[], cohort_of(&set));
+        assert_eq!(outcome.resets, vec![a]);
+        assert_eq!(ledger.consecutive_misses(&a), 0);
+        assert!(ledger.strike_entries().is_empty());
+    }
+
+    #[test]
+    fn suspend_resets_the_streak() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+        let i = SERVICE_STRIKE_INTERVAL_DAA;
+
+        let mut last_penalty = ServicePenalty::None;
+        for k in 0..4u64 {
+            let d = 1_000 + k * (i + 10);
+            let rh = [k as u8 + 1; 32];
+            ledger.on_chain_block(d, &[(rh, 0, 256)], &[], &[], cohort_of(&set));
+            ledger.on_chain_block(d + 1, &[], &[], &[], cohort_of(&set));
+            let misses = ledger.on_chain_block(d + 2 + w, &[], &[], &[], cohort_of(&set)).misses;
+            assert_eq!(misses.len(), 1);
+            last_penalty = misses[0].penalty;
+            if k == 2 {
+                assert_eq!(last_penalty, ServicePenalty::Suspend);
+                // the executed suspension restarts the streak…
+                assert_eq!(ledger.consecutive_misses(&a), 0);
+            }
+        }
+        // …so the fourth miss escalates from one, not into an endless re-suspension
+        assert_eq!(last_penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
+    }
+
+    #[test]
+    fn refold_with_base_and_warmup_matches_incremental() {
+        // The cold-start invariant: a refold that overlays the persisted baseline, warms
+        // request/vault memory below the store frontier (dropping claims through the persisted
+        // burn set) and folds normally above it must reproduce the incremental state and
+        // re-emit exactly the events above the frontier.
+        use super::EscrowClaim;
+        use crate::tx::TransactionOutpoint;
+
         let a = Hash::from_bytes([1u8; 32]);
         let set = [a];
         let w = service_window_daa(0, 256);
         let i = SERVICE_STRIKE_INTERVAL_DAA;
-        let e = SERVICE_STRIKE_EPOCH_DAA;
+        let claim = |n: u64, daa: u64| EscrowClaim { outpoint: TransactionOutpoint::new(n.into(), 1), value: n, daa };
 
-        let mut accepts: Vec<u64> = (0..6).map(|k| 30_000 + k * (i + 2)).collect();
-        accepts.push(30_000 + i + 2 + 18_000);
-        accepts.sort_unstable();
-        let mut blocks: Vec<(u64, Vec<[u8; 32]>)> = Vec::new();
-        for (n, &d) in accepts.iter().enumerate() {
-            let rh = [n as u8 + 1; 32];
-            blocks.push((d, vec![rh]));
-            blocks.push((d + 1, Vec::new()));
-            blocks.push((d + 2 + w, Vec::new()));
+        // Four rounds spaced one interval apart: miss, miss, serve, miss.
+        let rounds: Vec<(u64, u8, bool)> = (0..4u64).map(|k| (1_000 + k * (i + 10), k as u8 + 1, k == 2)).collect();
+        let fold_round =
+            |ledger: &mut ServiceLedger, d: u64, n: u8, served: bool, warm: Option<&dyn Fn(&TransactionOutpoint) -> bool>| {
+                let rh = [n; 32];
+                let escrows = [(a, claim(n as u64, d))];
+                let mut outcomes = Vec::new();
+                match warm {
+                    Some(is_burned) => {
+                        ledger.on_chain_block_warmup(d, &[(rh, 0, 256)], &[], &escrows, is_burned, cohort_of(&set));
+                        ledger.on_chain_block_warmup(d + 1, &[], &[], &[], is_burned, cohort_of(&set));
+                        if served {
+                            ledger.on_chain_block_warmup(d + 2, &[], &[(rh, Some(a))], &[], is_burned, cohort_of(&set));
+                        }
+                        ledger.on_chain_block_warmup(d + 2 + w, &[], &[], &[], is_burned, cohort_of(&set));
+                    }
+                    None => {
+                        outcomes.push((d, ledger.on_chain_block(d, &[(rh, 0, 256)], &[], &escrows, cohort_of(&set))));
+                        outcomes.push((d + 1, ledger.on_chain_block(d + 1, &[], &[], &[], cohort_of(&set))));
+                        if served {
+                            outcomes.push((d + 2, ledger.on_chain_block(d + 2, &[], &[(rh, Some(a))], &[], cohort_of(&set))));
+                        }
+                        outcomes.push((d + 2 + w, ledger.on_chain_block(d + 2 + w, &[], &[], &[], cohort_of(&set))));
+                    }
+                }
+                outcomes
+            };
+
+        // Incremental fold over everything, collecting the persisted trace as it goes.
+        let mut inc = ServiceLedger::default();
+        let mut trace: Vec<(u64, FoldOutcome)> = Vec::new();
+        for &(d, n, served) in rounds.iter() {
+            trace.extend(fold_round(&mut inc, d, n, served, None));
         }
-        blocks.sort_unstable_by_key(|(d, _)| *d);
-        let to = blocks.last().unwrap().0;
-        let epoch_start = to - to % e;
 
-        let fold = |from: u64| {
-            let mut ledger = ServiceLedger::default();
-            let mut misses: Vec<(u64, ServiceMiss)> = Vec::new();
-            for (d, hashes) in blocks.iter().filter(|(d, _)| *d >= from) {
-                let reqs: Vec<_> = hashes.iter().map(|rh| (*rh, 0u8, 256u32)).collect();
-                misses.extend(ledger.on_chain_block(*d, &reqs, &[], &[], cohort_of(&set)).into_iter().map(|m| (*d, m)));
+        // "Persist" everything up to and including round 2's events (the store frontier).
+        let cursor = rounds[1].0 + 2 + w;
+        let mut base = std::collections::BTreeMap::new();
+        let mut burned_set = std::collections::HashSet::new();
+        for (d, outcome) in trace.iter().filter(|(d, _)| *d <= cursor) {
+            for miss in outcome.misses.iter() {
+                let record = if miss.penalty == ServicePenalty::Suspend {
+                    StrikeEntry { count: 0, last_daa: *d }
+                } else {
+                    StrikeEntry { count: miss.consecutive_misses, last_daa: *d }
+                };
+                base.insert(miss.miner, record);
+                for c in miss.burned.iter() {
+                    burned_set.insert(c.outpoint);
+                }
             }
-            (ledger, misses)
+            for miner in outcome.resets.iter() {
+                base.insert(*miner, StrikeEntry { count: 0, last_daa: 0 });
+            }
+        }
+
+        // Refold: baseline + warmup below the frontier, normal fold above it.
+        let mut refolded = ServiceLedger::default();
+        refolded.set_base(std::sync::Arc::new(base));
+        let is_burned = |op: &TransactionOutpoint| burned_set.contains(op);
+        let mut replayed: Vec<(u64, FoldOutcome)> = Vec::new();
+        for &(d, n, served) in rounds.iter() {
+            if d + 2 + w <= cursor {
+                fold_round(&mut refolded, d, n, served, Some(&is_burned));
+            } else {
+                replayed.extend(fold_round(&mut refolded, d, n, served, None));
+            }
+        }
+
+        let _to = rounds.last().unwrap().0 + 2 + w;
+        assert_eq!(inc.consecutive_misses(&a), refolded.consecutive_misses(&a));
+        assert_eq!(inc.strike_entries(), refolded.strike_entries());
+        assert_eq!(inc.vault_claims(&a), refolded.vault_claims(&a));
+        let events_above = |t: &[(u64, FoldOutcome)]| {
+            t.iter()
+                .filter(|(d, _)| *d > cursor)
+                .flat_map(|(d, o)| o.misses.iter().map(move |m| (*d, m.miner, m.consecutive_misses, m.penalty)))
+                .collect::<Vec<_>>()
         };
-
-        let (inc, inc_misses) = fold(0);
-        let (refolded, ref_misses) = fold(epoch_start.saturating_sub(SERVICE_LEDGER_HORIZON_DAA));
-
-        let recent = |ms: &[(u64, ServiceMiss)]| ms.iter().filter(|(d, _)| *d >= epoch_start).cloned().collect::<Vec<_>>();
-        assert_eq!(recent(&inc_misses), recent(&ref_misses), "misses since the epoch start must be fold-invariant");
-        assert_eq!(inc.consecutive_misses(&a, to), refolded.consecutive_misses(&a, to));
-        // the boundary reset restarted the chain: the post-boundary strikes count from 1
-        assert_eq!(recent(&inc_misses).iter().map(|(_, m)| m.consecutive_misses).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(events_above(&trace), events_above(&replayed), "events above the frontier must replay identically");
     }
 
     #[test]
@@ -687,5 +861,4 @@ mod tests {
         }
         assert_eq!(c, 0);
     }
-
 }

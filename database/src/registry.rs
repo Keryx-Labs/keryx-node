@@ -135,9 +135,11 @@ pub enum DatabaseStorePrefixes {
     PomProof = 195,
     /// Service-bond burned escrow outpoints (finality-deep misses): outpoint → miss daa.
     ServiceBurn = 196,
-    /// Service-bond production suspensions (finality-deep third strikes): miner escrow key →
-    /// suspension deadline DAA. A miner's blocks are rejected while their daa is below it.
-    ServiceSuspend = 197,
+    /// Service-bond strike log (finality-deep events, append-only): `daa (BE) || miner identity`
+    /// → (consecutive misses, last strike daa). The fold's strike baseline is the last record
+    /// per miner; counts only reset on a served response or an executed suspension, never by
+    /// time. Suspensions are the `{0, daa > 0}` rows. (197 was the retired suspend store.)
+    ServiceStrike = 198,
 
     // ---- Separator ----
     /// Reserved as a separator

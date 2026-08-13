@@ -138,9 +138,10 @@ pub struct VirtualStateProcessor {
     pub(super) service_burned: parking_lot::RwLock<std::collections::HashSet<keryx_consensus_core::tx::TransactionOutpoint>>,
     pub(super) service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
     /// Finality-deep production suspensions (miner escrow key → deadline daa), persisted counterpart
-    /// in `service_suspend_store`. Consulted by block validation.
+    /// Consulted by block validation; rebuilt from the strike log at boot.
     pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, u64>>,
-    pub(super) service_suspend_store: Arc<crate::model::stores::service_suspend::DbServiceSuspendStore>,
+    /// Strike log: the finality-anchored baseline the ledger folds over.
+    pub(super) service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -336,7 +337,7 @@ impl VirtualStateProcessor {
             service_burned: Default::default(),
             service_burn_store: storage.service_burn_store.clone(),
             service_suspended: Default::default(),
-            service_suspend_store: storage.service_suspend_store.clone(),
+            service_strike_store: storage.service_strike_store.clone(),
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),

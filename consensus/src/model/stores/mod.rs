@@ -4,7 +4,7 @@ pub mod age_buckets;
 pub mod maturation_queue;
 pub mod ai_slash;
 pub mod service_burn;
-pub mod service_suspend;
+pub mod service_strike;
 pub mod collateral;
 pub mod block_transactions;
 pub mod block_window_cache;
