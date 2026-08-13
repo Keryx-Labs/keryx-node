@@ -251,6 +251,23 @@ impl BlockBodyProcessor {
         );
         let tier = tiers.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
 
+        // H6: the block declares its proven tier in the coinbase (`/ai:tier:N`) so a freshly
+        // synced node can read it for the service-bond cohort fold without the (GC-able) proof.
+        // Bind the declaration to the proof here, on the live path, so a canonical block always
+        // declares its true tier. A block that omits the declaration is accepted (the fold then
+        // deterministically sees no tier for it); one that declares a wrong tier is rejected.
+        if pom_v3 {
+            let cb = self
+                .coinbase_manager
+                .deserialize_coinbase_payload(&block.transactions[0].payload)
+                .map_err(RuleError::BadCoinbasePayload)?;
+            if let Some(declared) = keryx_consensus_core::collateral::parse_declared_tier(cb.miner_data.extra_data) {
+                if declared != proof.tier {
+                    return Err(RuleError::PomDeclaredTierMismatch(declared, proof.tier));
+                }
+            }
+        }
+
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
         let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
         // H5.1 (emergency relaunch): the walk seed derives from the v2-salted pph words — blocks

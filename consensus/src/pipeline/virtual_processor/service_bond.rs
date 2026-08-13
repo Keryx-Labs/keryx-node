@@ -2,8 +2,7 @@ use super::VirtualStateProcessor;
 use crate::processes::service_commit;
 use crate::model::stores::{
     acceptance_data::AcceptanceDataStoreReader, block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader,
-    ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, pom_tier::PomTierStoreReader,
-    selected_chain::SelectedChainStoreReader,
+    ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss, ServicePenalty,
@@ -13,7 +12,6 @@ use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
 use keryx_consensus_core::ChainPath;
 use keryx_core::{info, warn};
-use keryx_database::prelude::StoreResultExt;
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
 use keryx_txscript::script_class::ScriptClass;
@@ -165,9 +163,12 @@ fn log_new_service_misses(
 impl VirtualStateProcessor {
     /// `(identity, proven tier, delegated escrow key)` of each paid mergeset blue of chain block
     /// `hash` — the same blue set the coinbase rewards. The identity is [`miner_key`] of the
-    /// blue's payout SPK: the identity that holds the bond and takes the penalties; the escrow
-    /// key is the hot key it delegated to (cert enforced by block validity past the gate). Blues
-    /// without a stored tier or without an escrow announcement are skipped.
+    /// blue's payout SPK; the escrow key is the hot key it delegated to (cert enforced by block
+    /// validity past the gate). The tier is read from the blue's coinbase declaration (`/ai:tier:`),
+    /// NOT `pom_tier_store`: the coinbase is committed via the merkle root and present on every
+    /// node for blocks above the pruning point, so the cohort fold is identical on a freshly synced
+    /// node, whereas the tier store cannot be populated for proofless historical bodies. Blues
+    /// without a tier declaration or an escrow announcement are skipped.
     pub(super) fn service_producers_of_chain_block(&self, hash: Hash) -> Vec<(Hash, u8, Hash)> {
         let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
         let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
@@ -176,10 +177,11 @@ impl VirtualStateProcessor {
             .iter()
             .filter(|b| !non_daa.contains(b))
             .filter_map(|b| {
-                let tier = self.pom_tier_store.get(*b).optional().unwrap()?;
                 let txs = self.block_transactions_store.get(*b).unwrap();
                 let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
-                let pubkey = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(coinbase.miner_data.extra_data)?;
+                let extra = coinbase.miner_data.extra_data;
+                let tier = keryx_consensus_core::collateral::parse_declared_tier(extra)?;
+                let pubkey = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(extra)?;
                 Some((miner_key(&coinbase.miner_data.script_public_key), tier, escrow_miner_key(&pubkey)))
             })
             .collect()
