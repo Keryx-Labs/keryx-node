@@ -275,9 +275,9 @@ impl HandleRelayInvsFlow {
                 Err(RuleError::MissingParents(missing_parents)) => {
                     debug!("Block {} is orphan and has missing parents: {:?}", block.hash(), missing_parents);
                     if let Some(mut ancestor_batch) = self.process_orphan(&session, block.clone(), inv.known_within_range).await? {
-                        // Block is not an orphan, retrying (same proof policy as the first attempt)
+                        // Block is not an orphan, retrying with the exact proof policy of the first attempt.
                         let BlockValidationFutures { block_task: block_task_inner, virtual_state_task: virtual_state_task_inner } =
-                            if inv.is_orphan_root {
+                            if inv.is_orphan_root && !proof_required {
                                 session.validate_and_insert_block_ibd(block.clone())
                             } else {
                                 session.validate_and_insert_block(block.clone())
