@@ -476,7 +476,7 @@ async fn burned_escrow_outpoint_spend_is_rejected() {
         vec![],
     );
     let res = vp.validate_transaction_in_utxo_context(&tx, &UtxoCollection::default(), 1, TxValidationFlags::Full);
-    assert!(matches!(res, Err(TxRuleError::SpendOfBurnedEscrow)));
+    assert!(matches!(res, Err(TxRuleError::SpendOfBurnedEscrow(_))));
 
     // An untouched outpoint still fails only on the missing entry, proving the set is selective.
     let other = TransactionOutpoint::new(8u64.into(), 1);

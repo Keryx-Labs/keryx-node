@@ -1410,6 +1410,23 @@ impl VirtualStateProcessor {
         })
     }
 
+    /// If any of `outpoints` is a burned escrow outpoint, returns the full burned set formatted as
+    /// space-separated `txid:index`. A claiming miner reads this to slash exactly the burned members
+    /// and re-batch the rest instead of bisecting to find them. `None` when none are burned.
+    fn burned_outpoints_msg<'b>(&self, outpoints: impl Iterator<Item = &'b TransactionOutpoint>) -> Option<String> {
+        let guard = self.service_burned.read();
+        let mut msg = String::new();
+        for o in outpoints {
+            if guard.contains(o) {
+                if !msg.is_empty() {
+                    msg.push(' ');
+                }
+                msg.push_str(&format!("{}:{}", o.transaction_id, o.index));
+            }
+        }
+        (!msg.is_empty()).then_some(msg)
+    }
+
     /// Attempts to populate the transaction with UTXO entries and performs all utxo-related tx validations
     pub(super) fn validate_transaction_in_utxo_context<'a>(
         &self,
@@ -1425,14 +1442,16 @@ impl VirtualStateProcessor {
         // lost in the result->ipfs_cid migration, so every honest AiResponse was slashable by anyone.
         // Escrows are therefore always spendable now; no slashed-escrow check is performed.
 
+        // Service-bond (H6): a finality-deep miss burns the miner's escrow claims — spending one is
+        // invalid forever. The set only ever contains reorg-immune entries, so every POV reaches the
+        // same verdict. Report the full burned set (not the first), so a claiming miner slashes
+        // exactly those and re-batches the rest. A burned outpoint is still present in the view
+        // (burn is an overlay, not a deletion), so this never masks a genuine missing-input.
+        if let Some(msg) = self.burned_outpoints_msg(transaction.inputs.iter().map(|i| &i.previous_outpoint)) {
+            return Err(TxRuleError::SpendOfBurnedEscrow(msg));
+        }
         let mut entries = Vec::with_capacity(transaction.inputs.len());
         for input in transaction.inputs.iter() {
-            // Service-bond (H6): a finality-deep miss burns the miner's escrow claims — spending
-            // one is invalid forever. The set only ever contains reorg-immune entries, so every
-            // POV reaches the same verdict.
-            if self.service_burned.read().contains(&input.previous_outpoint) {
-                return Err(TxRuleError::SpendOfBurnedEscrow);
-            }
             if let Some(mut entry) = utxo_view.get(&input.previous_outpoint) {
                 if let Some(anchor) = historical_anchor_override(&input.previous_outpoint)
                     && entry.effective_daa != anchor
@@ -1492,10 +1511,8 @@ impl VirtualStateProcessor {
         args: &TransactionValidationArgs,
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
-        for input in mutable_tx.tx.inputs.iter() {
-            if self.service_burned.read().contains(&input.previous_outpoint) {
-                return Err(TxRuleError::SpendOfBurnedEscrow);
-            }
+        if let Some(msg) = self.burned_outpoints_msg(mutable_tx.tx.inputs.iter().map(|i| &i.previous_outpoint)) {
+            return Err(TxRuleError::SpendOfBurnedEscrow(msg));
         }
 
         // Calc the contextual storage mass
