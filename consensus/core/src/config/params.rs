@@ -1599,17 +1599,18 @@ pub const MAINNET_PARAMS: Params = Params {
     // H5.4 relaunch difficulty reset — additive, gate = the frozen virtual daa of the v1.4.2
     // relaunch chain (see H5_4_ACTIVATION_DAA for the placement rule).
     difficulty_reset_activation_h5_4: ForkActivation::new(H5_4_ACTIVATION_DAA),
-    // H6 reset — arm together with `pom_v3_activation`, at the same score.
-    difficulty_reset_activation_h6: ForkActivation::never(),
-    h6_reset_bits: None,
+    // H6 reset — armed together with `pom_v3_activation`, at the same score. Target set ~10000x
+    // easier than the pre-fork difficulty: the matrix walk is measured ~7500x slower than the
+    // pre-H6 walk, with headroom for partial adoption. The difficulty window re-converges after.
+    difficulty_reset_activation_h6: ForkActivation::new(77_203_262),
+    h6_reset_bits: Some(0x1e32f496),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
     h5_1_activation: ForkActivation::new(H5_1_ACTIVATION_DAA),
     h5_2_activation: ForkActivation::new(H5_2_ACTIVATION_DAA),
-    // H6 matrix walk: UNSCHEDULED on mainnet (study + testnet first; needs its own
-    // difficulty-reset companion when armed).
-    pom_v3_activation: ForkActivation::never(),
+    // H6 matrix walk, armed together with its difficulty-reset companion at the same score.
+    pom_v3_activation: ForkActivation::new(77_203_262),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1709,14 +1710,13 @@ pub const TESTNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
     // MUST equal pom_v3_activation.
-    difficulty_reset_activation_h6: ForkActivation::new(108_000),
+    difficulty_reset_activation_h6: ForkActivation::new(1000),
     h6_reset_bits: Some(0x1f7fffff),
     h5_activation: ForkActivation::new(0),
     h5_1_activation: ForkActivation::new(0),
     h5_2_activation: ForkActivation::new(0),
-    // H6 matrix walk — the only era transition this testnet crosses. ~3 h of mining at 10 BPS,
-    // leaving participants time to join before the gate.
-    pom_v3_activation: ForkActivation::new(108_000),
+    // H6 matrix walk — the only era transition this testnet crosses.
+    pom_v3_activation: ForkActivation::new(1000),
     chain_anchor: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
