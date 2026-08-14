@@ -5,8 +5,17 @@ use std::collections::HashMap;
 pub type UtxoCollection = HashMap<TransactionOutpoint, UtxoEntry>;
 
 pub trait UtxoCollectionExtensions {
-    /// Checks if the `outpoint` key exists with an entry that holds `entry.block_daa_score == daa_score`
+    /// Checks if the `outpoint` key exists with an entry that holds `entry.block_daa_score == daa_score`.
+    /// This is the COIN identity: an outpoint plus its creation score names one coin regardless of
+    /// the derived age anchor, so removal always annihilates the matching addition.
     fn contains_with_daa_score(&self, outpoint: &TransactionOutpoint, daa_score: u64) -> bool;
+
+    /// Checks if the `outpoint` key exists with an entry matching `entry` on both committed
+    /// dimensions (`block_daa_score` AND `effective_daa`). Used where a re-addition may legitimately
+    /// carry a different anchor than the pending removal: such a pair is a value replacement and
+    /// must survive composition (remove old + add new), not cancel — cancelling would leave the
+    /// store holding an entry the committed multiset no longer contains.
+    fn contains_matching_entry(&self, outpoint: &TransactionOutpoint, entry: &UtxoEntry) -> bool;
 
     /// Adds all entries from `other` to `self`.
     /// Note that this means that values from `other` might override values of `self`.
@@ -34,6 +43,14 @@ impl UtxoView for UtxoCollection {
 impl UtxoCollectionExtensions for UtxoCollection {
     fn contains_with_daa_score(&self, outpoint: &TransactionOutpoint, daa_score: u64) -> bool {
         if let Some(entry) = self.get(outpoint) { entry.block_daa_score == daa_score } else { false }
+    }
+
+    fn contains_matching_entry(&self, outpoint: &TransactionOutpoint, entry: &UtxoEntry) -> bool {
+        if let Some(existing) = self.get(outpoint) {
+            existing.block_daa_score == entry.block_daa_score && existing.effective_daa == entry.effective_daa
+        } else {
+            false
+        }
     }
 
     fn add_collection(&mut self, other: &Self) {
@@ -107,6 +124,26 @@ pub(super) fn intersection_with_remainder_having_daa_score_in_place(
 ) {
     for (outpoint, entry) in this.iter() {
         if other.contains_with_daa_score(outpoint, entry.block_daa_score) {
+            result.insert(*outpoint, entry.clone());
+        } else {
+            remainder.insert(*outpoint, entry.clone());
+        }
+    }
+}
+
+/// Same split as [`intersection_with_remainder_having_daa_score_in_place`], but the intersection
+/// additionally demands equality on the age anchor. A same-coin pair whose anchors differ lands in
+/// `remainder`, so composition preserves it as an explicit replacement (remove old + add new)
+/// instead of cancelling — cancellation would leave downstream state (store, coin-age buckets,
+/// maturation queue) holding the stale value the committed multiset no longer contains.
+pub(super) fn intersection_with_remainder_matching_entry_in_place(
+    this: &UtxoCollection,
+    other: &UtxoCollection,
+    result: &mut UtxoCollection,
+    remainder: &mut UtxoCollection,
+) {
+    for (outpoint, entry) in this.iter() {
+        if other.contains_matching_entry(outpoint, entry) {
             result.insert(*outpoint, entry.clone());
         } else {
             remainder.insert(*outpoint, entry.clone());

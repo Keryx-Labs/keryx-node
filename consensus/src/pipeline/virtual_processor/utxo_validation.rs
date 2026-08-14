@@ -43,7 +43,10 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{
+        MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint,
+        ValidatedTransaction, VerifiableTransaction,
+    },
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -295,24 +298,29 @@ impl VirtualStateProcessor {
         // the `utxo_commitment` verified above already pins this block's resulting UTXO set to the
         // canonical chain, so the block's coinbase outputs are trusted without re-deriving the ratio
         // bracket — which such a node cannot yet reproduce for the post-fork canonical chain.
-        // Coinbase ratio/tier verification. We ALWAYS compute the expected coinbase and log any
-        // mismatch (so the producer's and every validator's computation can be compared across nodes);
-        // we only REJECT when `enforce` holds. Enforcement requires the relaunch-frontier gate
+        // Coinbase ratio/tier verification. Enforcement requires the relaunch-frontier gate
         // (`ratio_verification_activation`, so non-revalidatable pre-relaunch history is trusted — its
         // `utxo_commitment`, checked above, pins the state) AND the node not being in a trust window
         // (archival / `KERYX_TRUST_COINBASE` / fast-sync catch-up). With the gate set to `never()`,
         // enforcement is OFF (observe-only) network-wide — the relaunch runs while we confirm the
         // prefix-sum makes all nodes agree, then enforcement is switched on by setting the gate DAA.
+        //
+        // When not enforcing, the expected coinbase is only computed under `KERYX_RATIO_DEBUG`
+        // (cross-node comparison logs). The ratio balances fold `sp_diff`, which grows with the
+        // distance from the committed virtual — computing it per block turns a long re-validation
+        // walk quadratic, so a trusted transition must not pay for a comparison it discards.
         let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase();
-        self.verify_coinbase_transaction(
-            &txs[0],
-            header.daa_score,
-            &ctx.ghostdag_data,
-            &ctx.mergeset_rewards,
-            &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
-            &[sp_diff, &ctx.mergeset_diff],
-            enforce,
-        )?;
+        if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
+            self.verify_coinbase_transaction(
+                &txs[0],
+                header.daa_score,
+                &ctx.ghostdag_data,
+                &ctx.mergeset_rewards,
+                &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+                &[sp_diff, &ctx.mergeset_diff],
+                enforce,
+            )?;
+        }
 
         // Sealed service-state commitment: the header must commit the canonical service state
         // at its own pruning point. This runs in chain order (the local flush frontier is at
@@ -1425,7 +1433,13 @@ impl VirtualStateProcessor {
             if self.service_burned.read().contains(&input.previous_outpoint) {
                 return Err(TxRuleError::SpendOfBurnedEscrow);
             }
-            if let Some(entry) = utxo_view.get(&input.previous_outpoint) {
+            if let Some(mut entry) = utxo_view.get(&input.previous_outpoint) {
+                if let Some(anchor) = historical_anchor_override(&input.previous_outpoint)
+                    && entry.effective_daa != anchor
+                {
+                    info!("Historical anchor override applied for {}", input.previous_outpoint);
+                    entry.effective_daa = anchor;
+                }
                 entries.push(entry);
             } else {
                 // Missing at least one input. For perf considerations, we report once a single miss is detected and avoid collecting all possible misses.
@@ -1571,6 +1585,28 @@ impl VirtualStateProcessor {
             keryx_merkle::calc_merkle_root(accepted_tx_ids),
         )
     }
+}
+
+/// Age anchors the canonical chain committed for specific historical spends, where clean
+/// re-derivation computes a different value. Applied at input population so re-validation of the
+/// canonical chain reproduces the committed state byte-for-byte. Keyed by outpoint; every listed
+/// coin is long spent, so the table is inert outside historical validation.
+const HISTORICAL_ANCHOR_OVERRIDES: &[(Hash, u32, u64)] = &[(
+    // aeb4e536e444210419a3bf2fae8e582816ad36339be0f429c0eaac611e3bcab3:1 — spent at DAA 74807554
+    // committing anchor 74780462; re-derivation yields 74780464.
+    Hash::from_bytes([
+        0xae, 0xb4, 0xe5, 0x36, 0xe4, 0x44, 0x21, 0x04, 0x19, 0xa3, 0xbf, 0x2f, 0xae, 0x8e, 0x58, 0x28, 0x16, 0xad, 0x36, 0x33,
+        0x9b, 0xe0, 0xf4, 0x29, 0xc0, 0xea, 0xac, 0x61, 0x1e, 0x3b, 0xca, 0xb3,
+    ]),
+    1,
+    74780462,
+)];
+
+fn historical_anchor_override(outpoint: &TransactionOutpoint) -> Option<u64> {
+    HISTORICAL_ANCHOR_OVERRIDES
+        .iter()
+        .find(|(txid, index, _)| outpoint.transaction_id == *txid && outpoint.index == *index)
+        .map(|&(_, _, anchor)| anchor)
 }
 
 /// The `AiRequest` rules that need nothing but the transaction itself: the per-model
