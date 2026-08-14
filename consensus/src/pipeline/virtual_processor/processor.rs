@@ -291,6 +291,13 @@ pub struct VirtualStateProcessor {
     // `KERYX_TRUST_COINBASE` operator override, read once at construction (it never changes at
     // runtime) so the per-block `trust_coinbase()` hot path avoids a fresh env lookup per coinbase.
     pub(super) trust_coinbase_env: bool,
+    // `KERYX_REVALIDATE_DISQUALIFIED` operator override, read once at construction: cached
+    // `StatusDisqualifiedFromChain` verdicts are ignored and the UTXO state is recomputed, letting
+    // a node whose store carries stale disqualifications re-attempt the chain after a binary
+    // upgrade. Blocks that fail again are simply re-marked; blocks that pass are committed
+    // `StatusUTXOValid` permanently, so the flag is meant to be set for one recovery run and then
+    // removed.
+    pub(super) revalidate_disqualified_env: bool,
 }
 
 impl VirtualStateProcessor {
@@ -321,6 +328,10 @@ impl VirtualStateProcessor {
                 "Ratio/tier coinbase verification DISABLED ({}) — following the chain on UTXO-commitment trust only.",
                 if is_archival { "archival node" } else { "KERYX_TRUST_COINBASE set" }
             );
+        }
+        let revalidate_disqualified_env = std::env::var("KERYX_REVALIDATE_DISQUALIFIED").is_ok();
+        if revalidate_disqualified_env {
+            info!("KERYX_REVALIDATE_DISQUALIFIED set — cached chain disqualifications will be re-validated. Remove the flag after recovery.");
         }
         Self {
             receiver,
@@ -414,6 +425,7 @@ impl VirtualStateProcessor {
             coin_age_retention: params.finality_depth(),
             is_archival,
             trust_coinbase_env,
+            revalidate_disqualified_env,
         }
     }
 
@@ -585,8 +597,8 @@ impl VirtualStateProcessor {
     /// `to` itself (with the exception of returning `from` if `to` is already known to be UTXO disqualified).
     /// When returning it is guaranteed that `diff` holds the diff of the returned block from virtual
     fn calculate_utxo_state_relatively(&self, stores: &VirtualStores, diff: &mut UtxoDiff, from: Hash, to: Hash) -> Hash {
-        // Avoid reorging if disqualified status is already known
-        if self.statuses_store.read().get(to).unwrap() == StatusDisqualifiedFromChain {
+        // Avoid reorging if disqualified status is already known (unless re-validation is forced)
+        if !self.revalidate_disqualified_env && self.statuses_store.read().get(to).unwrap() == StatusDisqualifiedFromChain {
             return from;
         }
 
@@ -614,7 +626,19 @@ impl VirtualStateProcessor {
         // Walk back up to the new virtual selected parent candidate
         let mut chain_block_counter = 0;
         let mut chain_disqualified_counter = 0;
+        // A long walk (recovery re-validation, deep reorg) is otherwise silent at INFO level;
+        // surface progress at a low rate so a grind is distinguishable from a hang.
+        let mut last_progress_log = std::time::Instant::now();
         for (selected_parent, current) in self.reachability_service.forward_chain_iterator(split_point, to, true).tuple_windows() {
+            if last_progress_log.elapsed().as_secs() >= 10 {
+                last_progress_log = std::time::Instant::now();
+                info!(
+                    "Virtual chain resolution: re-validated {} chain blocks ({} disqualified), at daa score {}",
+                    chain_block_counter,
+                    chain_disqualified_counter,
+                    self.headers_store.get_daa_score(current).unwrap_or_default()
+                );
+            }
             if selected_parent != diff_point {
                 // This indicates that the selected parent is disqualified, propagate up and continue
                 let statuses_guard = self.statuses_store.upgradable_read();
@@ -631,7 +655,9 @@ impl VirtualStateProcessor {
                     diff_point = current;
                 }
                 Err(StoreError::KeyNotFound(_)) => {
-                    if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
+                    if !self.revalidate_disqualified_env
+                        && self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain
+                    {
                         // Current block is already known to be disqualified
                         continue;
                     }
@@ -1177,7 +1203,7 @@ impl VirtualStateProcessor {
             //     this block's parents, because the valid sink may lie BELOW a disqualified block
             //     (a valid block built on top of one). A disqualified branch is bounded (real
             //     bodies), so this is not the header-only overhang case. Fixes a sink-search stall.
-            if candidate_status == StatusDisqualifiedFromChain {
+            if candidate_status == StatusDisqualifiedFromChain && !self.revalidate_disqualified_env {
                 if !self.pom_activation.is_active(self.headers_store.get_daa_score(candidate).unwrap()) {
                     continue;
                 }
