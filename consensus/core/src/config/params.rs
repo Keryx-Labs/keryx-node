@@ -590,11 +590,25 @@ pub const TIER_REWARD_BPS: [u64; 4] = [8_200, 8_800, 9_400, 10_000];
 ///   4  Llama-3.3-70B-Q2  --very-high     0%
 pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 
-/// Tier-reward schedule for a block at `daa_score`: 5-tier H2 once `very_light_activation` is live,
-/// legacy 4-tier before. Chosen per block from that block's own DAA (never frozen) — same gating
-/// discipline as `pom_tiers`, so archival/IBD recomputation of pre-H2 blocks stays canonical.
-pub fn tier_reward_bps(very_light_active: bool) -> &'static [u64] {
-    if very_light_active {
+/// H6 (5-tier) tier-reward schedule, gated by `pom_v3_activation`. Widens the H2 8-point steps to
+/// 10-point steps with the top tier still the 100 % reference, so the entry tier bottoms out at
+/// −40 % (vs −32 % under H2): a steeper possession gradient across the H6 lineup. Same five tiers,
+/// so the coinbase decode and every per-tier mechanism are unchanged.
+///   0  Qwen3.5-9B    -40%
+///   1  GLM-4-9B      -30%
+///   2  Gemma-4-12B   -20%
+///   3  Qwen3.6-27B   -10%
+///   4  Kimi-48B        0%
+pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
+
+/// Tier-reward schedule for a block at `daa_score`: 5-tier H6 once `pom_v3_activation` is live,
+/// 5-tier H2 once `very_light_activation`, legacy 4-tier before. Chosen per block from that block's
+/// own DAA (never frozen) — same gating discipline as `pom_tiers`, so archival/IBD recomputation of
+/// older blocks stays canonical.
+pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool) -> &'static [u64] {
+    if pom_v3_active {
+        &TIER_REWARD_BPS_H6
+    } else if very_light_active {
         &TIER_REWARD_BPS_H2
     } else {
         &TIER_REWARD_BPS

@@ -655,9 +655,12 @@ impl VirtualStateProcessor {
         if !self.pom_activation.is_active(pov_daa_score) {
             return map;
         }
-        // Reward schedule gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
-        // keyed on this block's own daa_score to match `pom_tiers` and stay canonical under IBD.
-        let schedule = tier_reward_bps(self.very_light_activation.is_active(pov_daa_score));
+        // Reward schedule gated per block by daa_score (5-tier H6 once pom_v3 is live, else 5-tier H2,
+        // else legacy 4-tier), keyed on this block's own daa_score to match `pom_tiers` under IBD.
+        let schedule = tier_reward_bps(
+            self.very_light_activation.is_active(pov_daa_score),
+            self.pom_v3_activation.is_active(pov_daa_score),
+        );
         // H6: the tier bonus is gated on standing — an identity in probation (young, or carrying
         // a strike as of the lagged anchor) earns the floor rate whatever tier it proves. Rotating
         // identities therefore forfeits the bonus for the whole probation.
