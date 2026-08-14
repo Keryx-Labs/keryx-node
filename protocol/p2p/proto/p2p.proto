@@ -98,6 +98,11 @@ message BlockHeader{
   // into the block hash — the header-only PoW value / block level derive from it.
   // 0 (proto default, absent on the wire) for pre-fork blocks.
   uint64 pomFinalState = 15;
+  // H6: sealed service-state commitment at this header's pruning point, committed into
+  // the block hash. Absent (zero) for pre-gate blocks.
+  Hash serviceStateHash = 16;
+  // H6: the winning walk's proven PoM tier, committed into the block hash. Zero pre-gate.
+  uint32 pomTier = 17;
 }
 
 message BlockLevelParents {
@@ -323,4 +328,19 @@ message BlockWithTrustedDataV4Message {
 message TrustedDataMessage {
   repeated DaaBlockV4 daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
   repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
+}
+
+// H6 sealed service state: a fresh node downloads every finality-flushed service-bond row
+// (escrow burns and strike-log records) up to its new pruning point and verifies the set's
+// MuHash against `serviceStateHash` of an already-validated header referencing that pruning
+// point. Rows are the canonical commitment byte forms (see consensus `service_commit`).
+message RequestServiceStateMessage {
+  Hash pruningPointHash = 1;
+}
+
+message ServiceStateChunkMessage {
+  repeated bytes rows = 1;
+}
+
+message DoneServiceStateChunksMessage {
 }

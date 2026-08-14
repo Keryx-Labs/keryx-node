@@ -103,16 +103,22 @@ impl UtxoDiff {
 
         let mut intersection = UtxoCollection::new();
 
-        // If does not exist neither in `add` nor in `remove` - add to `remove`
+        // If does not exist neither in `add` nor in `remove` - add to `remove`.
+        // Matching here is on the COIN identity (outpoint + creation score) only: a removal always
+        // annihilates the pending addition of the same coin, whatever anchor either side carries —
+        // a created-then-spent coin must be absent from the composed diff.
         intersection_with_remainder_having_daa_score_in_place(other.removed(), &self.add, &mut intersection, &mut self.remove);
         // If already exists in `add` with the same DAA score - remove from `add`
         self.add.remove_collection(&intersection);
 
         intersection.clear();
 
-        // If does not exist neither in `add` nor in `remove`, or exists in `remove' with different DAA score - add to 'add'
-        intersection_with_remainder_having_daa_score_in_place(other.added(), &self.remove, &mut intersection, &mut self.add);
-        // If already exists in `remove` with the same DAA score - remove from `remove`
+        // If does not exist neither in `add` nor in `remove`, or exists in `remove` with a
+        // different DAA score OR a different age anchor - add to `add`. The anchor-strict match
+        // keeps a same-coin re-addition with a changed anchor as an explicit replacement
+        // (remove old + add new) so the store and the age accounting both see the new value.
+        intersection_with_remainder_matching_entry_in_place(other.added(), &self.remove, &mut intersection, &mut self.add);
+        // If already exists in `remove` with the same DAA score and anchor - remove from `remove`
         self.remove.remove_collection(&intersection);
 
         Ok(())
@@ -350,6 +356,45 @@ mod tests {
         diff.add_transaction(&mtx.as_verifiable(), D, false).unwrap();
         assert_eq!(diff.add[&TransactionOutpoint::new(tx_id, 0)].effective_daa, D);
         assert_eq!(diff.add[&TransactionOutpoint::new(tx_id, 1)].effective_daa, D);
+    }
+
+    /// Composition must not cancel an add/remove pair that shares (outpoint, creation score) but
+    /// differs on the age anchor: both fields are committed, so such a pair represents a genuine
+    /// entry replacement. Cancelling it leaves the store holding an entry the multiset no longer
+    /// contains.
+    #[test]
+    fn with_diff_keeps_anchor_replacement() {
+        let outpoint = TransactionOutpoint::new(TransactionId::from_str(&"1".repeat(64)).unwrap(), 0);
+        let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[3u8; 3]));
+        let stale = UtxoEntry::new_aged(100, spk.clone(), 470, false, 462);
+        let canonical = UtxoEntry::new_aged(100, spk.clone(), 470, false, 464);
+
+        let mut diff = UtxoDiff::default();
+        diff.remove.insert(outpoint, stale.clone());
+        let incoming = UtxoDiff::new([(outpoint, canonical.clone())].into_iter().collect(), UtxoCollection::new());
+        diff.with_diff_in_place(&incoming).unwrap();
+
+        assert_eq!(diff.remove.get(&outpoint), Some(&stale), "stale entry must still be removed from the store");
+        assert_eq!(diff.add.get(&outpoint), Some(&canonical), "canonical entry must be (re)inserted");
+    }
+
+    /// The converse direction is coin-identity matching: a removal annihilates the pending addition
+    /// of the same coin (outpoint + creation score) even when the two carry different anchors — a
+    /// created-then-spent coin must be absent from the composed diff, never resurrected.
+    #[test]
+    fn with_diff_annihilates_spend_of_pending_add() {
+        let outpoint = TransactionOutpoint::new(TransactionId::from_str(&"2".repeat(64)).unwrap(), 0);
+        let spk = ScriptPublicKey::new(0, ScriptVec::from_slice(&[4u8; 3]));
+        let created = UtxoEntry::new_aged(100, spk.clone(), 470, false, 464);
+        let spent = UtxoEntry::new_aged(100, spk.clone(), 470, false, 462);
+
+        let mut diff = UtxoDiff::default();
+        diff.add.insert(outpoint, created);
+        let incoming = UtxoDiff::new(UtxoCollection::new(), [(outpoint, spent)].into_iter().collect());
+        diff.with_diff_in_place(&incoming).unwrap();
+
+        assert!(diff.add.is_empty(), "created-then-spent coin must not survive in add");
+        assert!(diff.remove.is_empty(), "created-then-spent coin must not appear in remove");
     }
 
     #[test]

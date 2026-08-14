@@ -96,14 +96,23 @@ pub enum RuleError {
     #[error("PoM possession proof missing")]
     PomProofMissing,
 
+    #[error("PoM witness already failed verification for this block (negative cache)")]
+    KnownBadPomWitness,
+
     #[error("PoM possession proof references unknown tier {0}")]
     PomUnknownTier(u8),
 
     #[error("invalid PoM possession proof: {0:?}")]
     BadPomProof(crate::pom::PomVerifyError),
 
+    #[error("invalid PoM v3 (H6 matrix-walk) proof: {0:?}")]
+    BadPomProofV3(crate::pom_v3::PomV3VerifyError),
+
     #[error("header pom_final_state {0} does not match the possession proof final state {1}")]
     PomFinalStateMismatch(u64, u64),
+
+    #[error("header commits tier {0} but the possession proof proves tier {1}")]
+    PomDeclaredTierMismatch(u8, u8),
 
     #[error("coinbase blue score of {0} is not the expected value of {1}")]
     BadCoinbasePayloadBlueScore(u64, u64),
@@ -150,6 +159,15 @@ pub enum RuleError {
     #[error("block {0} accepted ID merkle root is invalid - block header indicates {1}, but calculated value is {2}")]
     BadAcceptedIDMerkleRoot(Hash, Hash, Hash),
 
+    #[error("block {0} service-state commitment is invalid - block header indicates {1}, but the sealed state at its pruning point is {2}")]
+    BadServiceStateCommitment(Hash, Hash, Hash),
+
+    #[error("coinbase announces no escrow delegation (`/escrow:` + `/esig:`), mandatory at/after the H6 gate")]
+    MissingEscrowDelegation,
+
+    #[error("coinbase escrow delegation signature does not verify against the payout key")]
+    BadEscrowDelegation,
+
     #[error("coinbase transaction is not built as expected")]
     BadCoinbaseTransaction,
 
@@ -158,6 +176,12 @@ pub enum RuleError {
 
     #[error("AiResponse tx {0} references model_id {1} not declared in coinbase ai:cap:")]
     AiResponseModelCapMissing(TransactionId, String),
+
+    #[error("AiResponse tx {0} carries a signed (v2) payload before its activation")]
+    AiResponseV2BeforeActivation(TransactionId),
+
+    #[error("AiRequest tx {0} max_tokens {1} exceeds the cap {2}")]
+    AiRequestMaxTokensExceeded(TransactionId, u32, u32),
 
     #[error("AiRequest tx {0} inference_reward {1} sompi is below minimum {2} sompi for model {3}")]
     AiRequestInferenceRewardBelowMinimum(TransactionId, u64, u64, String),

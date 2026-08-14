@@ -31,7 +31,7 @@ use keryx_p2p_lib::{
     pb::{
         RequestAntipastMessage, RequestBlockBodiesMessage, RequestHeadersMessage, RequestIbdBlocksMessage,
         RequestPruningPointAndItsAnticoneMessage, RequestPruningPointProofMessage, RequestPruningPointUtxoSetMessage,
-        kaspad_message::Payload,
+        RequestServiceStateMessage, kaspad_message::Payload,
     },
 };
 use keryx_utils::channel::JobReceiver;
@@ -154,7 +154,7 @@ impl IbdFlow {
                         self.router
                     );
 
-                    self.sync_new_utxo_set(&session, pruning_point).await?;
+                    self.sync_new_utxo_set(&session, pruning_point, &relay_block.header).await?;
                 }
                 // Once utxo is valid, simply sync missing headers
                 body_target = self
@@ -182,7 +182,7 @@ impl IbdFlow {
                         // Next, sync a utxoset corresponding to the new pruning point from the syncer.
                         // Note that the new pruning point's anticone need not be downloaded separately as in other IBD types
                         // as it was just downloaded as part of the headers proof.
-                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point).await?;
+                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point, &relay_block.header).await?;
                     }
                     Err(e) => {
                         warn!("IBD with headers proof from {} was unsuccessful ({})", self.router, e);
@@ -197,7 +197,7 @@ impl IbdFlow {
                     Ok(()) => {
                         info!("header stage of pruning catchup from peer {} completed", self.router);
                         self.sync_missing_trusted_bodies(&session).await?;
-                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point).await?;
+                        self.sync_new_utxo_set(&session, negotiation_output.syncer_pruning_point, &relay_block.header).await?;
                         // Note that pruning of old data will only occur once virtual has caught up sufficiently far
                     }
 
@@ -673,16 +673,93 @@ impl IbdFlow {
         Ok(syncer_virtual_selected_parent)
     }
 
-    async fn sync_new_utxo_set(&mut self, consensus: &ConsensusProxy, pruning_point: Hash) -> Result<(), ProtocolError> {
+    async fn sync_new_utxo_set(
+        &mut self,
+        consensus: &ConsensusProxy,
+        pruning_point: Hash,
+        relay_header: &Header,
+    ) -> Result<(), ProtocolError> {
         // A better solution could be to create a copy of the old utxo state for some sort of fallback rather than delete it.
         consensus.async_clear_pruning_utxo_set().await; // this deletes the old pruning utxoset and also sets the pruning utxo as invalidated
         self.sync_pruning_point_utxoset(consensus, pruning_point).await?;
         // Only if the function has reached here, will the utxo be considered "final"
         consensus.async_set_pruning_utxoset_stable().await;
+        self.sync_service_state(consensus, pruning_point, relay_header).await?;
         // Once a new utxoset is stored, the utxoindex needs to be resynced as well. This happens through the reset handler mechanism.
         let consensus_manager = self.ctx.consensus_manager.clone();
         spawn_blocking(move || consensus_manager.invoke_consensus_reset_handlers()).await.unwrap();
         self.ctx.on_pruning_point_utxoset_override();
+        Ok(())
+    }
+
+    /// Downloads the sealed service-bond state (every finality-flushed row up to the new pruning
+    /// point) and verifies its MuHash against `service_state_hash` of the already-validated relay
+    /// header before importing. No-op below the H6 gate.
+    async fn sync_service_state(
+        &mut self,
+        consensus: &ConsensusProxy,
+        pruning_point: Hash,
+        relay_header: &Header,
+    ) -> Result<(), ProtocolError> {
+        let pp_daa = consensus.async_get_header(pruning_point).await?.daa_score;
+        if !keryx_consensus_core::pom::service_commit_active(pp_daa) {
+            return Ok(());
+        }
+        // The expected commitment lives in headers whose own pruning point is the one we synced:
+        // the relay header on the fresh-sync path, the local headers-selected-tip on the
+        // recovery path (where the pruning point is the local one, not the syncer's).
+        let expected = if relay_header.pruning_point == pruning_point {
+            relay_header.service_state_hash
+        } else {
+            let hst = consensus.async_get_headers_selected_tip().await;
+            let hst_header = consensus.async_get_header(hst).await?;
+            if hst_header.pruning_point != pruning_point {
+                return Err(ProtocolError::Other("no validated header anchors the negotiated pruning point"));
+            }
+            hst_header.service_state_hash
+        };
+        info!("downloading the sealed service state for pruning point {}", pruning_point);
+        self.router
+            .enqueue(make_message!(
+                Payload::RequestServiceState,
+                RequestServiceStateMessage { pruning_point_hash: Some(pruning_point.into()) }
+            ))
+            .await?;
+        let mut rows: Vec<Vec<u8>> = Vec::new();
+        let mut acc = MuHash::new();
+        loop {
+            match tokio::time::timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+                Ok(Some(msg)) => match msg.payload {
+                    Some(Payload::ServiceStateChunk(chunk)) => {
+                        for row in chunk.rows {
+                            acc.add_element(&row);
+                            rows.push(row);
+                        }
+                    }
+                    Some(Payload::DoneServiceStateChunks(_)) => break,
+                    _ => {
+                        return Err(ProtocolError::UnexpectedMessage(
+                            stringify!(Payload::ServiceStateChunk | Payload::DoneServiceStateChunks),
+                            msg.payload.as_ref().map(|v| v.into()),
+                        ));
+                    }
+                },
+                Ok(None) => return Err(ProtocolError::ConnectionClosed),
+                Err(_) => return Err(ProtocolError::Timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT)),
+            }
+        }
+        // Mirror `commitment_at` exactly: no rows seals nothing, and the expected value is then
+        // the zero hash.
+        let computed = if rows.is_empty() { Hash::default() } else { acc.finalize() };
+        if computed != expected {
+            return Err(ProtocolError::OtherOwned(format!(
+                "service-state verification failed: peer rows hash to {}, header commits {}",
+                computed, expected
+            )));
+        }
+        let count = rows.len();
+        consensus.clone().spawn_blocking(move |c| c.import_service_state(rows)).await?;
+        info!("imported and verified {} sealed service-state rows", count);
         Ok(())
     }
 

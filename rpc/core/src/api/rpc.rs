@@ -325,6 +325,27 @@ pub trait RpcApi: Sync + Send + AnySync {
     /// Returns the total balance in unspent transactions towards a given address.
     ///
     /// This call is only available when this node was started with `--utxoindex`.
+    async fn get_utxo_entries_by_outpoints(
+        &self,
+        outpoints: Vec<RpcTransactionOutpoint>,
+    ) -> RpcResult<Vec<RpcUtxosByAddressesEntry>> {
+        Ok(self.get_utxo_entries_by_outpoints_call(None, GetUtxoEntriesByOutpointsRequest::new(outpoints)).await?.entries)
+    }
+    async fn get_utxo_entries_by_outpoints_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetUtxoEntriesByOutpointsRequest,
+    ) -> RpcResult<GetUtxoEntriesByOutpointsResponse>;
+
+    async fn get_utxo_count_by_address(&self, address: RpcAddress) -> RpcResult<u64> {
+        Ok(self.get_utxo_count_by_address_call(None, GetUtxoCountByAddressRequest::new(address)).await?.count)
+    }
+    async fn get_utxo_count_by_address_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetUtxoCountByAddressRequest,
+    ) -> RpcResult<GetUtxoCountByAddressResponse>;
+
     async fn get_balance_by_address(&self, address: RpcAddress) -> RpcResult<u64> {
         Ok(self.get_balance_by_address_call(None, GetBalanceByAddressRequest::new(address)).await?.balance)
     }
@@ -429,6 +450,16 @@ pub trait RpcApi: Sync + Send + AnySync {
         connection: Option<&DynRpcConnection>,
         request: GetCoinSupplyRequest,
     ) -> RpcResult<GetCoinSupplyResponse>;
+
+    /// Service-bond enforcement state: live strikes, suspensions and misses awaiting finality.
+    async fn get_service_strikes(&self) -> RpcResult<GetServiceStrikesResponse> {
+        self.get_service_strikes_call(None, GetServiceStrikesRequest {}).await
+    }
+    async fn get_service_strikes_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetServiceStrikesRequest,
+    ) -> RpcResult<GetServiceStrikesResponse>;
 
     async fn get_daa_score_timestamp_estimate(&self, daa_scores: Vec<u64>) -> RpcResult<Vec<u64>> {
         Ok(self.get_daa_score_timestamp_estimate_call(None, GetDaaScoreTimestampEstimateRequest { daa_scores }).await?.timestamps)

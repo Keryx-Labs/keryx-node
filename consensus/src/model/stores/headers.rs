@@ -41,6 +41,117 @@ pub trait HeaderStore: HeaderStoreReader {
     fn delete(&self, hash: Hash) -> Result<(), StoreError>;
 }
 
+/// Backward compatibility for datadirs written before the H6 `pom_tier` header field was added:
+/// same layout as today's `Header` minus the trailing `pom_tier` (it still carries
+/// `service_state_hash`). Entries decoded through this struct are pre-upgrade writes whose
+/// canonical `pom_tier` is zero (not hashed, not consensus below the gate).
+#[derive(Clone, Debug, Deserialize)]
+struct HeaderPreTier {
+    pub hash: Hash,
+    pub version: u16,
+    pub parents_by_level: CompressedParents,
+    pub hash_merkle_root: Hash,
+    pub accepted_id_merkle_root: Hash,
+    pub utxo_commitment: Hash,
+    pub timestamp: u64,
+    pub bits: u32,
+    pub nonce: u64,
+    pub daa_score: u64,
+    pub blue_work: keryx_consensus_core::BlueWorkType,
+    pub blue_score: u64,
+    pub pruning_point: Hash,
+    pub pom_final_state: u64,
+    pub service_state_hash: Hash,
+}
+
+#[derive(Clone, Deserialize)]
+struct HeaderWithBlockLevelPreTier {
+    header: HeaderPreTier,
+    block_level: BlockLevel,
+}
+
+impl From<HeaderWithBlockLevelPreTier> for HeaderWithBlockLevel {
+    fn from(value: HeaderWithBlockLevelPreTier) -> Self {
+        Self {
+            header: Header {
+                hash: value.header.hash,
+                version: value.header.version,
+                parents_by_level: value.header.parents_by_level,
+                hash_merkle_root: value.header.hash_merkle_root,
+                accepted_id_merkle_root: value.header.accepted_id_merkle_root,
+                utxo_commitment: value.header.utxo_commitment,
+                timestamp: value.header.timestamp,
+                bits: value.header.bits,
+                nonce: value.header.nonce,
+                daa_score: value.header.daa_score,
+                blue_work: value.header.blue_work,
+                blue_score: value.header.blue_score,
+                pruning_point: value.header.pruning_point,
+                pom_final_state: value.header.pom_final_state,
+                service_state_hash: value.header.service_state_hash,
+                pom_tier: 0,
+            }
+            .into(),
+            block_level: value.block_level,
+        }
+    }
+}
+
+/// Backward compatibility for datadirs written before the H6 sealed-service-state upgrade:
+/// same layout as today's `Header` minus the trailing `service_state_hash`. Entries decoded
+/// through this struct are pre-upgrade writes whose canonical field value is zero (not hashed,
+/// not consensus below the gate).
+#[derive(Clone, Debug, Deserialize)]
+struct HeaderPreSeal {
+    pub hash: Hash,
+    pub version: u16,
+    pub parents_by_level: CompressedParents,
+    pub hash_merkle_root: Hash,
+    pub accepted_id_merkle_root: Hash,
+    pub utxo_commitment: Hash,
+    pub timestamp: u64,
+    pub bits: u32,
+    pub nonce: u64,
+    pub daa_score: u64,
+    pub blue_work: keryx_consensus_core::BlueWorkType,
+    pub blue_score: u64,
+    pub pruning_point: Hash,
+    pub pom_final_state: u64,
+}
+
+#[derive(Clone, Deserialize)]
+struct HeaderWithBlockLevelPreSeal {
+    header: HeaderPreSeal,
+    block_level: BlockLevel,
+}
+
+impl From<HeaderWithBlockLevelPreSeal> for HeaderWithBlockLevel {
+    fn from(value: HeaderWithBlockLevelPreSeal) -> Self {
+        Self {
+            header: Header {
+                hash: value.header.hash,
+                version: value.header.version,
+                parents_by_level: value.header.parents_by_level,
+                hash_merkle_root: value.header.hash_merkle_root,
+                accepted_id_merkle_root: value.header.accepted_id_merkle_root,
+                utxo_commitment: value.header.utxo_commitment,
+                timestamp: value.header.timestamp,
+                bits: value.header.bits,
+                nonce: value.header.nonce,
+                daa_score: value.header.daa_score,
+                blue_work: value.header.blue_work,
+                blue_score: value.header.blue_score,
+                pruning_point: value.header.pruning_point,
+                pom_final_state: value.header.pom_final_state,
+                service_state_hash: Default::default(),
+                pom_tier: 0,
+            }
+            .into(),
+            block_level: value.block_level,
+        }
+    }
+}
+
 /// Backward compatibility for datadirs written before the H3 (`pom_level_activation`) upgrade:
 /// same layout as today's `Header` minus the trailing `pom_final_state`. Entries decoded through
 /// this struct are pre-upgrade writes, i.e. pre-H3 blocks, whose canonical field value is 0
@@ -86,6 +197,8 @@ impl From<HeaderWithBlockLevelPreH3> for HeaderWithBlockLevel {
                 blue_score: value.header.blue_score,
                 pruning_point: value.header.pruning_point,
                 pom_final_state: 0,
+                service_state_hash: Default::default(),
+                pom_tier: 0,
             }
             .into(),
             block_level: value.block_level,
@@ -135,6 +248,8 @@ impl From<HeaderWithBlockLevel2> for HeaderWithBlockLevel {
                 blue_score: value.header.blue_score,
                 pruning_point: value.header.pruning_point,
                 pom_final_state: 0,
+                service_state_hash: Default::default(),
+                pom_tier: 0,
             }
             .into(),
             block_level: value.block_level,
@@ -242,12 +357,12 @@ impl HeaderStoreReader for DbHeadersStore {
     fn get_header(&self, hash: Hash) -> Result<Arc<Header>, StoreError> {
         Ok(self
             .headers_access
-            .read_with_fallbacks::<HeaderWithBlockLevelPreH3, HeaderWithBlockLevel2>(self.fallback_prefix.as_ref(), hash)?
+            .read_with_fallbacks4::<HeaderWithBlockLevelPreTier, HeaderWithBlockLevelPreSeal, HeaderWithBlockLevelPreH3, HeaderWithBlockLevel2>(self.fallback_prefix.as_ref(), hash)?
             .header)
     }
 
     fn get_header_with_block_level(&self, hash: Hash) -> Result<HeaderWithBlockLevel, StoreError> {
-        self.headers_access.read_with_fallbacks::<HeaderWithBlockLevelPreH3, HeaderWithBlockLevel2>(self.fallback_prefix.as_ref(), hash)
+        self.headers_access.read_with_fallbacks4::<HeaderWithBlockLevelPreTier, HeaderWithBlockLevelPreSeal, HeaderWithBlockLevelPreH3, HeaderWithBlockLevel2>(self.fallback_prefix.as_ref(), hash)
     }
 
     fn get_compact_header_data(&self, hash: Hash) -> Result<CompactHeaderData, StoreError> {

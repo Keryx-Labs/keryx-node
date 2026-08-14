@@ -5,7 +5,10 @@ use crate::{
 };
 use keryx_addresses::Address;
 use keryx_consensus::processes::coinbase::RD_ALLOCATION_ADDRESS;
-use keryx_consensus_core::{api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, errors::block::RuleError};
+use keryx_consensus_core::{
+    api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, config::params::POM_PROOF_SERVE_DEPTH_DAA,
+    errors::block::RuleError,
+};
 use keryx_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
 use keryx_core::{debug, info, warn};
 use keryx_hashes::Hash;
@@ -231,7 +234,27 @@ impl HandleRelayInvsFlow {
             // the network on 2026-07-24/25). Apply the IBD trust model (accumulated work) to
             // roots and skip possession-proof verification; direct tip relays keep full
             // enforcement, so the possession teeth at the live tip are unchanged.
-            let BlockValidationFutures { block_task, mut virtual_state_task } = if inv.is_orphan_root {
+            //
+            // EXCEPT, from the H6 gate on, for roots that are still RECENT: skipping the proof does
+            // not merely leave the tier unauthenticated, it leaves the PoW itself unverified (the
+            // header-only check folds `pom_final_state`, which is grindable at hash speed without
+            // the weights — see `check_pow_and_calc_block_level`), so this path would accept a
+            // block nobody paid for. Within `POM_PROOF_SERVE_DEPTH_DAA` every honest node still
+            // retains and serves the proof, so demanding it cannot starve a root that really
+            // exists. Gated on `pom_v3_activation`: under v3 the proof is what authenticates both
+            // the tier and the work, so the stricter reading belongs to that era switch — and the
+            // gate lets the policy be disarmed by a version bump rather than a rollback. Two more
+            // conditions keep the 07-24/25 wedge closed: we only enforce while NEARLY SYNCED (a
+            // lagging node's own virtual says nothing about what the network still retains), and a
+            // missing proof is a soft skip below — never a peer disconnect.
+            let proof_required = orphan_root_proof_required(
+                inv.is_orphan_root,
+                self.ctx.config.pom_v3_activation.is_active(block.header.daa_score),
+                self.ctx.should_mine(&session).await,
+                session.get_virtual_daa_score(),
+                block.header.daa_score,
+            );
+            let BlockValidationFutures { block_task, mut virtual_state_task } = if inv.is_orphan_root && !proof_required {
                 session.validate_and_insert_block_ibd(block.clone())
             } else {
                 session.validate_and_insert_block(block.clone())
@@ -239,12 +262,22 @@ impl HandleRelayInvsFlow {
 
             let ancestor_batch = match block_task.await {
                 Ok(_) => Default::default(),
+                // A recent orphan root served without its proof: skip it for now and queue the
+                // re-fetch. NEVER a disconnect — the peer may simply not hold the proof, and
+                // banning peers over a propagation hole is how 2026-07-24/25 became a wedge.
+                // `PomProofMissing` never marks the block invalid (body processor), so the block
+                // stays retryable and enters as soon as any peer serves it proof-carrying.
+                Err(RuleError::PomProofMissing) if proof_required => {
+                    self.ctx.enqueue_pom_reproof(inv.hash);
+                    debug!("Relay: recent orphan root {} arrived without its possession proof — queued for re-fetch", inv.hash);
+                    continue;
+                }
                 Err(RuleError::MissingParents(missing_parents)) => {
                     debug!("Block {} is orphan and has missing parents: {:?}", block.hash(), missing_parents);
                     if let Some(mut ancestor_batch) = self.process_orphan(&session, block.clone(), inv.known_within_range).await? {
-                        // Block is not an orphan, retrying (same proof policy as the first attempt)
+                        // Block is not an orphan, retrying with the exact proof policy of the first attempt.
                         let BlockValidationFutures { block_task: block_task_inner, virtual_state_task: virtual_state_task_inner } =
-                            if inv.is_orphan_root {
+                            if inv.is_orphan_root && !proof_required {
                                 session.validate_and_insert_block_ibd(block.clone())
                             } else {
                                 session.validate_and_insert_block(block.clone())
@@ -267,6 +300,12 @@ impl HandleRelayInvsFlow {
                                     debug!("Unorphaned {} ancestors and retried orphan block {} successfully", n, block.hash())
                                 }
                             },
+                            // Same soft skip as the first attempt (see above).
+                            Err(RuleError::PomProofMissing) if proof_required => {
+                                self.ctx.enqueue_pom_reproof(inv.hash);
+                                debug!("Relay: retried orphan root {} still proofless — queued for re-fetch", inv.hash);
+                                continue;
+                            }
                             Err(rule_error) => return Err(rule_error.into()),
                         }
                         ancestor_batch
@@ -316,6 +355,10 @@ impl HandleRelayInvsFlow {
     /// Re-fetches a block whose possession proof is missing locally and adopts the proof it
     /// carries. Peers serving the block naked as well are left for a later guard-rail re-queue —
     /// another peer (or the same one, once healed itself) may carry the proof.
+    ///
+    /// Two cases: the block is stored but naked (graft the proof onto it), or it was never
+    /// inserted because the proof-required relay path skipped it (submit the proof-carrying block
+    /// through the enforcing path — there is no stored header to graft onto).
     async fn try_readopt_pom_proof(&mut self, requested_hash: Hash) -> Result<(), ProtocolError> {
         let Some((block, request_scope)) = self.request_block(requested_hash, self.msg_route.id(), self.header_format).await? else {
             return Ok(());
@@ -326,6 +369,18 @@ impl HandleRelayInvsFlow {
             return Ok(());
         };
         let session = self.ctx.consensus().unguarded_session();
+        // Adoption grafts the proof onto a block we already store. A block skipped by the
+        // proof-required relay path was never inserted, so there is no stored header to graft
+        // onto — submit the proof-carrying block itself through the enforcing path instead.
+        if session.async_get_block_status(requested_hash).await.is_none() {
+            let block =
+                Block { header: block.header, transactions: block.transactions, pom_proof: Some(proof), pom_tier: block.pom_tier };
+            match session.validate_and_insert_block(block).block_task.await {
+                Ok(_) => info!("PoM re-proof: inserted {} with the proof served by peer {}", requested_hash, self.router),
+                Err(e) => debug!("PoM re-proof: proof-carrying {} from peer {} still rejected: {}", requested_hash, self.router, e),
+            }
+            return Ok(());
+        }
         match session.async_adopt_pom_proof(requested_hash, (*proof).clone()).await {
             Ok(true) => info!("PoM re-proof: adopted the possession proof of {} from peer {}", requested_hash, self.router),
             Ok(false) => {}
@@ -497,5 +552,74 @@ impl HandleRelayInvsFlow {
             Ok(_) | Err(TrySendError::Full(_)) => Ok(()),
             Err(TrySendError::Closed(_)) => Err(ProtocolError::ConnectionClosed), // This indicates that IBD flow has exited
         }
+    }
+}
+
+/// Whether a relayed block must carry a verified possession proof to be inserted.
+///
+/// Orphan roots normally take the IBD trust model (accumulated work) because they can sit
+/// arbitrarily deep, where proofs are legitimately GC'ed. But skipping the proof also skips the
+/// only real PoW check — the header-only fold of `pom_final_state` is grindable at hash speed
+/// without holding the weights — so from the H6 gate on, a recent root must not enter that way.
+///
+/// `h6_active` is `pom_v3_activation` at the block's DAA score: v3 is the era where the proof
+/// authenticates the tier and the work, and gating here keeps the switch coordinated and
+/// reversible by version bump.
+///
+/// The two guards below are what keep this from re-creating the 2026-07-24/25 wedge:
+/// * `nearly_synced`: a node that lags has no idea what the network still retains; its own
+///   virtual DAA is a meaningless yardstick, so it keeps the permissive path.
+/// * depth `<= POM_PROOF_SERVE_DEPTH_DAA`: inside the service window every honest node still
+///   holds and serves the proof, so demanding it cannot starve a root that genuinely exists.
+///
+/// A `true` verdict never bans a peer: the caller treats a missing proof as a soft skip plus a
+/// re-fetch request (`PomProofMissing` does not mark the block invalid, so it stays retryable).
+fn orphan_root_proof_required(
+    is_orphan_root: bool,
+    h6_active: bool,
+    nearly_synced: bool,
+    virtual_daa: u64,
+    block_daa: u64,
+) -> bool {
+    is_orphan_root && h6_active && nearly_synced && virtual_daa.saturating_sub(block_daa) <= POM_PROOF_SERVE_DEPTH_DAA
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIP: u64 = 1_000_000;
+
+    #[test]
+    fn recent_orphan_root_requires_its_proof() {
+        // Inside the service window while synced: the proof exists network-wide, demand it.
+        assert!(orphan_root_proof_required(true, true, true, TIP, TIP - 10));
+        assert!(orphan_root_proof_required(true, true, true, TIP, TIP - POM_PROOF_SERVE_DEPTH_DAA));
+    }
+
+    #[test]
+    fn old_orphan_root_stays_exempt() {
+        // Past the service window the proof is legitimately gone — demanding it would wedge us.
+        assert!(!orphan_root_proof_required(true, true, true, TIP, TIP - POM_PROOF_SERVE_DEPTH_DAA - 1));
+        assert!(!orphan_root_proof_required(true, true, true, TIP, 0));
+    }
+
+    #[test]
+    fn lagging_node_never_demands() {
+        // The 2026-07-24/25 wedge shape: a far-behind receiver sees a root that is AHEAD of its
+        // own virtual (depth saturates to 0, i.e. "recent") while the network has long GC'ed the
+        // proof. Not being nearly synced must keep such a node on the permissive path.
+        assert!(!orphan_root_proof_required(true, true, false, 1_000, 500_000));
+        assert!(!orphan_root_proof_required(true, true, false, TIP, TIP - 10));
+    }
+
+    #[test]
+    fn direct_relays_and_pre_h6_blocks_are_unaffected() {
+        // Direct relay already goes through the enforcing path unconditionally — this predicate
+        // only ever upgrades orphan roots, never downgrades anything.
+        assert!(!orphan_root_proof_required(false, true, true, TIP, TIP - 10));
+        // Before the H6 gate the permissive orphan-root path is kept verbatim, so shipping this
+        // release changes nothing on a network that has not crossed the fork.
+        assert!(!orphan_root_proof_required(true, false, true, TIP, TIP - 10));
     }
 }

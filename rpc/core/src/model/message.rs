@@ -1349,6 +1349,128 @@ impl Deserializer for GetBalanceByAddressResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetUtxoEntriesByOutpointsRequest {
+    pub outpoints: Vec<RpcTransactionOutpoint>,
+}
+
+impl GetUtxoEntriesByOutpointsRequest {
+    pub fn new(outpoints: Vec<RpcTransactionOutpoint>) -> Self {
+        Self { outpoints }
+    }
+}
+
+impl Serializer for GetUtxoEntriesByOutpointsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcTransactionOutpoint>, &self.outpoints, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoEntriesByOutpointsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let outpoints = deserialize!(Vec<RpcTransactionOutpoint>, reader)?;
+
+        Ok(Self { outpoints })
+    }
+}
+
+/// Entries of the queried outpoints that are live in the virtual UTXO set.
+/// An outpoint absent from `entries` is spent or never existed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxoEntriesByOutpointsResponse {
+    pub entries: Vec<RpcUtxosByAddressesEntry>,
+}
+
+impl GetUtxoEntriesByOutpointsResponse {
+    pub fn new(entries: Vec<RpcUtxosByAddressesEntry>) -> Self {
+        Self { entries }
+    }
+}
+
+impl Serializer for GetUtxoEntriesByOutpointsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        serialize!(Vec<RpcUtxosByAddressesEntry>, &self.entries, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoEntriesByOutpointsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let entries = deserialize!(Vec<RpcUtxosByAddressesEntry>, reader)?;
+
+        Ok(Self { entries })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxoCountByAddressRequest {
+    pub address: RpcAddress,
+}
+
+impl GetUtxoCountByAddressRequest {
+    pub fn new(address: RpcAddress) -> Self {
+        Self { address }
+    }
+}
+
+impl Serializer for GetUtxoCountByAddressRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcAddress, &self.address, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoCountByAddressRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let address = load!(RpcAddress, reader)?;
+
+        Ok(Self { address })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetUtxoCountByAddressResponse {
+    pub count: u64,
+}
+
+impl GetUtxoCountByAddressResponse {
+    pub fn new(count: u64) -> Self {
+        Self { count }
+    }
+}
+
+impl Serializer for GetUtxoCountByAddressResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.count, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetUtxoCountByAddressResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let count = load!(u64, reader)?;
+
+        Ok(Self { count })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetBalancesByAddressesRequest {
     pub addresses: Vec<RpcAddress>,
 }
@@ -1789,6 +1911,95 @@ impl Deserializer for GetCoinSupplyResponse {
         let circulating_sompi = load!(u64, reader)?;
 
         Ok(Self { max_sompi, circulating_sompi })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceStrike {
+    pub miner: RpcHash,
+    pub consecutive_misses: u32,
+    pub last_strike_daa_score: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceSuspension {
+    pub miner: RpcHash,
+    pub until_daa_score: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServicePendingBurn {
+    pub miner: RpcHash,
+    pub miss_daa_score: u64,
+    pub consecutive_misses: u32,
+    pub burned_claims: u32,
+    pub burned_sompi: u64,
+}
+
+/// Strikes a miner has taken over the whole retained log. The live counter in `RpcServiceStrike`
+/// resets on a served response and on an executed suspension, so only this one answers "how often
+/// has this miner failed". Display only — nothing in consensus reads it.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceStrikeTotal {
+    pub miner: RpcHash,
+    pub strikes: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceStrikesRequest {}
+
+impl Serializer for GetServiceStrikesRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceStrikesRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceStrikesResponse {
+    pub virtual_daa_score: u64,
+    pub strikes: Vec<RpcServiceStrike>,
+    pub suspended: Vec<RpcServiceSuspension>,
+    pub pending_burns: Vec<RpcServicePendingBurn>,
+    pub lifetime_strikes: Vec<RpcServiceStrikeTotal>,
+}
+
+impl Serializer for GetServiceStrikesResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(u64, &self.virtual_daa_score, writer)?;
+        store!(Vec<RpcServiceStrike>, &self.strikes, writer)?;
+        store!(Vec<RpcServiceSuspension>, &self.suspended, writer)?;
+        store!(Vec<RpcServicePendingBurn>, &self.pending_burns, writer)?;
+        store!(Vec<RpcServiceStrikeTotal>, &self.lifetime_strikes, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceStrikesResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let virtual_daa_score = load!(u64, reader)?;
+        let strikes = load!(Vec<RpcServiceStrike>, reader)?;
+        let suspended = load!(Vec<RpcServiceSuspension>, reader)?;
+        let pending_burns = load!(Vec<RpcServicePendingBurn>, reader)?;
+        // v1 clients and v1 payloads predate the lifetime tally: absent means unknown, not zero.
+        let lifetime_strikes =
+            if version >= 2 { load!(Vec<RpcServiceStrikeTotal>, reader)? } else { Vec::new() };
+        Ok(Self { virtual_daa_score, strikes, suspended, pending_burns, lifetime_strikes })
     }
 }
 

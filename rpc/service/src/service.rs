@@ -400,6 +400,25 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         }
         let script_public_key = keryx_txscript::pay_to_address_script(&request.pay_address);
         let extra_data_bytes = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
+        // H6: a block without a valid escrow delegation is INVALID, so refuse the template
+        // loudly instead of letting a misconfigured miner mine into the void. The cert is a
+        // schnorr signature by the pay-address key over the announced escrow key.
+        if self.config.pom_v3_activation.is_active(session.get_virtual_daa_score()) {
+            use keryx_consensus_core::collateral::{parse_escrow_esig, parse_escrow_pubkey, verify_escrow_delegation};
+            let (Some(escrow_pubkey), Some(esig)) = (parse_escrow_pubkey(&extra_data_bytes), parse_escrow_esig(&extra_data_bytes))
+            else {
+                return Err(RpcError::General(
+                    "H6: mining requires an escrow delegation — announce `/escrow:<pubkey>` and `/esig:<cert>` (see delegate-escrow)"
+                        .to_string(),
+                ));
+            };
+            if !verify_escrow_delegation(script_public_key.version(), script_public_key.script(), &escrow_pubkey, &esig) {
+                return Err(RpcError::General(
+                    "H6: escrow delegation cert does not verify against the pay address — regenerate it with delegate-escrow"
+                        .to_string(),
+                ));
+            }
+        }
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data_bytes);
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 
@@ -831,6 +850,55 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetUtxosByAddressesResponse::new(self.index_converter.get_utxos_by_addresses_entries(&entry_map)))
     }
 
+    async fn get_utxo_entries_by_outpoints_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetUtxoEntriesByOutpointsRequest,
+    ) -> RpcResult<GetUtxoEntriesByOutpointsResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        // do not read the virtual utxo set while in unstable ibd state.
+        if session.async_is_consensus_in_transitional_ibd_state().await {
+            return Err(RpcError::ConsensusInTransitionalIbdState);
+        }
+        let outpoints = request.outpoints.into_iter().map(|outpoint| outpoint.into()).collect();
+        let entries = session
+            .async_get_utxos_by_outpoints(outpoints)
+            .await
+            .into_iter()
+            .map(|(outpoint, entry)| RpcUtxosByAddressesEntry {
+                address: extract_script_pub_key_address(&entry.script_public_key, self.config.prefix()).ok(),
+                outpoint: outpoint.into(),
+                utxo_entry: entry.into(),
+            })
+            .collect();
+        Ok(GetUtxoEntriesByOutpointsResponse::new(entries))
+    }
+
+    async fn get_utxo_count_by_address_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetUtxoCountByAddressRequest,
+    ) -> RpcResult<GetUtxoCountByAddressResponse> {
+        if !self.config.utxoindex {
+            return Err(RpcError::NoUtxoIndex);
+        }
+
+        let session = self.consensus_manager.consensus().unguarded_session();
+
+        // do not count utxos while in unstable ibd state.
+        if session.async_is_consensus_in_transitional_ibd_state().await {
+            return Err(RpcError::ConsensusInTransitionalIbdState);
+        }
+        let count = self
+            .utxoindex
+            .clone()
+            .unwrap()
+            .get_utxo_count_by_script_public_key(pay_to_address_script(&request.address))
+            .await
+            .unwrap_or_default();
+        Ok(GetUtxoCountByAddressResponse::new(count))
+    }
+
     async fn get_balance_by_address_call(
         &self,
         _connection: Option<&DynRpcConnection>,
@@ -876,6 +944,48 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             })
             .collect();
         Ok(GetBalancesByAddressesResponse::new(entries))
+    }
+
+    async fn get_service_strikes_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _: GetServiceStrikesRequest,
+    ) -> RpcResult<GetServiceStrikesResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let snapshot = session.get_service_strikes();
+        Ok(GetServiceStrikesResponse {
+            virtual_daa_score: snapshot.virtual_daa_score,
+            strikes: snapshot
+                .strikes
+                .into_iter()
+                .map(|(miner, consecutive_misses, last_strike_daa_score)| RpcServiceStrike {
+                    miner,
+                    consecutive_misses,
+                    last_strike_daa_score,
+                })
+                .collect(),
+            suspended: snapshot
+                .suspended
+                .into_iter()
+                .map(|(miner, until_daa_score)| RpcServiceSuspension { miner, until_daa_score })
+                .collect(),
+            pending_burns: snapshot
+                .pending_burns
+                .into_iter()
+                .map(|(miner, miss_daa_score, consecutive_misses, burned_claims, burned_sompi)| RpcServicePendingBurn {
+                    miner,
+                    miss_daa_score,
+                    consecutive_misses,
+                    burned_claims,
+                    burned_sompi,
+                })
+                .collect(),
+            lifetime_strikes: snapshot
+                .lifetime_strikes
+                .into_iter()
+                .map(|(miner, strikes)| RpcServiceStrikeTotal { miner, strikes })
+                .collect(),
+        })
     }
 
     async fn get_coin_supply_call(

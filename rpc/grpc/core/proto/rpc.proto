@@ -43,6 +43,11 @@ message RpcBlockHeader {
   // into the block hash. Miners MUST fill it on submit_block (from the walk that solved
   // the block), exactly like the nonce. 0 (absent) for pre-fork blocks.
   uint64 pomFinalState = 16;
+  // H6: sealed service-state commitment at this header's pruning point, filled by the
+  // node at template build. Hex string; empty for pre-gate blocks.
+  string serviceStateHash = 17;
+  // H6: the winning walk's proven PoM tier, committed into the block hash.
+  uint32 pomTier = 18;
 }
 
 message RpcBlockLevelParents {
@@ -584,6 +589,30 @@ message GetBalanceByAddressRequestMessage {
   string address = 1;
 }
 
+// Count the UTXOs of an address inside the node's utxoindex, without
+// serializing the set. Requires the node to be started with --utxoindex.
+// Live UTXO entries of specific outpoints, read from the virtual UTXO set.
+// An outpoint absent from the response is spent or never existed.
+message GetUtxoEntriesByOutpointsRequestMessage {
+  repeated RpcOutpoint outpoints = 1;
+}
+
+message GetUtxoEntriesByOutpointsResponseMessage {
+  repeated RpcUtxosByAddressesEntry entries = 1;
+
+  RPCError error = 1000;
+}
+
+message GetUtxoCountByAddressRequestMessage {
+  string address = 1;
+}
+
+message GetUtxoCountByAddressResponseMessage {
+  uint64 count = 1;
+
+  RPCError error = 1000;
+}
+
 message GetBalanceByAddressResponseMessage {
   uint64 balance = 1;
 
@@ -1010,6 +1039,10 @@ message RpcOptionalHeader {
   optional string pruningPoint = 14;
   // H3 (pom_level_activation): final state of the winning PoM possession walk.
   optional uint64 pomFinalState = 15;
+  // H6: sealed service-state commitment at this header's pruning point (hex).
+  optional string serviceStateHash = 16;
+  // H6: the winning walk's proven PoM tier.
+  optional uint32 pomTier = 17;
 }
 
 message RpcOptionalTransactionOutpoint {
@@ -1106,6 +1139,44 @@ message GetCurrentBlockColorRequestMessage {
 
 message GetCurrentBlockColorResponseMessage {
   bool blue = 1;
+
+  RPCError error = 1000;
+}
+
+message ServiceStrikeMessage {
+  string miner = 1;
+  uint32 consecutiveMisses = 2;
+  uint64 lastStrikeDaaScore = 3;
+}
+
+message ServiceSuspensionMessage {
+  string miner = 1;
+  uint64 untilDaaScore = 2;
+}
+
+message ServicePendingBurnMessage {
+  string miner = 1;
+  uint64 missDaaScore = 2;
+  uint32 consecutiveMisses = 3;
+  uint32 burnedClaims = 4;
+  uint64 burnedSompi = 5;
+}
+
+// Lifetime strike tally per miner — never reset, unlike ServiceStrikeMessage.consecutiveMisses.
+message ServiceStrikeTotalMessage {
+  string miner = 1;
+  uint32 strikes = 2;
+}
+
+message GetServiceStrikesRequestMessage {
+}
+
+message GetServiceStrikesResponseMessage {
+  uint64 virtualDaaScore = 1;
+  repeated ServiceStrikeMessage strikes = 2;
+  repeated ServiceSuspensionMessage suspended = 3;
+  repeated ServicePendingBurnMessage pendingBurns = 4;
+  repeated ServiceStrikeTotalMessage lifetimeStrikes = 5;
 
   RPCError error = 1000;
 }

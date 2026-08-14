@@ -132,6 +132,23 @@ pub struct VirtualStateProcessor {
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, read to scale the tier-reward coinbase split.
     pub(super) pom_tier_store: Arc<DbPomTierStore>,
+    /// RAM-only service-bond ledger (H6), folded along the committed selected chain.
+    pub(super) service_ledger: parking_lot::Mutex<super::service_bond::ServiceLedgerSync>,
+    /// Burned escrow outpoints (finality-deep misses), persisted counterpart in `service_burn_store`.
+    pub(super) service_burned: parking_lot::RwLock<std::collections::HashSet<keryx_consensus_core::tx::TransactionOutpoint>>,
+    pub(super) service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
+    /// Finality-deep production suspensions (miner escrow key → deadline daa), persisted counterpart
+    /// Consulted by block validation; rebuilt from the strike log at boot.
+    pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, u64>>,
+    /// Strike log: the finality-anchored baseline the ledger folds over.
+    pub(super) service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
+    /// Sealed service-state commitment index (see `processes::service_commit`).
+    pub(super) service_commit_index: Arc<crate::processes::service_commit::ServiceCommitIndex>,
+    /// First sightings (append-once), the standing/probation clock.
+    pub(super) service_first_seen_store: Arc<crate::model::stores::service_first_seen::DbServiceFirstSeenStore>,
+    /// Standing state mirror (see `service_bond::StandingIndex`).
+    pub(super) service_standing: parking_lot::RwLock<super::service_bond::StandingIndex>,
+    pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
     pub(super) body_tips_store: Arc<RwLock<DbTipsStore>>,
@@ -242,6 +259,8 @@ pub struct VirtualStateProcessor {
     // FIFO-inherited `effective_daa` anchors (see `UtxoDiff::add_transaction`) and the ratio
     // numerator switches to the per-coin-capped effective balance. Dormant (`never()`) until H4.
     pub(super) coin_age_activation: ForkActivation,
+    // H6 gate — selects the H6 inference-minimum table in `ai_reward_minimums`.
+    pub(super) pom_v3_activation: ForkActivation,
     pub(super) difficulty_reset_activation_h5_3: ForkActivation,
     pub(super) difficulty_reset_activation_h5_4: ForkActivation,
     // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
@@ -272,6 +291,13 @@ pub struct VirtualStateProcessor {
     // `KERYX_TRUST_COINBASE` operator override, read once at construction (it never changes at
     // runtime) so the per-block `trust_coinbase()` hot path avoids a fresh env lookup per coinbase.
     pub(super) trust_coinbase_env: bool,
+    // `KERYX_REVALIDATE_DISQUALIFIED` operator override, read once at construction: cached
+    // `StatusDisqualifiedFromChain` verdicts are ignored and the UTXO state is recomputed, letting
+    // a node whose store carries stale disqualifications re-attempt the chain after a binary
+    // upgrade. Blocks that fail again are simply re-marked; blocks that pass are committed
+    // `StatusUTXOValid` permanently, so the flag is meant to be set for one recovery run and then
+    // removed.
+    pub(super) revalidate_disqualified_env: bool,
 }
 
 impl VirtualStateProcessor {
@@ -303,6 +329,10 @@ impl VirtualStateProcessor {
                 if is_archival { "archival node" } else { "KERYX_TRUST_COINBASE set" }
             );
         }
+        let revalidate_disqualified_env = std::env::var("KERYX_REVALIDATE_DISQUALIFIED").is_ok();
+        if revalidate_disqualified_env {
+            info!("KERYX_REVALIDATE_DISQUALIFIED set — cached chain disqualifications will be re-validated. Remove the flag after recovery.");
+        }
         Self {
             receiver,
             pruning_sender,
@@ -320,6 +350,15 @@ impl VirtualStateProcessor {
             daa_excluded_store: storage.daa_excluded_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
+            service_ledger: Default::default(),
+            service_burned: Default::default(),
+            service_burn_store: storage.service_burn_store.clone(),
+            service_suspended: Default::default(),
+            service_strike_store: storage.service_strike_store.clone(),
+            service_commit_index: storage.service_commit_index.clone(),
+            service_first_seen_store: storage.service_first_seen_store.clone(),
+            service_standing: Default::default(),
+            finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
             body_tips_store: storage.body_tips_store.clone(),
@@ -379,12 +418,14 @@ impl VirtualStateProcessor {
             ratio_reward_window: params.ratio_reward_window,
             ratio_reward_window_daa: params.ratio_reward_window_daa,
             coin_age_activation: params.coin_age_activation,
+            pom_v3_activation: params.pom_v3_activation,
             difficulty_reset_activation_h5_3: params.difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4: params.difficulty_reset_activation_h5_4,
             coin_age_maturity_w: params.coin_age_maturity_w,
             coin_age_retention: params.finality_depth(),
             is_archival,
             trust_coinbase_env,
+            revalidate_disqualified_env,
         }
     }
 
@@ -494,6 +535,8 @@ impl VirtualStateProcessor {
             )
             .expect("all possible rule errors are unexpected here");
 
+        self.advance_service_ledger(&chain_path, pruning_point);
+
         let compact_sink_ghostdag_data = if let Some(sink_ghostdag_data) = Lazy::get(&sink_ghostdag_data) {
             // If we had to retrieve the full data, we convert it to compact
             sink_ghostdag_data.to_compact()
@@ -554,8 +597,8 @@ impl VirtualStateProcessor {
     /// `to` itself (with the exception of returning `from` if `to` is already known to be UTXO disqualified).
     /// When returning it is guaranteed that `diff` holds the diff of the returned block from virtual
     fn calculate_utxo_state_relatively(&self, stores: &VirtualStores, diff: &mut UtxoDiff, from: Hash, to: Hash) -> Hash {
-        // Avoid reorging if disqualified status is already known
-        if self.statuses_store.read().get(to).unwrap() == StatusDisqualifiedFromChain {
+        // Avoid reorging if disqualified status is already known (unless re-validation is forced)
+        if !self.revalidate_disqualified_env && self.statuses_store.read().get(to).unwrap() == StatusDisqualifiedFromChain {
             return from;
         }
 
@@ -583,7 +626,19 @@ impl VirtualStateProcessor {
         // Walk back up to the new virtual selected parent candidate
         let mut chain_block_counter = 0;
         let mut chain_disqualified_counter = 0;
+        // A long walk (recovery re-validation, deep reorg) is otherwise silent at INFO level;
+        // surface progress at a low rate so a grind is distinguishable from a hang.
+        let mut last_progress_log = std::time::Instant::now();
         for (selected_parent, current) in self.reachability_service.forward_chain_iterator(split_point, to, true).tuple_windows() {
+            if last_progress_log.elapsed().as_secs() >= 10 {
+                last_progress_log = std::time::Instant::now();
+                info!(
+                    "Virtual chain resolution: re-validated {} chain blocks ({} disqualified), at daa score {}",
+                    chain_block_counter,
+                    chain_disqualified_counter,
+                    self.headers_store.get_daa_score(current).unwrap_or_default()
+                );
+            }
             if selected_parent != diff_point {
                 // This indicates that the selected parent is disqualified, propagate up and continue
                 let statuses_guard = self.statuses_store.upgradable_read();
@@ -600,7 +655,9 @@ impl VirtualStateProcessor {
                     diff_point = current;
                 }
                 Err(StoreError::KeyNotFound(_)) => {
-                    if self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain {
+                    if !self.revalidate_disqualified_env
+                        && self.statuses_store.read().get(current).unwrap() == StatusDisqualifiedFromChain
+                    {
                         // Current block is already known to be disqualified
                         continue;
                     }
@@ -1146,7 +1203,7 @@ impl VirtualStateProcessor {
             //     this block's parents, because the valid sink may lie BELOW a disqualified block
             //     (a valid block built on top of one). A disqualified branch is bounded (real
             //     bodies), so this is not the header-only overhang case. Fixes a sink-search stall.
-            if candidate_status == StatusDisqualifiedFromChain {
+            if candidate_status == StatusDisqualifiedFromChain && !self.revalidate_disqualified_env {
                 if !self.pom_activation.is_active(self.headers_store.get_daa_score(candidate).unwrap()) {
                     continue;
                 }
@@ -1351,6 +1408,20 @@ impl VirtualStateProcessor {
         if self.model_cap_enforcement_activation.is_active(virtual_daa_score) {
             check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score))
                 .map_err(|e| TxRuleError::AiRequestPayloadRule(e.to_string()))?;
+        }
+        // Same admission rules as the block check: signed (v2) AiResponses only after the
+        // service-bond gate, and the max_tokens cap after it.
+        if !self.pom_v3_activation.is_active(virtual_daa_score) {
+            if mutable_tx.tx.is_ai_response() && mutable_tx.tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
+                return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN));
+            }
+        } else if mutable_tx.tx.is_ai_request() {
+            if let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload) {
+                let cap = keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
+                if req.max_tokens > cap {
+                    return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
+                }
+            }
         }
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
@@ -1563,6 +1634,8 @@ impl VirtualStateProcessor {
             virtual_state.daa_score,
             &[],
         );
+        let suspended_blues =
+            self.suspended_blues(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score);
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1573,6 +1646,7 @@ impl VirtualStateProcessor {
                 &virtual_state.mergeset_non_daa,
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
+                &suspended_blues,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);
@@ -1591,6 +1665,14 @@ impl VirtualStateProcessor {
         // mineable; it validates under the same rule in `calculate_difficulty_bits`, and its insertion
         // re-resolves the virtual normally. Outside the window this is a no-op (uses `virtual_state.bits`).
         let template_bits = self.window_manager.reset_difficulty_bits(virtual_state.daa_score).unwrap_or(virtual_state.bits);
+        // Sealed service-state commitment at the template's own pruning point — a node-side
+        // value (unlike pom_final_state, the miner never touches it).
+        let service_state_hash = if keryx_consensus_core::pom::service_commit_active(virtual_state.daa_score) {
+            let pp_daa = self.headers_store.get_daa_score(header_pruning_point).unwrap();
+            self.service_commit_index.commitment_at(pp_daa)
+        } else {
+            Default::default()
+        };
         let header = Header::new_finalized(
             version,
             parents_by_level,
@@ -1605,6 +1687,8 @@ impl VirtualStateProcessor {
             virtual_state.ghostdag_data.blue_score,
             header_pruning_point,
             0, // pom_final_state: filled by the miner from the winning walk (H3), like the nonce
+            service_state_hash,
+            0, // pom_tier: filled by the miner from the winning walk (H6), like pom_final_state
         );
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();
@@ -1623,6 +1707,7 @@ impl VirtualStateProcessor {
 
     /// Make sure pruning point-related stores are initialized
     pub fn init(self: &Arc<Self>) {
+        self.load_service_burned();
         let pruning_point_read = self.pruning_point_store.upgradable_read();
         if pruning_point_read.pruning_point().optional().unwrap().is_none() {
             let mut pruning_point_write = RwLockUpgradableReadGuard::upgrade(pruning_point_read);

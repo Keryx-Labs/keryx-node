@@ -154,6 +154,8 @@ mod mockery {
                 blue_work: mock(),
                 pruning_point: mock(),
                 pom_final_state: mock(),
+                service_state_hash: mock(),
+                pom_tier: mock(),
             }
         }
     }
@@ -174,6 +176,8 @@ mod mockery {
                 blue_work: mock(),
                 pruning_point: mock(),
                 pom_final_state: mock(),
+                service_state_hash: mock(),
+                pom_tier: mock(),
             }
         }
     }
@@ -425,6 +429,8 @@ mod mockery {
                 blue_work: mock(),
                 pruning_point: mock(),
                 pom_final_state: mock(),
+                service_state_hash: mock(),
+                pom_tier: mock(),
             }
         }
     }
@@ -1120,6 +1126,34 @@ mod mockery {
     }
 
     test!(GetCoinSupplyRequest);
+
+    impl Mock for GetServiceStrikesRequest {
+        fn mock() -> Self {
+            GetServiceStrikesRequest {}
+        }
+    }
+
+    test!(GetServiceStrikesRequest);
+
+    impl Mock for GetServiceStrikesResponse {
+        fn mock() -> Self {
+            GetServiceStrikesResponse {
+                virtual_daa_score: mock(),
+                strikes: vec![RpcServiceStrike { miner: mock(), consecutive_misses: 2, last_strike_daa_score: mock() }],
+                suspended: vec![RpcServiceSuspension { miner: mock(), until_daa_score: mock() }],
+                pending_burns: vec![RpcServicePendingBurn {
+                    miner: mock(),
+                    miss_daa_score: mock(),
+                    consecutive_misses: 1,
+                    burned_claims: 5,
+                    burned_sompi: mock(),
+                }],
+                lifetime_strikes: vec![RpcServiceStrikeTotal { miner: mock(), strikes: 7 }],
+            }
+        }
+    }
+
+    test!(GetServiceStrikesResponse);
 
     impl Mock for GetCoinSupplyResponse {
         fn mock() -> Self {

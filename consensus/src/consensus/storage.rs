@@ -88,6 +88,12 @@ pub struct ConsensusStorage {
     // OPoI slash stores (Phase 3 A4)
     pub ai_response_store: Arc<DbAiResponseStore>,
     pub ai_slashed_store: Arc<DbAiSlashedStore>,
+    pub service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
+    pub service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
+    pub service_first_seen_store: Arc<crate::model::stores::service_first_seen::DbServiceFirstSeenStore>,
+    /// RAM-only sealed service-state commitment index; rebuilt from the two stores at boot,
+    /// advanced at every finality flush, read by template build and body validation.
+    pub service_commit_index: Arc<crate::processes::service_commit::ServiceCommitIndex>,
 
 
     // Block window caches
@@ -269,6 +275,13 @@ impl ConsensusStorage {
         // OPoI slash stores
         let ai_response_store = Arc::new(DbAiResponseStore::new(db.clone(), header_data_builder.build()));
         let ai_slashed_store = Arc::new(DbAiSlashedStore::new(db.clone(), header_data_builder.build()));
+        let service_burn_store =
+            Arc::new(crate::model::stores::service_burn::DbServiceBurnStore::new(db.clone(), header_data_builder.build()));
+        let service_strike_store =
+            Arc::new(crate::model::stores::service_strike::DbServiceStrikeStore::new(db.clone(), header_data_builder.build()));
+        let service_first_seen_store =
+            Arc::new(crate::model::stores::service_first_seen::DbServiceFirstSeenStore::new(db.clone(), header_data_builder.build()));
+        let service_commit_index = Arc::new(crate::processes::service_commit::ServiceCommitIndex::new());
 
         // Tips
         let headers_selected_tip_store = Arc::new(RwLock::new(DbHeadersSelectedTipStore::new(db.clone())));
@@ -311,6 +324,10 @@ impl ConsensusStorage {
             windowed_production_prefix_store,
             ai_response_store,
             ai_slashed_store,
+            service_burn_store,
+            service_strike_store,
+            service_first_seen_store,
+            service_commit_index,
             past_pruning_points_store,
             daa_excluded_store,
             depth_store,

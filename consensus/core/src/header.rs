@@ -153,6 +153,24 @@ pub struct Header {
     /// to derive the header-only verifiable PoW value and block level. Zero before the fork.
     #[serde(default)]
     pub pom_final_state: u64,
+    /// Sealed service-state commitment as of this header's pruning point: MuHash over every
+    /// finality-flushed service-bond row (escrow burns and strike-log records) with daa at or
+    /// below the pruning point's daa. Consensus at/after the H6 gate: hashed into the block
+    /// hash (but NOT into `pre_pow_hash` — the pre-PoW stream stays byte-identical across the
+    /// fork), filled by the node at template build and validated in body processing. Lets a
+    /// fresh node download the service state and verify it against an already-validated
+    /// header. Zero before the fork.
+    #[serde(default)]
+    pub service_state_hash: Hash,
+    /// The winning walk's proven PoM tier. Consensus at/after the H6 gate: hashed into the block
+    /// hash (but NOT into `pre_pow_hash`, like `pom_final_state` — filled by the miner from the
+    /// winning GPU's walk at submit, so it cannot feed the pre-PoW seed), cross-checked against
+    /// `PomProof::tier` in body validation. The service-bond cohort fold reads the producer tier
+    /// from here: the header is committed and retained deeper than block bodies, so a freshly
+    /// synced node derives the identical cohorts, whereas `pom_tier_store` cannot be populated for
+    /// proofless historical bodies. Zero before the fork.
+    #[serde(default)]
+    pub pom_tier: u8,
 }
 
 impl Header {
@@ -171,6 +189,8 @@ impl Header {
         blue_score: u64,
         pruning_point: Hash,
         pom_final_state: u64,
+        service_state_hash: Hash,
+        pom_tier: u8,
     ) -> Self {
         let mut header = Self {
             hash: Default::default(), // Temp init before the finalize below
@@ -187,6 +207,8 @@ impl Header {
             blue_score,
             pruning_point,
             pom_final_state,
+            service_state_hash,
+            pom_tier,
         };
         header.finalize();
         header
@@ -221,6 +243,8 @@ impl Header {
             blue_score: 0,
             pruning_point: Default::default(),
             pom_final_state: 0,
+            service_state_hash: Default::default(),
+            pom_tier: 0,
         }
     }
 }
@@ -277,6 +301,8 @@ mod tests {
             0,
             Uint192([0x1234567890abcfed, 0xc0dec0ffeec0ffee, 0x1234567890abcdef]),
             u64::MAX,
+            Default::default(),
+            0,
             Default::default(),
             0,
         );

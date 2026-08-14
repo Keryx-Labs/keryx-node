@@ -16,6 +16,7 @@ use keryx_consensus_core::{
         PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_pow_value, pom_pow_value_h3,
         verify_pom_proof, verify_pom_proof_v2,
     },
+    pom_v3::verify_pom_proof_v3_container,
     tx::TransactionOutpoint,
 };
 use keryx_database::prelude::StoreError;
@@ -35,6 +36,7 @@ impl BlockBodyProcessor {
         self.check_block_double_spends(block)?;
         self.check_no_chained_transactions(block)?;
         self.check_opoi_tag(block)?;
+        self.check_escrow_delegation(block)?;
         // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
         if !skip_pom_proof {
@@ -155,6 +157,28 @@ impl BlockBodyProcessor {
         Ok(())
     }
 
+    /// H6: every block must announce an escrow key AND a valid delegation cert — a schnorr
+    /// signature by the payout key over the escrow key. There is no opt-out: a coinbase without
+    /// both is invalid past the gate. Skipped alongside PoW (simnet / tests).
+    fn check_escrow_delegation(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if self.skip_opoi || !self.pom_v3_activation.is_active(block.header.daa_score) {
+            return Ok(());
+        }
+        let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&block.transactions[0].payload).map_err(RuleError::BadCoinbasePayload)?;
+        let extra_data = coinbase.miner_data.extra_data;
+        let (Some(escrow_pubkey), Some(esig)) = (
+            keryx_consensus_core::collateral::parse_escrow_pubkey(extra_data),
+            keryx_consensus_core::collateral::parse_escrow_esig(extra_data),
+        ) else {
+            return Err(RuleError::MissingEscrowDelegation);
+        };
+        let spk = &coinbase.miner_data.script_public_key;
+        if !self.coinbase_manager.verify_escrow_delegation_cached(spk.version(), spk.script(), &escrow_pubkey, &esig) {
+            return Err(RuleError::BadEscrowDelegation);
+        }
+        Ok(())
+    }
+
     fn check_opoi_tag(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         if self.skip_opoi {
             return Ok(());
@@ -218,12 +242,22 @@ impl BlockBodyProcessor {
         // coin_age_verification) > H2 (5-tier, very_light) > legacy 4-tier. Chosen from this block's
         // own daa_score so archival/IBD recomputation stays canonical. H4 co-activates with the
         // recompute-from-chunks verifier; H5 rides the same v2 verifier with the non-foldable walk.
+        let pom_v3 = self.pom_v3_activation.is_active(header.daa_score);
         let tiers = pom_tiers(
+            pom_v3,
             self.h5_activation.is_active(header.daa_score),
             self.coin_age_verification_activation.is_active(header.daa_score),
             self.very_light_activation.is_active(header.daa_score),
         );
         let tier = tiers.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
+
+        // H6: the header commits the proven tier (`header.pom_tier`) so a freshly synced node can
+        // read it for the service-bond cohort fold without the (GC-able) proof. Bind it to the
+        // proof here, on the live path, so a canonical block's committed tier is always its true
+        // tier — the fold can then trust it on any node.
+        if pom_v3 && header.pom_tier != proof.tier {
+            return Err(RuleError::PomDeclaredTierMismatch(header.pom_tier, proof.tier));
+        }
 
         // pre_pow_hash commits everything except nonce/time (same as the legacy PoW front-end).
         let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
@@ -245,6 +279,27 @@ impl BlockBodyProcessor {
         };
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
         let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
+
+        // H6: matrix-walk witness (pom_v3). The verifier NEVER re-walks (that would be
+        // K * D^3 = 4.3 GMACs per block — IBD in days, the H3 lesson): it re-derives the offset
+        // chain from the listed snippets, recomputes S_0 from the seed, and re-checks 32
+        // PRF-sampled single entries against the per-step state commitments and the UNCHANGED
+        // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
+        // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
+        // later), so the pin check above already ran.
+        if pom_v3 {
+            return verify_pom_proof_v3_container(
+                &pre_pow_hash,
+                header.nonce,
+                seed,
+                proof,
+                tier.chunks,
+                &tier.root,
+                &target,
+                final_hash,
+            )
+            .map_err(RuleError::BadPomProofV3);
+        }
 
         // H4: recompute-from-chunks verifier (all K transitions re-walked, `final_state` derived).
         // Replaces the 32/256 spot-check, which accepted a forged `final_state` ~88% of the time.
@@ -566,6 +621,8 @@ mod tests {
                 0,
                 0.into(),
                 9,
+                Default::default(),
+                0,
                 Default::default(),
                 0,
             ),

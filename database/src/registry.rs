@@ -133,6 +133,16 @@ pub enum DatabaseStorePrefixes {
     /// be re-served (relay/IBD) with its proof; otherwise `get_block` returns `pom_proof: None` and
     /// peers reject the served block (`PoM possession proof missing`).
     PomProof = 195,
+    /// Service-bond burned escrow outpoints (finality-deep misses): outpoint → miss daa.
+    ServiceBurn = 196,
+    /// Service-bond strike log (finality-deep events, append-only): `daa (BE) || miner identity`
+    /// → (consecutive misses, last strike daa). The fold's strike baseline is the last record
+    /// per miner; counts only reset on a served response or an executed suspension, never by
+    /// time. Suspensions are the `{0, daa > 0}` rows. (197 was the retired suspend store.)
+    ServiceStrike = 198,
+    /// Service-bond first sightings (finality-deep, append-once): miner identity → daa of its
+    /// first certified block. The standing/probation clock.
+    ServiceFirstSeen = 199,
 
     // ---- Separator ----
     /// Reserved as a separator

@@ -40,6 +40,11 @@ export interface IHeader {
     // H3 (pom_level_activation): final state of the winning PoM possession walk,
     // committed into the block hash. Optional; defaults to 0 (pre-fork blocks).
     pomFinalState?: bigint;
+    // H6: sealed service-state commitment at this header's pruning point. Optional;
+    // defaults to the zero hash (pre-gate blocks).
+    serviceStateHash?: HexString;
+    // H6: the winning walk's proven PoM tier. Optional; defaults to 0 (pre-gate blocks).
+    pomTier?: number;
 }
 
 /**
@@ -66,6 +71,11 @@ export interface IRawHeader {
     // H3 (pom_level_activation): final state of the winning PoM possession walk,
     // committed into the block hash. Optional; defaults to 0 (pre-fork blocks).
     pomFinalState?: bigint;
+    // H6: sealed service-state commitment at this header's pruning point. Optional;
+    // defaults to the zero hash (pre-gate blocks).
+    serviceStateHash?: HexString;
+    // H6: the winning walk's proven PoM tier. Optional; defaults to 0 (pre-gate blocks).
+    pomTier?: number;
 }
 "#;
 
@@ -194,6 +204,26 @@ impl Header {
     #[wasm_bindgen(setter = pomFinalState)]
     pub fn set_pom_final_state(&mut self, pom_final_state: u64) {
         self.inner_mut().pom_final_state = pom_final_state
+    }
+
+    #[wasm_bindgen(getter = serviceStateHash)]
+    pub fn service_state_hash(&self) -> String {
+        self.inner().service_state_hash.to_hex()
+    }
+
+    #[wasm_bindgen(setter = serviceStateHash)]
+    pub fn set_service_state_hash_from_js_value(&mut self, js_value: JsValue) {
+        self.inner_mut().service_state_hash = Hash::from_slice(&js_value.try_as_vec_u8().expect("service state hash"));
+    }
+
+    #[wasm_bindgen(getter = pomTier)]
+    pub fn pom_tier(&self) -> u8 {
+        self.inner().pom_tier
+    }
+
+    #[wasm_bindgen(setter = pomTier)]
+    pub fn set_pom_tier(&mut self, pom_tier: u8) {
+        self.inner_mut().pom_tier = pom_tier
     }
 
     #[wasm_bindgen(getter = hash)]
@@ -332,6 +362,13 @@ impl TryCastFromJs for Header {
                         .map_err(|err| Error::convert("pruningPoint", err))?,
                     // Optional for JS callers: absent on pre-H3 headers / legacy templates.
                     pom_final_state: object.get_u64("pomFinalState").unwrap_or_default(),
+                    // Optional for JS callers: absent on pre-H6 headers.
+                    service_state_hash: object
+                        .get_value("serviceStateHash")
+                        .ok()
+                        .and_then(|v| v.try_into_owned().ok())
+                        .unwrap_or_default(),
+                    pom_tier: object.get_u16("pomTier").map(|v| v as u8).unwrap_or_default(),
                 };
 
                 Ok(header.into())

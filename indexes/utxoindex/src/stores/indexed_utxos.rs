@@ -125,6 +125,16 @@ pub trait UtxoSetByScriptPublicKeyStoreReader {
     /// Get [UtxoSetByScriptPublicKey] set by queried [ScriptPublicKeys],
     fn get_utxos_from_script_public_keys(&self, script_public_keys: ScriptPublicKeys) -> StoreResult<UtxoSetByScriptPublicKey>;
     fn get_balance_from_script_public_keys(&self, script_public_keys: ScriptPublicKeys) -> StoreResult<BalanceByScriptPublicKey>;
+    /// Get up to `limit` UTXO entries of one script public key, resuming strictly after
+    /// `resume_after` when provided. Entries come in stable DB key order (outpoint bytes),
+    /// so successive calls walk the bucket exactly once. Building block for chunked scans
+    /// that bound how long the utxoindex lock is held per call.
+    fn get_utxos_from_script_public_key_chunk(
+        &self,
+        script_public_key: &ScriptPublicKey,
+        resume_after: Option<TransactionOutpoint>,
+        limit: usize,
+    ) -> StoreResult<Vec<(TransactionOutpoint, CompactUtxoEntry)>>;
     fn get_all_outpoints(&self) -> StoreResult<HashSet<TransactionOutpoint>>; // This can have a big memory footprint, so it should be used only for tests.
 }
 
@@ -197,6 +207,27 @@ impl UtxoSetByScriptPublicKeyStoreReader for DbUtxoSetByScriptPublicKeyStore {
         Ok(balance_by_script_public_keys)
     }
 
+    fn get_utxos_from_script_public_key_chunk(
+        &self,
+        script_public_key: &ScriptPublicKey,
+        resume_after: Option<TransactionOutpoint>,
+        limit: usize,
+    ) -> StoreResult<Vec<(TransactionOutpoint, CompactUtxoEntry)>> {
+        let script_public_key_bucket = ScriptPublicKeyBucket::from(script_public_key);
+        let seek_key = resume_after
+            .as_ref()
+            .map(|outpoint| UtxoEntryFullAccessKey::new(script_public_key_bucket.clone(), TransactionOutpointKey::from(outpoint)));
+        let skip_first = seek_key.is_some();
+        Ok(self
+            .access
+            .seek_iterator(Some(script_public_key_bucket.as_ref()), seek_key, limit, skip_first)
+            .map(|res| {
+                let (key, entry) = res.unwrap();
+                (TransactionOutpointKey(<[u8; TRANSACTION_OUTPOINT_KEY_SIZE]>::try_from(&key[..]).unwrap()).into(), entry)
+            })
+            .collect())
+    }
+
     // This can have a big memory footprint, so it should be used only for tests.
     fn get_all_outpoints(&self) -> StoreResult<HashSet<TransactionOutpoint>> {
         Ok(HashSet::from_iter(
@@ -254,5 +285,65 @@ impl UtxoSetByScriptPublicKeyStore for DbUtxoSetByScriptPublicKeyStore {
     /// Removes all entries in the cache and db, besides prefixes themselves.
     fn delete_all(&mut self) -> StoreResult<()> {
         self.access.delete_all(DirectDbWriter::new(&self.db))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_database::create_temp_db;
+    use keryx_database::prelude::ConnBuilder;
+
+    fn spk(byte: u8) -> ScriptPublicKey {
+        ScriptPublicKey::new(0, ScriptVec::from_slice(&[byte; 32]))
+    }
+
+    #[test]
+    fn test_chunked_scan_matches_full_scan() {
+        let (_db_lifetime, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let mut store = DbUtxoSetByScriptPublicKeyStore::new(db, CachePolicy::Empty);
+
+        // 257 entries in the target bucket (not a multiple of the walk limit), plus a
+        // neighbor bucket that must never leak into the walk.
+        let target = spk(1);
+        let neighbor = spk(2);
+        let mut target_collection = CompactUtxoCollection::new();
+        for i in 0..257u32 {
+            target_collection
+                .insert(TransactionOutpoint::new(Hash::from_u64_word(i as u64 + 1), i), CompactUtxoEntry::new(i as u64 * 7 + 1, i as u64, i % 2 == 0));
+        }
+        let mut neighbor_collection = CompactUtxoCollection::new();
+        neighbor_collection.insert(TransactionOutpoint::new(Hash::from_u64_word(9999), 0), CompactUtxoEntry::new(42, 0, false));
+        let mut to_add = UtxoSetByScriptPublicKey::new();
+        to_add.insert(target.clone(), target_collection.clone());
+        to_add.insert(neighbor.clone(), neighbor_collection);
+        store.add_utxo_entries(&to_add).unwrap();
+
+        // Walk the target bucket in chunks of 100, resuming from the last outpoint.
+        let mut walked = CompactUtxoCollection::new();
+        let mut resume_after: Option<TransactionOutpoint> = None;
+        loop {
+            let chunk = store.get_utxos_from_script_public_key_chunk(&target, resume_after, 100).unwrap();
+            let exhausted = chunk.len() < 100;
+            resume_after = chunk.last().map(|(outpoint, _)| *outpoint);
+            for (outpoint, entry) in chunk {
+                assert!(walked.insert(outpoint, entry).is_none(), "chunked walk revisited an outpoint");
+            }
+            if exhausted {
+                break;
+            }
+        }
+
+        assert_eq!(walked.len(), target_collection.len(), "chunked walk must cover the whole bucket exactly once");
+        for (outpoint, entry) in target_collection.iter() {
+            assert_eq!(walked.get(outpoint).expect("chunked walk missed an outpoint").amount, entry.amount);
+        }
+
+        // A limit larger than the bucket returns everything in one call.
+        assert_eq!(store.get_utxos_from_script_public_key_chunk(&target, None, usize::MAX).unwrap().len(), target_collection.len());
+        // Resuming after the last outpoint returns an empty chunk.
+        let full = store.get_utxos_from_script_public_key_chunk(&target, None, usize::MAX).unwrap();
+        let last = full.last().map(|(outpoint, _)| *outpoint);
+        assert!(store.get_utxos_from_script_public_key_chunk(&target, last, 100).unwrap().is_empty());
     }
 }

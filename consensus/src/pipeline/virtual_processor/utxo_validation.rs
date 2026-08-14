@@ -6,8 +6,9 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiResponseModelCapMissing, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment,
-            InvalidTransactionsInUtxoContext, WrongHeaderPruningPoint,
+            AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
+            BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext,
+            WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -32,7 +33,7 @@ use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -42,7 +43,10 @@ use keryx_consensus_core::{
     hashing,
     header::Header,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{
+        MutableTransaction, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint,
+        ValidatedTransaction, VerifiableTransaction,
+    },
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
@@ -50,6 +54,7 @@ use keryx_consensus_core::{
 };
 use keryx_core::{debug, info, trace, warn};
 use keryx_hashes::Hash;
+use keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
@@ -71,6 +76,22 @@ use std::{
 static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_3_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_4_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H6_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a hardfork banner should print for the block crossing `activation`. Latching alone is
+/// not enough: IBD re-validates the historical crossing block, and a network whose gate is active
+/// from genesis (`daa_score() == 0`, e.g. H4 on the testnet) keeps every young chain inside the
+/// lag window — both re-printed the banner on every sync. A banner announces a LIVE crossing:
+/// the gate must be a real fork (score > 0), the block must sit inside the lag window past it,
+/// and its timestamp must be recent wall-clock (a replayed historical crossing is old news).
+fn banner_should_fire(activation: keryx_consensus_core::config::params::ForkActivation, header: &Header) -> bool {
+    /// Max wall-clock age (ms) of a crossing block for its banner to count as live.
+    const BANNER_LIVE_WINDOW_MS: u64 = 3_600_000;
+    activation.is_active(header.daa_score)
+        && activation.daa_score() > 0
+        && header.daa_score < activation.daa_score() + BANNER_MAX_LAG
+        && keryx_core::time::unix_now().saturating_sub(header.timestamp) < BANNER_LIVE_WINDOW_MS
+}
 
 /// Max DAA a block may sit past the H4 gate and still trigger the activation banner. The gate uses
 /// an at-or-after match (an exact-equality banner would be skipped at 10 BPS), which alone is true
@@ -217,7 +238,7 @@ impl VirtualStateProcessor {
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
             let escrow_spk =
-                self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data);
+                self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data, pov_daa_score);
             ctx.mergeset_rewards.insert(
                 merged_block,
                 BlockRewardData::new_with_escrow(
@@ -277,24 +298,42 @@ impl VirtualStateProcessor {
         // the `utxo_commitment` verified above already pins this block's resulting UTXO set to the
         // canonical chain, so the block's coinbase outputs are trusted without re-deriving the ratio
         // bracket — which such a node cannot yet reproduce for the post-fork canonical chain.
-        // Coinbase ratio/tier verification. We ALWAYS compute the expected coinbase and log any
-        // mismatch (so the producer's and every validator's computation can be compared across nodes);
-        // we only REJECT when `enforce` holds. Enforcement requires the relaunch-frontier gate
+        // Coinbase ratio/tier verification. Enforcement requires the relaunch-frontier gate
         // (`ratio_verification_activation`, so non-revalidatable pre-relaunch history is trusted — its
         // `utxo_commitment`, checked above, pins the state) AND the node not being in a trust window
         // (archival / `KERYX_TRUST_COINBASE` / fast-sync catch-up). With the gate set to `never()`,
         // enforcement is OFF (observe-only) network-wide — the relaunch runs while we confirm the
         // prefix-sum makes all nodes agree, then enforcement is switched on by setting the gate DAA.
+        //
+        // When not enforcing, the expected coinbase is only computed under `KERYX_RATIO_DEBUG`
+        // (cross-node comparison logs). The ratio balances fold `sp_diff`, which grows with the
+        // distance from the committed virtual — computing it per block turns a long re-validation
+        // walk quadratic, so a trusted transition must not pay for a comparison it discards.
         let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase();
-        self.verify_coinbase_transaction(
-            &txs[0],
-            header.daa_score,
-            &ctx.ghostdag_data,
-            &ctx.mergeset_rewards,
-            &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
-            &[sp_diff, &ctx.mergeset_diff],
-            enforce,
-        )?;
+        if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
+            self.verify_coinbase_transaction(
+                &txs[0],
+                header.daa_score,
+                &ctx.ghostdag_data,
+                &ctx.mergeset_rewards,
+                &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+                &[sp_diff, &ctx.mergeset_diff],
+                enforce,
+            )?;
+        }
+
+        // Sealed service-state commitment: the header must commit the canonical service state
+        // at its own pruning point. This runs in chain order (the local flush frontier is at
+        // least finality-deep past the pruning point), and is skipped in the same trust windows
+        // as the coinbase check — a node that cannot yet reproduce the fold trusts the
+        // utxo-commitment-pinned chain instead.
+        if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase() {
+            let pp_daa = self.headers_store.get_daa_score(header.pruning_point).unwrap();
+            let expected = self.service_commit_index.commitment_at(pp_daa);
+            if header.service_state_hash != expected {
+                return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
+            }
+        }
 
         // Verify the header pruning point
         let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
@@ -357,8 +396,7 @@ impl VirtualStateProcessor {
         // the gate (BANNER_MAX_LAG) so a node booting already synced far beyond H4 no longer
         // re-prints it on every restart. `compare_exchange` keeps it to one print per process (the
         // first post-gate block within the window, whether reached live or during IBD).
-        if self.coin_age_activation.is_active(header.daa_score)
-            && header.daa_score < self.coin_age_activation.daa_score() + BANNER_MAX_LAG
+        if banner_should_fire(self.coin_age_activation, header)
             && COIN_AGE_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             // Header carries the GATE score (the fork's identity, always exact), not this block's —
@@ -379,8 +417,7 @@ impl VirtualStateProcessor {
         // the gate, never on strict equality: the DAA score is a cumulative count and routinely
         // skips the exact activation value at 10 BPS, so an equality test would leave the banner
         // silent and its absence would read as "the fork did not activate".
-        if self.difficulty_reset_activation_h5_3.is_active(header.daa_score)
-            && header.daa_score < self.difficulty_reset_activation_h5_3.daa_score() + BANNER_MAX_LAG
+        if banner_should_fire(self.difficulty_reset_activation_h5_3, header)
             && H5_3_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             info!("════════════════ KERYX HARDFORK H5.3 · DAA {} ════════════════", self.difficulty_reset_activation_h5_3.daa_score());
@@ -395,8 +432,7 @@ impl VirtualStateProcessor {
         // H5.4 relaunch banner. Same latching shape as H4/H5.3 — fires on the first block at or
         // AFTER the gate, never on strict equality (the DAA score routinely skips the exact
         // activation value at 10 BPS).
-        if self.difficulty_reset_activation_h5_4.is_active(header.daa_score)
-            && header.daa_score < self.difficulty_reset_activation_h5_4.daa_score() + BANNER_MAX_LAG
+        if banner_should_fire(self.difficulty_reset_activation_h5_4, header)
             && H5_4_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             info!("════════════════ KERYX HARDFORK H5.4 · DAA {} ════════════════", self.difficulty_reset_activation_h5_4.daa_score());
@@ -406,6 +442,45 @@ impl VirtualStateProcessor {
             info!("  Miners        — unchanged: no walk-seed rotation, existing rigs keep mining");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // H6 banner. Same latching shape as the others — fires once, on the first block at or
+        // after the gate, only for a live crossing (see `banner_should_fire`).
+        if banner_should_fire(self.pom_v3_activation, header)
+            && H6_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H6 · DAA {} ════════════════", self.pom_v3_activation.daa_score());
+            info!("  PoM v3        — matrix-walk possession proof; new model lineup (Qwen3.5-9B tier 0)");
+            info!("  Escrow        — MANDATORY: blocks without `/escrow:` + a valid `/esig:` delegation cert are invalid");
+            info!("  Identity      — strikes, suspensions and standing follow the payout address, not the hot escrow key");
+            info!("  Sealed state  — burns/strikes/sightings committed in headers, downloaded and verified at IBD");
+            info!("  Standing      — fresh identities mine at the floor tier rate for the probation window");
+            info!("  Service-bond  — silent cohort members escalate: burn → slash-all → suspension; serving resets");
+            info!("  Escrow lock   — CSV extended to ~22h; ~10h of claims stay burnable");
+            info!("  Difficulty    — reset window open at the gate");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // Signed (v2) AiResponse payloads only become valid at the service-bond gate; before it
+        // this keeps the fixed 78-byte rule every deployed node enforces. The gate also brings
+        // the max_tokens cap on AiRequests.
+        if !self.pom_v3_activation.is_active(header.daa_score) {
+            for tx in txs.iter().skip(1) {
+                if tx.is_ai_response() && tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
+                    return Err(AiResponseV2BeforeActivation(tx.id()));
+                }
+            }
+        } else {
+            for tx in txs.iter().skip(1) {
+                if tx.is_ai_request() {
+                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
+                        if req.max_tokens > AI_REQUEST_MAX_TOKENS_CAP {
+                            return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
+                        }
+                    }
+                }
+            }
         }
 
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
@@ -453,7 +528,9 @@ impl VirtualStateProcessor {
     /// OPoI v2 introduced the uncensored lineup. Resolved in one place so the pre-UTXO fast path,
     /// the full block check and mempool admission cannot read different tables for the same score.
     pub(super) fn ai_reward_minimums(&self, daa_score: u64) -> &[([u8; 32], u64)] {
-        if self.coin_age_activation.is_active(daa_score) {
+        if self.pom_v3_activation.is_active(daa_score) {
+            INFERENCE_REWARD_MINIMUMS_V2_H6
+        } else if self.coin_age_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_V2_H4
         } else if self.inference_min_h2_activation.is_active(daa_score) {
             self.inference_reward_minimums_v2_h2
@@ -494,6 +571,7 @@ impl VirtualStateProcessor {
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
         let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
+        let suspended_blues = self.suspended_blues(ghostdag_data, mergeset_non_daa, daa_score);
         let expected_coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -504,6 +582,7 @@ impl VirtualStateProcessor {
                 mergeset_non_daa,
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
+                &suspended_blues,
             )
             .unwrap()
             .tx;
@@ -539,6 +618,33 @@ impl VirtualStateProcessor {
     /// before `pom_activation` (⇒ every miner cut paid in full, no penalty, no burn). A blue with no
     /// stored tier (cannot happen for a valid post-fork block — `check_pom_proof` requires the proof)
     /// is simply left out, falling back to the full cut on the coinbase side.
+    /// Blue block hashes whose producer is under a finality-deep service-bond suspension as of this
+    /// block — their miner cut is burned by `expected_coinbase_transaction`. Derived from the
+    /// reorg-immune suspended set (populated in-order during virtual resolution, finality-deep), so
+    /// every H6 node computes the identical set at this block's view. Empty pre-H6.
+    pub(super) fn suspended_blues(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        pov_daa_score: u64,
+    ) -> BlockHashSet {
+        let mut set = BlockHashSet::new();
+        if !self.pom_v3_activation.is_active(pov_daa_score) || self.service_suspended.read().is_empty() {
+            return set;
+        }
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            let txs = self.block_transactions_store.get(*blue).unwrap();
+            let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+            // Identity is the payout SPK key: rotating the hot escrow key does not shed a
+            // suspension.
+            let identity = keryx_consensus_core::collateral::miner_key(&coinbase.miner_data.script_public_key);
+            if self.is_producer_suspended(&identity, pov_daa_score) {
+                set.insert(*blue);
+            }
+        }
+        set
+    }
+
     pub(super) fn tier_bps_by_block(
         &self,
         ghostdag_data: &GhostdagData,
@@ -549,12 +655,27 @@ impl VirtualStateProcessor {
         if !self.pom_activation.is_active(pov_daa_score) {
             return map;
         }
-        // Reward schedule gated per block by `very_light_activation` (5-tier H2 vs legacy 4-tier),
-        // keyed on this block's own daa_score to match `pom_tiers` and stay canonical under IBD.
-        let schedule = tier_reward_bps(self.very_light_activation.is_active(pov_daa_score));
+        // Reward schedule gated per block by daa_score (5-tier H6 once pom_v3 is live, else 5-tier H2,
+        // else legacy 4-tier), keyed on this block's own daa_score to match `pom_tiers` under IBD.
+        let schedule = tier_reward_bps(
+            self.very_light_activation.is_active(pov_daa_score),
+            self.pom_v3_activation.is_active(pov_daa_score),
+        );
+        // H6: the tier bonus is gated on standing — an identity in probation (young, or carrying
+        // a strike as of the lagged anchor) earns the floor rate whatever tier it proves. Rotating
+        // identities therefore forfeits the bonus for the whole probation.
+        let standing_gate = self.pom_v3_activation.is_active(pov_daa_score);
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             if let Some(tier) = self.pom_tier_store.get(*blue).optional().unwrap() {
-                let bps = schedule.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+                let mut bps = schedule.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+                if standing_gate {
+                    let txs = self.block_transactions_store.get(*blue).unwrap();
+                    let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+                    let identity = keryx_consensus_core::collateral::miner_key(&coinbase.miner_data.script_public_key);
+                    if !self.service_standing_at(&identity, pov_daa_score) {
+                        bps = schedule[0];
+                    }
+                }
                 map.insert(*blue, bps);
             }
         }
@@ -933,7 +1054,7 @@ impl VirtualStateProcessor {
     /// indices below `hi_idx`; `floor_idx` (the pruning clamp) keeps every probe inside retained,
     /// consensus-shared history. If even the floor's daa exceeds the bound (window truncated by
     /// pruning), the floor itself is returned — the caller clamps to it anyway.
-    fn chain_index_at_or_below_daa(
+    pub(super) fn chain_index_at_or_below_daa(
         &self,
         sc: &impl SelectedChainStoreReader,
         bound_daa: u64,
@@ -1292,6 +1413,23 @@ impl VirtualStateProcessor {
         })
     }
 
+    /// If any of `outpoints` is a burned escrow outpoint, returns the full burned set formatted as
+    /// space-separated `txid:index`. A claiming miner reads this to slash exactly the burned members
+    /// and re-batch the rest instead of bisecting to find them. `None` when none are burned.
+    fn burned_outpoints_msg<'b>(&self, outpoints: impl Iterator<Item = &'b TransactionOutpoint>) -> Option<String> {
+        let guard = self.service_burned.read();
+        let mut msg = String::new();
+        for o in outpoints {
+            if guard.contains(o) {
+                if !msg.is_empty() {
+                    msg.push(' ');
+                }
+                msg.push_str(&format!("{}:{}", o.transaction_id, o.index));
+            }
+        }
+        (!msg.is_empty()).then_some(msg)
+    }
+
     /// Attempts to populate the transaction with UTXO entries and performs all utxo-related tx validations
     pub(super) fn validate_transaction_in_utxo_context<'a>(
         &self,
@@ -1307,9 +1445,23 @@ impl VirtualStateProcessor {
         // lost in the result->ipfs_cid migration, so every honest AiResponse was slashable by anyone.
         // Escrows are therefore always spendable now; no slashed-escrow check is performed.
 
+        // Service-bond (H6): a finality-deep miss burns the miner's escrow claims — spending one is
+        // invalid forever. The set only ever contains reorg-immune entries, so every POV reaches the
+        // same verdict. Report the full burned set (not the first), so a claiming miner slashes
+        // exactly those and re-batches the rest. A burned outpoint is still present in the view
+        // (burn is an overlay, not a deletion), so this never masks a genuine missing-input.
+        if let Some(msg) = self.burned_outpoints_msg(transaction.inputs.iter().map(|i| &i.previous_outpoint)) {
+            return Err(TxRuleError::SpendOfBurnedEscrow(msg));
+        }
         let mut entries = Vec::with_capacity(transaction.inputs.len());
         for input in transaction.inputs.iter() {
-            if let Some(entry) = utxo_view.get(&input.previous_outpoint) {
+            if let Some(mut entry) = utxo_view.get(&input.previous_outpoint) {
+                if let Some(anchor) = historical_anchor_override(&input.previous_outpoint)
+                    && entry.effective_daa != anchor
+                {
+                    info!("Historical anchor override applied for {}", input.previous_outpoint);
+                    entry.effective_daa = anchor;
+                }
                 entries.push(entry);
             } else {
                 // Missing at least one input. For perf considerations, we report once a single miss is detected and avoid collecting all possible misses.
@@ -1362,6 +1514,9 @@ impl VirtualStateProcessor {
         args: &TransactionValidationArgs,
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
+        if let Some(msg) = self.burned_outpoints_msg(mutable_tx.tx.inputs.iter().map(|i| &i.previous_outpoint)) {
+            return Err(TxRuleError::SpendOfBurnedEscrow(msg));
+        }
 
         // Calc the contextual storage mass
         let contextual_mass = self
@@ -1450,6 +1605,28 @@ impl VirtualStateProcessor {
             keryx_merkle::calc_merkle_root(accepted_tx_ids),
         )
     }
+}
+
+/// Age anchors the canonical chain committed for specific historical spends, where clean
+/// re-derivation computes a different value. Applied at input population so re-validation of the
+/// canonical chain reproduces the committed state byte-for-byte. Keyed by outpoint; every listed
+/// coin is long spent, so the table is inert outside historical validation.
+const HISTORICAL_ANCHOR_OVERRIDES: &[(Hash, u32, u64)] = &[(
+    // aeb4e536e444210419a3bf2fae8e582816ad36339be0f429c0eaac611e3bcab3:1 — spent at DAA 74807554
+    // committing anchor 74780462; re-derivation yields 74780464.
+    Hash::from_bytes([
+        0xae, 0xb4, 0xe5, 0x36, 0xe4, 0x44, 0x21, 0x04, 0x19, 0xa3, 0xbf, 0x2f, 0xae, 0x8e, 0x58, 0x28, 0x16, 0xad, 0x36, 0x33,
+        0x9b, 0xe0, 0xf4, 0x29, 0xc0, 0xea, 0xac, 0x61, 0x1e, 0x3b, 0xca, 0xb3,
+    ]),
+    1,
+    74780462,
+)];
+
+fn historical_anchor_override(outpoint: &TransactionOutpoint) -> Option<u64> {
+    HISTORICAL_ANCHOR_OVERRIDES
+        .iter()
+        .find(|(txid, index, _)| outpoint.transaction_id == *txid && outpoint.index == *index)
+        .map(|&(_, _, anchor)| anchor)
 }
 
 /// The `AiRequest` rules that need nothing but the transaction itself: the per-model

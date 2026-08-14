@@ -11,6 +11,7 @@ use crate::v7::{
     request_pp_proof::RequestPruningPointProofFlow,
     request_pruning_point_and_anticone::PruningPointAndItsAnticoneRequestsFlow,
     request_pruning_point_utxo_set::RequestPruningPointUtxoSetFlow,
+    request_service_state::RequestServiceStateFlow,
     txrelay::flow::{RelayTransactionsFlow, RequestTransactionsFlow},
 };
 use crate::{flow_context::FlowContext, flow_trait::Flow};
@@ -29,6 +30,7 @@ pub(crate) mod request_ibd_chain_block_locator;
 pub(crate) mod request_pp_proof;
 pub(crate) mod request_pruning_point_and_anticone;
 pub(crate) mod request_pruning_point_utxo_set;
+pub(crate) mod request_service_state;
 pub(crate) mod txrelay;
 
 pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
@@ -57,6 +59,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
                 KaspadMessagePayloadType::UnexpectedPruningPoint,
                 KaspadMessagePayloadType::PruningPointUtxoSetChunk,
                 KaspadMessagePayloadType::DonePruningPointUtxoSetChunks,
+                KaspadMessagePayloadType::ServiceStateChunk,
+                KaspadMessagePayloadType::DoneServiceStateChunks,
             ]),
             relay_receiver,
             body_only_ibd_permitted,
@@ -103,6 +107,11 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
                 KaspadMessagePayloadType::RequestPruningPointUtxoSet,
                 KaspadMessagePayloadType::RequestNextPruningPointUtxoSetChunk,
             ]),
+        )),
+        Box::new(RequestServiceStateFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![KaspadMessagePayloadType::RequestServiceState]),
         )),
         Box::new(HandleIbdBlockRequests::new(
             ctx.clone(),

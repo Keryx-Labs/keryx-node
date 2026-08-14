@@ -9,6 +9,7 @@ use crate::{
     block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
     blockstatus::BlockStatus,
     coinbase::MinerData,
+    collateral::ServiceStrikesSnapshot,
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         block::{BlockProcessResult, RuleError},
@@ -116,6 +117,23 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn get_virtual_daa_score(&self) -> u64 {
+        unimplemented!()
+    }
+
+    /// Every finality-flushed service-bond row (canonical commitment byte form) with event daa
+    /// at or below `pruning_point`'s daa — what a fresh node downloads at IBD.
+    fn get_service_state_rows(&self, pruning_point: Hash) -> ConsensusResult<Vec<Vec<u8>>> {
+        unimplemented!()
+    }
+
+    /// Imports a verified service-state row set (canonical byte forms) into the service stores
+    /// and rebuilds the derived RAM state. Rows MUST have been verified against a validated
+    /// header's `service_state_hash` by the caller.
+    fn import_service_state(&self, rows: Vec<Vec<u8>>) -> ConsensusResult<()> {
+        unimplemented!()
+    }
+
+    fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
         unimplemented!()
     }
 
@@ -229,6 +247,12 @@ pub trait ConsensusApi: Send + Sync {
         chunk_size: usize,
         skip_first: bool,
     ) -> Vec<(TransactionOutpoint, UtxoEntry)> {
+        unimplemented!()
+    }
+
+    /// Point-lookup of specific outpoints in the virtual UTXO set. Only live
+    /// outpoints are returned; a missing outpoint is spent or never existed.
+    fn get_utxos_by_outpoints(&self, outpoints: Vec<TransactionOutpoint>) -> Vec<(TransactionOutpoint, UtxoEntry)> {
         unimplemented!()
     }
 

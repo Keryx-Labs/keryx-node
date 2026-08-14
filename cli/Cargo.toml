@@ -36,6 +36,7 @@ js-sys.workspace = true
 hex.workspace = true
 keryx-addresses.workspace = true
 keryx-bip32.workspace = true
+keryx-txscript.workspace = true
 keryx-consensus-core.workspace = true
 keryx-core.workspace = true
 keryx-daemon.workspace = true

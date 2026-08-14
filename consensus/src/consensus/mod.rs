@@ -57,6 +57,7 @@ use keryx_consensus_core::{
     blockhash::BlockHashExtensions,
     blockstatus::BlockStatus,
     coinbase::MinerData,
+    collateral::ServiceStrikesSnapshot,
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         coinbase::CoinbaseResult,
@@ -181,6 +182,9 @@ impl Consensus {
         // Same pattern for the PoM block-level fork (H3): header hashing commits to
         // `pom_final_state` from this score on and has no access to Params.
         keryx_consensus_core::pom::init_pom_level_activation(params.pom_level_activation.daa_score());
+        // Same pattern for the sealed service-state commitment (H6): header hashing commits
+        // to `service_state_hash` from the H6 gate on.
+        keryx_consensus_core::pom::init_service_commit_activation(params.pom_v3_activation.daa_score());
 
         //
         // Storage layer
@@ -337,6 +341,19 @@ impl Consensus {
             "ratio_reward_window ({}) must be strictly less than pruning_depth ({}) — the windowed-production \
              prefix index requires the whole window to stay above the pruning floor",
             this.config.params.ratio_reward_window,
+            this.config.pruning_depth()
+        );
+        // Same invariant class for the service-bond cold refold: its deepest reach (the finality
+        // anchor plus the burnable-window warmup) must stay above the pruning floor, or a fresh
+        // node would silently rebuild a truncated vault → divergent burns.
+        assert!(
+            this.config.params.finality_depth()
+                + keryx_consensus_core::collateral::SERVICE_BURNABLE_WINDOW_DAA
+                <= this.config.pruning_depth(),
+            "finality_depth ({}) + SERVICE_BURNABLE_WINDOW_DAA ({}) must not exceed pruning_depth ({}) — the \
+             service-bond cold refold requires its whole window to stay above the pruning floor",
+            this.config.params.finality_depth(),
+            keryx_consensus_core::collateral::SERVICE_BURNABLE_WINDOW_DAA,
             this.config.pruning_depth()
         );
 
@@ -700,6 +717,90 @@ impl ConsensusApi for Consensus {
         self.lkg_virtual_state.load().daa_score
     }
 
+    fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
+        self.virtual_processor.service_strikes_snapshot(self.lkg_virtual_state.load().daa_score)
+    }
+
+    fn get_service_state_rows(&self, pruning_point: Hash) -> ConsensusResult<Vec<Vec<u8>>> {
+        let Some(pp_daa) = self.headers_store.get_daa_score(pruning_point).optional().unwrap() else {
+            return Err(ConsensusError::HeaderNotFound(pruning_point));
+        };
+        let mut rows: Vec<Vec<u8>> = Vec::new();
+        for entry in self.storage.service_burn_store.iterator() {
+            let (key, daa) = entry.unwrap();
+            if daa > pp_daa {
+                continue;
+            }
+            let tx_id: [u8; 32] = key[..32].try_into().unwrap();
+            let index = u32::from_le_bytes(key[32..36].try_into().unwrap());
+            rows.push(crate::processes::service_commit::burn_row_bytes(tx_id.into(), index, daa).to_vec());
+        }
+        for entry in self.storage.service_strike_store.iterator() {
+            let (key, record) = entry.unwrap();
+            let (daa, miner) = crate::model::stores::service_strike::StrikeLogKey::parse(&key);
+            if daa > pp_daa {
+                continue;
+            }
+            rows.push(crate::processes::service_commit::strike_row_bytes(daa, miner, record.count, record.last_daa).to_vec());
+        }
+        for entry in self.storage.service_first_seen_store.iterator() {
+            let (key, daa) = entry.unwrap();
+            if daa > pp_daa {
+                continue;
+            }
+            let miner: [u8; 32] = key[..32].try_into().unwrap();
+            rows.push(crate::processes::service_commit::first_seen_row_bytes(Hash::from_bytes(miner), daa).to_vec());
+        }
+        Ok(rows)
+    }
+
+    fn import_service_state(&self, rows: Vec<Vec<u8>>) -> ConsensusResult<()> {
+        use crate::model::stores::ai_slash::OutpointKey;
+        use keryx_consensus_core::collateral::StrikeEntry;
+        // Parse and validate every row before writing anything.
+        enum Row {
+            Burn { tx_id: Hash, index: u32, daa: u64 },
+            Strike { daa: u64, miner: Hash, entry: StrikeEntry },
+            Sighting { miner: Hash, daa: u64 },
+        }
+        let mut parsed = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            match (row.first(), row.len()) {
+                (Some(0x01), 45) => {
+                    let tx_id: [u8; 32] = row[1..33].try_into().unwrap();
+                    let index = u32::from_le_bytes(row[33..37].try_into().unwrap());
+                    let daa = u64::from_le_bytes(row[37..45].try_into().unwrap());
+                    parsed.push(Row::Burn { tx_id: tx_id.into(), index, daa });
+                }
+                (Some(0x02), 53) => {
+                    let daa = u64::from_le_bytes(row[1..9].try_into().unwrap());
+                    let miner: [u8; 32] = row[9..41].try_into().unwrap();
+                    let count = u32::from_le_bytes(row[41..45].try_into().unwrap());
+                    let last_daa = u64::from_le_bytes(row[45..53].try_into().unwrap());
+                    parsed.push(Row::Strike { daa, miner: Hash::from_bytes(miner), entry: StrikeEntry { count, last_daa } });
+                }
+                (Some(0x03), 41) => {
+                    let miner: [u8; 32] = row[1..33].try_into().unwrap();
+                    let daa = u64::from_le_bytes(row[33..41].try_into().unwrap());
+                    parsed.push(Row::Sighting { miner: Hash::from_bytes(miner), daa });
+                }
+                _ => return Err(ConsensusError::General("malformed service-state row")),
+            }
+        }
+        for row in parsed {
+            match row {
+                Row::Burn { tx_id, index, daa } => {
+                    self.storage.service_burn_store.set(OutpointKey::new(tx_id, index), daa).unwrap()
+                }
+                Row::Strike { daa, miner, entry } => self.storage.service_strike_store.set(daa, miner, entry).unwrap(),
+                Row::Sighting { miner, daa } => self.storage.service_first_seen_store.set(miner, daa).unwrap(),
+            }
+        }
+        // Rebuild every derived RAM view (burned set, suspensions, commitment index, cursor).
+        self.virtual_processor.load_service_burned();
+        Ok(())
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         self.lkg_virtual_state.load().bits
     }
@@ -1057,6 +1158,14 @@ impl ConsensusApi for Consensus {
         let virtual_stores = self.virtual_stores.read();
         let iter = virtual_stores.utxo_set.seek_iterator(from_outpoint, chunk_size, skip_first);
         iter.map(|item| item.unwrap()).collect()
+    }
+
+    fn get_utxos_by_outpoints(&self, outpoints: Vec<TransactionOutpoint>) -> Vec<(TransactionOutpoint, UtxoEntry)> {
+        let virtual_stores = self.virtual_stores.read();
+        outpoints
+            .into_iter()
+            .filter_map(|outpoint| virtual_stores.utxo_set.get(&outpoint).ok().map(|entry| (outpoint, (*entry).clone())))
+            .collect()
     }
 
     fn get_tips(&self) -> Vec<Hash> {

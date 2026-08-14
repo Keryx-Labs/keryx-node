@@ -2,8 +2,8 @@ use keryx_addresses::{Address, Prefix, Version};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet,
     coinbase::*,
-    collateral::CHALLENGE_WINDOW_BLOCKS,
-    config::params::{RATIO_REWARD_BPS_DIVISOR, TIER_REWARD_BPS_DIVISOR},
+    collateral::{CHALLENGE_WINDOW_BLOCKS, SERVICE_BOND_CSV_WINDOW_BLOCKS},
+    config::params::{ForkActivation, RATIO_REWARD_BPS_DIVISOR, TIER_REWARD_BPS_DIVISOR},
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
@@ -31,10 +31,6 @@ const RD_ALLOCATION_BPS_DIVISOR: u64 = 10_000;
 const ESCROW_RATE_BPS: u64 = 2_000;
 const ESCROW_RATE_BPS_DIVISOR: u64 = 10_000;
 
-/// Marker searched in coinbase extra_data to locate the escrow public key.
-/// Format: `/escrow:<64-hex-chars-of-32-byte-schnorr-pubkey>`
-const ESCROW_MARKER: &[u8] = b"/escrow:";
-const ESCROW_PUBKEY_HEX_LEN: usize = 64;
 
 /// Seed used to derive the provably-unspendable burn address.
 /// `TransactionHash("KERYX_PROOF_OF_BURN_V1")` is not a valid EC point →
@@ -115,16 +111,14 @@ const KRX_TAIL_EMISSION_PER_SECOND: u64 = 10;
 
 /// Builds a CSV-timelocked P2PK script for the OPoI escrow output.
 ///
-/// Script: `<CHALLENGE_WINDOW_BLOCKS> OP_CSV OP_DROP <pubkey_32> OP_CHECKSIG`
+/// Script: `<csv_blocks> OP_CSV <pubkey_32> OP_CHECKSIG`
 ///
 /// The output cannot be spent until the spending transaction's input sequence
-/// satisfies the relative lock (>= CHALLENGE_WINDOW_BLOCKS deep), giving the
-/// network the full challenge window to submit a fraud proof before the miner
-/// claims their collateral.
-fn build_escrow_script(pubkey_bytes: &[u8]) -> Option<ScriptPublicKey> {
+/// satisfies the relative lock (>= csv_blocks deep).
+fn build_escrow_script(pubkey_bytes: &[u8], csv_blocks: u64) -> Option<ScriptPublicKey> {
     // Keryx's OP_CSV pops its argument — no OP_DROP needed after it.
     let script = ScriptBuilder::new()
-        .add_sequence(CHALLENGE_WINDOW_BLOCKS)
+        .add_sequence(csv_blocks)
         .ok()?
         .add_op(OpCheckSequenceVerify)
         .ok()?
@@ -134,6 +128,13 @@ fn build_escrow_script(pubkey_bytes: &[u8]) -> Option<ScriptPublicKey> {
         .ok()?
         .drain();
     Some(ScriptPublicKey::from_vec(0, script))
+}
+
+/// Extracts the 32-byte escrow pubkey announced in a coinbase payload's extra data
+/// (`/escrow:<hex64>` field), if present. Canonical implementation lives in
+/// `keryx_consensus_core::collateral` (shared with the RPC template guard).
+pub fn parse_escrow_pubkey_from_extra_data(extra_data: &[u8]) -> Option<[u8; 32]> {
+    keryx_consensus_core::collateral::parse_escrow_pubkey(extra_data)
 }
 
 /// Returns the provably-unspendable burn SPK derived from BURN_SEED.
@@ -188,6 +189,14 @@ pub struct CoinbaseManager {
     rd_allocation_script_public_key: ScriptPublicKey,
     /// Provably-unspendable burn SPK — receives the 20% escrow cut of standard miners.
     burn_script_public_key: ScriptPublicKey,
+    /// H6 gate — at/after this DAA the subsidy of a merged DAA-red block is BURNED instead of
+    /// paid to the merging miner (like red fees already are). Removes the economic incentive to
+    /// induce other miners' blocks to go red — a connectivity edge no longer transfers their
+    /// subsidy into the merger's pocket. Keyed on the merging block's own daa_score.
+    pom_v3_activation: ForkActivation,
+    /// Escrow-delegation verification cache: certs are static per miner, so the schnorr verify
+    /// runs once per (payout SPK, escrow key, sig) triple. Shared across manager clones.
+    delegation_cache: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, bool>>>,
 }
 
 /// Struct used to streamline payload parsing
@@ -215,6 +224,7 @@ impl CoinbaseManager {
         emission_start_daa_score: u64,
         pre_emission_base_subsidy: u64,
         bps: u64,
+        pom_v3_activation: ForkActivation,
     ) -> Self {
         let emission_schedule = build_emission_schedule(bps);
         let tail_emission_per_block = KRX_TAIL_EMISSION_PER_SECOND.div_ceil(bps);
@@ -237,7 +247,29 @@ impl CoinbaseManager {
             tail_emission_per_block,
             rd_allocation_script_public_key,
             burn_script_public_key,
+            pom_v3_activation,
+            delegation_cache: Default::default(),
         }
+    }
+
+    /// Cached escrow-delegation verification (see `collateral::verify_escrow_delegation`).
+    pub fn verify_escrow_delegation_cached(&self, version: u16, script: &[u8], escrow_pubkey: &[u8; 32], sig: &[u8; 64]) -> bool {
+        let mut data = Vec::with_capacity(2 + script.len() + 96);
+        data.extend_from_slice(&version.to_le_bytes());
+        data.extend_from_slice(script);
+        data.extend_from_slice(escrow_pubkey);
+        data.extend_from_slice(sig);
+        let key = TransactionHash::hash(data);
+        if let Some(&ok) = self.delegation_cache.read().get(&key) {
+            return ok;
+        }
+        let ok = keryx_consensus_core::collateral::verify_escrow_delegation(version, script, escrow_pubkey, sig);
+        let mut cache = self.delegation_cache.write();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(key, ok);
+        ok
     }
 
     pub fn expected_coinbase_transaction<T: AsRef<[u8]>>(
@@ -257,6 +289,11 @@ impl CoinbaseManager {
         // (no penalty), so this is a no-op before `ratio_reward_activation`. Compounds
         // multiplicatively with `tier_bps_by_block` (see `ratio_bps_by_block`).
         ratio_bps_by_block: &BlockHashMap<u64>,
+        // Service-bond suspension: blue block hashes whose producer is under a finality-deep
+        // production suspension as of this block. Their entire miner cut is burned (they earn
+        // nothing), the reorg-immune analogue of "this producer's blocks are invalid". Empty
+        // before the suspension can exist, so a no-op pre-H6.
+        suspended_blues: &BlockHashSet,
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
         // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D
         // allocation, + 1 for the accumulated tier-reward burn
@@ -292,20 +329,35 @@ impl CoinbaseManager {
                 // own activation. Integer divisions are applied in a fixed order for determinism.
                 let tier_bps = tier_bps_by_block.get(blue).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
                 let ratio_bps = ratio_bps_by_block.get(blue).copied().unwrap_or(RATIO_REWARD_BPS_DIVISOR);
-                let miner_paid = miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * ratio_bps / RATIO_REWARD_BPS_DIVISOR;
+                // A suspended producer earns nothing: his whole miner cut is burned. The escrow and
+                // R&D cuts keep their full-subsidy base, so the total block reward is unchanged.
+                let miner_paid = if suspended_blues.contains(blue) {
+                    0
+                } else {
+                    miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * ratio_bps / RATIO_REWARD_BPS_DIVISOR
+                };
                 reward_burn_total += miner_subsidy - miner_paid;
-                outputs.push(TransactionOutput::new(miner_paid, reward_data.script_public_key.clone()));
-                let escrow_spk = reward_data
-                    .escrow_script_public_key
-                    .clone()
-                    .unwrap_or_else(|| self.burn_script_public_key.clone());
-                outputs.push(TransactionOutput::new(escrow_cut, escrow_spk));
+                // Zero-value outputs are rejected in isolation, so a fully-burned miner cut emits
+                // none: the amount is already in `reward_burn_total`.
+                if miner_paid > 0 {
+                    outputs.push(TransactionOutput::new(miner_paid, reward_data.script_public_key.clone()));
+                }
+                if escrow_cut > 0 {
+                    let escrow_spk = reward_data
+                        .escrow_script_public_key
+                        .clone()
+                        .unwrap_or_else(|| self.burn_script_public_key.clone());
+                    outputs.push(TransactionOutput::new(escrow_cut, escrow_spk));
+                }
             }
         }
 
-        // Collect all rewards from mergeset reds ∩ DAA window and create a
-        // single output rewarding the subsidy to the current block (the "merging" block).
-        // Fees from red blocks are burned like all other fees.
+        // Collect all rewards from mergeset reds ∩ DAA window.
+        // Fees from red blocks are always burned. The subsidy of a DAA-red block goes to the
+        // merging miner pre-H6, and is BURNED at/after the H6 gate: paying it out rewards
+        // inducing other miners' blocks to go red (see `pom_v3_activation` doc), so past the
+        // gate it joins the red fees in the burn output.
+        let burn_red_subsidy = self.pom_v3_activation.is_active(daa_score);
         let mut red_subsidy = 0u64;
         let mut red_fees = 0u64;
 
@@ -314,8 +366,11 @@ impl CoinbaseManager {
             if mergeset_non_daa.contains(red) {
                 // Non-DAA red: subsidy forfeited, fees burned.
                 red_fees += reward_data.total_fees;
+            } else if burn_red_subsidy {
+                // DAA red, post-H6: both subsidy and fees burned.
+                red_fees += reward_data.subsidy + reward_data.total_fees;
             } else {
-                // DAA red: subsidy goes to merging miner, fees burned.
+                // DAA red, pre-H6: subsidy goes to merging miner, fees burned.
                 red_subsidy += reward_data.subsidy;
                 red_fees += reward_data.total_fees;
             }
@@ -430,19 +485,16 @@ impl CoinbaseManager {
     /// Looks for `/escrow:` followed by exactly 64 hex chars (32-byte Schnorr pubkey).
     /// Returns `None` if the marker is absent or the key is malformed — treated as a
     /// standard miner whose escrow cut is sent to the burn address instead.
-    pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8]) -> Option<ScriptPublicKey> {
-        let marker_pos = extra_data.windows(ESCROW_MARKER.len()).position(|w| w == ESCROW_MARKER)?;
-        let hex_start = marker_pos + ESCROW_MARKER.len();
-        let hex_end = hex_start + ESCROW_PUBKEY_HEX_LEN;
-        if hex_end > extra_data.len() {
-            return None;
-        }
-        let hex_str = std::str::from_utf8(&extra_data[hex_start..hex_end]).ok()?;
-        let pubkey_bytes: Vec<u8> = (0..32)
-            .map(|i| u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16))
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
-        build_escrow_script(&pubkey_bytes)
+    /// The CSV lock is gated by the rewarding block's own daa score: the service-bond lock
+    /// (~22 h) at/after `pom_v3_activation`, the legacy challenge window (~1 h) before.
+    pub fn parse_escrow_from_extra_data(&self, extra_data: &[u8], daa_score: u64) -> Option<ScriptPublicKey> {
+        let pubkey_bytes = parse_escrow_pubkey_from_extra_data(extra_data)?;
+        let csv_blocks = if self.pom_v3_activation.is_active(daa_score) {
+            SERVICE_BOND_CSV_WINDOW_BLOCKS
+        } else {
+            CHALLENGE_WINDOW_BLOCKS
+        };
+        build_escrow_script(&pubkey_bytes, csv_blocks)
     }
 
     pub fn deserialize_coinbase_payload<'a>(&self, payload: &'a [u8]) -> CoinbaseResult<CoinbaseData<&'a [u8]>> {
@@ -551,7 +603,33 @@ mod tests {
             params.deflationary_phase_daa_score,
             params.pre_deflationary_phase_base_subsidy,
             params.bps_history().after(),
+            params.pom_v3_activation,
         )
+    }
+
+    /// The escrow CSV lock is era-gated on the rewarding block's daa score: legacy challenge
+    /// window before `pom_v3_activation`, service-bond lock at/after. Both eras must classify as
+    /// the same structural CsvPubKey (spend paths and escrow detection are value-agnostic).
+    #[test]
+    fn escrow_csv_lock_is_era_gated() {
+        use keryx_consensus_core::config::params::ForkActivation;
+        use keryx_txscript::script_class::ScriptClass;
+
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::new(1_000);
+        let manager = create_manager(&params);
+        let extra = format!("/miner/escrow:{}", "11".repeat(32)).into_bytes();
+
+        let legacy = manager.parse_escrow_from_extra_data(&extra, 999).unwrap();
+        let bonded = manager.parse_escrow_from_extra_data(&extra, 1_000).unwrap();
+        assert_ne!(legacy.script(), bonded.script(), "the CSV lock must change at the gate");
+        assert!(ScriptClass::is_csv_pay_to_pubkey(legacy.script()));
+        assert!(ScriptClass::is_csv_pay_to_pubkey(bonded.script()));
+
+        let expected_legacy = build_escrow_script(&[0x11u8; 32], CHALLENGE_WINDOW_BLOCKS).unwrap();
+        let expected_bonded = build_escrow_script(&[0x11u8; 32], SERVICE_BOND_CSV_WINDOW_BLOCKS).unwrap();
+        assert_eq!(legacy, expected_legacy);
+        assert_eq!(bonded, expected_bonded);
     }
 
     #[test]
@@ -618,7 +696,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps)
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
             .unwrap()
             .tx;
 
@@ -644,6 +722,63 @@ mod tests {
         assert_eq!(total, 2 * subsidy, "tier penalty must not change the total block reward");
     }
 
+    /// A suspended producer earns nothing: his entire miner cut is burned, while the escrow and
+    /// R&D cuts keep their full base and the total block reward is unchanged.
+    #[test]
+    fn suspended_producer_miner_cut_burned() {
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let subsidy = 1_000_000_000u64;
+
+        let (h_a, h_b): (Hash, Hash) = (1.into(), 2.into());
+        let spk_a = ScriptPublicKey::from_vec(0, vec![0xaa]);
+        let spk_b = ScriptPublicKey::from_vec(0, vec![0xbb]);
+        let escrow_a = ScriptPublicKey::from_vec(0, vec![0xa1]);
+        let escrow_b = ScriptPublicKey::from_vec(0, vec![0xb1]);
+
+        let mut mergeset_rewards = BlockHashMap::new();
+        mergeset_rewards.insert(h_a, BlockRewardData::new_with_escrow(subsidy, 0, spk_a.clone(), Some(escrow_a.clone())));
+        mergeset_rewards.insert(h_b, BlockRewardData::new_with_escrow(subsidy, 0, spk_b.clone(), Some(escrow_b.clone())));
+
+        let ghostdag = ghostdag_with_blues(vec![h_a, h_b]);
+        let miner_data = MinerData::new(ScriptPublicKey::from_vec(0, vec![0xcc]), vec![]);
+
+        // A is suspended; B is not.
+        let mut suspended = BlockHashSet::new();
+        suspended.insert(h_a);
+
+        let tx = cbm
+            .expected_coinbase_transaction(
+                0,
+                miner_data,
+                &ghostdag,
+                &mergeset_rewards,
+                &BlockHashSet::new(),
+                &BlockHashMap::new(),
+                &BlockHashMap::new(),
+                &suspended,
+            )
+            .unwrap()
+            .tx;
+
+        let rd = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+        let escrow = subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR;
+        let full_miner = subsidy - rd - escrow;
+        let value_of = |spk: &ScriptPublicKey| tx.outputs.iter().find(|o| &o.script_public_key == spk).map(|o| o.value);
+
+        // Suspended producer's miner cut is fully burned; the other is paid in full. The withheld
+        // cut emits NO output at all — a zero-value one would make the coinbase invalid in
+        // isolation, so every block merging a suspended producer's blue would be rejected.
+        assert_eq!(value_of(&spk_a), None, "suspended producer must get no miner output");
+        assert_eq!(value_of(&spk_b), Some(full_miner), "the un-suspended producer is paid in full");
+        assert!(tx.outputs.iter().all(|o| o.value > 0), "a zero-value output makes the coinbase invalid in isolation");
+        // Escrow cuts untouched for both.
+        assert_eq!(value_of(&escrow_a), Some(escrow), "escrow cut keeps its full base even when suspended");
+        assert_eq!(value_of(&escrow_b), Some(escrow));
+        // Total block reward unchanged — the withheld cut is burned, not removed.
+        let total: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        assert_eq!(total, 2 * subsidy, "suspension must not change the total block reward");
+    }
+
     /// Empty tier map (the pre-`pom_activation` state) is a no-op: the miner cut is paid in full,
     /// the total is unchanged, and no extra burn output is appended.
     #[test]
@@ -667,7 +802,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps)
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
             .unwrap()
             .tx;
 
@@ -708,7 +843,7 @@ mod tests {
         ratio_bps.insert(h_a, RATIO_REWARD_BPS[0]); // floor bracket 40 %
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps)
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
             .unwrap()
             .tx;
 
@@ -884,5 +1019,77 @@ mod tests {
         let deserialized_data = cbm.deserialize_coinbase_payload(&payload).unwrap();
 
         assert_eq!(data2, deserialized_data);
+    }
+
+    /// A `GhostdagData` with one blue (selected parent) and one DAA-red block in the mergeset.
+    fn ghostdag_with_red(blue: Hash, red: Hash) -> GhostdagData {
+        GhostdagData::new(
+            0,
+            Default::default(),
+            blue,
+            BlockHashes::new(vec![blue]),
+            BlockHashes::new(vec![red]),
+            HashKTypeMap::new(BlockHashMap::new()),
+        )
+    }
+
+    /// A merging block carrying one DAA-red: pre-H6 the red subsidy is paid to the merging miner
+    /// (minus the R&D cut); post-H6 it is burned like the red fees. Total supply is conserved in
+    /// both eras — this is a pure redistribution.
+    #[test]
+    fn red_subsidy_burned_post_h6() {
+        let subsidy = 1_000_000_000u64;
+        let red_fees = 7_000_000u64;
+        let (blue, red): (Hash, Hash) = (1.into(), 2.into());
+        let miner_spk = ScriptPublicKey::from_vec(0, vec![0xcc]);
+        let burn_spk = super::burn_script_public_key();
+
+        let build = |gate: ForkActivation| {
+            let cbm = CoinbaseManager::new(
+                MAINNET_PARAMS.coinbase_payload_script_public_key_max_len,
+                MAINNET_PARAMS.max_coinbase_payload_len,
+                MAINNET_PARAMS.deflationary_phase_daa_score,
+                MAINNET_PARAMS.pre_deflationary_phase_base_subsidy,
+                MAINNET_PARAMS.bps_history().after(),
+                gate,
+            );
+            let mut mergeset_rewards = BlockHashMap::new();
+            // Blue with no subsidy (isolate the red), red with subsidy + fees.
+            mergeset_rewards.insert(blue, BlockRewardData::new(0, 0, miner_spk.clone()));
+            mergeset_rewards.insert(red, BlockRewardData::new(subsidy, red_fees, ScriptPublicKey::from_vec(0, vec![0xdd])));
+            let ghostdag = ghostdag_with_red(blue, red);
+            let miner_data = MinerData::new(miner_spk.clone(), vec![]);
+            cbm.expected_coinbase_transaction(
+                0,
+                miner_data,
+                &ghostdag,
+                &mergeset_rewards,
+                &BlockHashSet::new(),
+                &BlockHashMap::new(),
+                &BlockHashMap::new(),
+                &BlockHashSet::new(),
+            )
+            .unwrap()
+            .tx
+        };
+
+        let value_to = |tx: &Transaction, spk: &ScriptPublicKey| {
+            tx.outputs.iter().filter(|o| &o.script_public_key == spk).map(|o| o.value).sum::<u64>()
+        };
+        let rd_cut = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;
+
+        // Pre-H6: the merging miner is paid the red subsidy minus the R&D cut; red fees are burned.
+        let pre = build(ForkActivation::never());
+        assert_eq!(value_to(&pre, &miner_spk), subsidy - rd_cut, "pre-H6: merger keeps the red subsidy");
+        assert_eq!(value_to(&pre, &burn_spk), red_fees, "pre-H6: only red fees are burned");
+
+        // Post-H6: the merging miner gets nothing from the red; subsidy AND fees are burned.
+        let post = build(ForkActivation::new(0));
+        assert_eq!(value_to(&post, &miner_spk), 0, "post-H6: merger gets nothing from the red");
+        assert_eq!(value_to(&post, &burn_spk), subsidy + red_fees, "post-H6: red subsidy joins the burn");
+
+        // Total distributed is identical across eras — no supply created or destroyed by the switch.
+        let total = |tx: &Transaction| tx.outputs.iter().map(|o| o.value).sum::<u64>();
+        assert_eq!(total(&pre), total(&post), "the burn switch is a pure redistribution");
     }
 }

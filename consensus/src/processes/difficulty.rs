@@ -159,6 +159,8 @@ pub struct SampledDifficultyManager<T: HeaderStoreReader, U: GhostdagStoreReader
     difficulty_reset_activation_h5: ForkActivation,
     difficulty_reset_activation_h5_3: ForkActivation,
     difficulty_reset_activation_h5_4: ForkActivation,
+    difficulty_reset_activation_h6: ForkActivation,
+    h6_reset_bits: Option<u32>,
 }
 
 impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U> {
@@ -178,6 +180,8 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         difficulty_reset_activation_h5: ForkActivation,
         difficulty_reset_activation_h5_3: ForkActivation,
         difficulty_reset_activation_h5_4: ForkActivation,
+        difficulty_reset_activation_h6: ForkActivation,
+        h6_reset_bits: Option<u32>,
     ) -> Self {
         Self::check_min_difficulty_window_size(difficulty_window_size, min_difficulty_window_size);
         Self {
@@ -195,10 +199,13 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
             difficulty_reset_activation_h5,
             difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4,
+            difficulty_reset_activation_h6,
+            h6_reset_bits,
         }
     }
 
-    /// True while `daa_score` is inside ANY difficulty-reset window (H2 OR H4 OR H5 OR H5.3 OR H5.4).
+    /// True while `daa_score` is inside ANY difficulty-reset window (H2 OR H4 OR H5 OR H5.3 OR H5.4
+    /// OR H6).
     /// Each reset is a self-contained window `[activation, activation + full_window)` forcing
     /// `genesis_bits`; the windows never overlap (each gate ≫ previous + full_window), so checking
     /// all of them is a plain OR. See `difficulty_reset_activation_h4` in params for why each is a
@@ -210,16 +217,27 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
             || self.difficulty_reset_activation_h5.is_within_range_from_activation(daa_score, range)
             || self.difficulty_reset_activation_h5_3.is_within_range_from_activation(daa_score, range)
             || self.difficulty_reset_activation_h5_4.is_within_range_from_activation(daa_score, range)
+            || self.difficulty_reset_activation_h6.is_within_range_from_activation(daa_score, range)
     }
 
-    /// Returns `Some(genesis_bits)` while the difficulty-reset hardfork window is active for
+    /// The target every reset window pins, or `None` outside all of them. The H6 window is checked
+    /// first: it may carry its own target rather than the genesis one.
+    fn reset_target_bits(&self, daa_score: u64) -> Option<u32> {
+        let range = self.difficulty_full_window_size();
+        if self.difficulty_reset_activation_h6.is_within_range_from_activation(daa_score, range) {
+            return Some(self.h6_reset_bits.unwrap_or(self.genesis_bits));
+        }
+        self.in_any_reset_window(daa_score).then_some(self.genesis_bits)
+    }
+
+    /// Returns the reset target while a difficulty-reset hardfork window is active for
     /// `daa_score`, else `None`. Used to override a stale *persisted* virtual `bits` at block-template
     /// build time. The virtual only recomputes its difficulty when a new block is processed, but on a
     /// frozen chain no block can be found at the inherited (too-high) difficulty — a deadlock. Forcing
     /// the template to genesis lets the first block be mined; it validates against the same reset rule
     /// in `calculate_difficulty_bits`, and its insertion re-resolves the virtual normally afterwards.
     pub fn reset_bits(&self, daa_score: u64) -> Option<u32> {
-        self.in_any_reset_window(daa_score).then_some(self.genesis_bits)
+        self.reset_target_bits(daa_score)
     }
 
     #[inline]
@@ -265,8 +283,8 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         // which point the DAA re-converges to the real PoM hashrate. Forward-only: blocks below the
         // activation score are never in range here. Checked before the window fetch so the genesis
         // burst doesn't pay 661 store reads per block.
-        if self.in_any_reset_window(daa_score) {
-            return self.genesis_bits;
+        if let Some(bits) = self.reset_target_bits(daa_score) {
+            return bits;
         }
 
         let mut difficulty_blocks = self.get_difficulty_blocks(window);

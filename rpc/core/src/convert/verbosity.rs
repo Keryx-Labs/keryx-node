@@ -80,6 +80,8 @@ impl_verbosity_from! {
         include_utxo_commitment:         (RpcDataVerbosityLevel::Full),
         include_pruning_point:           (RpcDataVerbosityLevel::Full),
         include_pom_final_state:         (RpcDataVerbosityLevel::Low),
+        include_service_state_hash:      (RpcDataVerbosityLevel::Full),
+        include_pom_tier:                (RpcDataVerbosityLevel::Low),
     }
 }
 

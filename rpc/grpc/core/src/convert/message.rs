@@ -347,6 +347,20 @@ from!(item: RpcResult<&keryx_rpc_core::GetBalanceByAddressResponse>, protowire::
     Self { balance: item.balance, error: None }
 });
 
+from!(item: &keryx_rpc_core::GetUtxoEntriesByOutpointsRequest, protowire::GetUtxoEntriesByOutpointsRequestMessage, {
+    Self { outpoints: item.outpoints.iter().map(|x| x.into()).collect() }
+});
+from!(item: RpcResult<&keryx_rpc_core::GetUtxoEntriesByOutpointsResponse>, protowire::GetUtxoEntriesByOutpointsResponseMessage, {
+    Self { entries: item.entries.iter().map(|x| x.into()).collect(), error: None }
+});
+
+from!(item: &keryx_rpc_core::GetUtxoCountByAddressRequest, protowire::GetUtxoCountByAddressRequestMessage, {
+    Self { address: (&item.address).into() }
+});
+from!(item: RpcResult<&keryx_rpc_core::GetUtxoCountByAddressResponse>, protowire::GetUtxoCountByAddressResponseMessage, {
+    Self { count: item.count, error: None }
+});
+
 from!(item: &keryx_rpc_core::GetBalancesByAddressesRequest, protowire::GetBalancesByAddressesRequestMessage, {
     Self { addresses: item.addresses.iter().map(|x| x.into()).collect() }
 });
@@ -391,6 +405,44 @@ from!(
 from!(&keryx_rpc_core::GetCoinSupplyRequest, protowire::GetCoinSupplyRequestMessage);
 from!(item: RpcResult<&keryx_rpc_core::GetCoinSupplyResponse>, protowire::GetCoinSupplyResponseMessage, {
     Self { max_sompi: item.max_sompi, circulating_sompi: item.circulating_sompi, error: None }
+});
+
+from!(&keryx_rpc_core::GetServiceStrikesRequest, protowire::GetServiceStrikesRequestMessage);
+from!(item: RpcResult<&keryx_rpc_core::GetServiceStrikesResponse>, protowire::GetServiceStrikesResponseMessage, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        strikes: item
+            .strikes
+            .iter()
+            .map(|s| protowire::ServiceStrikeMessage {
+                miner: s.miner.to_string(),
+                consecutive_misses: s.consecutive_misses,
+                last_strike_daa_score: s.last_strike_daa_score,
+            })
+            .collect(),
+        suspended: item
+            .suspended
+            .iter()
+            .map(|s| protowire::ServiceSuspensionMessage { miner: s.miner.to_string(), until_daa_score: s.until_daa_score })
+            .collect(),
+        pending_burns: item
+            .pending_burns
+            .iter()
+            .map(|b| protowire::ServicePendingBurnMessage {
+                miner: b.miner.to_string(),
+                miss_daa_score: b.miss_daa_score,
+                consecutive_misses: b.consecutive_misses,
+                burned_claims: b.burned_claims,
+                burned_sompi: b.burned_sompi,
+            })
+            .collect(),
+        lifetime_strikes: item
+            .lifetime_strikes
+            .iter()
+            .map(|t| protowire::ServiceStrikeTotalMessage { miner: t.miner.to_string(), strikes: t.strikes })
+            .collect(),
+        error: None,
+    }
 });
 
 from!(item: &keryx_rpc_core::GetDaaScoreTimestampEstimateRequest, protowire::GetDaaScoreTimestampEstimateRequestMessage, {
@@ -872,6 +924,20 @@ try_from!(item: &protowire::GetBalanceByAddressResponseMessage, RpcResult<keryx_
     Self { balance: item.balance }
 });
 
+try_from!(item: &protowire::GetUtxoEntriesByOutpointsRequestMessage, keryx_rpc_core::GetUtxoEntriesByOutpointsRequest, {
+    Self { outpoints: item.outpoints.iter().map(|x| x.try_into()).collect::<Result<Vec<_>, _>>()? }
+});
+try_from!(item: &protowire::GetUtxoEntriesByOutpointsResponseMessage, RpcResult<keryx_rpc_core::GetUtxoEntriesByOutpointsResponse>, {
+    Self { entries: item.entries.iter().map(|x| x.try_into()).collect::<Result<Vec<_>, _>>()? }
+});
+
+try_from!(item: &protowire::GetUtxoCountByAddressRequestMessage, keryx_rpc_core::GetUtxoCountByAddressRequest, {
+    Self { address: item.address.as_str().try_into()? }
+});
+try_from!(item: &protowire::GetUtxoCountByAddressResponseMessage, RpcResult<keryx_rpc_core::GetUtxoCountByAddressResponse>, {
+    Self { count: item.count }
+});
+
 try_from!(item: &protowire::GetBalancesByAddressesRequestMessage, keryx_rpc_core::GetBalancesByAddressesRequest, {
     Self { addresses: item.addresses.iter().map(|x| x.as_str().try_into()).collect::<Result<Vec<_>, _>>()? }
 });
@@ -918,6 +984,47 @@ try_from!(
 try_from!(&protowire::GetCoinSupplyRequestMessage, keryx_rpc_core::GetCoinSupplyRequest);
 try_from!(item: &protowire::GetCoinSupplyResponseMessage, RpcResult<keryx_rpc_core::GetCoinSupplyResponse>, {
     Self { max_sompi: item.max_sompi, circulating_sompi: item.circulating_sompi }
+});
+
+try_from!(&protowire::GetServiceStrikesRequestMessage, keryx_rpc_core::GetServiceStrikesRequest);
+try_from!(item: &protowire::GetServiceStrikesResponseMessage, RpcResult<keryx_rpc_core::GetServiceStrikesResponse>, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        strikes: item
+            .strikes
+            .iter()
+            .map(|s| {
+                Ok(keryx_rpc_core::RpcServiceStrike {
+                    miner: RpcHash::from_str(&s.miner)?,
+                    consecutive_misses: s.consecutive_misses,
+                    last_strike_daa_score: s.last_strike_daa_score,
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+        suspended: item
+            .suspended
+            .iter()
+            .map(|s| Ok(keryx_rpc_core::RpcServiceSuspension { miner: RpcHash::from_str(&s.miner)?, until_daa_score: s.until_daa_score }))
+            .collect::<RpcResult<Vec<_>>>()?,
+        pending_burns: item
+            .pending_burns
+            .iter()
+            .map(|b| {
+                Ok(keryx_rpc_core::RpcServicePendingBurn {
+                    miner: RpcHash::from_str(&b.miner)?,
+                    miss_daa_score: b.miss_daa_score,
+                    consecutive_misses: b.consecutive_misses,
+                    burned_claims: b.burned_claims,
+                    burned_sompi: b.burned_sompi,
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+        lifetime_strikes: item
+            .lifetime_strikes
+            .iter()
+            .map(|t| Ok(keryx_rpc_core::RpcServiceStrikeTotal { miner: RpcHash::from_str(&t.miner)?, strikes: t.strikes }))
+            .collect::<RpcResult<Vec<_>>>()?,
+    }
 });
 
 try_from!(item: &protowire::GetDaaScoreTimestampEstimateRequestMessage, keryx_rpc_core::GetDaaScoreTimestampEstimateRequest , {

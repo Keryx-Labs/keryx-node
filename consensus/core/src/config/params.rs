@@ -286,6 +286,17 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H4: &[([u8; 32], u64)] = &[
     (KIMI_LINEAR_48B_MODEL_ID,    400_000_000),   // 4.0 KRX  (--very-high)
 ];
 
+/// Per-model minimum inference_reward in sompi, H6 lineup — enforced from `pom_v3_activation`.
+/// The H6 tier-0 floor starts at 1 KRX (a 9B-class model, no sub-1-KRX tier anymore) and the
+/// new 12B tier prices between GLM-9B and Qwen3.6-27B.
+pub const INFERENCE_REWARD_MINIMUMS_V2_H6: &[([u8; 32], u64)] = &[
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  100_000_000),   // 1.0 KRX  (--very-light)
+    (GLM_4_9B_0414_MODEL_ID,           150_000_000),   // 1.5 KRX  (--light)
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 200_000_000),   // 2.0 KRX  (default)
+    (QWEN3_6_27B_MODEL_ID,             250_000_000),   // 2.5 KRX  (--high)
+    (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),   // 4.0 KRX  (--very-high)
+];
+
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
 
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
@@ -473,13 +484,71 @@ pub const POM_TIERS_H5: &[crate::pom::PomTier] = &[
     POM_TIERS_H4[4],
 ];
 
+/// Qwen3.5-9B-abliterated Q5_K_M (huihui-ai abliteration, mradermacher GGUF). H6 tier 0
+/// (--very-light): replaces BOTH Qwen3-8B (old tier 0, quality) and Mistral-7B-v0.3 (old
+/// tier 1, 2024 lineage) — the H6 lineup keeps 5 tiers by inserting a 16 GB-class tier 2.
+/// `model_id` = CIDv0[2..34] of the pinned GGUF
+/// (IPFS Qmb5E3zospd78SfiRHB9iZWNz29xuwRJufieZbWzEFBuGB).
+pub const QWEN3_5_9B_ABLITERATED_MODEL_ID: [u8; 32] = [
+    0xbd, 0x34, 0x56, 0x8c, 0xd8, 0x9f, 0x5f, 0x19,
+    0xc6, 0xc3, 0xa6, 0xe1, 0xa6, 0x1b, 0x92, 0x9b,
+    0xc8, 0x68, 0x70, 0x94, 0x09, 0xea, 0xad, 0x8e,
+    0x67, 0x2d, 0x85, 0xf3, 0xc1, 0xeb, 0x57, 0x10,
+];
+
+/// gemma-4-12B-it-abliterated Q6_K (huihui-ai abliteration, mradermacher GGUF). H6 tier 2:
+/// fills the 16 GB-card gap between GLM-9B (~8 GB) and Qwen3.6-27B (~17 GB). `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS QmSDVicqRDwitecBaPitHsAePLUEamgL4KfrBWYHVWQyx9).
+pub const GEMMA_4_12B_ABLITERATED_MODEL_ID: [u8; 32] = [
+    0x39, 0x99, 0x84, 0x04, 0x56, 0x00, 0xf7, 0xd5,
+    0x8d, 0x1b, 0x2c, 0xf0, 0x1e, 0x6a, 0x4b, 0xf4,
+    0x66, 0xfa, 0x15, 0xc7, 0xac, 0x31, 0xbd, 0x0d,
+    0xd1, 0xa7, 0x1e, 0x00, 0x3b, 0x61, 0x7c, 0xc6,
+];
+
+/// H6 possession anchors — 5 tiers, same count as H4/H5 so the tier-reward bareme, the
+/// coinbase decode and every per-tier mechanism stay untouched. Changes vs H5: tier 0 =
+/// Qwen3.5-9B (quality + raises the possession floor exploited by every custom-miner
+/// operation measured), tier 1 = GLM-9B (slides from position 2), tier 2 = gemma-4-12B
+/// (NEW, 16 GB cards), tiers 3-4 unchanged. Gated by `pom_v3_activation` (the single H6
+/// gate). Roots from pom-rt-builder over the pinned GGUFs (name-sorted tensors,
+/// floor(len/32) 32 B chunks, blake3 leaf/tree).
+pub const POM_TIERS_H6: &[crate::pom::PomTier] = &[
+    crate::pom::PomTier {
+        model_id: QWEN3_5_9B_ABLITERATED_MODEL_ID,
+        root: [
+            0x2c, 0x49, 0x71, 0x64, 0xea, 0xf2, 0x00, 0x78, 0xad, 0xd2, 0x0e, 0x82, 0xae, 0x4e, 0x1b, 0x0f,
+            0xdb, 0x27, 0xd3, 0xfd, 0xd5, 0xea, 0xef, 0xc1, 0xc4, 0x8f, 0x20, 0x41, 0x11, 0xe1, 0x4e, 0x88,
+        ],
+        chunks: 203_469_888,
+    },
+    POM_TIERS_H4[2], // GLM-4-9B, tier 2 -> 1
+    crate::pom::PomTier {
+        model_id: GEMMA_4_12B_ABLITERATED_MODEL_ID,
+        root: [
+            0x8e, 0x4d, 0x5b, 0xe3, 0xaa, 0x7c, 0x3a, 0xb9, 0x35, 0x83, 0x5f, 0xf5, 0xe1, 0x9d, 0x7a, 0x3d,
+            0xfa, 0x11, 0x8a, 0xf3, 0x24, 0xd5, 0xba, 0x65, 0x16, 0x29, 0xd6, 0xed, 0x16, 0x1a, 0x1e, 0x37,
+        ],
+        chunks: 305_318_656,
+    },
+    POM_TIERS_H4[3], // Qwen3.6-27B, unchanged
+    POM_TIERS_H4[4], // Kimi-Linear-48B, unchanged
+];
+
 /// Possession anchors for a block at `daa_score`: the H5 set once `h5_activation` is live (tier-0
 /// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
 /// else the legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
 /// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
 /// against the wrong anchors and reject the chain.
-pub fn pom_tiers(h5_active: bool, coin_age_active: bool, very_light_active: bool) -> &'static [crate::pom::PomTier] {
-    if h5_active {
+pub fn pom_tiers(
+    pom_v3_active: bool,
+    h5_active: bool,
+    coin_age_active: bool,
+    very_light_active: bool,
+) -> &'static [crate::pom::PomTier] {
+    if pom_v3_active {
+        POM_TIERS_H6
+    } else if h5_active {
         POM_TIERS_H5
     } else if coin_age_active {
         POM_TIERS_H4
@@ -521,11 +590,25 @@ pub const TIER_REWARD_BPS: [u64; 4] = [8_200, 8_800, 9_400, 10_000];
 ///   4  Llama-3.3-70B-Q2  --very-high     0%
 pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 
-/// Tier-reward schedule for a block at `daa_score`: 5-tier H2 once `very_light_activation` is live,
-/// legacy 4-tier before. Chosen per block from that block's own DAA (never frozen) — same gating
-/// discipline as `pom_tiers`, so archival/IBD recomputation of pre-H2 blocks stays canonical.
-pub fn tier_reward_bps(very_light_active: bool) -> &'static [u64] {
-    if very_light_active {
+/// H6 (5-tier) tier-reward schedule, gated by `pom_v3_activation`. Widens the H2 8-point steps to
+/// 10-point steps with the top tier still the 100 % reference, so the entry tier bottoms out at
+/// −40 % (vs −32 % under H2): a steeper possession gradient across the H6 lineup. Same five tiers,
+/// so the coinbase decode and every per-tier mechanism are unchanged.
+///   0  Qwen3.5-9B    -40%
+///   1  GLM-4-9B      -30%
+///   2  Gemma-4-12B   -20%
+///   3  Qwen3.6-27B   -10%
+///   4  Kimi-48B        0%
+pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
+
+/// Tier-reward schedule for a block at `daa_score`: 5-tier H6 once `pom_v3_activation` is live,
+/// 5-tier H2 once `very_light_activation`, legacy 4-tier before. Chosen per block from that block's
+/// own DAA (never frozen) — same gating discipline as `pom_tiers`, so archival/IBD recomputation of
+/// older blocks stays canonical.
+pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool) -> &'static [u64] {
+    if pom_v3_active {
+        &TIER_REWARD_BPS_H6
+    } else if very_light_active {
         &TIER_REWARD_BPS_H2
     } else {
         &TIER_REWARD_BPS
@@ -1064,6 +1147,13 @@ pub struct Params {
     /// a live cumulative-weight race. `never()` while H5.4 is unscheduled.
     pub difficulty_reset_activation_h5_4: ForkActivation,
 
+    /// Sixth difficulty-reset window. MUST be set to the same score as `pom_v3_activation`.
+    pub difficulty_reset_activation_h6: ForkActivation,
+
+    /// Target the H6 reset window pins. `None` keeps `genesis.bits`. Read by both the template
+    /// builder and block validation — they MUST agree or every mined block is rejected.
+    pub h6_reset_bits: Option<u32>,
+
     /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
     /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
     /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
@@ -1078,6 +1168,14 @@ pub struct Params {
     /// H5.2 chain-anchoring activation (walk-seed salt v3), keyed on the block's own DAA
     /// score. Driven by `H5_2_ACTIVATION_DAA`. `never()` on nets where H5.2 does not apply.
     pub h5_2_activation: ForkActivation,
+
+    /// H6 matrix-walk activation (PoM proof v3), keyed on the block's own DAA score. At/after
+    /// this score `check_pom_proof` requires the `PomProofV3` witness (spot-checked matrix
+    /// walk, `pom_v3`); `Header::pom_final_state` carries `pom_v3::fold64(roots[K])` so every
+    /// header-only mechanism is unchanged. `never()` until H6 is scheduled — a hard fork that
+    /// MUST ship with its own difficulty reset (the v3 walk is ~3 orders of magnitude slower
+    /// per nonce than the v2 hash walk).
+    pub pom_v3_activation: ForkActivation,
 
     /// Chain-anchor checkpoint `(hash, daa_score)` — local peering policy, see `CHAIN_ANCHOR_HASH`.
     /// `None` disables enforcement (all nets but mainnet).
@@ -1313,9 +1411,12 @@ impl Params {
             difficulty_reset_activation_h5: self.difficulty_reset_activation_h5,
             difficulty_reset_activation_h5_3: self.difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4: self.difficulty_reset_activation_h5_4,
+            difficulty_reset_activation_h6: self.difficulty_reset_activation_h6,
+            h6_reset_bits: self.h6_reset_bits,
             h5_activation: self.h5_activation,
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
+            pom_v3_activation: self.pom_v3_activation,
 
             chain_anchor: self.chain_anchor,
 
@@ -1498,11 +1599,18 @@ pub const MAINNET_PARAMS: Params = Params {
     // H5.4 relaunch difficulty reset — additive, gate = the frozen virtual daa of the v1.4.2
     // relaunch chain (see H5_4_ACTIVATION_DAA for the placement rule).
     difficulty_reset_activation_h5_4: ForkActivation::new(H5_4_ACTIVATION_DAA),
+    // H6 reset — armed together with `pom_v3_activation`, at the same score. Target set ~10000x
+    // easier than the pre-fork difficulty: the matrix walk is measured ~7500x slower than the
+    // pre-H6 walk, with headroom for partial adoption. The difficulty window re-converges after.
+    difficulty_reset_activation_h6: ForkActivation::new(77_203_262),
+    h6_reset_bits: Some(0x1e32f496),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
     h5_1_activation: ForkActivation::new(H5_1_ACTIVATION_DAA),
     h5_2_activation: ForkActivation::new(H5_2_ACTIVATION_DAA),
+    // H6 matrix walk, armed together with its difficulty-reset companion at the same score.
+    pom_v3_activation: ForkActivation::new(77_203_262),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1565,9 +1673,9 @@ pub const TESTNET_PARAMS: Params = Params {
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
     // Testnet mirrors the current mainnet state from genesis: every shipped fork
-    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels)
-    // is active at DAA 0, so the only transition exercised on this testnet is the
-    // coin-age H4 rehearsal below.
+    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels,
+    // coin-age H4, H5/H5.1/H5.2) is active at DAA 0, so the only transition exercised
+    // on this testnet is the H6 crossing at DAA 108_000.
     opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
@@ -1596,20 +1704,19 @@ pub const TESTNET_PARAMS: Params = Params {
     ratio_verification_activation: ForkActivation::new(0), // no corrupted history on testnet — verify all
     // Testnet has no frozen-chain history to relaunch from; the H2 difficulty reset stays disabled.
     difficulty_reset_activation: ForkActivation::never(),
-    // H4 reset ENABLED on testnet (mirrors the coin-age gates at 3_000) so the additive-reset path
-    // is exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
-    difficulty_reset_activation_h4: ForkActivation::new(3_000),
-    // H5 reset ENABLED on testnet at the same gate as the H5 bundle, so the additive-reset path is
-    // exercised end-to-end before mainnet. Harmless on a trivial-difficulty testnet.
-    difficulty_reset_activation_h5: ForkActivation::new(3_000),
-    difficulty_reset_activation_h5_3: ForkActivation::new(5_000),
-    // H5.4 reset ENABLED on testnet, on its own window past the H5.3 one.
-    difficulty_reset_activation_h5_4: ForkActivation::new(6_000),
-    // H5 bundle gate active early on testnet for validation.
-    h5_activation: ForkActivation::new(3_000),
-    // H5.1 mirrors the H5 testnet gate so both eras cross together in one E2E run.
-    h5_1_activation: ForkActivation::new(3_000),
-    h5_2_activation: ForkActivation::new(4_000),
+    // No frozen chain to relaunch from on a fresh testnet — the relaunch resets stay disabled.
+    difficulty_reset_activation_h4: ForkActivation::never(),
+    difficulty_reset_activation_h5: ForkActivation::never(),
+    difficulty_reset_activation_h5_3: ForkActivation::never(),
+    difficulty_reset_activation_h5_4: ForkActivation::never(),
+    // MUST equal pom_v3_activation.
+    difficulty_reset_activation_h6: ForkActivation::new(1000),
+    h6_reset_bits: Some(0x1f7fffff),
+    h5_activation: ForkActivation::new(0),
+    h5_1_activation: ForkActivation::new(0),
+    h5_2_activation: ForkActivation::new(0),
+    // H6 matrix walk — the only era transition this testnet crosses.
+    pom_v3_activation: ForkActivation::new(1000),
     chain_anchor: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
@@ -1617,14 +1724,11 @@ pub const TESTNET_PARAMS: Params = Params {
     ratio_reward_window: 1_000,
     ratio_reward_window_daa: 1_000,
 
-    // Coin-age holder-reward (v3): the ONLY mid-chain transition on this testnet — from genesis
-    // the chain is in the current-mainnet state (everything above at 0), then at DAA 3_000 the H4
-    // boundary fires: FIFO anchors start, the per-coin muhash field appears, the ratio numerator
-    // switches to the effective balance, the recalibrated ratio-reward v2 bracket table takes
-    // over, and the shrunk maturity ramp (W=2_000) + queue promotions kick in. Rehearses the
-    // mainnet H4 gate end-to-end.
-    coin_age_activation: ForkActivation::new(3_000),
-    coin_age_verification_activation: ForkActivation::new(3_000),
+    // Coin-age holder-reward (v3): active from genesis with the rest of the mainnet state — FIFO
+    // anchors, per-coin muhash field, effective-balance ratio numerator and the recalibrated
+    // ratio-reward v2 bracket table all apply from block 0, with the shrunk maturity ramp (W=2_000).
+    coin_age_activation: ForkActivation::new(0),
+    coin_age_verification_activation: ForkActivation::new(0),
     coin_age_maturity_w: 2_000,
 };
 
@@ -1687,9 +1791,12 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
+    difficulty_reset_activation_h6: ForkActivation::never(),
+    h6_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
+    pom_v3_activation: ForkActivation::never(),
     chain_anchor: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1758,9 +1865,12 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
+    difficulty_reset_activation_h6: ForkActivation::never(),
+    h6_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
+    pom_v3_activation: ForkActivation::never(),
     chain_anchor: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,

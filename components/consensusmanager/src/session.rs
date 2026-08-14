@@ -212,6 +212,10 @@ impl ConsensusSessionOwned {
         self.consensus.get_virtual_daa_score()
     }
 
+    pub fn get_service_strikes(&self) -> keryx_consensus_core::collateral::ServiceStrikesSnapshot {
+        self.consensus.get_service_strikes()
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()
@@ -291,6 +295,10 @@ impl ConsensusSessionOwned {
         skip_first: bool,
     ) -> Vec<(TransactionOutpoint, UtxoEntry)> {
         self.clone().spawn_blocking(move |c| c.get_virtual_utxos(from_outpoint, chunk_size, skip_first)).await
+    }
+
+    pub async fn async_get_utxos_by_outpoints(&self, outpoints: Vec<TransactionOutpoint>) -> Vec<(TransactionOutpoint, UtxoEntry)> {
+        self.clone().spawn_blocking(move |c| c.get_utxos_by_outpoints(outpoints)).await
     }
 
     pub async fn async_get_tips(&self) -> Vec<Hash> {
@@ -446,6 +454,14 @@ impl ConsensusSessionOwned {
         self.clone()
             .spawn_blocking(move |c| c.get_pruning_point_utxos(expected_pruning_point, from_outpoint, chunk_size, skip_first))
             .await
+    }
+
+    pub async fn async_get_service_state_rows(&self, pruning_point: Hash) -> ConsensusResult<Vec<Vec<u8>>> {
+        self.clone().spawn_blocking(move |c| c.get_service_state_rows(pruning_point)).await
+    }
+
+    pub async fn async_import_service_state(&self, rows: Vec<Vec<u8>>) -> ConsensusResult<()> {
+        self.clone().spawn_blocking(move |c| c.import_service_state(rows)).await
     }
 
     pub async fn async_get_missing_block_body_hashes(&self, high: Hash) -> ConsensusResult<Vec<Hash>> {

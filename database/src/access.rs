@@ -176,6 +176,98 @@ where
         }
     }
 
+    /// Like `read_with_fallbacks`, with TWO in-place decode fallbacks tried in order (newest
+    /// layout first). Needed once a persisted struct has grown trailing fields twice: three
+    /// layouts coexist in the same column. Same safety argument — shorter (older) layouts always
+    /// underflow when read as a longer one, so each fallback is only reached on a genuine error.
+    pub fn read_with_fallbacks3<TDecodeFallback1, TDecodeFallback2, TPrefixFallback>(
+        &self,
+        fallback_prefix: &[u8],
+        key: TKey,
+    ) -> Result<TData, StoreError>
+    where
+        TKey: Clone + AsRef<[u8]> + ToString,
+        TData: DeserializeOwned,
+        TDecodeFallback1: DeserializeOwned + Into<TData>,
+        TDecodeFallback2: DeserializeOwned + Into<TData>,
+        TPrefixFallback: DeserializeOwned + Into<TData>,
+    {
+        if let Some(data) = self.cache.get(&key) {
+            Ok(data)
+        } else {
+            let db_key = DbKey::new(&self.prefix, key.clone());
+            if let Some(slice) = self.db.get_pinned(&db_key)? {
+                let data: TData = match bincode::deserialize(&slice) {
+                    Ok(data) => data,
+                    Err(_) => match bincode::deserialize::<TDecodeFallback1>(&slice) {
+                        Ok(data) => data.into(),
+                        Err(_) => bincode::deserialize::<TDecodeFallback2>(&slice)?.into(),
+                    },
+                };
+                self.cache.insert(key, data.clone());
+                Ok(data)
+            } else {
+                let db_key = DbKey::new(fallback_prefix, key.clone());
+                if let Some(slice) = self.db.get_pinned(&db_key)? {
+                    let data: TPrefixFallback = bincode::deserialize(&slice)?;
+                    let data: TData = data.into();
+                    self.cache.insert(key, data.clone());
+                    Ok(data)
+                } else {
+                    Err(StoreError::KeyNotFound(db_key))
+                }
+            }
+        }
+    }
+
+    /// Like `read_with_fallbacks3`, with THREE in-place decode fallbacks tried newest-first.
+    /// Needed once a persisted struct has grown trailing fields three times: four layouts coexist
+    /// in the same column. Same safety argument — shorter (older) layouts always underflow when
+    /// read as a longer one, so each fallback is only reached on a genuine error.
+    pub fn read_with_fallbacks4<TDecodeFallback1, TDecodeFallback2, TDecodeFallback3, TPrefixFallback>(
+        &self,
+        fallback_prefix: &[u8],
+        key: TKey,
+    ) -> Result<TData, StoreError>
+    where
+        TKey: Clone + AsRef<[u8]> + ToString,
+        TData: DeserializeOwned,
+        TDecodeFallback1: DeserializeOwned + Into<TData>,
+        TDecodeFallback2: DeserializeOwned + Into<TData>,
+        TDecodeFallback3: DeserializeOwned + Into<TData>,
+        TPrefixFallback: DeserializeOwned + Into<TData>,
+    {
+        if let Some(data) = self.cache.get(&key) {
+            Ok(data)
+        } else {
+            let db_key = DbKey::new(&self.prefix, key.clone());
+            if let Some(slice) = self.db.get_pinned(&db_key)? {
+                let data: TData = match bincode::deserialize(&slice) {
+                    Ok(data) => data,
+                    Err(_) => match bincode::deserialize::<TDecodeFallback1>(&slice) {
+                        Ok(data) => data.into(),
+                        Err(_) => match bincode::deserialize::<TDecodeFallback2>(&slice) {
+                            Ok(data) => data.into(),
+                            Err(_) => bincode::deserialize::<TDecodeFallback3>(&slice)?.into(),
+                        },
+                    },
+                };
+                self.cache.insert(key, data.clone());
+                Ok(data)
+            } else {
+                let db_key = DbKey::new(fallback_prefix, key.clone());
+                if let Some(slice) = self.db.get_pinned(&db_key)? {
+                    let data: TPrefixFallback = bincode::deserialize(&slice)?;
+                    let data: TData = data.into();
+                    self.cache.insert(key, data.clone());
+                    Ok(data)
+                } else {
+                    Err(StoreError::KeyNotFound(db_key))
+                }
+            }
+        }
+    }
+
     /// Like `read`, with an in-place decode fallback (no prefix fallback): if the bytes fail to
     /// decode as `TData`, the SAME bytes are re-tried as `TDecodeFallback` (a previous layout of
     /// `TData`) and converted. See `read_with_fallbacks` for the safety argument (a grown

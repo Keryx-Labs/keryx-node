@@ -264,6 +264,9 @@ impl RpcApi for GrpcClient {
     route!(shutdown_call, Shutdown);
     route!(get_headers_call, GetHeaders);
     route!(get_utxos_by_addresses_call, GetUtxosByAddresses);
+    route!(get_utxo_count_by_address_call, GetUtxoCountByAddress);
+    route!(get_utxo_entries_by_outpoints_call, GetUtxoEntriesByOutpoints);
+    route!(get_service_strikes_call, GetServiceStrikes);
     route!(get_balance_by_address_call, GetBalanceByAddress);
     route!(get_balances_by_addresses_call, GetBalancesByAddresses);
     route!(get_sink_blue_score_call, GetSinkBlueScore);
