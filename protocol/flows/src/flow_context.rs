@@ -787,6 +787,11 @@ impl FlowContext {
 /// by a "1.4.5", which compares lower).
 const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 2);
 
+/// Minimum keryxd peer version accepted once our virtual daa has crossed the H6 gate: a pre-H6
+/// build cannot follow the post-gate chain (difficulty reset and the sealed service-state
+/// commitment make our blocks invalid to it). Same monotonic-ordering note as above.
+const H6_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 6);
+
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
 /// (dnsseeder crawlers etc.), which are let through — the chain anchor and the ban-worthy
@@ -847,15 +852,22 @@ impl ConnectionInitializer for FlowContext {
             return Err(ProtocolError::WrongNetwork(network_name, peer_version.network));
         }
 
-        // Handshake version gate (local peering policy): reject pre-relaunch keryxd builds before
-        // registering any flow — they cannot follow the post-H5.3 chain (the difficulty-reset window
-        // makes our blocks invalid to them) and would only churn IBD noise.
+        // Handshake version gate (local peering policy): reject builds too old to follow our chain
+        // before registering any flow — they would only churn IBD noise. The floor rises at the H6
+        // gate, keyed on our own virtual daa so a node still catching up to the gate keeps peering
+        // with the builds it needs to get there.
+        let min_version = if self.config.pom_v3_activation.is_active(self.consensus().unguarded_session_blocking().get_virtual_daa_score())
+        {
+            H6_MINIMUM_KERYXD_PEER_VERSION
+        } else {
+            MINIMUM_KERYXD_PEER_VERSION
+        };
         if let Some((major, minor, patch)) = parse_keryxd_user_agent_version(&peer_version.user_agent)
-            && (major, minor, patch) < MINIMUM_KERYXD_PEER_VERSION
+            && (major, minor, patch) < min_version
         {
             return Err(ProtocolError::OtherOwned(format!(
                 "obsolete keryxd version {}.{}.{} (minimum accepted: {}.{}.{})",
-                major, minor, patch, MINIMUM_KERYXD_PEER_VERSION.0, MINIMUM_KERYXD_PEER_VERSION.1, MINIMUM_KERYXD_PEER_VERSION.2
+                major, minor, patch, min_version.0, min_version.1, min_version.2
             )));
         }
 
