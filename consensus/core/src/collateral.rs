@@ -185,6 +185,17 @@ pub fn service_window_daa(tier: u8, max_tokens: u32) -> u64 {
 /// response or an executed suspension.
 pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
 
+/// How long an authenticated response is held when its request has not been accepted yet. An
+/// AiResponse carries no inputs, so nothing orders its acceptance against its request's: the
+/// selected chain can accept it first. Sized on the consensus merge depth
+/// (`BPS * MERGE_DEPTH_DURATION`) — past it a block can no longer be merged, so its transactions
+/// can no longer be accepted and the inversion is out of reach.
+pub const SERVICE_EARLY_RESPONSE_HORIZON_DAA: u64 = 36_000;
+
+/// Ceiling on distinct request hashes held by the above. Eviction takes the oldest first and only
+/// returns an inversion to the behaviour it had before it was handled — it never creates a miss.
+const MAX_EARLY_RESPONSE_HASHES: usize = 4_096;
+
 /// Penalty applied to a miner for a missed service assignment, by consecutive-miss count.
 /// A successful serve resets the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,6 +350,7 @@ pub struct FoldOutcome {
 #[derive(Clone, Debug)]
 pub struct LightSnapshot {
     pending: std::collections::BTreeMap<[u8; 32], PendingRequest>,
+    early_responses: std::collections::BTreeMap<[u8; 32], (u64, Vec<Hash>)>,
     strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
     first_seen: std::collections::BTreeMap<Hash, u64>,
     base: std::sync::Arc<std::collections::BTreeMap<Hash, StrikeEntry>>,
@@ -352,6 +364,10 @@ pub struct LightSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct ServiceLedger {
     pending: std::collections::BTreeMap<[u8; 32], PendingRequest>,
+    /// Authenticated responses whose request is not pending yet, by request hash: the daa they
+    /// were first seen at, and the escrow keys that signed them. Drained into the request's
+    /// `early_responders` the moment it is accepted.
+    early_responses: std::collections::BTreeMap<[u8; 32], (u64, Vec<Hash>)>,
     /// Strike delta folded since the anchor; overlays `base` (delta wins, `count: 0` tombstones).
     strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
     /// Per-miner still-locked escrow claims, chain order (newest at the back).
@@ -441,21 +457,31 @@ impl ServiceLedger {
         outcome.expired = expired;
 
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
+        self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
 
         // This block's own requests are admitted before its responses are folded: a response
         // accepted in the same chain block as its request must find the request pending, or it is
         // dropped and its author struck for an answer he did give. Arming still waits for the next
         // block (`daa > accepted_daa` below), so the cohort is unchanged.
         for (rh, tier, max_tokens) in requests {
+            let early = self.early_responses.remove(rh).map(|(_, keys)| keys).unwrap_or_default();
             // A re-accepted hash (identical payload resubmitted) must not reset the running
             // audit: overwriting would re-arm the window and push the miss out forever.
-            self.pending.entry(*rh).or_insert(PendingRequest {
+            let entry = self.pending.entry(*rh).or_insert(PendingRequest {
                 tier: *tier,
                 max_tokens: *max_tokens,
                 accepted_daa: daa,
                 audit: None,
                 early_responders: Vec::new(),
             });
+            // Answers that beat their own request to acceptance.
+            if entry.audit.is_none() {
+                for key in early {
+                    if !entry.early_responders.contains(&key) {
+                        entry.early_responders.push(key);
+                    }
+                }
+            }
         }
 
         // An authenticated response (signed by a delegated escrow key) marks every cohort
@@ -466,7 +492,13 @@ impl ServiceLedger {
             let Some(r) = responder else { continue };
             let mut served: Vec<Hash> = Vec::new();
             {
-                let Some(req) = self.pending.get_mut(rh) else { continue };
+                let Some(req) = self.pending.get_mut(rh) else {
+                    let entry = self.early_responses.entry(*rh).or_insert((daa, Vec::new()));
+                    if !entry.1.contains(r) {
+                        entry.1.push(*r);
+                    }
+                    continue;
+                };
                 let Some(audit) = req.audit.as_mut() else {
                     if !req.early_responders.contains(r) {
                         req.early_responders.push(*r);
@@ -488,6 +520,12 @@ impl ServiceLedger {
                     outcome.resets.push(identity);
                 }
             }
+        }
+
+        while self.early_responses.len() > MAX_EARLY_RESPONSE_HASHES {
+            let victim =
+                self.early_responses.iter().min_by_key(|(hash, (seen, _))| (*seen, **hash)).map(|(hash, _)| *hash).unwrap();
+            self.early_responses.remove(&victim);
         }
 
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
@@ -613,6 +651,7 @@ impl ServiceLedger {
     pub fn light_snapshot(&self) -> LightSnapshot {
         LightSnapshot {
             pending: self.pending.clone(),
+            early_responses: self.early_responses.clone(),
             strikes: self.strikes.clone(),
             first_seen: self.first_seen.clone(),
             base: self.base.clone(),
@@ -623,6 +662,7 @@ impl ServiceLedger {
     /// Restores everything but the vault from a light snapshot.
     pub fn restore_light(&mut self, snap: &LightSnapshot) {
         self.pending = snap.pending.clone();
+        self.early_responses = snap.early_responses.clone();
         self.strikes = snap.strikes.clone();
         self.first_seen = snap.first_seen.clone();
         self.base = snap.base.clone();
@@ -683,7 +723,8 @@ impl ServiceLedger {
 mod tests {
     use super::{
         eligible_pairs, service_window_daa, strike_penalty, update_strikes, FoldOutcome, ServiceLedger, ServicePenalty,
-        StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_LEDGER_HORIZON_DAA, SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
+        StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_EARLY_RESPONSE_HORIZON_DAA, SERVICE_LEDGER_HORIZON_DAA,
+        SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
     use keryx_hashes::Hash;
 
@@ -747,6 +788,44 @@ mod tests {
         assert!(misses.is_empty(), "an answered request must never strike its answerer");
         assert_eq!(ledger.consecutive_misses(&a), 0);
         assert_eq!(ledger.pending_len(), 0);
+    }
+
+    #[test]
+    fn answer_accepted_before_its_own_request_never_strikes() {
+        // An AiResponse has no inputs, so nothing orders its acceptance against its request's:
+        // the selected chain can accept the answer first. It is held until the request lands.
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+
+        let rh = [7u8; 32];
+        // the answer is accepted two chain blocks before the request it answers
+        assert!(ledger.on_chain_block(100, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set)).misses.is_empty());
+        assert!(ledger.on_chain_block(101, &[], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
+        ledger.on_chain_block(102, &[(rh, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(103, &[], &[], &[], |_| true, cohort_of(&set));
+        let misses = ledger.on_chain_block(104 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses;
+        assert!(misses.is_empty(), "an answer that beat its request must still count");
+        assert_eq!(ledger.consecutive_misses(&a), 0);
+    }
+
+    #[test]
+    fn early_answer_expires_with_the_merge_depth_horizon() {
+        // Held answers are not kept forever: past the merge-depth horizon the request can no
+        // longer be accepted, so the parked answer is dropped.
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+
+        let rh = [7u8; 32];
+        ledger.on_chain_block(100, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set));
+        let late = 100 + SERVICE_EARLY_RESPONSE_HORIZON_DAA + 1;
+        ledger.on_chain_block(late, &[(rh, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(late + 1, &[], &[], &[], |_| true, cohort_of(&set));
+        let misses = ledger.on_chain_block(late + 2 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses;
+        assert_eq!(misses.len(), 1, "a stale parked answer must not cancel a fresh request");
     }
 
     #[test]
