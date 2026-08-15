@@ -790,7 +790,7 @@ const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 2);
 /// Minimum keryxd peer version accepted once our virtual daa has crossed the H6 gate: a pre-H6
 /// build cannot follow the post-gate chain (difficulty reset and the sealed service-state
 /// commitment make our blocks invalid to it). Same monotonic-ordering note as above.
-const H6_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 6);
+const H6_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 7);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
