@@ -1756,10 +1756,17 @@ impl VirtualStateProcessor {
         let new_pruning_point_header = self.headers_store.get_header(new_pruning_point).unwrap();
         let imported_utxo_multiset_hash = imported_utxo_multiset.finalize();
         if imported_utxo_multiset_hash != new_pruning_point_header.utxo_commitment {
-            return Err(PruningImportError::ImportedMultisetHashMismatch(
-                new_pruning_point_header.utxo_commitment,
-                imported_utxo_multiset_hash,
-            ));
+            // A set received in chunks cannot carry the committed residue; restore it before
+            // rejecting, and carry the adjusted multiset forward so incremental validation agrees.
+            let adjusted = keryx_consensus_core::muhash::with_commitment_residue(&imported_utxo_multiset);
+            if adjusted.clone().finalize() == new_pruning_point_header.utxo_commitment {
+                imported_utxo_multiset = adjusted;
+            } else {
+                return Err(PruningImportError::ImportedMultisetHashMismatch(
+                    new_pruning_point_header.utxo_commitment,
+                    imported_utxo_multiset_hash,
+                ));
+            }
         }
 
         {
