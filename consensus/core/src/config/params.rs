@@ -1599,18 +1599,19 @@ pub const MAINNET_PARAMS: Params = Params {
     // H5.4 relaunch difficulty reset — additive, gate = the frozen virtual daa of the v1.4.2
     // relaunch chain (see H5_4_ACTIVATION_DAA for the placement rule).
     difficulty_reset_activation_h5_4: ForkActivation::new(H5_4_ACTIVATION_DAA),
-    // H6 reset — armed together with `pom_v3_activation`, at the same score. Target set ~10000x
-    // easier than the pre-fork difficulty: the matrix walk is measured ~7500x slower than the
-    // pre-H6 walk, with headroom for partial adoption. The difficulty window re-converges after.
-    difficulty_reset_activation_h6: ForkActivation::new(77_203_262),
-    h6_reset_bits: Some(0x1e32f496),
+    // H6 reset — armed together with `pom_v3_activation`, at the same score. Target set to the
+    // testnet H6 value: sized for the hashrate present at a cold restart, not a live crossing.
+    // The difficulty window re-converges upward as miners return.
+    difficulty_reset_activation_h6: ForkActivation::new(76_316_623),
+    h6_reset_bits: Some(0x1f7fffff),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
     h5_1_activation: ForkActivation::new(H5_1_ACTIVATION_DAA),
     h5_2_activation: ForkActivation::new(H5_2_ACTIVATION_DAA),
     // H6 matrix walk, armed together with its difficulty-reset companion at the same score.
-    pom_v3_activation: ForkActivation::new(77_203_262),
+    // Gate = virtual daa of the relaunch base: active from the first post-relaunch block.
+    pom_v3_activation: ForkActivation::new(76_316_623),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
