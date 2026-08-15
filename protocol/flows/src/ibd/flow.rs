@@ -1,5 +1,5 @@
 use crate::{
-    flow_context::FlowContext,
+    flow_context::{FlowContext, ibd_arbitration_modes, ibd_receive_rate},
     flow_trait::Flow,
     ibd::{HeadersChunkStream, TrustedEntryStream, negotiate::ChainNegotiationOutput},
 };
@@ -44,6 +44,12 @@ use tokio::time::sleep;
 use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progress::ProgressReporter};
 type BlockBody = Vec<Transaction>;
 
+// Bounded receive-only peer probing and progress-safe handoff.
+const IBD_SLOW_PEER_MIN_SYNC_BLOCKS: usize = IBD_BATCH_SIZE * 8;
+const IBD_SLOW_PEER_PROBE_BLOCKS: usize = IBD_BATCH_SIZE * 2;
+const IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC: f64 = 25.0;
+const IBD_SLOW_PEER_GLOBAL_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Flow for managing IBD - Initial Block Download
 pub struct IbdFlow {
     pub(super) ctx: FlowContext,
@@ -67,6 +73,67 @@ impl Flow for IbdFlow {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow_context::{ibd_cooldown_is_active, ibd_has_materially_better_active_peer, ibd_observation_is_fresh, ibd_yield_is_allowed};
+    use std::time::Instant;
+
+    #[test]
+    fn receive_rate_uses_received_blocks_and_receive_time() {
+        let rate = ibd_receive_rate(IBD_BATCH_SIZE, Duration::from_secs(2));
+        assert_eq!(rate, IBD_BATCH_SIZE as f64 / 2.0);
+    }
+
+    #[test]
+    fn slow_receive_yields_only_to_materially_better_peer() {
+        assert!(ibd_yield_is_allowed(12.0, Some(18.0)));
+        assert!(!ibd_yield_is_allowed(12.0, Some(14.0)));
+        assert!(!ibd_yield_is_allowed(12.0, None));
+    }
+
+    #[test]
+    fn post_probe_slow_sample_remains_eligible_for_yield() {
+        let initial = ibd_receive_rate(IBD_BATCH_SIZE, Duration::from_secs(2));
+        let later = ibd_receive_rate(IBD_BATCH_SIZE, Duration::from_secs(20));
+        assert!(initial >= IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC);
+        assert!(later < IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC);
+        assert!(ibd_yield_is_allowed(later, Some(initial)));
+    }
+
+    #[test]
+    fn short_sync_disables_arbitration_and_probe() {
+        let (arbitration_enabled, initial_probe_active) = ibd_arbitration_modes(IBD_SLOW_PEER_MIN_SYNC_BLOCKS - 1, IBD_SLOW_PEER_MIN_SYNC_BLOCKS);
+        assert!(!arbitration_enabled);
+        assert!(!initial_probe_active);
+    }
+
+    #[test]
+    fn large_sync_enables_initial_probe_and_post_probe_re_evaluation() {
+        let (arbitration_enabled, mut initial_probe_active) = ibd_arbitration_modes(IBD_SLOW_PEER_MIN_SYNC_BLOCKS, IBD_SLOW_PEER_MIN_SYNC_BLOCKS);
+        assert!(arbitration_enabled);
+        assert!(initial_probe_active);
+        initial_probe_active = false;
+        assert!(!initial_probe_active);
+        assert!(ibd_yield_is_allowed(10.0, Some(13.0)));
+    }
+
+    #[test]
+    fn stale_or_removed_alternative_does_not_allow_yield() {
+        let now = Instant::now();
+        assert!(!ibd_observation_is_fresh(now, now - Duration::from_secs(31)));
+        assert!(!ibd_has_materially_better_active_peer(10.0, [(false, 30.0)]));
+        assert!(!ibd_has_materially_better_active_peer(10.0, []));
+    }
+
+    #[test]
+    fn expired_cooldown_does_not_block_progress() {
+        let now = Instant::now();
+        assert!(!ibd_cooldown_is_active(now, Some(now - Duration::from_secs(1))));
+        assert!(!ibd_has_materially_better_active_peer(10.0, [(false, 30.0)]));
+    }
+}
+
 pub enum IbdType {
     Sync { highest_known_syncer_chain_hash: Hash, is_utxo_stable: bool, is_pp_anticone_synced: bool },
     DownloadHeadersProof,
@@ -77,6 +144,7 @@ struct QueueChunkOutput {
     jobs: Vec<BlockValidationFuture>,
     daa_score: u64,
     timestamp: u64,
+    receive_elapsed: Duration,
 }
 
 impl IbdFlow {
@@ -93,11 +161,17 @@ impl IbdFlow {
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         while let Ok(relay_block) = self.relay_receiver.recv().await {
-            if let Some(_guard) = self.ctx.try_set_ibd_running(self.router.key(), relay_block.header.daa_score) {
+            let peer_key = self.router.key();
+            if let Some(_guard) = self.ctx.try_set_ibd_running(peer_key, relay_block.header.daa_score) {
                 info!("IBD started with peer {}", self.router);
 
                 match self.ibd(relay_block).await {
                     Ok(_) => info!("IBD with peer {} completed successfully", self.router),
+                    Err(e @ ProtocolError::IbdPeerYield { .. }) => {
+                        self.ctx.mark_ibd_peer_slow(peer_key, IBD_SLOW_PEER_GLOBAL_COOLDOWN);
+                        info!("IBD peer {} voluntarily yielded: {}. Cooldown {:?}", self.router, e, IBD_SLOW_PEER_GLOBAL_COOLDOWN);
+                        continue;
+                    }
                     Err(e) => {
                         info!("IBD with peer {} completed with error: {}", self.router, e);
                         if e.is_ban_worthy() {
@@ -987,17 +1061,76 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         let high_daa = high_header.daa_score;
 
         let mut iter = hashes.chunks(IBD_BATCH_SIZE);
-        let QueueChunkOutput { jobs: mut prev_jobs, daa_score: mut prev_daa_score, timestamp: mut prev_timestamp } =
-            self.queue_block_processing_chunk(consensus, iter.next().expect("hashes was non empty"), high_daa).await?;
+        let (arbitration_enabled, mut initial_probe_active) = ibd_arbitration_modes(hashes.len(), IBD_SLOW_PEER_MIN_SYNC_BLOCKS);
+        let mut probe_blocks = 0usize;
+        let mut probe_receive_elapsed = Duration::ZERO;
+        let first_chunk = iter.next().expect("hashes was non empty");
+        let first_chunk_len = first_chunk.len();
+        let QueueChunkOutput {
+            jobs: mut prev_jobs,
+            daa_score: mut prev_daa_score,
+            timestamp: mut prev_timestamp,
+            receive_elapsed: prev_receive_elapsed,
+        } =
+            self.queue_block_processing_chunk(consensus, first_chunk, high_daa).await?;
+        if initial_probe_active {
+            probe_blocks += first_chunk_len;
+            probe_receive_elapsed += prev_receive_elapsed;
+        }
 
         for chunk in iter {
-            let QueueChunkOutput { jobs: current_jobs, daa_score: current_daa_score, timestamp: current_timestamp } =
+            let QueueChunkOutput {
+                jobs: current_jobs,
+                daa_score: current_daa_score,
+                timestamp: current_timestamp,
+                receive_elapsed: current_receive_elapsed,
+            } =
                 self.queue_block_processing_chunk(consensus, chunk, high_daa).await?;
             let prev_chunk_len = prev_jobs.len();
+            let current_chunk_len = chunk.len();
+            if initial_probe_active {
+                probe_blocks += current_chunk_len;
+                probe_receive_elapsed += current_receive_elapsed;
+            }
             // Join the previous chunk so that we always concurrently process a chunk and receive another
             try_join_all(prev_jobs).await?;
             // Log the progress
             progress_reporter.report(prev_chunk_len, prev_daa_score, prev_timestamp);
+
+            let chunk_rate = ibd_receive_rate(current_chunk_len, current_receive_elapsed);
+            self.ctx.record_ibd_peer_rate(self.router.key(), chunk_rate);
+            if arbitration_enabled
+                && !initial_probe_active
+                && chunk_rate < IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC
+                && self.ctx.has_better_ibd_peer(self.router.key(), chunk_rate)
+            {
+                try_join_all(current_jobs).await?;
+                progress_reporter.report(current_chunk_len, current_daa_score, current_timestamp);
+                return Err(ProtocolError::IbdPeerYield {
+                    rate: chunk_rate,
+                    sample: current_chunk_len,
+                    elapsed: current_receive_elapsed,
+                });
+            }
+
+            if initial_probe_active && probe_blocks >= IBD_SLOW_PEER_PROBE_BLOCKS {
+                let elapsed = probe_receive_elapsed;
+                let seconds = elapsed.as_secs_f64().max(0.001);
+                let blocks_per_second = ibd_receive_rate(probe_blocks, elapsed);
+                self.ctx.record_ibd_peer_rate(self.router.key(), blocks_per_second);
+                if blocks_per_second < IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC
+                    && self.ctx.has_better_ibd_peer(self.router.key(), blocks_per_second)
+                {
+                    try_join_all(current_jobs).await?;
+                    progress_reporter.report(current_chunk_len, current_daa_score, current_timestamp);
+                    return Err(ProtocolError::IbdPeerYield { rate: blocks_per_second, sample: probe_blocks, elapsed });
+                }
+                info!(
+                    "IBD peer probe passed for {}: {:.2} blocks/s over {} blocks in {:.3}s",
+                    self.router, blocks_per_second, probe_blocks, seconds
+                );
+                initial_probe_active = false;
+            }
             prev_daa_score = current_daa_score;
             prev_timestamp = current_timestamp;
             prev_jobs = current_jobs;
@@ -1038,8 +1171,11 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 RequestIbdBlocksMessage { hashes: chunk.iter().map(|h| h.into()).collect() }
             ))
             .await?;
+        let mut receive_elapsed = Duration::ZERO;
         for &expected_hash in chunk {
+            let receive_started = Instant::now();
             let msg = dequeue_with_timeout!(self.incoming_route, Payload::IbdBlock)?;
+            receive_elapsed += receive_started.elapsed();
             let mut block: Block = Versioned(self.header_format, msg).try_into()?;
             if block.hash() != expected_hash {
                 return Err(ProtocolError::OtherOwned(format!("expected block {} but got {}", expected_hash, block.hash())));
@@ -1060,7 +1196,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             current_timestamp = block.header.timestamp;
             jobs.push(consensus.validate_and_insert_block_ibd(block).virtual_state_task);
         }
-        Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
+        Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp, receive_elapsed })
     }
 
     async fn queue_block_processing_chunk_body_only(
@@ -1079,8 +1215,11 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 self.incoming_route.id()
             ))
             .await?;
+        let mut receive_elapsed = Duration::ZERO;
         for &expected_hash in chunk {
+            let receive_started = Instant::now();
             let msg = dequeue_with_timeout!(self.incoming_route, Payload::BlockBody)?;
+            receive_elapsed += receive_started.elapsed();
             // Capture the proven tier and possession proof before consuming `msg`. The tier is
             // needed to validate the coinbase tier-reward split; the proof must be persisted so this
             // block can later be relayed to proof-enforcing peers (otherwise it is served "naked"
@@ -1118,6 +1257,6 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             current_timestamp = block.header.timestamp;
             jobs.push(consensus.validate_and_insert_block_ibd(block).virtual_state_task);
         }
-        Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
+        Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp, receive_elapsed })
     }
 }
