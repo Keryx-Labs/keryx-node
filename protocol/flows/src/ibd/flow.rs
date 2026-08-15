@@ -44,6 +44,22 @@ use tokio::time::sleep;
 use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progress::ProgressReporter};
 type BlockBody = Vec<Transaction>;
 
+// NODO-2A: adaptive IBD peer probing.
+//
+// Only probe sizeable body-syncs. Two IBD chunks are enough to clearly
+// distinguish the ~18 blk/s peers observed in practice from peers capable
+// of ~65-70 blk/s, while keeping the probe bounded.
+const IBD_SLOW_PEER_MIN_SYNC_BLOCKS: usize = IBD_BATCH_SIZE * 8;
+const IBD_SLOW_PEER_PROBE_BLOCKS: usize = IBD_BATCH_SIZE * 2;
+const IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC: f64 = 25.0;
+
+// NODO-2B: global cooldown enforced by FlowContext.
+// The previous forced-handoff test showed the alternative peer becoming
+// available ~8.7s after yield, so 15s gives it time to enter arbitration.
+const IBD_SLOW_PEER_GLOBAL_COOLDOWN: Duration = Duration::from_secs(15);
+
+const IBD_SLOW_PEER_YIELD_PREFIX: &str = "__KERYX_IBD_SLOW_PEER_YIELD__";
+
 /// Flow for managing IBD - Initial Block Download
 pub struct IbdFlow {
     pub(super) ctx: FlowContext,
@@ -93,11 +109,40 @@ impl IbdFlow {
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         while let Ok(relay_block) = self.relay_receiver.recv().await {
-            if let Some(_guard) = self.ctx.try_set_ibd_running(self.router.key(), relay_block.header.daa_score) {
+            let peer_key = self.router.key();
+
+            // Leave the shared IBD lock free while this peer is cooling down.
+            // Afterwards consume the newest queued relay trigger rather than
+            // immediately racing again with the same stale trigger.
+            if let Some(remaining) = self.ctx.ibd_peer_cooldown_remaining(peer_key) {
+                info!("IBD peer {} waiting on global slow-peer cooldown ({:.3}s remaining)", self.router, remaining.as_secs_f64());
+                sleep(remaining).await;
+                continue;
+            }
+
+            if let Some(_guard) = self.ctx.try_set_ibd_running(peer_key, relay_block.header.daa_score) {
                 info!("IBD started with peer {}", self.router);
 
                 match self.ibd(relay_block).await {
                     Ok(_) => info!("IBD with peer {} completed successfully", self.router),
+
+                    Err(e)
+                        if matches!(
+                            &e,
+                            ProtocolError::OtherOwned(msg)
+                                if msg.starts_with(IBD_SLOW_PEER_YIELD_PREFIX)
+                        ) =>
+                    {
+                        self.ctx.mark_ibd_peer_slow(peer_key, IBD_SLOW_PEER_GLOBAL_COOLDOWN);
+
+                        info!(
+                            "IBD peer {} voluntarily yielded: {}. Global cooldown {:?}",
+                            self.router, e, IBD_SLOW_PEER_GLOBAL_COOLDOWN
+                        );
+
+                        continue;
+                    }
+
                     Err(e) => {
                         info!("IBD with peer {} completed with error: {}", self.router, e);
                         if e.is_ban_worthy() {
@@ -987,17 +1032,69 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         let high_daa = high_header.daa_score;
 
         let mut iter = hashes.chunks(IBD_BATCH_SIZE);
+
+        let mut probe_enabled = hashes.len() >= IBD_SLOW_PEER_MIN_SYNC_BLOCKS;
+        let probe_started = Instant::now();
+        let mut probe_blocks = 0usize;
+
         let QueueChunkOutput { jobs: mut prev_jobs, daa_score: mut prev_daa_score, timestamp: mut prev_timestamp } =
             self.queue_block_processing_chunk(consensus, iter.next().expect("hashes was non empty"), high_daa).await?;
+
+        if probe_enabled {
+            probe_blocks += prev_jobs.len();
+        }
 
         for chunk in iter {
             let QueueChunkOutput { jobs: current_jobs, daa_score: current_daa_score, timestamp: current_timestamp } =
                 self.queue_block_processing_chunk(consensus, chunk, high_daa).await?;
+
+            let current_chunk_len = current_jobs.len();
             let prev_chunk_len = prev_jobs.len();
+
+            if probe_enabled {
+                probe_blocks += current_chunk_len;
+            }
+
             // Join the previous chunk so that we always concurrently process a chunk and receive another
             try_join_all(prev_jobs).await?;
+
             // Log the progress
             progress_reporter.report(prev_chunk_len, prev_daa_score, prev_timestamp);
+
+            // Evaluate only after at least two complete IBD chunks. At this point
+            // the current chunk has also been fully received, so yielding cannot
+            // leave an incomplete RequestBlockBodies response on the route.
+            if probe_enabled && probe_blocks >= IBD_SLOW_PEER_PROBE_BLOCKS {
+                let elapsed = probe_started.elapsed();
+                let seconds = elapsed.as_secs_f64().max(0.001);
+                let blocks_per_second = probe_blocks as f64 / seconds;
+
+                if blocks_per_second < IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC {
+                    // Finish the already-received current chunk before yielding.
+                    // Partial IBD progress remains committed and the next peer will
+                    // simply request the remaining missing bodies.
+                    try_join_all(current_jobs).await?;
+                    progress_reporter.report(current_chunk_len, current_daa_score, current_timestamp);
+
+                    return Err(ProtocolError::OtherOwned(format!(
+                        "{} peer={} rate={:.2} blocks/s sample={} elapsed={:.3}s threshold={:.2}",
+                        IBD_SLOW_PEER_YIELD_PREFIX,
+                        self.router,
+                        blocks_per_second,
+                        probe_blocks,
+                        seconds,
+                        IBD_SLOW_PEER_MIN_BLOCKS_PER_SEC
+                    )));
+                }
+
+                info!(
+                    "IBD peer probe passed for {}: {:.2} blocks/s over {} blocks in {:.3}s",
+                    self.router, blocks_per_second, probe_blocks, seconds
+                );
+
+                probe_enabled = false;
+            }
+
             prev_daa_score = current_daa_score;
             prev_timestamp = current_timestamp;
             prev_jobs = current_jobs;

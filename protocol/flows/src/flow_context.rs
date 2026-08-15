@@ -218,6 +218,10 @@ pub struct FlowContextInner {
     shared_transaction_requests: Arc<Mutex<HashMap<TransactionId, RequestScopeMetadata>>>,
     is_ibd_running: Arc<AtomicBool>,
     ibd_metadata: Arc<RwLock<Option<IbdMetadata>>>,
+
+    // NODO-2B: shared per-peer IBD cooldowns.
+    ibd_peer_cooldowns: Mutex<HashMap<PeerKey, Instant>>,
+
     pub address_manager: Arc<Mutex<AddressManager>>,
     connection_manager: RwLock<Option<Arc<ConnectionManager>>>,
     mining_manager: MiningManagerProxy,
@@ -401,6 +405,7 @@ impl FlowContext {
                 shared_transaction_requests: Arc::new(Mutex::new(HashMap::new())),
                 is_ibd_running: Default::default(),
                 ibd_metadata: Default::default(),
+                ibd_peer_cooldowns: Default::default(),
                 hub,
                 address_manager,
                 connection_manager: Default::default(),
@@ -467,7 +472,30 @@ impl FlowContext {
         &self.mining_manager
     }
 
+    pub fn mark_ibd_peer_slow(&self, peer: PeerKey, cooldown: Duration) {
+        self.ibd_peer_cooldowns.lock().insert(peer, Instant::now() + cooldown);
+    }
+
+    pub fn ibd_peer_cooldown_remaining(&self, peer: PeerKey) -> Option<Duration> {
+        let now = Instant::now();
+        let mut cooldowns = self.ibd_peer_cooldowns.lock();
+
+        match cooldowns.get(&peer).copied() {
+            Some(until) if until > now => Some(until.duration_since(now)),
+            Some(_) => {
+                cooldowns.remove(&peer);
+                None
+            }
+            None => None,
+        }
+    }
+
     pub fn try_set_ibd_running(&self, peer: PeerKey, relay_daa_score: u64) -> Option<IbdRunningGuard> {
+        // NODO-2B: slow peers are rejected at the shared arbitration boundary.
+        if self.ibd_peer_cooldown_remaining(peer).is_some() {
+            return None;
+        }
+
         if self.is_ibd_running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             self.ibd_metadata.write().replace(IbdMetadata { peer, daa_score: relay_daa_score });
             Some(IbdRunningGuard { indicator: self.is_ibd_running.clone() })
