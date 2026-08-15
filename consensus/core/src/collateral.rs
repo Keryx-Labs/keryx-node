@@ -288,6 +288,10 @@ struct PendingRequest {
     max_tokens: u32,
     accepted_daa: u64,
     audit: Option<Audit>,
+    /// Escrow keys that answered between this request's acceptance and its arming — the one-block
+    /// gap where no audit exists yet to credit them. Drained into `responded` when the audit arms.
+    /// Bounded by the AiResponses of a single chain block's acceptance data, then cleared.
+    early_responders: Vec<Hash>,
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
@@ -369,8 +373,9 @@ impl ServiceLedger {
     /// `responses` its accepted AiResponses as `(request_hash, verified responder)`; `escrows` the
     /// escrow claims this block's coinbase creates, keyed by producing miner; `cohort` resolves a
     /// tier to its full declared-miner set at this block. Every cohort member must respond before
-    /// the request's window closes; responses are applied before expiries, so one landing in the
-    /// closing block still counts.
+    /// the request's window closes; requests are admitted before their block's responses and
+    /// responses are applied before expiries, so an answer landing in the opening block or in the
+    /// closing one counts just the same.
     pub fn on_chain_block(
         &mut self,
         daa: u64,
@@ -435,15 +440,39 @@ impl ServiceLedger {
         outcome.sightings = sightings;
         outcome.expired = expired;
 
+        self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
+
+        // This block's own requests are admitted before its responses are folded: a response
+        // accepted in the same chain block as its request must find the request pending, or it is
+        // dropped and its author struck for an answer he did give. Arming still waits for the next
+        // block (`daa > accepted_daa` below), so the cohort is unchanged.
+        for (rh, tier, max_tokens) in requests {
+            // A re-accepted hash (identical payload resubmitted) must not reset the running
+            // audit: overwriting would re-arm the window and push the miss out forever.
+            self.pending.entry(*rh).or_insert(PendingRequest {
+                tier: *tier,
+                max_tokens: *max_tokens,
+                accepted_daa: daa,
+                audit: None,
+                early_responders: Vec::new(),
+            });
+        }
+
         // An authenticated response (signed by a delegated escrow key) marks every cohort
         // identity that delegated to it as having served this audit and resets their streak.
-        // Anyone else's response is ignored by the ledger.
+        // Anyone else's response is ignored by the ledger. A response landing before the audit
+        // arms is parked on the request and credited when it does.
         for (rh, responder) in responses {
             let Some(r) = responder else { continue };
             let mut served: Vec<Hash> = Vec::new();
             {
                 let Some(req) = self.pending.get_mut(rh) else { continue };
-                let Some(audit) = req.audit.as_mut() else { continue };
+                let Some(audit) = req.audit.as_mut() else {
+                    if !req.early_responders.contains(r) {
+                        req.early_responders.push(*r);
+                    }
+                    continue;
+                };
                 let matched: Vec<Hash> = audit.delegations.iter().filter(|(e, _)| e == r).map(|(_, id)| *id).collect();
                 for identity in matched {
                     if audit.cohort.binary_search(&identity).is_ok() && !audit.responded.contains(&identity) {
@@ -461,9 +490,8 @@ impl ServiceLedger {
             }
         }
 
-        self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
-
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
+        let mut served_at_arm: Vec<Hash> = Vec::new();
         for rh in hashes {
             let req = self.pending.get(&rh).unwrap();
             match &req.audit {
@@ -514,20 +542,32 @@ impl ServiceLedger {
                         delegations.sort_unstable();
                         delegations.dedup();
                         let window = service_window_daa(req.tier, req.max_tokens);
+                        // Credit whoever answered before the audit existed: same membership test
+                        // as the live path, so an early answer and a late one are worth the same.
+                        let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
+                        let mut responded: Vec<Hash> = Vec::new();
+                        for key in early.iter() {
+                            for identity in delegations.iter().filter(|(e, _)| e == key).map(|(_, id)| id) {
+                                if ids.binary_search(identity).is_ok() && !responded.contains(identity) {
+                                    responded.push(*identity);
+                                    served_at_arm.push(*identity);
+                                }
+                            }
+                        }
                         self.pending.get_mut(&rh).unwrap().audit =
-                            Some(Audit { cohort: ids, delegations, responded: Vec::new(), window_end_daa: daa + window });
+                            Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window });
                     }
                 }
                 None => {}
             }
         }
 
-        for (rh, tier, max_tokens) in requests {
-            // A re-accepted hash (identical payload resubmitted) must not reset the running
-            // audit: overwriting would re-arm the window and push the miss out forever.
-            self.pending
-                .entry(*rh)
-                .or_insert(PendingRequest { tier: *tier, max_tokens: *max_tokens, accepted_daa: daa, audit: None });
+        for identity in served_at_arm {
+            // A warmup fold leaves strikes alone: the baseline already carries this reset.
+            if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
+                self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: 0 });
+                outcome.resets.push(identity);
+            }
         }
 
         outcome
@@ -676,7 +716,7 @@ mod tests {
 
         let rh = [7u8; 32];
         assert!(ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
-        // response in the audit-opening block is applied before the cohort exists: ignored
+        // a response in the audit-opening block is parked and credited when the audit arms
         assert!(ledger.on_chain_block(101, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set)).misses.is_empty());
         // a v1 (unsigned) response and a non-member response never count
         assert!(ledger.on_chain_block(102, &[], &[(rh, None), (rh, Some(b))], &[], |_| true, cohort_of(&set)).misses.is_empty());
@@ -685,6 +725,50 @@ mod tests {
         assert!(ledger.on_chain_block(103, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set)).misses.is_empty());
         assert!(ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
         assert_eq!(ledger.pending_len(), 0);
+    }
+
+    #[test]
+    fn answer_in_the_accepting_block_never_strikes() {
+        // A miner fast enough to answer inside the chain block that accepts the request used to
+        // have his answer dropped — no audit existed yet to credit it — and was struck for a
+        // request he had served. Observed on testnet at daa 9132, cohort of one.
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(3, 128);
+
+        let rh = [7u8; 32];
+        // request and its answer accepted by the same chain block
+        let out = ledger.on_chain_block(9132, &[(rh, 3, 128)], &[(rh, Some(a))], &[], |_| true, cohort_of(&set));
+        assert!(out.misses.is_empty());
+        // the audit arms on the next block and must open already satisfied
+        assert!(ledger.on_chain_block(9133, &[], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
+        let misses = ledger.on_chain_block(9134 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses;
+        assert!(misses.is_empty(), "an answered request must never strike its answerer");
+        assert_eq!(ledger.consecutive_misses(&a), 0);
+        assert_eq!(ledger.pending_len(), 0);
+    }
+
+    #[test]
+    fn only_the_silent_member_of_the_cohort_is_struck() {
+        // Cohort of three answering in the accepting block: A and B serve, C stays silent.
+        // C alone takes the strike.
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let c = Hash::from_bytes([3u8; 32]);
+        let set = [a, b, c];
+        let mut ledger = ServiceLedger::default();
+        let w = service_window_daa(0, 256);
+
+        let rh = [7u8; 32];
+        ledger.on_chain_block(100, &[(rh, 0, 256)], &[(rh, Some(a)), (rh, Some(b))], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses;
+        assert_eq!(misses.len(), 1);
+        assert_eq!(misses[0].miner, c);
+        assert_eq!(ledger.consecutive_misses(&a), 0);
+        assert_eq!(ledger.consecutive_misses(&b), 0);
+        assert_eq!(ledger.consecutive_misses(&c), 1);
     }
 
     #[test]
