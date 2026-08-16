@@ -5,8 +5,9 @@ use crate::model::stores::{
     ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss, ServicePenalty,
-    ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_SUSPENSION_DAA,
+    eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss,
+    ServicePenalty, ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA,
+    SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
@@ -16,8 +17,6 @@ use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
 use keryx_txscript::script_class::ScriptClass;
 
-/// Domain separator of the V2 AiResponse responder signature.
-const RESPONDER_SIG_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
 
 /// The escrow pubkey locked by a CSV escrow script, if the script is one.
 fn csv_escrow_pubkey(script: &[u8]) -> Option<[u8; 32]> {
@@ -32,14 +31,7 @@ fn csv_escrow_pubkey(script: &[u8]) -> Option<[u8; 32]> {
 /// signature over the v1 payload bytes verifies. `None` for v1 or a bad signature.
 fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
     let r = resp.responder.as_ref()?;
-    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
-    hasher.update(RESPONDER_SIG_DOMAIN);
-    hasher.update(&resp.signed_bytes());
-    let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
-    let pk = secp256k1::XOnlyPublicKey::from_slice(&r.escrow_pubkey).ok()?;
-    let sig = secp256k1::schnorr::Signature::from_slice(&r.signature).ok()?;
-    secp256k1::SECP256K1.verify_schnorr(&sig, &msg, &pk).ok()?;
-    Some(escrow_miner_key(&r.escrow_pubkey))
+    verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()).then(|| escrow_miner_key(&r.escrow_pubkey))
 }
 
 /// Retained per-chain-block ledger snapshots; reorgs deeper than this fall back to a horizon refold.
@@ -723,6 +715,7 @@ impl VirtualStateProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keryx_consensus_core::collateral::RESPONDER_SIG_DOMAIN;
     use keryx_inference::AiResponder;
 
     fn signed_response(seckey: &[u8; 32], tamper: bool) -> AiResponsePayload {

@@ -52,8 +52,9 @@ pub(crate) struct Mempool {
     orphan_pool: OrphanPool,
     accepted_transactions: AcceptedTransactions,
     counters: Arc<MiningCounters>,
-    /// Deduplication index: request_hash → tx_id. One AiResponse per request.
-    ai_response_index: HashMap<[u8; 32], TransactionId>,
+    /// Deduplication index: request_hash → pending (responder escrow key, tx_id) entries.
+    /// One AiResponse per (request, responder); `None` is the unsigned v1 responder.
+    ai_response_index: HashMap<[u8; 32], Vec<(Option<[u8; 32]>, TransactionId)>>,
     /// Deduplication index: response_hash → tx_id. One AiChallenge per response.
     ai_challenge_index: HashMap<[u8; 32], TransactionId>,
 }

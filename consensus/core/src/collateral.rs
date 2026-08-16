@@ -118,6 +118,26 @@ pub fn verify_escrow_delegation(payout_version: u16, payout_script: &[u8], escro
     secp256k1::SECP256K1.verify_schnorr(&signature, &msg, &payout_key).is_ok()
 }
 
+/// Domain separator of the V2 AiResponse responder signature.
+pub const RESPONDER_SIG_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
+
+/// Verifies a V2 responder signature: schnorr by `escrow_pubkey` over the domain-tagged
+/// blake2b-256 of the v1 payload bytes.
+pub fn verify_responder_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(RESPONDER_SIG_DOMAIN);
+    hasher.update(signed_bytes);
+    let mut msg = [0u8; 32];
+    msg.copy_from_slice(hasher.finalize().as_bytes());
+    let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(escrow_pubkey) else {
+        return false;
+    };
+    let Ok(sig) = secp256k1::schnorr::Signature::from_slice(signature) else {
+        return false;
+    };
+    secp256k1::SECP256K1.verify_schnorr(&sig, &secp256k1::Message::from_digest(msg), &pk).is_ok()
+}
+
 /// Deterministically select one index in `0..n` from a 32-byte seed (a block hash chosen after
 /// the request). Assigns the single responsible miner for an inference request from the eligible
 /// (recently-active tier) set. `None` for an empty set.

@@ -72,8 +72,14 @@ pub enum RuleError {
     #[error("transactions in mempool form a cycle")]
     RejectCycleInMempoolTransactions,
 
-    #[error("an AiResponse for request {0} is already in the mempool")]
+    #[error("an AiResponse for request {0} by the same responder is already in the mempool")]
     RejectDuplicateAiResponse(String),
+
+    #[error("the AiResponse for request {0} has an invalid responder signature")]
+    RejectAiResponderSignature(String),
+
+    #[error("request {0} already has the maximum number of pending AiResponses")]
+    RejectAiResponsesSaturated(String),
 
     #[error("an AiChallenge for response {0} is already in the mempool")]
     RejectDuplicateAiChallenge(String),

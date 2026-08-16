@@ -37,7 +37,12 @@ impl Mempool {
             // Clean up AI dedup indexes when a tx is evicted.
             if tx.mtx.tx.is_ai_response() {
                 if let Some(rh) = AiResponsePayload::deserialize(&tx.mtx.tx.payload).map(|r| r.request_hash) {
-                    self.ai_response_index.remove(&rh);
+                    if let Some(entries) = self.ai_response_index.get_mut(&rh) {
+                        entries.retain(|(_, id)| id != tx_id);
+                        if entries.is_empty() {
+                            self.ai_response_index.remove(&rh);
+                        }
+                    }
                 }
             }
             if tx.mtx.tx.is_ai_challenge() {

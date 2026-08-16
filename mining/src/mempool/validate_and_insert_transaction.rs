@@ -11,6 +11,7 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
+    collateral::verify_responder_signature,
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
@@ -130,8 +131,9 @@ impl Mempool {
 
         // Register in dedup indexes so no duplicate AI txs for the same hash get in.
         if accepted_transaction.is_ai_response() {
-            if let Some(request_hash) = ai_response_request_hash(&accepted_transaction.payload) {
-                self.ai_response_index.insert(request_hash, accepted_transaction.id());
+            if let Some(resp) = AiResponsePayload::deserialize(&accepted_transaction.payload) {
+                let responder = resp.responder.as_ref().map(|r| r.escrow_pubkey);
+                self.ai_response_index.entry(resp.request_hash).or_default().push((responder, accepted_transaction.id()));
             }
         }
         if accepted_transaction.is_ai_challenge() {
@@ -159,11 +161,26 @@ impl Mempool {
             return Err(RuleError::RejectDuplicate(transaction_id));
         }
 
-        // One AiResponse per request: reject if a response for the same request_hash is already pending.
+        // One AiResponse per (request, responder), with a per-request cap. A V2 responder
+        // signature must verify so the dedup key cannot be forged by third parties.
         if transaction.tx.is_ai_response() {
-            if let Some(request_hash) = ai_response_request_hash(&transaction.tx.payload) {
-                if self.ai_response_index.contains_key(&request_hash) {
-                    return Err(RuleError::RejectDuplicateAiResponse(hex::encode(request_hash)));
+            if let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) {
+                let responder = match resp.responder.as_ref() {
+                    Some(r) => {
+                        if !verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()) {
+                            return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
+                        }
+                        Some(r.escrow_pubkey)
+                    }
+                    None => None,
+                };
+                if let Some(entries) = self.ai_response_index.get(&resp.request_hash) {
+                    if entries.iter().any(|(key, _)| *key == responder) {
+                        return Err(RuleError::RejectDuplicateAiResponse(hex::encode(resp.request_hash)));
+                    }
+                    if entries.len() >= MAX_PENDING_AI_RESPONSES_PER_REQUEST {
+                        return Err(RuleError::RejectAiResponsesSaturated(hex::encode(resp.request_hash)));
+                    }
                 }
             }
         }
@@ -277,9 +294,9 @@ impl Mempool {
     }
 }
 
-fn ai_response_request_hash(payload: &[u8]) -> Option<[u8; 32]> {
-    AiResponsePayload::deserialize(payload).map(|r| r.request_hash)
-}
+/// Distinct pending AiResponses allowed per request — bounds mempool growth while leaving
+/// room for every cohort responder.
+const MAX_PENDING_AI_RESPONSES_PER_REQUEST: usize = 32;
 
 fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiChallengePayload::deserialize(payload).map(|c| c.response_hash)
