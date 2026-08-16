@@ -972,12 +972,15 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             pending_burns: snapshot
                 .pending_burns
                 .into_iter()
-                .map(|(miner, miss_daa_score, consecutive_misses, burned_claims, burned_sompi)| RpcServicePendingBurn {
-                    miner,
-                    miss_daa_score,
-                    consecutive_misses,
-                    burned_claims,
-                    burned_sompi,
+                .map(|(miner, miss_daa_score, consecutive_misses, burned_claims, burned_sompi, request_hash)| {
+                    RpcServicePendingBurn {
+                        miner,
+                        miss_daa_score,
+                        consecutive_misses,
+                        burned_claims,
+                        burned_sompi,
+                        request_hash: RpcHash::from_bytes(request_hash),
+                    }
                 })
                 .collect(),
             lifetime_strikes: snapshot

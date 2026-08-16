@@ -232,6 +232,7 @@ declare! {
         consecutiveMisses: number;
         burnedClaims: number;
         burnedSompi: bigint;
+        requestHash: HexString;
     }
     "#,
 }

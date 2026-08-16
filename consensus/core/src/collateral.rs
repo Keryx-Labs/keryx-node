@@ -282,8 +282,9 @@ pub struct ServiceStrikesSnapshot {
     pub strikes: Vec<(Hash, u32, u64)>,
     /// Production suspensions: (miner, suspended-until daa).
     pub suspended: Vec<(Hash, u64)>,
-    /// Misses awaiting finality: (miner, miss daa, consecutive misses, burned claims, burned sompi).
-    pub pending_burns: Vec<(Hash, u64, u32, u32, u64)>,
+    /// Misses awaiting finality: (miner, miss daa, consecutive misses, burned claims, burned
+    /// sompi, missed request hash).
+    pub pending_burns: Vec<(Hash, u64, u32, u32, u64, [u8; 32])>,
     /// Strikes taken over the whole retained log: (miner, count). Unlike `strikes`, this never
     /// resets — a served response and an executed suspension both clear the live counter, so it
     /// is the only figure that answers "how often has this miner failed". Display only.

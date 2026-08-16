@@ -1160,6 +1160,7 @@ message ServicePendingBurnMessage {
   uint32 consecutiveMisses = 3;
   uint32 burnedClaims = 4;
   uint64 burnedSompi = 5;
+  string requestHash = 6;
 }
 
 // Lifetime strike tally per miner — never reset, unlike ServiceStrikeMessage.consecutiveMisses.

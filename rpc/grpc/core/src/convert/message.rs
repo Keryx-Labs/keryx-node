@@ -434,6 +434,7 @@ from!(item: RpcResult<&keryx_rpc_core::GetServiceStrikesResponse>, protowire::Ge
                 consecutive_misses: b.consecutive_misses,
                 burned_claims: b.burned_claims,
                 burned_sompi: b.burned_sompi,
+                request_hash: b.request_hash.to_string(),
             })
             .collect(),
         lifetime_strikes: item
@@ -1016,6 +1017,8 @@ try_from!(item: &protowire::GetServiceStrikesResponseMessage, RpcResult<keryx_rp
                     consecutive_misses: b.consecutive_misses,
                     burned_claims: b.burned_claims,
                     burned_sompi: b.burned_sompi,
+                    // Empty on payloads from pre-requestHash nodes.
+                    request_hash: if b.request_hash.is_empty() { RpcHash::default() } else { RpcHash::from_str(&b.request_hash)? },
                 })
             })
             .collect::<RpcResult<Vec<_>>>()?,

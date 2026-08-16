@@ -285,6 +285,7 @@ impl VirtualStateProcessor {
                         miss.consecutive_misses,
                         miss.burned.len() as u32,
                         miss.burned.iter().map(|c| c.value).sum(),
+                        miss.request_hash,
                     )),
                     ServiceEvent::Reset(_) | ServiceEvent::Sighting(_) => None,
                 })

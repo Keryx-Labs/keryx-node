@@ -1937,6 +1937,8 @@ pub struct RpcServicePendingBurn {
     pub consecutive_misses: u32,
     pub burned_claims: u32,
     pub burned_sompi: u64,
+    /// blake2b-256 of the missed AiRequest payload — identifies which request went unanswered.
+    pub request_hash: RpcHash,
 }
 
 /// Strikes a miner has taken over the whole retained log. The live counter in `RpcServiceStrike`
@@ -1979,7 +1981,7 @@ pub struct GetServiceStrikesResponse {
 
 impl Serializer for GetServiceStrikesResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         store!(u64, &self.virtual_daa_score, writer)?;
         store!(Vec<RpcServiceStrike>, &self.strikes, writer)?;
         store!(Vec<RpcServiceSuspension>, &self.suspended, writer)?;
@@ -1995,7 +1997,30 @@ impl Deserializer for GetServiceStrikesResponse {
         let virtual_daa_score = load!(u64, reader)?;
         let strikes = load!(Vec<RpcServiceStrike>, reader)?;
         let suspended = load!(Vec<RpcServiceSuspension>, reader)?;
-        let pending_burns = load!(Vec<RpcServicePendingBurn>, reader)?;
+        // Pre-v3 payloads carry burn entries without a request hash: absent reads as the zero hash.
+        let pending_burns = if version >= 3 {
+            load!(Vec<RpcServicePendingBurn>, reader)?
+        } else {
+            #[derive(BorshDeserialize)]
+            struct LegacyPendingBurn {
+                miner: RpcHash,
+                miss_daa_score: u64,
+                consecutive_misses: u32,
+                burned_claims: u32,
+                burned_sompi: u64,
+            }
+            load!(Vec<LegacyPendingBurn>, reader)?
+                .into_iter()
+                .map(|b| RpcServicePendingBurn {
+                    miner: b.miner,
+                    miss_daa_score: b.miss_daa_score,
+                    consecutive_misses: b.consecutive_misses,
+                    burned_claims: b.burned_claims,
+                    burned_sompi: b.burned_sompi,
+                    request_hash: RpcHash::default(),
+                })
+                .collect()
+        };
         // v1 clients and v1 payloads predate the lifetime tally: absent means unknown, not zero.
         let lifetime_strikes =
             if version >= 2 { load!(Vec<RpcServiceStrikeTotal>, reader)? } else { Vec::new() };

@@ -1147,6 +1147,7 @@ mod mockery {
                     consecutive_misses: 1,
                     burned_claims: 5,
                     burned_sompi: mock(),
+                    request_hash: mock(),
                 }],
                 lifetime_strikes: vec![RpcServiceStrikeTotal { miner: mock(), strikes: 7 }],
             }
