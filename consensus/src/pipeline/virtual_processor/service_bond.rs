@@ -42,7 +42,8 @@ const SERVICE_SNAPSHOT_CAP: usize = 4_096;
 /// so the refold baseline and the standing clock carry them.
 enum ServiceEvent {
     Miss(ServiceMiss),
-    Reset(Hash),
+    /// (identity, preserved last-strike daa — keeps the rate-limit armed across a serve).
+    Reset(Hash, u64),
     Sighting(Hash),
 }
 
@@ -56,8 +57,9 @@ enum ServiceEvent {
 pub(super) struct StandingIndex {
     first_seen: std::collections::HashMap<Hash, u64>,
     /// (event daa, count, last_daa) per identity, ascending by daa (flush order). `last_daa` is
-    /// mirrored so a served reset `{0, 0}` stays distinguishable from an executed suspension
-    /// `{0, daa}` — both carry a zero count, but only the second is a strike.
+    /// mirrored so a served reset (`last_daa` zero or strictly older than the row daa) stays
+    /// distinguishable from an executed suspension (`last_daa` equal to its own row daa) — both
+    /// carry a zero count, but only the second is a strike.
     history: std::collections::HashMap<Hash, Vec<(u64, u32, u64)>>,
 }
 
@@ -92,7 +94,7 @@ impl StandingIndex {
         self.history
             .iter()
             .filter_map(|(id, rows)| {
-                let n = rows.iter().filter(|(_, count, last)| *count > 0 || *last > 0).count() as u32;
+                let n = rows.iter().filter(|(daa, count, last)| *count > 0 || (*last > 0 && *last == *daa)).count() as u32;
                 (n > 0).then_some((*id, n))
             })
             .collect()
@@ -287,7 +289,7 @@ impl VirtualStateProcessor {
                         miss.burned.iter().map(|c| c.value).sum(),
                         miss.request_hash,
                     )),
-                    ServiceEvent::Reset(_) | ServiceEvent::Sighting(_) => None,
+                    ServiceEvent::Reset(..) | ServiceEvent::Sighting(_) => None,
                 })
                 .collect();
         }
@@ -494,8 +496,8 @@ impl VirtualStateProcessor {
                 for miss in outcome.misses {
                     queue.push_back((i, daa, ServiceEvent::Miss(miss)));
                 }
-                for miner in outcome.resets {
-                    queue.push_back((i, daa, ServiceEvent::Reset(miner)));
+                for (miner, preserved) in outcome.resets {
+                    queue.push_back((i, daa, ServiceEvent::Reset(miner, preserved)));
                 }
             }
         }
@@ -569,8 +571,8 @@ impl VirtualStateProcessor {
             for miss in outcome.misses {
                 sync.queue.push_back((idx, daa, ServiceEvent::Miss(miss)));
             }
-            for miner in outcome.resets {
-                sync.queue.push_back((idx, daa, ServiceEvent::Reset(miner)));
+            for (miner, preserved) in outcome.resets {
+                sync.queue.push_back((idx, daa, ServiceEvent::Reset(miner, preserved)));
             }
             let snapshot = sync.ledger.light_snapshot();
             sync.snapshots.insert(idx, snapshot);
@@ -604,10 +606,10 @@ impl VirtualStateProcessor {
                         self.service_commit_index.add_row(&service_commit::first_seen_row_bytes(miner, daa));
                     }
                 }
-                ServiceEvent::Reset(miner) => {
-                    if self.service_standing.write().record_strike(miner, daa, 0, 0) {
-                        self.service_strike_store.set(daa, miner, StrikeEntry { count: 0, last_daa: 0 }).unwrap();
-                        self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miner, 0, 0));
+                ServiceEvent::Reset(miner, preserved) => {
+                    if self.service_standing.write().record_strike(miner, daa, 0, preserved) {
+                        self.service_strike_store.set(daa, miner, StrikeEntry { count: 0, last_daa: preserved }).unwrap();
+                        self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miner, 0, preserved));
                     }
                 }
                 ServiceEvent::Miss(miss) => {
@@ -687,9 +689,10 @@ impl VirtualStateProcessor {
             cursor = cursor.max(event_daa);
             rows.push((event_daa, service_commit::strike_row_bytes(event_daa, miner, record.count, record.last_daa).to_vec()));
             standing.record_strike(miner, event_daa, record.count, record.last_daa);
-            // `{0, daa > 0}` is an executed suspension; the log is in event order, so the last
-            // (largest) deadline per miner wins.
-            if record.count == 0 && record.last_daa > 0 {
+            // An executed suspension logs `{0, daa}` with `last_daa` equal to its own event daa;
+            // a served reset carries a strictly older (or zero) preserved daa. The log is in
+            // event order, so the last (largest) deadline per miner wins.
+            if record.count == 0 && record.last_daa == event_daa {
                 suspended.insert(miner, record.last_daa + self.finality_depth + SERVICE_SUSPENSION_DAA);
             }
         }

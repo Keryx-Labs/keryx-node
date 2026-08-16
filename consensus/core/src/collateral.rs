@@ -374,7 +374,9 @@ impl MemSizeEstimator for StrikeEntry {
 #[derive(Clone, Debug, Default)]
 pub struct FoldOutcome {
     pub misses: Vec<ServiceMiss>,
-    pub resets: Vec<Hash>,
+    /// Served-response streak resets as (identity, preserved last-strike daa). The preserved daa
+    /// keeps the strike rate-limit armed across a serve; 0 before the v2 gate.
+    pub resets: Vec<(Hash, u64)>,
     /// Identities sighted (first certified block) in this fold, new relative to the baseline.
     pub sightings: Vec<Hash>,
     /// Claims dropped by the burnable-window purge in this fold, in pop order — the undo log
@@ -555,8 +557,9 @@ impl ServiceLedger {
             for identity in served {
                 // A warmup fold leaves strikes alone: the baseline already carries this reset.
                 if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
-                    self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: 0 });
-                    outcome.resets.push(identity);
+                    let preserved = self.reset_preserved_last_daa(&identity, daa);
+                    self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: preserved });
+                    outcome.resets.push((identity, preserved));
                 }
             }
         }
@@ -643,12 +646,23 @@ impl ServiceLedger {
         for identity in served_at_arm {
             // A warmup fold leaves strikes alone: the baseline already carries this reset.
             if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
-                self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: 0 });
-                outcome.resets.push(identity);
+                let preserved = self.reset_preserved_last_daa(&identity, daa);
+                self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: preserved });
+                outcome.resets.push((identity, preserved));
             }
         }
 
         outcome
+    }
+
+    /// Last-strike daa a served-response reset carries forward, so a serve no longer disarms
+    /// the strike rate-limit. 0 (the disarming legacy value) before the v2 gate.
+    fn reset_preserved_last_daa(&self, identity: &Hash, daa: u64) -> u64 {
+        if self.window_v2_activation_daa.is_some_and(|a| daa >= a) {
+            self.strike_state(identity).map(|e| e.last_daa).unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     /// Takes the escrow claims a penalty burns out of the miner's vault: the `n` newest for
@@ -962,7 +976,7 @@ mod tests {
         ledger.on_chain_block(d2, &[(r2, 0, 256)], &[], &[], |_| true, cohort_of(&set));
         ledger.on_chain_block(d2 + 1, &[], &[], &[], |_| true, cohort_of(&set));
         let outcome = ledger.on_chain_block(d2 + 2, &[], &[(r2, Some(a))], &[], |_| true, cohort_of(&set));
-        assert_eq!(outcome.resets, vec![a], "a's serve must reset (and report) his streak");
+        assert_eq!(outcome.resets, vec![(a, 0)], "a's serve must reset (and report) his streak");
         let misses = ledger.on_chain_block(d2 + 2 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses;
         assert_eq!(misses.len(), 1);
         assert_eq!((misses[0].miner, misses[0].consecutive_misses), (b, 2));
@@ -1091,9 +1105,48 @@ mod tests {
         ledger.on_chain_block(far, &[(r2, 0, 256)], &[], &[], |_| true, cohort_of(&set));
         ledger.on_chain_block(far + 1, &[], &[], &[], |_| true, cohort_of(&set));
         let outcome = ledger.on_chain_block(far + 2, &[], &[(r2, Some(a))], &[], |_| true, cohort_of(&set));
-        assert_eq!(outcome.resets, vec![a]);
+        assert_eq!(outcome.resets, vec![(a, 0)]);
         assert_eq!(ledger.consecutive_misses(&a), 0);
         assert!(ledger.strike_entries().is_empty());
+    }
+
+    #[test]
+    fn serve_keeps_the_rate_limit_armed_post_v2() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        let w = service_window_daa_at(0, 256, true);
+        let i = SERVICE_STRIKE_INTERVAL_DAA;
+
+        let r1 = [1u8; 32];
+        ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, cohort_of(&set));
+        let strike_daa = 102 + w;
+        assert_eq!(ledger.on_chain_block(strike_daa, &[], &[], &[], |_| true, cohort_of(&set)).misses.len(), 1);
+
+        // the serve resets the streak but reports the preserved strike daa
+        let r2 = [2u8; 32];
+        ledger.on_chain_block(strike_daa + 10, &[(r2, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(strike_daa + 11, &[], &[], &[], |_| true, cohort_of(&set));
+        let outcome = ledger.on_chain_block(strike_daa + 12, &[], &[(r2, Some(a))], &[], |_| true, cohort_of(&set));
+        assert_eq!(outcome.resets, vec![(a, strike_daa)]);
+        assert_eq!(ledger.consecutive_misses(&a), 0);
+
+        // a miss closing inside the pre-serve strike's interval is still absorbed
+        let r3 = [3u8; 32];
+        ledger.on_chain_block(strike_daa + 20, &[(r3, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(strike_daa + 21, &[], &[], &[], |_| true, cohort_of(&set));
+        assert!(ledger.on_chain_block(strike_daa + 22 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
+
+        // past the interval it strikes again, from 1
+        let d4 = strike_daa + i + 100;
+        let r4 = [4u8; 32];
+        ledger.on_chain_block(d4, &[(r4, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(d4 + 1, &[], &[], &[], |_| true, cohort_of(&set));
+        let misses = ledger.on_chain_block(d4 + 2 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses;
+        assert_eq!(misses.len(), 1);
+        assert_eq!(misses[0].consecutive_misses, 1);
     }
 
     #[test]
@@ -1189,8 +1242,8 @@ mod tests {
                     burned_set.insert(c.outpoint);
                 }
             }
-            for miner in outcome.resets.iter() {
-                base.insert(*miner, StrikeEntry { count: 0, last_daa: 0 });
+            for (miner, preserved) in outcome.resets.iter() {
+                base.insert(*miner, StrikeEntry { count: 0, last_daa: *preserved });
             }
         }
 
