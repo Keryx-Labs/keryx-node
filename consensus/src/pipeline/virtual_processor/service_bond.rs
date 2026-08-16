@@ -7,7 +7,7 @@ use crate::model::stores::{
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss,
     ServicePenalty, ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA,
-    SERVICE_SUSPENSION_DAA,
+    SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::TransactionOutpoint;
@@ -360,6 +360,7 @@ impl VirtualStateProcessor {
         if !self.pom_v3_activation.is_active(daa) {
             return (FoldOutcome::default(), Vec::new());
         }
+        ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         let (requests, responses) = self.service_events_of_chain_block(hash);
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
         // live claims never are, and the frontier-daa refold must not resurrect a claim whose
@@ -379,8 +380,13 @@ impl VirtualStateProcessor {
                 );
             }
         }
+        let eligibility_window = if self.service_bond_v2_activation.is_active(daa) {
+            SERVICE_ELIGIBILITY_WINDOW_DAA_V2
+        } else {
+            SERVICE_ELIGIBILITY_WINDOW_DAA
+        };
         let cohort = |tier: u8| {
-            let set = self.service_eligible_miners_in(sc, hash, tier, SERVICE_ELIGIBILITY_WINDOW_DAA);
+            let set = self.service_eligible_miners_in(sc, hash, tier, eligibility_window);
             // Only the live fold logs: a refold replays the same armings.
             if live {
                 info!("service-bond: audit armed at daa {}, tier {}, cohort {}", daa, tier, set.len());

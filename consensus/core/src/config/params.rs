@@ -1179,6 +1179,11 @@ pub struct Params {
     /// per nonce than the v2 hash walk).
     pub pom_v3_activation: ForkActivation,
 
+    /// Service-bond v2 window retune: halves the cohort-eligibility window (6 000 → 3 000 DAA)
+    /// and raises the response-window base (300 → 3 000 DAA). Changes the audit fold, hence the
+    /// sealed service state — must be armed above every live tip before the binary ships.
+    pub service_bond_v2_activation: ForkActivation,
+
     /// Chain-anchor checkpoint `(hash, daa_score)` — local peering policy, see `CHAIN_ANCHOR_HASH`.
     /// `None` disables enforcement (all nets but mainnet).
     pub chain_anchor: Option<(Hash, u64)>,
@@ -1419,6 +1424,7 @@ impl Params {
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
             pom_v3_activation: self.pom_v3_activation,
+            service_bond_v2_activation: self.service_bond_v2_activation,
 
             chain_anchor: self.chain_anchor,
 
@@ -1614,6 +1620,8 @@ pub const MAINNET_PARAMS: Params = Params {
     // H6 matrix walk, armed together with its difficulty-reset companion at the same score.
     // Gate = virtual daa of the relaunch base: active from the first post-relaunch block.
     pom_v3_activation: ForkActivation::new(76_316_623),
+    // Service-bond v2 window retune — ARM AT RELEASE (tip+1 rule, same process as H6).
+    service_bond_v2_activation: ForkActivation::never(),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1720,6 +1728,9 @@ pub const TESTNET_PARAMS: Params = Params {
     h5_2_activation: ForkActivation::new(0),
     // H6 matrix walk — the only era transition this testnet crosses.
     pom_v3_activation: ForkActivation::new(1000),
+    // Service-bond v2 window retune — arm ABOVE the live testnet tip before deploying: the fold
+    // is sealed, flipping it below already-folded history splits the testnet.
+    service_bond_v2_activation: ForkActivation::never(),
     chain_anchor: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
@@ -1800,6 +1811,7 @@ pub const SIMNET_PARAMS: Params = Params {
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
     pom_v3_activation: ForkActivation::never(),
+    service_bond_v2_activation: ForkActivation::never(),
     chain_anchor: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1874,6 +1886,7 @@ pub const DEVNET_PARAMS: Params = Params {
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
     pom_v3_activation: ForkActivation::never(),
+    service_bond_v2_activation: ForkActivation::never(),
     chain_anchor: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,

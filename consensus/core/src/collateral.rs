@@ -171,6 +171,10 @@ pub const SERVICE_SUSPENSION_DAA: u64 = 864_000;
 /// tier block to be service-eligible. ~10 minutes at 10 BPS.
 pub const SERVICE_ELIGIBILITY_WINDOW_DAA: u64 = 6_000;
 
+/// Service-eligibility window once `service_bond_v2_activation` is live (~5 minutes at 10 BPS):
+/// an identity leaves every cohort this long after its last proven block.
+pub const SERVICE_ELIGIBILITY_WINDOW_DAA_V2: u64 = 3_000;
+
 /// Standing evaluation lag AND probation length (~14 h at 10 BPS): an identity is in standing at
 /// POV `p` iff, looking only at events with daa ≤ `p − LAG`, it has been sighted (first certified
 /// block) and its strike count reads zero. The lag is finality + the ledger horizon, so every
@@ -182,6 +186,10 @@ pub const SERVICE_STANDING_LAG_DAA: u64 = 504_000;
 /// Fixed part of the service window: assignment detection, propagation and inclusion. 30 s.
 pub const SERVICE_WINDOW_BASE_DAA: u64 = 300;
 
+/// Window base once `service_bond_v2_activation` is live (~5 minutes at 10 BPS): every cohort
+/// member gets at least this long to see and serve a request, a restarting rig included.
+pub const SERVICE_WINDOW_BASE_DAA_V2: u64 = 3_000;
+
 /// Hard cap on an AiRequest's `max_tokens` at/after the service-bond gate — matches the web
 /// interface maximum. Bounds the service window any single request can demand and rejects
 /// nonsense values.
@@ -191,12 +199,19 @@ pub const AI_REQUEST_MAX_TOKENS_CAP: u32 = 4_096;
 /// before it counts as a miss: a fixed base plus a per-requested-token allowance floored at the
 /// generation speed of the tier's model class (measured medians ~7-10 tok/s, ×2 margin).
 pub fn service_window_daa(tier: u8, max_tokens: u32) -> u64 {
+    service_window_daa_at(tier, max_tokens, false)
+}
+
+/// [`service_window_daa`] with the base selected by whether `service_bond_v2_activation` is
+/// active at the daa the audit arms.
+pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
     let per_token_daa: u64 = match tier {
         0..=2 => 2, // 0.2 s/token — 5 tok/s floor
         3 => 3,     // 0.3 s/token
         _ => 4,     // 0.4 s/token — 2.5 tok/s floor
     };
-    SERVICE_WINDOW_BASE_DAA + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
+    let base = if v2 { SERVICE_WINDOW_BASE_DAA_V2 } else { SERVICE_WINDOW_BASE_DAA };
+    base + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
 /// DAA horizon beyond which per-request ledger state is forgotten: pending requests expire and
@@ -401,6 +416,9 @@ pub struct ServiceLedger {
     first_seen: std::collections::BTreeMap<Hash, u64>,
     /// Finality-anchored first-sighting baseline.
     first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>,
+    /// Activation daa of the v2 service windows; `None` = not armed. Configuration, not folded
+    /// state — installed on every fold entry, untouched by snapshots.
+    window_v2_activation_daa: Option<u64>,
 }
 
 impl ServiceLedger {
@@ -600,7 +618,8 @@ impl ServiceLedger {
                         let mut delegations: Vec<(Hash, Hash)> = set.iter().map(|(id, esc)| (*esc, *id)).collect();
                         delegations.sort_unstable();
                         delegations.dedup();
-                        let window = service_window_daa(req.tier, req.max_tokens);
+                        let window =
+                            service_window_daa_at(req.tier, req.max_tokens, self.window_v2_activation_daa.is_some_and(|a| daa >= a));
                         // Credit whoever answered before the audit existed: same membership test
                         // as the live path, so an early answer and a late one are worth the same.
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
@@ -665,6 +684,11 @@ impl ServiceLedger {
     /// Installs the persisted first-sighting baseline (dedup source for sighting events).
     pub fn set_first_seen_base(&mut self, base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>) {
         self.first_seen_base = base;
+    }
+
+    /// Installs the `service_bond_v2_activation` daa the arming path reads.
+    pub fn set_window_v2_activation(&mut self, daa: u64) {
+        self.window_v2_activation_daa = Some(daa);
     }
 
     /// The small reorg-restore state: everything but the vault (whose restore goes through the

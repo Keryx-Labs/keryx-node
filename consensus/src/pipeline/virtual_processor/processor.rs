@@ -261,6 +261,7 @@ pub struct VirtualStateProcessor {
     pub(super) coin_age_activation: ForkActivation,
     // H6 gate — selects the H6 inference-minimum table in `ai_reward_minimums`.
     pub(super) pom_v3_activation: ForkActivation,
+    pub(super) service_bond_v2_activation: ForkActivation,
     pub(super) difficulty_reset_activation_h5_3: ForkActivation,
     pub(super) difficulty_reset_activation_h5_4: ForkActivation,
     // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
@@ -419,6 +420,7 @@ impl VirtualStateProcessor {
             ratio_reward_window_daa: params.ratio_reward_window_daa,
             coin_age_activation: params.coin_age_activation,
             pom_v3_activation: params.pom_v3_activation,
+            service_bond_v2_activation: params.service_bond_v2_activation,
             difficulty_reset_activation_h5_3: params.difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4: params.difficulty_reset_activation_h5_4,
             coin_age_maturity_w: params.coin_age_maturity_w,
