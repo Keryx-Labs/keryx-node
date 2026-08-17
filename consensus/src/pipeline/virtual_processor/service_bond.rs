@@ -2,7 +2,8 @@ use super::VirtualStateProcessor;
 use crate::processes::service_commit;
 use crate::model::stores::{
     acceptance_data::AcceptanceDataStoreReader, block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader,
-    ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, selected_chain::SelectedChainStoreReader,
+    ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, pruning::PruningStoreReader,
+    selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss,
@@ -208,8 +209,10 @@ impl VirtualStateProcessor {
     /// set. Empty if `seed` is not a committed chain block.
     #[allow(dead_code)] // consumed by the coming penalty/RPC layer; exercised by tests today
     pub(crate) fn service_eligible_miners_windowed(&self, seed: Hash, target_tier: u8, window_daa: u64) -> Vec<(Hash, Hash)> {
+        // Read before the chain lock so the two locks are never held in inverse order.
+        let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
         let sc = self.selected_chain_store.read();
-        self.service_eligible_miners_in(&*sc, seed, target_tier, window_daa)
+        self.service_eligible_miners_in(&*sc, seed, target_tier, window_daa, own_pp)
     }
 
     fn service_eligible_miners_in(
@@ -218,13 +221,14 @@ impl VirtualStateProcessor {
         seed: Hash,
         target_tier: u8,
         window_daa: u64,
+        own_pp: Hash,
     ) -> Vec<(Hash, Hash)> {
         let Ok(seed_idx) = sc.get_by_hash(seed) else {
             return vec![];
         };
         let seed_header = self.headers_store.get_header(seed).unwrap();
-        let pruning_idx = sc.get_by_hash(seed_header.pruning_point).unwrap_or(0);
         let daa_bound = seed_header.daa_score.saturating_sub(window_daa);
+        let pruning_idx = self.reward_window_floor(sc, seed_header.pruning_point, own_pp, daa_bound);
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, seed_idx, pruning_idx).max(pruning_idx);
         let mut recent = Vec::new();
         for i in (bottom + 1)..=seed_idx {
@@ -360,6 +364,7 @@ impl VirtualStateProcessor {
         ledger: &mut ServiceLedger,
         sc: &impl SelectedChainStoreReader,
         hash: Hash,
+        own_pp: Hash,
         live: bool,
         warmup: bool,
     ) -> (FoldOutcome, Vec<(Hash, EscrowClaim)>) {
@@ -393,7 +398,7 @@ impl VirtualStateProcessor {
             SERVICE_ELIGIBILITY_WINDOW_DAA
         };
         let cohort = |tier: u8| {
-            let set = self.service_eligible_miners_in(sc, hash, tier, eligibility_window);
+            let set = self.service_eligible_miners_in(sc, hash, tier, eligibility_window, own_pp);
             // Only the live fold logs: a refold replays the same armings.
             if live {
                 info!("service-bond: audit armed at daa {}, tier {}, cohort {}", daa, tier, set.len());
@@ -491,7 +496,7 @@ impl VirtualStateProcessor {
             // re-queued — a crash may have flushed that daa partially, and the flush itself is
             // idempotent (already-mirrored rows are skipped).
             let warmup = daa < cursor_daa;
-            let (outcome, _added) = self.fold_service_chain_block(&mut ledger, sc, hash, false, warmup);
+            let (outcome, _added) = self.fold_service_chain_block(&mut ledger, sc, hash, pruning_point, false, warmup);
             log_new_service_misses(logged, daa, &outcome.misses);
             if daa >= cursor_daa {
                 // Sightings first: a partially flushed daa must never persist a claim's burn
@@ -568,7 +573,7 @@ impl VirtualStateProcessor {
         for (k, h) in chain_path.added.iter().enumerate() {
             let idx = common + 1 + k as u64;
             let daa = self.headers_store.get_daa_score(*h).unwrap();
-            let (outcome, added) = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, true, false);
+            let (outcome, added) = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, pruning_point, true, false);
             log_new_service_misses(&mut sync.logged, daa, &outcome.misses);
             sync.undo.insert(idx, VaultUndo { added, misses: outcome.misses.clone(), expired: outcome.expired });
             for miner in outcome.sightings {

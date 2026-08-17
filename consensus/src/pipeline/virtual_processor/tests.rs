@@ -1202,3 +1202,16 @@ async fn reward_window_below_the_pruned_horizon_fails_loud() {
     let early = vp.selected_chain_store.read().get_by_index(6).unwrap();
     let _ = vp.production_window_ctx(early, 0);
 }
+
+#[tokio::test]
+async fn cohort_window_survives_a_pruned_header_pruning_point() {
+    let (tc, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+    let tip = {
+        use crate::model::stores::selected_chain::SelectedChainStoreReader;
+        vp.selected_chain_store.read().get_tip().unwrap().1
+    };
+    // No tier blocks were mined, so the set is empty — the point is that the window search
+    // must not probe below retention on the way there.
+    assert!(vp.service_eligible_miners_windowed(tip, 0, 100).is_empty());
+}

@@ -1074,8 +1074,9 @@ impl VirtualStateProcessor {
     /// indices below `hi_idx`; `floor_idx` (the pruning clamp) keeps every probe inside retained,
     /// consensus-shared history. If even the floor's daa exceeds the bound (window truncated by
     /// pruning), the floor itself is returned — the caller clamps to it anyway.
-    /// Chain-index floor for the reward-window search: the header's committed pruning point when
-    /// it is still on the retained selected chain, else the local retention boundary. A node
+    /// Chain-index floor for the daa-window searches (reward and service-bond): the header's
+    /// committed pruning point when it is still on the retained selected chain, else the local
+    /// retention boundary. A node
     /// prunes ahead of the blocks it re-validates during a restart catch-up, so their header
     /// pruning points can fall below retention; the substitute floor is consensus-neutral
     /// because the window bottom always sits above any retained floor (window < pruning depth).
@@ -1093,7 +1094,7 @@ impl VirtualStateProcessor {
             Err(_) => {
                 assert!(
                     self.headers_store.get_daa_score(own_pp).unwrap() <= daa_bound,
-                    "the reward window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir"
+                    "the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir"
                 );
                 sc.get_by_hash(own_pp).unwrap()
             }
