@@ -296,7 +296,7 @@ impl Mempool {
 
 /// Distinct pending AiResponses allowed per request — bounds mempool growth while leaving
 /// room for every cohort responder.
-const MAX_PENDING_AI_RESPONSES_PER_REQUEST: usize = 32;
+const MAX_PENDING_AI_RESPONSES_PER_REQUEST: usize = 256;
 
 fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiChallengePayload::deserialize(payload).map(|c| c.response_hash)
