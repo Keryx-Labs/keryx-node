@@ -1095,3 +1095,110 @@ async fn coin_age_maturation_choreography_adversarial() {
         ],
     );
 }
+
+// ── Reward-window floor under a pruned selected-chain index ───────────────────
+
+/// A consensus whose selected-chain index no longer reaches the header pruning points of the
+/// blocks under (re)validation: the DAG is 8 blocks wide (daa outruns the chain index, the shape
+/// of every freshly initialized store), and the index is pruned below chain index 5 with the
+/// pruning point moved there — what a node that pruned ahead of a restart catch-up holds.
+async fn pruned_floor_fixture() -> (TestConsensus, Vec<JoinHandle<()>>) {
+    use crate::model::stores::pruning::PruningStore;
+    use crate::model::stores::selected_chain::{SelectedChainStore, SelectedChainStoreReader};
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_database::prelude::{ConnBuilder, DirectDbWriter};
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_level_activation = ForkActivation::always();
+            p.ratio_reward_window_daa = 200;
+        })
+        .build();
+    let (db_lifetime, db) = keryx_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+    let (dummy_sender, _receiver) = async_channel::unbounded();
+    let tc = TestConsensus::with_db(db.clone(), &config, dummy_sender);
+    // Leak the tempdir guard: its drop asserts zero DB refs, which the should_panic
+    // test can never guarantee mid-unwind.
+    std::mem::forget(db_lifetime);
+    let handles = tc.init();
+
+    let mut prev_row = vec![config.genesis.hash];
+    let mut next: u64 = 1;
+    for _level in 0..40 {
+        let mut row = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let hash: Hash = next.into();
+            next += 1;
+            tc.add_utxo_valid_block_with_parents(hash, prev_row.clone(), vec![]).await.unwrap();
+            row.push(hash);
+        }
+        prev_row = row;
+    }
+
+    let vp = tc.virtual_processor().clone();
+    let pp_hash = {
+        let mut sc = vp.selected_chain_store.write();
+        let pp_hash = sc.get_by_index(5).unwrap();
+        sc.prune_below_point(DirectDbWriter::new(&db), pp_hash).unwrap();
+        pp_hash
+    };
+    vp.pruning_point_store.write().set(pp_hash, 5).unwrap();
+
+    {
+        let sc = vp.selected_chain_store.read();
+        assert!(sc.get_by_index(0).is_err(), "the index the unclamped search would probe must be gone");
+        assert!(sc.get_by_hash(config.genesis.hash).is_err(), "the header pruning point must be unresolvable");
+        let (tip_idx, _) = sc.get_tip().unwrap();
+        assert!(tip_idx < 200, "the chain index must sit inside the daa window for the floor to matter");
+    }
+    (tc, handles)
+}
+
+#[tokio::test]
+async fn reward_window_floor_survives_a_pruned_header_pruning_point() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use crate::pipeline::virtual_processor::utxo_validation::ProductionWindowCtx;
+
+    let (tc, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+
+    let sc = vp.selected_chain_store.read();
+    let (tip_idx, tip) = sc.get_tip().unwrap();
+    let tip_header = vp.headers_store.get_header(tip).unwrap();
+    let daa_bound = tip_header.daa_score - 200;
+
+    // The reference bottom, walked linearly over the retained index.
+    let mut expected = 5;
+    for i in 5..=tip_idx {
+        if vp.headers_store.get_daa_score(sc.get_by_index(i).unwrap()).unwrap() <= daa_bound {
+            expected = i;
+        } else {
+            break;
+        }
+    }
+    drop(sc);
+
+    match vp.production_window_ctx(tip, 0) {
+        ProductionWindowCtx::OnChain { m_idx, bottom } => {
+            assert_eq!(m_idx, tip_idx);
+            assert_eq!(bottom, expected);
+        }
+        _ => panic!("the committed tip must resolve as an on-chain window"),
+    }
+}
+
+#[tokio::test]
+#[should_panic(expected = "pruned horizon")]
+async fn reward_window_below_the_pruned_horizon_fails_loud() {
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+
+    let (tc, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+
+    // An early chain block: its whole daa window sits below the pruned horizon, so no local
+    // computation can match what the network computed for it.
+    let early = vp.selected_chain_store.read().get_by_index(6).unwrap();
+    let _ = vp.production_window_ctx(early, 0);
+}

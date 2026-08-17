@@ -30,6 +30,7 @@ use crate::model::stores::age_buckets::{AgeBuckets, AgeBucketsStoreReader};
 use crate::model::stores::maturation_queue::{DbMaturationQueueStore, MaturationEntry};
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
+use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::SelectedChainStoreReader;
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
@@ -805,14 +806,15 @@ impl VirtualStateProcessor {
                     prefix_vals.insert(*blue, v.max(prod_floor));
                 }
             }
+            let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
             let sc = self.selected_chain_store.read();
             if let Ok(sp_idx) = sc.get_by_hash(ghostdag_data.selected_parent) {
                 // Era-aware window bottom (exclusive), mirroring `production_window_ctx`:
                 // legacy = last `w` chain blocks; H3 = daa-sized window found by binary search.
                 let sp_header = self.headers_store.get_header(ghostdag_data.selected_parent).unwrap();
                 let bottom = if self.pom_level_activation.is_active(sp_header.daa_score) {
-                    let pruning_idx = sc.get_by_hash(sp_header.pruning_point).unwrap_or(0);
                     let daa_bound = sp_header.daa_score.saturating_sub(self.ratio_reward_window_daa);
+                    let pruning_idx = self.reward_window_floor(&*sc, sp_header.pruning_point, own_pp, daa_bound);
                     self.chain_index_at_or_below_daa(&*sc, daa_bound, sp_idx, pruning_idx)
                 } else {
                     sp_idx.saturating_sub(w)
@@ -1000,14 +1002,14 @@ impl VirtualStateProcessor {
     ///
     /// Both eras keep the pruning-point clamp (option C, see `windowed_production_for_block`).
     pub(super) fn production_window_ctx(&self, m_sp: Hash, w: u64) -> ProductionWindowCtx {
+        // Read before the chain lock so the two locks are never held in inverse order.
+        let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
         let sc = self.selected_chain_store.read();
         let m_sp_header = self.headers_store.get_header(m_sp).unwrap();
-        // Window floor: chain index of m_sp's committed pruning point (consensus). 0 if not on the
-        // selected chain (no clamp) — should not happen for a valid block's pruning point.
-        let pruning_idx = sc.get_by_hash(m_sp_header.pruning_point).unwrap_or(0);
         let h3 = self.pom_level_activation.is_active(m_sp_header.daa_score);
         // H3 window bottom in daa units — entries strictly above this daa are inside the window.
         let daa_bound = m_sp_header.daa_score.saturating_sub(self.ratio_reward_window_daa);
+        let pruning_idx = self.reward_window_floor(&*sc, m_sp_header.pruning_point, own_pp, daa_bound);
         if let Ok(m_idx) = sc.get_by_hash(m_sp) {
             // Case A: m_sp is a committed chain block.
             let bottom = if h3 {
@@ -1054,6 +1056,32 @@ impl VirtualStateProcessor {
     /// indices below `hi_idx`; `floor_idx` (the pruning clamp) keeps every probe inside retained,
     /// consensus-shared history. If even the floor's daa exceeds the bound (window truncated by
     /// pruning), the floor itself is returned — the caller clamps to it anyway.
+    /// Chain-index floor for the reward-window search: the header's committed pruning point when
+    /// it is still on the retained selected chain, else the local retention boundary. A node
+    /// prunes ahead of the blocks it re-validates during a restart catch-up, so their header
+    /// pruning points can fall below retention; the substitute floor is consensus-neutral
+    /// because the window bottom always sits above any retained floor (window < pruning depth).
+    /// If even the boundary's daa exceeds `daa_bound`, the window bottom itself was pruned and
+    /// no local computation can match the network — fail loud instead of diverging.
+    pub(super) fn reward_window_floor(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        header_pp: Hash,
+        own_pp: Hash,
+        daa_bound: u64,
+    ) -> u64 {
+        match sc.get_by_hash(header_pp) {
+            Ok(idx) => idx,
+            Err(_) => {
+                assert!(
+                    self.headers_store.get_daa_score(own_pp).unwrap() <= daa_bound,
+                    "the reward window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir"
+                );
+                sc.get_by_hash(own_pp).unwrap()
+            }
+        }
+    }
+
     pub(super) fn chain_index_at_or_below_daa(
         &self,
         sc: &impl SelectedChainStoreReader,
