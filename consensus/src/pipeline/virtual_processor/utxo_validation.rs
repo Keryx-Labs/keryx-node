@@ -78,6 +78,7 @@ static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_3_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_4_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H6_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a hardfork banner should print for the block crossing `activation`. Latching alone is
 /// not enough: IBD re-validates the historical crossing block, and a network whose gate is active
@@ -459,6 +460,23 @@ impl VirtualStateProcessor {
             info!("  Service-bond  — silent cohort members escalate: burn → slash-all → suspension; serving resets");
             info!("  Escrow lock   — CSV extended to ~22h; ~10h of claims stay burnable");
             info!("  Difficulty    — reset window open at the gate");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // H7 banner. Same latching shape as the others — fires once, on the first block at or
+        // after the gate, only for a live crossing (see `banner_should_fire`).
+        if banner_should_fire(self.service_bond_v2_activation, header)
+            && H7_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H7 · DAA {} ════════════════", self.service_bond_v2_activation.daa_score());
+            info!("  Service bond  — v2: the audit stops striking miners for losing a race");
+            info!("  Window        — every cohort member gets a {} DAA base (~5 min) to see and serve a request", keryx_consensus_core::collateral::SERVICE_WINDOW_BASE_DAA_V2);
+            info!("  Cohort        — eligibility tightens to {} DAA past the last proven tier block", keryx_consensus_core::collateral::SERVICE_ELIGIBILITY_WINDOW_DAA_V2);
+            info!("  First miss    — uniform {}-claim burn; a young identity no longer loses its whole vault", keryx_consensus_core::collateral::STRIKE_1_BURN_CLAIMS);
+            info!("  Standing      — probation-only: a strike keeps its burn but no longer demotes the reward rate");
+            info!("  Rate-limit    — a served response no longer disarms the one-strike-per-interval limit");
+            info!("  Miners        — unchanged: no model or walk changes, existing rigs keep mining");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
