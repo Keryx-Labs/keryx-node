@@ -1620,8 +1620,9 @@ pub const MAINNET_PARAMS: Params = Params {
     // H6 matrix walk, armed together with its difficulty-reset companion at the same score.
     // Gate = virtual daa of the relaunch base: active from the first post-relaunch block.
     pom_v3_activation: ForkActivation::new(76_316_623),
-    // Service-bond v2 window retune — ARM AT RELEASE (tip+1 rule, same process as H6).
-    service_bond_v2_activation: ForkActivation::never(),
+    // H7 service-bond v2. Scheduled for 2026-08-17 20:00 CEST: measured from daa 77_196_191 at
+    // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
+    service_bond_v2_activation: ForkActivation::new(77_525_000),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1720,17 +1721,25 @@ pub const TESTNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
-    // MUST equal pom_v3_activation.
-    difficulty_reset_activation_h6: ForkActivation::new(1000),
+    // Deliberately ONE ABOVE pom_v3_activation here, unlike mainnet where the two coincide.
+    // `is_within_range_from_activation` is false for an always-active gate, so a value of 0 would
+    // open no reset window at all and the chain would sit at genesis bits (0x1e7fffff) — one
+    // exponent step, i.e. 256x harder than the reset target, which starves a single-GPU testnet.
+    // At 1 the window covers [1, 26_441), far past the H7 gate.
+    difficulty_reset_activation_h6: ForkActivation::new(1),
     h6_reset_bits: Some(0x1f7fffff),
     h5_activation: ForkActivation::new(0),
     h5_1_activation: ForkActivation::new(0),
     h5_2_activation: ForkActivation::new(0),
-    // H6 matrix walk — the only era transition this testnet crosses.
-    pom_v3_activation: ForkActivation::new(1000),
-    // Service-bond v2 window retune — arm ABOVE the live testnet tip before deploying: the fold
-    // is sealed, flipping it below already-folded history splits the testnet.
-    service_bond_v2_activation: ForkActivation::never(),
+    // H6 matrix walk from genesis: this testnet starts in the mainnet's post-H6 state, so the
+    // only era transition it crosses is H7. It MUST be 0 and not 1 — the miner keeps no pre-H6
+    // model lineup, so below this gate it has no model to walk and cannot mine at all. Genesis
+    // itself is committed without body validation, so the mandatory escrow delegation never
+    // applies to it. MUST mirror the miner's gate.
+    pom_v3_activation: ForkActivation::new(0),
+    // H7 service-bond v2 — arm ABOVE the live testnet tip before deploying: the fold is sealed,
+    // flipping it below already-folded history splits the testnet.
+    service_bond_v2_activation: ForkActivation::new(500),
     chain_anchor: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
