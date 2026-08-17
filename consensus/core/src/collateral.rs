@@ -247,10 +247,16 @@ pub enum ServicePenalty {
 }
 
 /// Penalty for the `consecutive_misses`-th consecutive miss (0 = served, no penalty).
-/// An identity without standing (young, or already striking) skips the gentle first step:
-/// its whole locked escrow is the bond a disposable identity leaves on the table.
 pub fn strike_penalty(consecutive_misses: u32, established: bool) -> ServicePenalty {
-    match (consecutive_misses, established) {
+    strike_penalty_at(consecutive_misses, established, false)
+}
+
+/// [`strike_penalty`] with the first-miss step selected by whether
+/// `service_bond_v2_activation` is active at the daa the strike lands.
+/// Before the gate, an identity without standing skips the gentle first step;
+/// at and after it, the first miss costs the same for every identity.
+pub fn strike_penalty_at(consecutive_misses: u32, established: bool, v2: bool) -> ServicePenalty {
+    match (consecutive_misses, established || v2) {
         (0, _) => ServicePenalty::None,
         (1, true) => ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS),
         (1, false) | (2, _) => ServicePenalty::SlashAllPending,
@@ -591,7 +597,7 @@ impl ServiceLedger {
                         }
                         let count = self.consecutive_misses(miner) + 1;
                         self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
-                        let penalty = strike_penalty(count, is_established(miner));
+                        let penalty = strike_penalty_at(count, is_established(miner), self.v2_at(daa));
                         let burned = self.burn(miner, penalty);
                         if penalty == ServicePenalty::Suspend {
                             // The third strike executes the full drain and the suspension; the
@@ -622,7 +628,7 @@ impl ServiceLedger {
                         delegations.sort_unstable();
                         delegations.dedup();
                         let window =
-                            service_window_daa_at(req.tier, req.max_tokens, self.window_v2_activation_daa.is_some_and(|a| daa >= a));
+                            service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa));
                         // Credit whoever answered before the audit existed: same membership test
                         // as the live path, so an early answer and a late one are worth the same.
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
@@ -658,7 +664,7 @@ impl ServiceLedger {
     /// Last-strike daa a served-response reset carries forward, so a serve no longer disarms
     /// the strike rate-limit. 0 (the disarming legacy value) before the v2 gate.
     fn reset_preserved_last_daa(&self, identity: &Hash, daa: u64) -> u64 {
-        if self.window_v2_activation_daa.is_some_and(|a| daa >= a) {
+        if self.v2_at(daa) {
             self.strike_state(identity).map(|e| e.last_daa).unwrap_or(0)
         } else {
             0
@@ -698,6 +704,11 @@ impl ServiceLedger {
     /// Installs the persisted first-sighting baseline (dedup source for sighting events).
     pub fn set_first_seen_base(&mut self, base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>) {
         self.first_seen_base = base;
+    }
+
+    /// Whether `service_bond_v2_activation` is live at `daa`.
+    fn v2_at(&self, daa: u64) -> bool {
+        self.window_v2_activation_daa.is_some_and(|a| daa >= a)
     }
 
     /// Installs the `service_bond_v2_activation` daa the arming path reads.
@@ -781,7 +792,8 @@ impl ServiceLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        eligible_pairs, service_window_daa, strike_penalty, update_strikes, FoldOutcome, ServiceLedger, ServicePenalty,
+        eligible_pairs, service_window_daa, service_window_daa_at, strike_penalty, strike_penalty_at, update_strikes,
+        FoldOutcome, ServiceLedger, ServicePenalty,
         StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_EARLY_RESPONSE_HORIZON_DAA, SERVICE_LEDGER_HORIZON_DAA,
         SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
@@ -1412,6 +1424,32 @@ mod tests {
     }
 
     #[test]
+    fn young_identity_first_miss_burns_only_the_first_step_post_v2() {
+        use super::EscrowClaim;
+        use crate::tx::TransactionOutpoint;
+
+        // Same fold as `young_identity_first_miss_slashes_everything`, gate armed: the
+        // fold must read the new first step, not just the pure penalty table.
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        let w = service_window_daa_at(0, 256, true);
+        let claim = |n: u64, daa: u64| EscrowClaim { outpoint: TransactionOutpoint::new(n.into(), 1), value: n, daa };
+
+        let escrows: Vec<(Hash, EscrowClaim)> = (1..=7).map(|n| (a, claim(n, 100))).collect();
+        let r1 = [1u8; 32];
+        ledger.on_chain_block(100, &[(r1, 0, 256)], &[], &escrows, |_| false, cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[], &[], |_| false, cohort_of(&set));
+        let misses = ledger.on_chain_block(102 + w, &[], &[], &[], |_| false, cohort_of(&set)).misses;
+        assert_eq!(misses.len(), 1);
+        assert_eq!(misses[0].penalty, ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
+        assert_eq!(misses[0].burned.len(), STRIKE_1_BURN_CLAIMS as usize);
+        // The remaining claims stay locked instead of being drained.
+        assert_eq!(ledger.vault_claims(&a).len(), 7 - STRIKE_1_BURN_CLAIMS as usize);
+    }
+
+    #[test]
     fn sightings_report_each_identity_once() {
         use super::EscrowClaim;
         use crate::tx::TransactionOutpoint;
@@ -1441,6 +1479,32 @@ mod tests {
         assert_eq!(strike_penalty(1, false), ServicePenalty::SlashAllPending);
         assert_eq!(strike_penalty(2, false), ServicePenalty::SlashAllPending);
         assert_eq!(strike_penalty(3, false), ServicePenalty::Suspend);
+    }
+
+    #[test]
+    fn strike_penalty_first_step_is_uniform_post_v2() {
+        // The only cell the gate moves: first miss, identity without standing.
+        assert_eq!(strike_penalty_at(1, false, false), ServicePenalty::SlashAllPending);
+        assert_eq!(strike_penalty_at(1, false, true), ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
+
+        // Every other cell reads the same on both sides of the gate.
+        for established in [false, true] {
+            for count in [0u32, 2, 3, 9] {
+                assert_eq!(
+                    strike_penalty_at(count, established, false),
+                    strike_penalty_at(count, established, true),
+                    "count {count}, established {established}"
+                );
+            }
+            assert_eq!(strike_penalty_at(1, established, true), ServicePenalty::BurnClaims(STRIKE_1_BURN_CLAIMS));
+        }
+
+        // Escalation past the first miss is untouched: still slash-all then suspension.
+        assert_eq!(strike_penalty_at(2, false, true), ServicePenalty::SlashAllPending);
+        assert_eq!(strike_penalty_at(3, false, true), ServicePenalty::Suspend);
+
+        // The pre-gate wrapper keeps the old table.
+        assert_eq!(strike_penalty(1, false), strike_penalty_at(1, false, false));
     }
 
     #[test]
