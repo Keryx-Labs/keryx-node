@@ -661,9 +661,9 @@ impl VirtualStateProcessor {
             self.very_light_activation.is_active(pov_daa_score),
             self.pom_v3_activation.is_active(pov_daa_score),
         );
-        // H6: the tier bonus is gated on standing — an identity in probation (young, or carrying
-        // a strike as of the lagged anchor) earns the floor rate whatever tier it proves. Rotating
-        // identities therefore forfeits the bonus for the whole probation.
+        // H6: the tier bonus is gated on standing — an identity in probation earns the floor
+        // rate whatever tier it proves, so rotating identities forfeits the bonus for the whole
+        // probation. Before service_bond_v2 a strike as of the lagged anchor also demotes.
         let standing_gate = self.pom_v3_activation.is_active(pov_daa_score);
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             if let Some(tier) = self.pom_tier_store.get(*blue).optional().unwrap() {

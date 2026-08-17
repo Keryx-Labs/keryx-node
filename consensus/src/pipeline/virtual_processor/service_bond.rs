@@ -100,12 +100,17 @@ impl StandingIndex {
             .collect()
     }
 
-    /// Whether the identity is in standing at `pov`: sighted at or before the lagged anchor,
-    /// with a zero (or absent) strike count as of that anchor.
-    fn standing(&self, id: &Hash, pov: u64) -> bool {
+    /// Whether the identity is in standing at `pov`: sighted at or before the lagged anchor.
+    /// Before `service_bond_v2_activation` (`v2` false) a non-zero strike count as of that
+    /// anchor also revokes standing; at and after it, standing is probation-only — strikes
+    /// already carry their own penalty and no longer demote the reward rate.
+    fn standing(&self, id: &Hash, pov: u64, v2: bool) -> bool {
         let anchor = pov.saturating_sub(keryx_consensus_core::collateral::SERVICE_STANDING_LAG_DAA);
         if !self.first_seen.get(id).is_some_and(|&f| f <= anchor) {
             return false;
+        }
+        if v2 {
+            return true;
         }
         match self.history.get(id) {
             None => true,
@@ -406,10 +411,11 @@ impl VirtualStateProcessor {
         }
     }
 
-    /// Whether `identity` is in standing at `pov_daa` — sighted and strike-free at the lagged
-    /// anchor. Pure function of finality-flushed rows; identical on every node at every POV.
+    /// Whether `identity` is in standing at `pov_daa` — sighted at the lagged anchor, and
+    /// strike-free there too before the v2 gate. Pure function of finality-flushed rows plus
+    /// the POV daa; identical on every node at every POV.
     pub(super) fn service_standing_at(&self, identity: &Hash, pov_daa: u64) -> bool {
-        self.service_standing.read().standing(identity, pov_daa)
+        self.service_standing.read().standing(identity, pov_daa, self.service_bond_v2_activation.is_active(pov_daa))
     }
 
     /// Highest chain index whose daa is at or below `bound_daa`, searched down to `floor_idx`
@@ -742,6 +748,32 @@ mod tests {
             resp.response_length += 1;
         }
         resp
+    }
+
+    #[test]
+    fn standing_ignores_strikes_post_v2() {
+        use keryx_consensus_core::collateral::SERVICE_STANDING_LAG_DAA;
+
+        let a = Hash::from_bytes([1u8; 32]);
+        let mut idx = StandingIndex::default();
+        idx.record_sighting(a, 0);
+        idx.record_strike(a, 100, 1, 100);
+        let pov = SERVICE_STANDING_LAG_DAA + 200;
+
+        // Pre-gate a strike at the anchor revokes standing; at the gate it no longer does.
+        assert!(!idx.standing(&a, pov, false));
+        assert!(idx.standing(&a, pov, true));
+
+        // The sighting probation is era-independent: a young identity has no standing either way.
+        let b = Hash::from_bytes([2u8; 32]);
+        idx.record_sighting(b, pov - 10);
+        assert!(!idx.standing(&b, pov, false));
+        assert!(!idx.standing(&b, pov, true));
+
+        // A served reset (count 0) at the anchor restores standing in both eras.
+        idx.record_strike(a, 150, 0, 100);
+        assert!(idx.standing(&a, pov, false));
+        assert!(idx.standing(&a, pov, true));
     }
 
     #[test]
