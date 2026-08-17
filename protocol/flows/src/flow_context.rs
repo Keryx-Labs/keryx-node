@@ -60,6 +60,34 @@ use tokio::sync::{
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use uuid::Uuid;
 
+pub(crate) const IBD_SLOW_PEER_MATERIALLY_BETTER_FACTOR: f64 = 1.20;
+const IBD_PEER_OBSERVATION_FRESHNESS: Duration = Duration::from_secs(30);
+
+pub(crate) fn ibd_yield_is_allowed(rate: f64, best_alternative: Option<f64>) -> bool {
+    best_alternative.is_some_and(|alternative| alternative > rate * IBD_SLOW_PEER_MATERIALLY_BETTER_FACTOR)
+}
+
+pub(crate) fn ibd_receive_rate(received_blocks: usize, receive_elapsed: Duration) -> f64 {
+    received_blocks as f64 / receive_elapsed.as_secs_f64().max(0.001)
+}
+
+pub(crate) fn ibd_arbitration_modes(sync_blocks: usize, minimum_probe_blocks: usize) -> (bool, bool) {
+    let arbitration_enabled = sync_blocks >= minimum_probe_blocks;
+    (arbitration_enabled, arbitration_enabled)
+}
+
+pub(crate) fn ibd_has_materially_better_active_peer(rate: f64, alternatives: impl IntoIterator<Item = (bool, f64)>) -> bool {
+    alternatives.into_iter().any(|(active, alternative_rate)| active && ibd_yield_is_allowed(rate, Some(alternative_rate)))
+}
+
+pub(crate) fn ibd_cooldown_is_active(now: Instant, until: Option<Instant>) -> bool {
+    until.is_some_and(|until| until > now)
+}
+
+pub(crate) fn ibd_observation_is_fresh(now: Instant, observed_at: Instant) -> bool {
+    now.duration_since(observed_at) <= IBD_PEER_OBSERVATION_FRESHNESS
+}
+
 /// The P2P protocol version.
 const PROTOCOL_VERSION: u32 = 9;
 
@@ -218,6 +246,10 @@ pub struct FlowContextInner {
     shared_transaction_requests: Arc<Mutex<HashMap<TransactionId, RequestScopeMetadata>>>,
     is_ibd_running: Arc<AtomicBool>,
     ibd_metadata: Arc<RwLock<Option<IbdMetadata>>>,
+
+    // Shared per-peer IBD cooldowns and receive-rate observations.
+    ibd_peer_cooldowns: Mutex<HashMap<PeerKey, Instant>>,
+    ibd_peer_rates: Mutex<HashMap<PeerKey, IbdPeerObservation>>,
     pub address_manager: Arc<Mutex<AddressManager>>,
     connection_manager: RwLock<Option<Arc<ConnectionManager>>>,
     mining_manager: MiningManagerProxy,
@@ -249,6 +281,12 @@ pub struct FlowContext {
 
 pub struct IbdRunningGuard {
     indicator: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+struct IbdPeerObservation {
+    rate: f64,
+    observed_at: Instant,
 }
 
 impl Drop for IbdRunningGuard {
@@ -401,6 +439,8 @@ impl FlowContext {
                 shared_transaction_requests: Arc::new(Mutex::new(HashMap::new())),
                 is_ibd_running: Default::default(),
                 ibd_metadata: Default::default(),
+                ibd_peer_cooldowns: Default::default(),
+                ibd_peer_rates: Default::default(),
                 hub,
                 address_manager,
                 connection_manager: Default::default(),
@@ -467,7 +507,60 @@ impl FlowContext {
         &self.mining_manager
     }
 
-    pub fn try_set_ibd_running(&self, peer: PeerKey, relay_daa_score: u64) -> Option<IbdRunningGuard> {
+    pub(crate) fn mark_ibd_peer_slow(&self, peer: PeerKey, cooldown: Duration) {
+        let now = Instant::now();
+        let mut cooldowns = self.ibd_peer_cooldowns.lock();
+        cooldowns.retain(|_, until| ibd_cooldown_is_active(now, Some(*until)));
+        cooldowns.insert(peer, now + cooldown);
+    }
+
+    pub(crate) fn ibd_peer_cooldown_remaining(&self, peer: PeerKey) -> Option<Duration> {
+        let now = Instant::now();
+        let mut cooldowns = self.ibd_peer_cooldowns.lock();
+        match cooldowns.get(&peer).copied() {
+            Some(until) if ibd_cooldown_is_active(now, Some(until)) => Some(until.duration_since(now)),
+            Some(_) => { cooldowns.remove(&peer); None }
+            None => None,
+        }
+    }
+
+    pub(crate) fn record_ibd_peer_rate(&self, peer: PeerKey, rate: f64) {
+        let now = Instant::now();
+        let mut rates = self.ibd_peer_rates.lock();
+        rates.retain(|_, observation| ibd_observation_is_fresh(now, observation.observed_at));
+        rates.insert(peer, IbdPeerObservation { rate, observed_at: now });
+    }
+
+    pub(crate) fn has_better_ibd_peer(&self, peer: PeerKey, rate: f64) -> bool {
+        let now = Instant::now();
+        let observations = {
+            let mut rates = self.ibd_peer_rates.lock();
+            rates.retain(|_, observation| ibd_observation_is_fresh(now, observation.observed_at));
+            rates.iter().filter_map(|(alternative, observation)| (*alternative != peer).then_some((*alternative, observation.rate))).collect::<Vec<_>>()
+        };
+
+        ibd_has_materially_better_active_peer(
+            rate,
+            observations.into_iter().map(|(alternative, alternative_rate)| (self.hub.has_peer(alternative), alternative_rate)),
+        )
+    }
+
+    fn ibd_peer_is_deprioritized(&self, peer: PeerKey) -> bool {
+        let now = Instant::now();
+        let rate = {
+            let mut rates = self.ibd_peer_rates.lock();
+            rates.retain(|_, observation| ibd_observation_is_fresh(now, observation.observed_at));
+            rates.get(&peer).map(|observation| observation.rate)
+        };
+        let Some(rate) = rate else { return false };
+        self.ibd_peer_cooldown_remaining(peer).is_some() && self.has_better_ibd_peer(peer, rate)
+    }
+
+    pub(crate) fn try_set_ibd_running(&self, peer: PeerKey, relay_daa_score: u64) -> Option<IbdRunningGuard> {
+        // Cooldown is a soft preference: preserve progress if no materially better peer exists.
+        if self.ibd_peer_is_deprioritized(peer) {
+            return None;
+        }
         if self.is_ibd_running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
             self.ibd_metadata.write().replace(IbdMetadata { peer, daa_score: relay_daa_score });
             Some(IbdRunningGuard { indicator: self.is_ibd_running.clone() })

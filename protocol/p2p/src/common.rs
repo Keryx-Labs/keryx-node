@@ -46,6 +46,10 @@ pub enum ProtocolError {
     #[error("{0}")]
     OtherOwned(String),
 
+    /// Internal control flow for progress-preserving IBD arbitration.
+    #[error("IBD peer yielded after receiving {sample} blocks at {rate:.2} blocks/s")]
+    IbdPeerYield { rate: f64, sample: usize, elapsed: Duration },
+
     #[error("misbehaving peer: {0}")]
     MisbehavingPeer(String),
 
