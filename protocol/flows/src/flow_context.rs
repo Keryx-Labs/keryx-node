@@ -792,6 +792,12 @@ const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 2);
 /// commitment make our blocks invalid to it). Same monotonic-ordering note as above.
 const H6_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 7);
 
+/// Minimum keryxd peer version accepted once our virtual daa has crossed the H7 gate: the
+/// service-bond v2 fold changes the penalties and standing a node derives, hence the sealed
+/// service state, so a pre-H7 build disagrees with our blocks past the gate. Same
+/// monotonic-ordering note as above.
+const H7_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 8);
+
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
 /// (dnsseeder crawlers etc.), which are let through — the chain anchor and the ban-worthy
@@ -856,8 +862,10 @@ impl ConnectionInitializer for FlowContext {
         // before registering any flow — they would only churn IBD noise. The floor rises at the H6
         // gate, keyed on our own virtual daa so a node still catching up to the gate keeps peering
         // with the builds it needs to get there.
-        let min_version = if self.config.pom_v3_activation.is_active(self.consensus().unguarded_session_blocking().get_virtual_daa_score())
-        {
+        let virtual_daa = self.consensus().unguarded_session_blocking().get_virtual_daa_score();
+        let min_version = if self.config.service_bond_v2_activation.is_active(virtual_daa) {
+            H7_MINIMUM_KERYXD_PEER_VERSION
+        } else if self.config.pom_v3_activation.is_active(virtual_daa) {
             H6_MINIMUM_KERYXD_PEER_VERSION
         } else {
             MINIMUM_KERYXD_PEER_VERSION
