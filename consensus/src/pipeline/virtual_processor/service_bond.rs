@@ -258,6 +258,7 @@ impl VirtualStateProcessor {
     fn service_events_of_chain_block(
         &self,
         hash: Hash,
+        txid_identity: bool,
     ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Option<Hash>)>) {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
@@ -270,9 +271,17 @@ impl VirtualStateProcessor {
                 if tx.is_ai_request() {
                     if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
                         if let Some(tier) = POM_TIERS_H6.iter().position(|t| t.model_id == req.model_id) {
-                            let digest = blake2b_simd::blake2b(&tx.payload);
+                            // Past the gate a request is identified by its transaction id, which is
+                            // unique by construction. The payload digest is not: the same prompt with
+                            // the same parameters is the same hash, so two senders — or one retry —
+                            // used to collide into a single, unanswerable assignment.
                             let mut request_hash = [0u8; 32];
-                            request_hash.copy_from_slice(&digest.as_bytes()[..32]);
+                            if txid_identity {
+                                request_hash.copy_from_slice(&tx.id().as_bytes());
+                            } else {
+                                let digest = blake2b_simd::blake2b(&tx.payload);
+                                request_hash.copy_from_slice(&digest.as_bytes()[..32]);
+                            }
                             requests.push((request_hash, tier as u8, req.max_tokens));
                             request_rewards.push((request_hash, req.inference_reward));
                         }
@@ -415,7 +424,7 @@ impl VirtualStateProcessor {
         }
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
-        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash);
+        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa));
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:

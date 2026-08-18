@@ -220,6 +220,13 @@ pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
 /// response or an executed suspension.
 pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
 
+/// How long a served request hash stays remembered so a later acceptance of the same hash cannot
+/// arm a second audit (~24 h at 10 BPS). A hash can repeat because request identity is the payload
+/// digest: the same prompt, sent twice, is the same request. The second audit would be
+/// unanswerable — responders dedupe on that hash and the identical response is already on chain —
+/// so the whole cohort would be struck for a request nobody can serve.
+pub const SERVICE_AUDITED_MEMORY_DAA: u64 = 864_000;
+
 /// Ceiling, above a syncee's pruning point, for service rows it cannot re-derive itself: such
 /// events come from requests accepted at most an eligibility window above the pruning point
 /// (deeper cohort windows cross unretained history), and a request stops generating events one
@@ -445,6 +452,7 @@ pub struct LightSnapshot {
     base: std::sync::Arc<std::collections::BTreeMap<Hash, StrikeEntry>>,
     first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>,
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
+    audited: std::collections::BTreeMap<[u8; 32], u64>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -476,6 +484,10 @@ pub struct ServiceLedger {
     /// Activation daa of vault reward routing (requests accepted at or after it mint their
     /// reward to the first accepted responder); `None` = not armed. Configuration, like above.
     reward_routing_daa: Option<u64>,
+    /// Request hashes already admitted, with the daa they were admitted at. Gated by
+    /// `reward_routing_daa`: past the gate a repeat acceptance of a remembered hash is ignored
+    /// instead of arming a second, unanswerable audit.
+    audited: std::collections::BTreeMap<[u8; 32], u64>,
     /// Latest coinbase payout script seen per identity, folded from chain-block producers —
     /// resolves a reward winner to a mintable script.
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
@@ -601,7 +613,20 @@ impl ServiceLedger {
         // accepted in the same chain block as its request must find the request pending, or it is
         // dropped and its author struck for an answer he did give. Arming still waits for the next
         // block (`daa > accepted_daa` below), so the cohort is unchanged.
+        let gated = self.reward_routing_daa.is_some_and(|a| daa >= a);
+        if gated {
+            self.audited.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
+        }
         for (rh, tier, max_tokens) in requests {
+            // Past the gate, a hash already admitted never opens a second audit: the responders
+            // that served it cannot serve it again (same dedup key, same response transaction),
+            // so the repeat would strike a whole cohort for an unanswerable assignment.
+            if gated && self.audited.contains_key(rh) {
+                continue;
+            }
+            if gated {
+                self.audited.insert(*rh, daa);
+            }
             let early = self.early_responses.remove(rh).map(|(_, keys)| keys).unwrap_or_default();
             // A re-accepted hash (identical payload resubmitted) must not reset the running
             // audit: overwriting would re-arm the window and push the miss out forever.
@@ -850,6 +875,7 @@ impl ServiceLedger {
             base: self.base.clone(),
             first_seen_base: self.first_seen_base.clone(),
             producer_spk: self.producer_spk.clone(),
+            audited: self.audited.clone(),
         }
     }
 
@@ -862,6 +888,7 @@ impl ServiceLedger {
         self.base = snap.base.clone();
         self.first_seen_base = snap.first_seen_base.clone();
         self.producer_spk = snap.producer_spk.clone();
+        self.audited = snap.audited.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -1030,6 +1057,40 @@ mod tests {
         let out = ledger.on_chain_block_with_rewards(312, &[], &[], &[(rh2, Some(a))], &[], &[], |_| true, cohort_of(&set));
         assert_eq!(out.rewards.len(), 1);
         assert_eq!(out.rewards[0].spk, Some(spk_a));
+    }
+
+    /// Past the gate, re-accepting a hash already admitted must not open a second audit: the
+    /// cohort that served it cannot serve it again, so the repeat would strike everyone for an
+    /// assignment nobody can honour. Before the gate the old behaviour is untouched.
+    #[test]
+    fn a_repeat_request_hash_never_arms_a_second_audit() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let set = [a];
+        let rh = [7u8; 32];
+        let w = service_window_daa(0, 256);
+
+        // Pre-gate: the repeat is admitted exactly as before.
+        let mut legacy = ServiceLedger::default();
+        legacy.on_chain_block(100, &[(rh, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        legacy.on_chain_block(101, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set));
+        legacy.on_chain_block(102 + w, &[], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(legacy.pending_len(), 0);
+        legacy.on_chain_block(103 + w, &[(rh, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(legacy.pending_len(), 1, "pre-gate behaviour must be unchanged");
+
+        // Post-gate: the first audit runs and closes served; the repeat is ignored, so the
+        // cohort is never struck for it.
+        let mut ledger = ServiceLedger::default();
+        ledger.set_reward_routing_activation(100);
+        ledger.on_chain_block(100, &[(rh, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block(101, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set));
+        assert!(ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
+        assert_eq!(ledger.pending_len(), 0);
+
+        ledger.on_chain_block(103 + w, &[(rh, 0, 256)], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(ledger.pending_len(), 0, "a remembered hash must not be admitted again");
+        let misses = ledger.on_chain_block(104 + 2 * w, &[], &[], &[], |_| true, cohort_of(&set)).misses;
+        assert!(misses.is_empty(), "the repeat must strike nobody");
     }
 
     #[test]
