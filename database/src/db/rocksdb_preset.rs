@@ -5,6 +5,21 @@
 
 use rocksdb::{Cache, Options, WriteBufferManager};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Kill-switch for key-value separation, set once at startup (`--rocksdb-no-blob-files`).
+/// Existing blob files remain readable: only new writes return inline to the LSM, and
+/// compaction drains the old blob files over time.
+static BLOB_FILES_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Disable blob-file writing for every database opened after this call.
+pub fn disable_blob_files() {
+    BLOB_FILES_DISABLED.store(true, Ordering::Relaxed);
+}
+
+fn blob_files_disabled() -> bool {
+    BLOB_FILES_DISABLED.load(Ordering::Relaxed)
+}
 
 /// Values at/above this size are written to blob files instead of being carried inline in the LSM
 /// (RocksDB key-value separation, aka BlobDB).
@@ -172,13 +187,15 @@ impl RocksDbPreset {
         opts.set_block_based_table_factory(&block_opts);
 
         // Key-value separation: see `BLOB_MIN_VALUE_BYTES`.
-        opts.set_enable_blob_files(true);
-        opts.set_min_blob_size(BLOB_MIN_VALUE_BYTES);
-        opts.set_blob_file_size(64 * 1024 * 1024);
-        opts.set_blob_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_enable_blob_gc(true);
-        opts.set_blob_gc_age_cutoff(0.9);
-        opts.set_blob_gc_force_threshold(0.2);
+        if !blob_files_disabled() {
+            opts.set_enable_blob_files(true);
+            opts.set_min_blob_size(BLOB_MIN_VALUE_BYTES);
+            opts.set_blob_file_size(64 * 1024 * 1024);
+            opts.set_blob_compression_type(rocksdb::DBCompressionType::Lz4);
+            opts.set_enable_blob_gc(true);
+            opts.set_blob_gc_age_cutoff(0.9);
+            opts.set_blob_gc_force_threshold(0.2);
+        }
 
         if let Some(resources) = resources {
             opts.set_blob_cache(&resources.blob_cache);
@@ -284,14 +301,16 @@ impl RocksDbPreset {
         opts.set_auto_tuned_ratelimiter(rate_limit as i64, 100_000, 10);
 
         // Enable BlobDB for large values (reduces write amplification)
-        opts.set_enable_blob_files(true);
-        opts.set_min_blob_size(BLOB_MIN_VALUE_BYTES);
-        opts.set_blob_file_size(256 * 1024 * 1024); // 256MB blob files
-        opts.set_blob_compression_type(DBCompressionType::Zstd); // Compress blobs
-        opts.set_enable_blob_gc(true); // Enable garbage collection
-        opts.set_blob_gc_age_cutoff(0.9); // GC blobs when 90% old
-        opts.set_blob_gc_force_threshold(0.1); // Force GC at 10% garbage
-        opts.set_blob_compaction_readahead_size(8 * 1024 * 1024); // 8 MB blob readahead
+        if !blob_files_disabled() {
+            opts.set_enable_blob_files(true);
+            opts.set_min_blob_size(BLOB_MIN_VALUE_BYTES);
+            opts.set_blob_file_size(256 * 1024 * 1024); // 256MB blob files
+            opts.set_blob_compression_type(DBCompressionType::Zstd); // Compress blobs
+            opts.set_enable_blob_gc(true); // Enable garbage collection
+            opts.set_blob_gc_age_cutoff(0.9); // GC blobs when 90% old
+            opts.set_blob_gc_force_threshold(0.1); // Force GC at 10% garbage
+            opts.set_blob_compaction_readahead_size(8 * 1024 * 1024); // 8 MB blob readahead
+        }
 
         if let Some(resources) = resources {
             opts.set_blob_cache(&resources.blob_cache);

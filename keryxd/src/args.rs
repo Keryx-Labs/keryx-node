@@ -98,6 +98,7 @@ pub struct Args {
     pub rocksdb_wal_dir: Option<String>,
     pub rocksdb_cache_size: Option<usize>,
     pub rocksdb_rate_limit_mb: Option<usize>,
+    pub rocksdb_no_blob_files: bool,
 }
 
 impl Default for Args {
@@ -154,6 +155,7 @@ impl Default for Args {
             rocksdb_wal_dir: None,
             rocksdb_cache_size: None,
             rocksdb_rate_limit_mb: None,
+            rocksdb_no_blob_files: false,
         }
     }
 }
@@ -459,6 +461,12 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
                        disk is shared with other workloads; raise it if compaction cannot keep up (write stalls). \
                        See docs/storage-performance.md.")
         )
+        .arg(
+            arg!(--"rocksdb-no-blob-files" "Store large values inline in the LSM instead of dedicated blob files. \
+                       Existing blob files remain readable and drain over time; no resync needed. Increases write \
+                       amplification — operational fallback, not recommended for normal use.")
+                .env("KERYXD_ROCKSDB_NO_BLOB_FILES")
+        )
         ;
 
     #[cfg(feature = "devnet-prealloc")]
@@ -551,6 +559,7 @@ impl Args {
             rocksdb_wal_dir: m.get_one::<String>("rocksdb-wal-dir").cloned().or(defaults.rocksdb_wal_dir),
             rocksdb_cache_size: m.get_one::<usize>("rocksdb-cache-size").cloned().or(defaults.rocksdb_cache_size),
             rocksdb_rate_limit_mb: m.get_one::<usize>("rocksdb-rate-limit-mb").cloned().or(defaults.rocksdb_rate_limit_mb),
+            rocksdb_no_blob_files: arg_match_unwrap_or::<bool>(&m, "rocksdb-no-blob-files", defaults.rocksdb_no_blob_files),
         };
 
         if arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", false) {

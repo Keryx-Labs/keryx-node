@@ -230,6 +230,10 @@ const MIN_MEMTABLE_BYTES_HDD: usize = 512 * 1024 * 1024;
 ///
 /// Returns: (preset, shared resources, wal_directory)
 fn configure_rocksdb(args: &Args) -> (RocksDbPreset, Option<RocksDbResources>, Option<PathBuf>) {
+    if args.rocksdb_no_blob_files {
+        keryx_database::prelude::disable_blob_files();
+        info!("RocksDB blob files disabled: large values stay inline; existing blob files remain readable and drain via compaction");
+    }
     // Parse preset
     let preset = if let Some(preset_str) = &args.rocksdb_preset {
         match preset_str.parse::<RocksDbPreset>() {
