@@ -53,8 +53,10 @@ pub const RD_ALLOCATION_ADDRESS: &str =
 /// — the 2026-07-04 storm peaked at 123 outputs (~60 blues), 2 blues short. Aligning the
 /// validator is a consensus loosening, hence the H3 gate (all nodes upgrade at that DAA).
 /// Root-caused by Dizzztroyer (PR #16).
-pub fn coinbase_outputs_limit(ghostdag_k: u64, h3: bool) -> u64 {
-    if h3 { 3 * (ghostdag_k + 1) + 4 } else { ghostdag_k + 2 }
+pub fn coinbase_outputs_limit(ghostdag_k: u64, h3: bool, h8: bool) -> u64 {
+    let base = if h3 { 3 * (ghostdag_k + 1) + 4 } else { ghostdag_k + 2 };
+    // H8 adds up to MAX_REWARD_MINTS_PER_BLOCK inference-reward mint outputs.
+    if h8 { base + keryx_consensus_core::collateral::MAX_REWARD_MINTS_PER_BLOCK as u64 } else { base }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -294,6 +296,10 @@ impl CoinbaseManager {
         // nothing), the reorg-immune analogue of "this producer's blocks are invalid". Empty
         // before the suspension can exist, so a no-op pre-H6.
         suspended_blues: &BlockHashSet,
+        // H8 reward routing: inference-reward mints finalized by this block's selected parent,
+        // in canonical `(event daa, request hash)` order (see `service_reward_mints_for`).
+        // Empty pre-gate, so a no-op before `reward_routing_activation`.
+        reward_mints: &[(ScriptPublicKey, u64)],
     ) -> CoinbaseResult<CoinbaseTransactionTemplate> {
         // × 2 for (miner + escrow/burn) per blue, + 1 for possible red reward, + 1 for R&D
         // allocation, + 1 for the accumulated tier-reward burn
@@ -401,6 +407,11 @@ impl CoinbaseManager {
         // it never shifts `red_reward_output_index`. Zero before both rewards activate.
         if reward_burn_total > 0 {
             outputs.push(TransactionOutput::new(reward_burn_total, self.burn_script_public_key.clone()));
+        }
+
+        // Inference-reward mints, in the caller's canonical order, after every other output.
+        for (spk, amount) in reward_mints {
+            outputs.push(TransactionOutput::new(*amount, spk.clone()));
         }
 
         // Build the current block's payload
@@ -589,11 +600,12 @@ mod tests {
         let k = MAINNET_PARAMS.ghostdag_k() as u64;
         assert_eq!(k, 124, "10 BPS ghostdag K");
         // Pre-H3: legacy upstream cap. Post-H3: builder structural max (3 per blue + 4 aggregates).
-        assert_eq!(coinbase_outputs_limit(k, false), 126);
-        assert_eq!(coinbase_outputs_limit(k, true), 379);
+        assert_eq!(coinbase_outputs_limit(k, false, false), 126);
+        assert_eq!(coinbase_outputs_limit(k, true, false), 379);
         // The H3 bound must cover the worst case the builder can emit: 3 outputs for each of the
         // K+1 mergeset blues plus the 4 aggregate outputs.
-        assert_eq!(coinbase_outputs_limit(k, true), 3 * (k + 1) + 4);
+        assert_eq!(coinbase_outputs_limit(k, true, false), 3 * (k + 1) + 4);
+        assert_eq!(coinbase_outputs_limit(k, true, true), 3 * (k + 1) + 4 + 64);
     }
 
     fn create_manager(params: &Params) -> CoinbaseManager {
@@ -696,7 +708,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new(), &[])
             .unwrap()
             .tx;
 
@@ -756,6 +768,7 @@ mod tests {
                 &BlockHashMap::new(),
                 &BlockHashMap::new(),
                 &suspended,
+                &[],
             )
             .unwrap()
             .tx;
@@ -802,7 +815,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new(), &[])
             .unwrap()
             .tx;
 
@@ -843,7 +856,7 @@ mod tests {
         ratio_bps.insert(h_a, RATIO_REWARD_BPS[0]); // floor bracket 40 %
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new())
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new(), &[])
             .unwrap()
             .tx;
 
@@ -1068,6 +1081,7 @@ mod tests {
                 &BlockHashMap::new(),
                 &BlockHashMap::new(),
                 &BlockHashSet::new(),
+                &[],
             )
             .unwrap()
             .tx

@@ -41,6 +41,11 @@ pub const SUBNETWORK_ID_AI_REQUEST_HEX: &str = "03000000000000000000000000000000
 pub const SUBNETWORK_ID_AI_RESPONSE_HEX: &str = "0400000000000000000000000000000000000000";
 pub const SUBNETWORK_ID_AI_CHALLENGE_HEX: &str = "0500000000000000000000000000000000000000";
 
+/// Canonical keyless reward-vault script of a routed AiRequest (`OP_RETURN "aivault"`):
+/// provably unspendable, so the vaulted amount burns unless a coinbase mints it to the
+/// first accepted responder.
+pub const INFERENCE_VAULT_SCRIPT: [u8; 9] = [0x6a, 0x07, b'a', b'i', b'v', b'a', b'u', b'l', b't'];
+
 /// Payload of a `SUBNETWORK_ID_AI_REQUEST` transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiRequestPayload {

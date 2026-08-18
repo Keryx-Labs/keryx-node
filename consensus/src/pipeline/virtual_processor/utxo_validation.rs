@@ -79,6 +79,7 @@ static H5_3_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_4_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H6_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a hardfork banner should print for the block crossing `activation`. Latching alone is
 /// not enough: IBD re-validates the historical crossing block, and a network whose gate is active
@@ -481,6 +482,18 @@ impl VirtualStateProcessor {
             info!("═══════════════════════════════════════════════════════════════");
         }
 
+        if banner_should_fire(self.reward_routing_activation, header)
+            && H8_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H8 · DAA {} ════════════════", self.reward_routing_activation.daa_score());
+            info!("  Inference     — the reward goes to the FIRST miner whose response is accepted, not a client-designated key");
+            info!("  Requests      — lock their reward in a keyless vault output; no answer within the horizon = burned");
+            info!("  Coinbase      — mints finalized rewards to the winner's payout address (up to {} per block)", keryx_consensus_core::collateral::MAX_REWARD_MINTS_PER_BLOCK);
+            info!("  Miners        — unchanged: no model or walk changes, existing rigs keep mining");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         // Signed (v2) AiResponse payloads only become valid at the service-bond gate; before it
         // this keeps the fixed 78-byte rule every deployed node enforces. The gate also brings
         // the max_tokens cap on AiRequests.
@@ -521,7 +534,7 @@ impl VirtualStateProcessor {
             // disqualification, are unchanged, so patched and unpatched nodes agree and no gate
             // is needed. (The complementary fix is upstream — keeping such a tx out of the
             // mempool so honest miners never include it and lose their block.)
-            check_ai_request_payload_rules_all(&txs, self.ai_reward_minimums(header.daa_score))?;
+            check_ai_request_payload_rules_all(&txs, self.ai_reward_minimums(header.daa_score), self.reward_routing_activation.is_active(header.daa_score))?;
         }
 
         // Verify all transactions are valid in context
@@ -535,7 +548,7 @@ impl VirtualStateProcessor {
 
         // Enforce AiRequest inference_reward minimums and fee coverage after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
-            check_ai_request_inference_rewards(&txs, &validated_transactions, self.ai_reward_minimums(header.daa_score))?;
+            check_ai_request_inference_rewards(&txs, &validated_transactions, self.ai_reward_minimums(header.daa_score), self.reward_routing_activation.is_active(header.daa_score))?;
         }
 
         Ok(())
@@ -591,6 +604,7 @@ impl VirtualStateProcessor {
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
         let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
         let suspended_blues = self.suspended_blues(ghostdag_data, mergeset_non_daa, daa_score);
+        let reward_mints = self.service_reward_mints_for(ghostdag_data.selected_parent);
         let expected_coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -602,6 +616,7 @@ impl VirtualStateProcessor {
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
                 &suspended_blues,
+                &reward_mints,
             )
             .unwrap()
             .tx;
@@ -1706,12 +1721,20 @@ fn check_ai_request_payload_rules(tx: &Transaction, req: &AiRequestPayload, mini
 /// Structural validation of the escrow output — `outputs[1]` present, a CSV P2PK script, and worth
 /// at least `inference_reward`. Reads only the transaction's own outputs, so it needs no UTXO
 /// context either; shared by the same two call sites as [`check_ai_request_payload_rules`].
-fn check_ai_request_escrow_output(tx: &Transaction, req: &AiRequestPayload) -> BlockProcessResult<()> {
+fn check_ai_request_escrow_output(tx: &Transaction, req: &AiRequestPayload, routed: bool) -> BlockProcessResult<()> {
     if tx.outputs.len() < 2 {
         return Err(AiRequestMissingEscrowOutput(tx.id()));
     }
     let escrow_out = &tx.outputs[1];
-    if !ScriptClass::is_csv_pay_to_pubkey(escrow_out.script_public_key.script()) {
+    if routed {
+        // H8 routing: the reward locks in the canonical keyless vault; the coinbase mints it
+        // to the first accepted responder.
+        if escrow_out.script_public_key.version() != 0
+            || escrow_out.script_public_key.script() != &keryx_inference::INFERENCE_VAULT_SCRIPT[..]
+        {
+            return Err(AiRequestInvalidEscrowScript(tx.id()));
+        }
+    } else if !ScriptClass::is_csv_pay_to_pubkey(escrow_out.script_public_key.script()) {
         return Err(AiRequestInvalidEscrowScript(tx.id()));
     }
     if escrow_out.value < req.inference_reward {
@@ -1730,9 +1753,9 @@ fn check_ai_request_escrow_output(tx: &Transaction, req: &AiRequestPayload) -> B
 /// exactly the same blocks and no gate is needed. A block violating both a payload rule and the
 /// fee rule now reports the payload error instead of the fee one — same disqualification, only the
 /// logged reason differs.
-fn check_ai_request_payload_rules_all(txs: &[Transaction], minimums: &[([u8; 32], u64)]) -> BlockProcessResult<()> {
+fn check_ai_request_payload_rules_all(txs: &[Transaction], minimums: &[([u8; 32], u64)], routed: bool) -> BlockProcessResult<()> {
     for tx in txs.iter().skip(1) {
-        check_ai_request_tx_payload_rules(tx, minimums)?;
+        check_ai_request_tx_payload_rules(tx, minimums, routed)?;
     }
     Ok(())
 }
@@ -1740,13 +1763,13 @@ fn check_ai_request_payload_rules_all(txs: &[Transaction], minimums: &[([u8; 32]
 /// Same rules for a SINGLE transaction, with no block around it — the entry point used by mempool
 /// admission (`validate_mempool_transaction_impl`) so a transaction that would poison every block
 /// including it never reaches a template. A non-`AiRequest` transaction passes untouched.
-pub(super) fn check_ai_request_tx_payload_rules(tx: &Transaction, minimums: &[([u8; 32], u64)]) -> BlockProcessResult<()> {
+pub(super) fn check_ai_request_tx_payload_rules(tx: &Transaction, minimums: &[([u8; 32], u64)], routed: bool) -> BlockProcessResult<()> {
     if !tx.is_ai_request() {
         return Ok(());
     }
     if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
         check_ai_request_payload_rules(tx, &req, minimums)?;
-        check_ai_request_escrow_output(tx, &req)?;
+        check_ai_request_escrow_output(tx, &req, routed)?;
     }
     Ok(())
 }
@@ -1765,6 +1788,7 @@ fn check_ai_request_inference_rewards(
     txs: &[Transaction],
     validated: &[(keryx_consensus_core::tx::ValidatedTransaction<'_>, u32)],
     minimums: &[([u8; 32], u64)],
+    routed: bool,
 ) -> BlockProcessResult<()> {
     let fee_map: std::collections::HashMap<TransactionId, u64> =
         validated.iter().map(|(vt, _)| (vt.id(), vt.calculated_fee)).collect();
@@ -1784,7 +1808,7 @@ fn check_ai_request_inference_rewards(
                 }
             }
             // Escrow output[1] structure (shared with the pre-UTXO fast path).
-            check_ai_request_escrow_output(tx, &req)?;
+            check_ai_request_escrow_output(tx, &req, routed)?;
         }
     }
     Ok(())
@@ -1999,7 +2023,7 @@ mod tests {
         let minimums = [(model_id, base)];
         let effective_min = base + 2 * INFERENCE_REWARD_TOKEN_STEP;
         let txs = vec![make_coinbase_no_caps(), ai_request_with_reward(model_id, effective_min)];
-        assert!(check_ai_request_payload_rules_all(&txs, &minimums).is_ok());
+        assert!(check_ai_request_payload_rules_all(&txs, &minimums, false).is_ok());
     }
 
     #[test]
@@ -2010,7 +2034,7 @@ mod tests {
         let effective_min = base + 2 * INFERENCE_REWARD_TOKEN_STEP;
         let txs = vec![make_coinbase_no_caps(), ai_request_with_reward(model_id, effective_min - 1)];
         assert!(matches!(
-            check_ai_request_payload_rules_all(&txs, &minimums),
+            check_ai_request_payload_rules_all(&txs, &minimums, false),
             Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))
         ));
     }
@@ -2024,7 +2048,7 @@ mod tests {
         let minimums = [(model_id, base)];
         let txs = vec![make_coinbase_no_caps(), ai_request_with_reward(model_id, base)];
         assert!(matches!(
-            check_ai_request_payload_rules_all(&txs, &minimums),
+            check_ai_request_payload_rules_all(&txs, &minimums, false),
             Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))
         ));
     }
@@ -2035,7 +2059,7 @@ mod tests {
     fn unknown_model_id_has_no_minimum() {
         let minimums = [([0x55u8; 32], 400_000_000u64)];
         let txs = vec![make_coinbase_no_caps(), ai_request_with_reward([0x66u8; 32], 1)];
-        assert!(check_ai_request_payload_rules_all(&txs, &minimums).is_ok());
+        assert!(check_ai_request_payload_rules_all(&txs, &minimums, false).is_ok());
     }
 
     /// Rule moved forward on nectopower's review: a below-minimum `priority_fee` needs no UTXO
@@ -2050,7 +2074,7 @@ mod tests {
             vec![TransactionOutput::new(1, ScriptPublicKey::new(0, vec![].into())), TransactionOutput::new(reward, csv_p2pk_script())];
         let tx = Transaction::new(0, vec![], outputs, 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize());
         assert!(matches!(
-            check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &minimums),
+            check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &minimums, false),
             Err(AiRequestPriorityFeeBelowMinimum(_, _, _))
         ));
     }
@@ -2070,13 +2094,13 @@ mod tests {
         ];
         let tx = Transaction::new(0, vec![], underfunded, 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize());
         assert!(matches!(
-            check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &minimums),
+            check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &minimums, false),
             Err(AiRequestEscrowBelowInferenceReward(_, _, _))
         ));
 
         let tx = Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize());
         assert!(matches!(
-            check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &minimums),
+            check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &minimums, false),
             Err(AiRequestMissingEscrowOutput(_))
         ));
     }
@@ -2090,16 +2114,16 @@ mod tests {
         let minimums = [(model_id, 400_000_000u64)];
         let underpaid = ai_request_with_reward(model_id, 400_000_000);
         assert!(matches!(
-            check_ai_request_tx_payload_rules(&underpaid, &minimums),
+            check_ai_request_tx_payload_rules(&underpaid, &minimums, false),
             Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))
         ));
 
         let ok = ai_request_with_reward(model_id, 400_000_000 + 2 * INFERENCE_REWARD_TOKEN_STEP);
-        assert!(check_ai_request_tx_payload_rules(&ok, &minimums).is_ok());
+        assert!(check_ai_request_tx_payload_rules(&ok, &minimums, false).is_ok());
 
         // A plain transaction carries no AiRequest payload and is none of this rule's business.
         let plain = Transaction::new(0, vec![], vec![], 0, subnets::SUBNETWORK_ID_NATIVE, 0, vec![]);
-        assert!(check_ai_request_tx_payload_rules(&plain, &minimums).is_ok());
+        assert!(check_ai_request_tx_payload_rules(&plain, &minimums, false).is_ok());
     }
 
     /// The fast path and the full check must reach the same verdict — that equivalence is the
@@ -2111,8 +2135,8 @@ mod tests {
         let minimums = [(model_id, base)];
         let bad = ai_request_with_reward(model_id, base);
         let txs = vec![make_coinbase_no_caps(), bad];
-        let fast = check_ai_request_payload_rules_all(&txs, &minimums);
-        let full = check_ai_request_inference_rewards(&txs, &[], &minimums);
+        let fast = check_ai_request_payload_rules_all(&txs, &minimums, false);
+        let full = check_ai_request_inference_rewards(&txs, &[], &minimums, false);
         assert!(matches!(fast, Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))));
         assert!(matches!(full, Err(AiRequestInferenceRewardBelowMinimum(_, _, _, _))));
     }

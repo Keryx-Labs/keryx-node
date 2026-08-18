@@ -756,6 +756,20 @@ impl ConsensusApi for Consensus {
             let miner: [u8; 32] = key[..32].try_into().unwrap();
             rows.push(crate::processes::service_commit::first_seen_row_bytes(Hash::from_bytes(miner), daa).to_vec());
         }
+        for entry in self.storage.service_reward_store.iterator() {
+            let (key, record) = entry.unwrap();
+            if record.daa > cutoff {
+                continue;
+            }
+            let request_hash: [u8; 32] = key[..32].try_into().unwrap();
+            rows.push(crate::processes::service_commit::reward_row_bytes(
+                request_hash,
+                record.winner,
+                record.amount,
+                record.daa,
+                record.spk.as_ref(),
+            ));
+        }
         Ok(rows)
     }
 
@@ -767,6 +781,7 @@ impl ConsensusApi for Consensus {
             Burn { tx_id: Hash, index: u32, daa: u64 },
             Strike { daa: u64, miner: Hash, entry: StrikeEntry },
             Sighting { miner: Hash, daa: u64 },
+            Reward { request_hash: [u8; 32], entry: keryx_consensus_core::collateral::RewardEntry },
         }
         let mut parsed = Vec::with_capacity(rows.len());
         for row in rows.iter() {
@@ -789,6 +804,25 @@ impl ConsensusApi for Consensus {
                     let daa = u64::from_le_bytes(row[33..41].try_into().unwrap());
                     parsed.push(Row::Sighting { miner: Hash::from_bytes(miner), daa });
                 }
+                (Some(0x04), n) if n >= 85 => {
+                    let request_hash: [u8; 32] = row[1..33].try_into().unwrap();
+                    let winner: [u8; 32] = row[33..65].try_into().unwrap();
+                    let amount = u64::from_le_bytes(row[65..73].try_into().unwrap());
+                    let daa = u64::from_le_bytes(row[73..81].try_into().unwrap());
+                    let version = u16::from_le_bytes(row[81..83].try_into().unwrap());
+                    let script_len = u16::from_le_bytes(row[83..85].try_into().unwrap()) as usize;
+                    if n != 85 + script_len {
+                        return Err(ConsensusError::General("malformed service-state row"));
+                    }
+                    // A zero version with an empty script is the canonical "stayed burned" form.
+                    let spk = (script_len > 0 || version != 0).then(|| {
+                        keryx_consensus_core::tx::ScriptPublicKey::from_vec(version, row[85..85 + script_len].to_vec())
+                    });
+                    parsed.push(Row::Reward {
+                        request_hash,
+                        entry: keryx_consensus_core::collateral::RewardEntry { winner: Hash::from_bytes(winner), amount, daa, spk },
+                    });
+                }
                 _ => return Err(ConsensusError::General("malformed service-state row")),
             }
         }
@@ -799,6 +833,9 @@ impl ConsensusApi for Consensus {
                 }
                 Row::Strike { daa, miner, entry } => self.storage.service_strike_store.set(daa, miner, entry).unwrap(),
                 Row::Sighting { miner, daa } => self.storage.service_first_seen_store.set(miner, daa).unwrap(),
+                Row::Reward { request_hash, entry } => {
+                    self.storage.service_reward_store.set(crate::model::stores::service_reward::RewardKey(request_hash), entry).unwrap()
+                }
             }
         }
         // Rebuild every derived RAM view (burned set, suspensions, commitment index, cursor).

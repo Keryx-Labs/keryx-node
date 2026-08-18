@@ -80,7 +80,11 @@ impl BlockBodyProcessor {
     /// them). The tx-level check keeps the H3 structural max as an absolute upper bound.
     fn check_coinbase_outputs_count(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let coinbase = &block.transactions[0];
-        let limit = coinbase_outputs_limit(self.ghostdag_k as u64, self.pom_level_activation.is_active(block.header.daa_score));
+        let limit = coinbase_outputs_limit(
+            self.ghostdag_k as u64,
+            self.pom_level_activation.is_active(block.header.daa_score),
+            self.reward_routing_activation.is_active(block.header.daa_score),
+        );
         if coinbase.outputs.len() as u64 > limit {
             return Err(RuleError::TxInIsolationValidationFailed(
                 coinbase.id(),

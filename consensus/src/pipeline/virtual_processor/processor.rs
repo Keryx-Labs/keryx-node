@@ -148,6 +148,16 @@ pub struct VirtualStateProcessor {
     pub(super) service_first_seen_store: Arc<crate::model::stores::service_first_seen::DbServiceFirstSeenStore>,
     /// Standing state mirror (see `service_bond::StandingIndex`).
     pub(super) service_standing: parking_lot::RwLock<super::service_bond::StandingIndex>,
+    /// Rewarded request hashes (append-once mint dedup), persisted counterpart in `service_reward_store`.
+    pub(super) service_rewarded: parking_lot::RwLock<std::collections::HashSet<[u8; 32]>>,
+    pub(super) service_reward_store: Arc<crate::model::stores::service_reward::DbServiceRewardStore>,
+    /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
+    #[allow(clippy::type_complexity)]
+    pub(super) service_reward_recent: parking_lot::RwLock<
+        std::collections::BTreeMap<u64, Vec<([u8; 32], u64, Option<keryx_consensus_core::tx::ScriptPublicKey>)>>,
+    >,
+    /// H8 reward-routing activation (see `params.reward_routing_activation`).
+    pub(super) reward_routing_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -359,6 +369,10 @@ impl VirtualStateProcessor {
             service_commit_index: storage.service_commit_index.clone(),
             service_first_seen_store: storage.service_first_seen_store.clone(),
             service_standing: Default::default(),
+            service_rewarded: Default::default(),
+            service_reward_store: storage.service_reward_store.clone(),
+            service_reward_recent: Default::default(),
+            reward_routing_activation: params.reward_routing_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1408,7 +1422,7 @@ impl VirtualStateProcessor {
         // Local admission policy over the same rules the block check enforces, evaluated at the
         // virtual score: no gate, and no way for it to reject a block a peer would accept.
         if self.model_cap_enforcement_activation.is_active(virtual_daa_score) {
-            check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score))
+            check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score), self.reward_routing_activation.is_active(virtual_daa_score))
                 .map_err(|e| TxRuleError::AiRequestPayloadRule(e.to_string()))?;
         }
         // Same admission rules as the block check: signed (v2) AiResponses only after the
@@ -1638,6 +1652,7 @@ impl VirtualStateProcessor {
         );
         let suspended_blues =
             self.suspended_blues(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score);
+        let reward_mints = self.service_reward_mints_for(virtual_state.ghostdag_data.selected_parent);
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1649,6 +1664,7 @@ impl VirtualStateProcessor {
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
                 &suspended_blues,
+                &reward_mints,
             )
             .unwrap();
         txs.insert(0, coinbase.tx);

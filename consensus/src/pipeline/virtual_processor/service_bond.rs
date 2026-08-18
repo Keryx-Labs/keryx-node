@@ -6,12 +6,12 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, ServiceLedger, ServiceMiss,
-    ServicePenalty, ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA,
-    SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
+    eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
+    ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA,
+    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
-use keryx_consensus_core::tx::TransactionOutpoint;
+use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_core::{info, warn};
 use keryx_hashes::Hash;
@@ -46,6 +46,9 @@ enum ServiceEvent {
     /// (identity, preserved last-strike daa — keeps the rate-limit armed across a serve).
     Reset(Hash, u64),
     Sighting(Hash),
+    /// An inference-reward win (H8 routing): minted by the coinbase of the chain block whose
+    /// selected parent finalizes it.
+    Reward(ServiceReward),
 }
 
 /// RAM mirror of the persisted standing state: first sightings and the full strike history per
@@ -252,8 +255,12 @@ impl VirtualStateProcessor {
     /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
     /// Requests for models outside the tier lineup are skipped; a v1 response or an invalid
     /// responder signature yields `None` (a volunteer — never serves the assignment).
-    fn service_events_of_chain_block(&self, hash: Hash) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], Option<Hash>)>) {
+    fn service_events_of_chain_block(
+        &self,
+        hash: Hash,
+    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Option<Hash>)>) {
         let mut requests = Vec::new();
+        let mut request_rewards = Vec::new();
         let mut responses = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
         for mbad in acceptance.iter() {
@@ -267,6 +274,7 @@ impl VirtualStateProcessor {
                             let mut request_hash = [0u8; 32];
                             request_hash.copy_from_slice(&digest.as_bytes()[..32]);
                             requests.push((request_hash, tier as u8, req.max_tokens));
+                            request_rewards.push((request_hash, req.inference_reward));
                         }
                     }
                 } else if tx.is_ai_response() {
@@ -276,7 +284,25 @@ impl VirtualStateProcessor {
                 }
             }
         }
-        (requests, responses)
+        (requests, request_rewards, responses)
+    }
+
+    /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
+    /// resolution input, from the same walk as [`Self::service_producers_of_chain_block`].
+    fn service_producer_spks_of_chain_block(&self, hash: Hash) -> Vec<(Hash, ScriptPublicKey)> {
+        let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
+        let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
+        ghostdag_data
+            .mergeset_blues
+            .iter()
+            .filter(|b| !non_daa.contains(b))
+            .filter_map(|b| {
+                let txs = self.block_transactions_store.get(*b).unwrap();
+                let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+                crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(coinbase.miner_data.extra_data)?;
+                Some((miner_key(&coinbase.miner_data.script_public_key), coinbase.miner_data.script_public_key))
+            })
+            .collect()
     }
 
     /// The current service-ledger escrow claims of `miner` — future RPC surface, test-read today.
@@ -304,7 +330,7 @@ impl VirtualStateProcessor {
                         miss.burned.iter().map(|c| c.value).sum(),
                         miss.request_hash,
                     )),
-                    ServiceEvent::Reset(..) | ServiceEvent::Sighting(_) => None,
+                    ServiceEvent::Reset(..) | ServiceEvent::Sighting(_) | ServiceEvent::Reward(_) => None,
                 })
                 .collect();
         }
@@ -379,7 +405,10 @@ impl VirtualStateProcessor {
             return (FoldOutcome::default(), Vec::new());
         }
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
-        let (requests, responses) = self.service_events_of_chain_block(hash);
+        ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
+        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash);
+        let producers =
+            if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
         // live claims never are, and the frontier-daa refold must not resurrect a claim whose
         // burning miss is rate-limit-absorbed by the baseline.
@@ -413,11 +442,28 @@ impl VirtualStateProcessor {
         };
         if warmup {
             let burned = self.service_burned.read();
-            ledger.on_chain_block_warmup(daa, &requests, &responses, &escrows, &|op| burned.contains(op), cohort);
+            ledger.on_chain_block_warmup_with_rewards(
+                daa,
+                &requests,
+                &request_rewards,
+                &responses,
+                &escrows,
+                &producers,
+                &|op| burned.contains(op),
+                cohort,
+            );
             (FoldOutcome::default(), escrows)
         } else {
-            let outcome =
-                ledger.on_chain_block(daa, &requests, &responses, &escrows, |id| self.service_standing_at(id, daa), cohort);
+            let outcome = ledger.on_chain_block_with_rewards(
+                daa,
+                &requests,
+                &request_rewards,
+                &responses,
+                &escrows,
+                &producers,
+                |id| self.service_standing_at(id, daa),
+                cohort,
+            );
             (outcome, escrows)
         }
     }
@@ -516,6 +562,9 @@ impl VirtualStateProcessor {
                 for (miner, preserved) in outcome.resets {
                     queue.push_back((i, daa, ServiceEvent::Reset(miner, preserved)));
                 }
+                for reward in outcome.rewards {
+                    queue.push_back((i, daa, ServiceEvent::Reward(reward)));
+                }
             }
         }
         ledger
@@ -590,6 +639,9 @@ impl VirtualStateProcessor {
             }
             for (miner, preserved) in outcome.resets {
                 sync.queue.push_back((idx, daa, ServiceEvent::Reset(miner, preserved)));
+            }
+            for reward in outcome.rewards {
+                sync.queue.push_back((idx, daa, ServiceEvent::Reward(reward)));
             }
             let snapshot = sync.ledger.light_snapshot();
             sync.snapshots.insert(idx, snapshot);
@@ -672,6 +724,35 @@ impl VirtualStateProcessor {
                         info!("service-bond: SUSPENSION FINAL for miner {} until daa {} (miss daa {})", miss.miner, until, daa);
                     }
                 }
+                ServiceEvent::Reward(reward) => {
+                    if self.service_rewarded.write().insert(reward.request_hash) {
+                        self.service_reward_store
+                            .set(
+                                crate::model::stores::service_reward::RewardKey(reward.request_hash),
+                                RewardEntry { winner: reward.winner, amount: reward.amount, daa, spk: reward.spk.clone() },
+                            )
+                            .unwrap();
+                        self.service_commit_index.add_row(&service_commit::reward_row_bytes(
+                            reward.request_hash,
+                            reward.winner,
+                            reward.amount,
+                            daa,
+                            reward.spk.as_ref(),
+                        ));
+                        self.service_reward_recent.write().entry(daa).or_default().push((
+                            reward.request_hash,
+                            reward.amount,
+                            reward.spk.clone(),
+                        ));
+                        info!(
+                            "service-bond: reward FINAL for request {} → miner {} ({} sompi{})",
+                            hex::encode(reward.request_hash),
+                            reward.winner,
+                            reward.amount,
+                            if reward.spk.is_some() { "" } else { ", no payout script — burned" }
+                        );
+                    }
+                }
             }
             sync.deep_cursor_daa = sync.deep_cursor_daa.max(daa);
         }
@@ -722,8 +803,60 @@ impl VirtualStateProcessor {
             cursor = cursor.max(daa);
         }
         drop(standing);
+        {
+            let mut rewarded = self.service_rewarded.write();
+            let mut recent = self.service_reward_recent.write();
+            rewarded.clear();
+            recent.clear();
+            for entry in self.service_reward_store.iterator() {
+                let (key, record) = entry.unwrap();
+                let request_hash: [u8; 32] = key[..32].try_into().unwrap();
+                rewarded.insert(request_hash);
+                recent.entry(record.daa).or_default().push((request_hash, record.amount, record.spk.clone()));
+                rows.push((
+                    record.daa,
+                    service_commit::reward_row_bytes(request_hash, record.winner, record.amount, record.daa, record.spk.as_ref()),
+                ));
+                cursor = cursor.max(record.daa);
+            }
+        }
         self.service_commit_index.rebuild(rows);
         self.service_ledger.lock().deep_cursor_daa = cursor;
+    }
+
+    /// Coinbase mint expectation for a block whose selected parent is `sp`: the reward wins
+    /// finalized exactly by `sp`'s fold — event daa in `(parent(sp).daa − finality, sp.daa −
+    /// finality]` — in `(daa, request hash)` order. Wins with no payout script stay burned.
+    pub(super) fn service_reward_mints_for(&self, sp: Hash) -> Vec<(ScriptPublicKey, u64)> {
+        let sp_daa = self.headers_store.get_daa_score(sp).unwrap();
+        if !self.reward_routing_activation.is_active(sp_daa) {
+            return Vec::new();
+        }
+        let sc = self.selected_chain_store.read();
+        let Ok(sp_idx) = sc.get_by_hash(sp) else { return Vec::new() };
+        let parent_daa = if sp_idx == 0 {
+            0
+        } else {
+            match sc.get_by_index(sp_idx - 1) {
+                Ok(h) => self.headers_store.get_daa_score(h).unwrap(),
+                Err(_) => return Vec::new(),
+            }
+        };
+        drop(sc);
+        let lo = parent_daa.saturating_sub(self.finality_depth);
+        let hi = sp_daa.saturating_sub(self.finality_depth);
+        if hi <= lo {
+            return Vec::new();
+        }
+        let recent = self.service_reward_recent.read();
+        let mut wins: Vec<([u8; 32], u64, ScriptPublicKey)> = Vec::new();
+        for (_, entries) in recent.range((std::ops::Bound::Excluded(lo), std::ops::Bound::Included(hi))) {
+            let mut at_daa: Vec<_> = entries.iter().filter_map(|(rh, amount, spk)| spk.clone().map(|s| (*rh, *amount, s))).collect();
+            at_daa.sort_unstable_by_key(|(rh, _, _)| *rh);
+            wins.extend(at_daa);
+        }
+        wins.truncate(keryx_consensus_core::collateral::MAX_REWARD_MINTS_PER_BLOCK);
+        wins.into_iter().map(|(_, amount, spk)| (spk, amount)).collect()
     }
 
     /// Whether `producer` is under a finality-deep suspension at `daa_score`. The window is

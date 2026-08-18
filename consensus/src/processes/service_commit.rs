@@ -29,6 +29,36 @@ pub fn first_seen_row_bytes(miner: Hash, daa: u64) -> [u8; 41] {
     bytes
 }
 
+/// Canonical byte form of an inference-reward row. Variable length: the fixed head carries
+/// `daa` at [73..81]; the tail is the payout script (`version_le(2) || len_le(2) || script`),
+/// zero-length when the reward stayed burned.
+pub fn reward_row_bytes(
+    request_hash: [u8; 32],
+    winner: Hash,
+    amount: u64,
+    daa: u64,
+    spk: Option<&keryx_consensus_core::tx::ScriptPublicKey>,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(85 + spk.map_or(0, |s| s.script().len()));
+    bytes.push(0x04);
+    bytes.extend_from_slice(&request_hash);
+    bytes.extend_from_slice(&winner.as_bytes());
+    bytes.extend_from_slice(&amount.to_le_bytes());
+    bytes.extend_from_slice(&daa.to_le_bytes());
+    match spk {
+        Some(s) => {
+            bytes.extend_from_slice(&s.version().to_le_bytes());
+            bytes.extend_from_slice(&(s.script().len() as u16).to_le_bytes());
+            bytes.extend_from_slice(s.script());
+        }
+        None => {
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+        }
+    }
+    bytes
+}
+
 /// Canonical byte form of a strike-log row.
 pub fn strike_row_bytes(daa: u64, miner: Hash, count: u32, last_daa: u64) -> [u8; 53] {
     let mut bytes = [0u8; 53];

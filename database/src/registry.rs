@@ -143,6 +143,9 @@ pub enum DatabaseStorePrefixes {
     /// Service-bond first sightings (finality-deep, append-once): miner identity → daa of its
     /// first certified block. The standing/probation clock.
     ServiceFirstSeen = 199,
+    /// Inference-reward wins (finality-deep, append-once): request hash → (winner identity,
+    /// amount, event daa). Mint dedup and commitment rebuild.
+    ServiceReward = 200,
 
     // ---- Separator ----
     /// Reserved as a separator

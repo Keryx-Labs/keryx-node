@@ -44,7 +44,6 @@ use tokio::time::sleep;
 use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progress::ProgressReporter};
 type BlockBody = Vec<Transaction>;
 
-/// Flow for managing IBD - Initial Block Download
 /// Event daa of a canonical service-state row, `None` for a malformed one. Mirrors the row
 /// layouts in `service_commit`.
 fn service_row_daa(row: &[u8]) -> Option<u64> {
@@ -52,10 +51,12 @@ fn service_row_daa(row: &[u8]) -> Option<u64> {
         (0x01, 45) => Some(u64::from_le_bytes(row[37..45].try_into().unwrap())),
         (0x02, 53) => Some(u64::from_le_bytes(row[1..9].try_into().unwrap())),
         (0x03, 41) => Some(u64::from_le_bytes(row[33..41].try_into().unwrap())),
+        (0x04, n) if n >= 85 => Some(u64::from_le_bytes(row[73..81].try_into().unwrap())),
         _ => None,
     }
 }
 
+/// Flow for managing IBD - Initial Block Download
 pub struct IbdFlow {
     pub(super) ctx: FlowContext,
     pub(super) router: Arc<Router>,

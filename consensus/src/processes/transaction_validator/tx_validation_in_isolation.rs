@@ -59,7 +59,7 @@ impl TransactionValidator {
         // `coinbase_outputs_limit`). The era-exact cap (legacy K+2 pre-H3) is activation-
         // dependent, so it is enforced with header context in the body processor's
         // `check_coinbase_outputs_count` — checks in this module must stay context-free.
-        let outputs_limit = crate::processes::coinbase::coinbase_outputs_limit(self.ghostdag_k as u64, true);
+        let outputs_limit = crate::processes::coinbase::coinbase_outputs_limit(self.ghostdag_k as u64, true, true);
         if tx.outputs.len() as u64 > outputs_limit {
             return Err(TxRuleError::CoinbaseTooManyOutputs(tx.outputs.len(), outputs_limit));
         }
@@ -269,9 +269,10 @@ mod tests {
         tv.validate_tx_in_isolation(&valid_cb).unwrap();
 
         // Structural coinbase output bound = 3*(K+1)+4 (H3 builder max — 3 outputs per mergeset
-        // blue + 4 aggregates). The boundary is accepted, one above is rejected. The stricter
-        // pre-H3 cap (K+2) is era-gated in the body processor, not here.
-        let structural_max = 3 * (params.ghostdag_k() as u64 + 1) + 4;
+        // blue + 4 aggregates) plus the H8 reward-mint headroom. The boundary is accepted, one
+        // above is rejected. The stricter era-exact caps live in the body processor, not here.
+        let structural_max =
+            3 * (params.ghostdag_k() as u64 + 1) + 4 + keryx_consensus_core::collateral::MAX_REWARD_MINTS_PER_BLOCK as u64;
         let cb_with = |n: u64| {
             let mut cb = valid_cb.clone();
             cb.outputs = vec![valid_cb.outputs[0].clone(); n as usize];

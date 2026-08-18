@@ -227,6 +227,10 @@ pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
 /// below `pruning_point + SERVICE_STATE_HANDOFF_DAA`; the syncee re-derives only above it.
 pub const SERVICE_STATE_HANDOFF_DAA: u64 = SERVICE_ELIGIBILITY_WINDOW_DAA + SERVICE_LEDGER_HORIZON_DAA;
 
+/// Hard cap on inference-reward mint outputs per coinbase (H8 routing). Wins beyond it, in
+/// canonical `(event daa, request hash)` order, stay burned — bounds the coinbase output count.
+pub const MAX_REWARD_MINTS_PER_BLOCK: usize = 64;
+
 /// How long an authenticated response is held when its request has not been accepted yet. An
 /// AiResponse carries no inputs, so nothing orders its acceptance against its request's: the
 /// selected chain can accept it first. Sized on the consensus merge depth
@@ -347,6 +351,11 @@ struct PendingRequest {
     tier: u8,
     max_tokens: u32,
     accepted_daa: u64,
+    /// Sompi locked in the request's keyless reward vault (0 for pre-routing-gate requests,
+    /// which lock their reward to a designated escrow key instead).
+    reward: u64,
+    /// First identity credited with an accepted response — the one the reward mints to.
+    winner: Option<Hash>,
     audit: Option<Audit>,
     /// Escrow keys that answered between this request's acceptance and its arming — the one-block
     /// gap where no audit exists yet to credit them. Drained into `responded` when the audit arms.
@@ -382,11 +391,40 @@ impl MemSizeEstimator for StrikeEntry {
     }
 }
 
+/// Persisted record of a finality-deep inference-reward win: winner identity, vaulted amount,
+/// event daa, and the payout script the mint goes to (`None` leaves the amount burned).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewardEntry {
+    pub winner: Hash,
+    pub amount: u64,
+    pub daa: u64,
+    pub spk: Option<crate::tx::ScriptPublicKey>,
+}
+
+impl MemSizeEstimator for RewardEntry {
+    fn estimate_mem_bytes(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
+/// An inference reward won: the first identity credited with an accepted response to a
+/// routing-gated request. Minted to `spk` by a coinbase once finality-deep; `None` (identity
+/// with no known payout script) leaves the vaulted amount burned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceReward {
+    pub request_hash: [u8; 32],
+    pub winner: Hash,
+    pub amount: u64,
+    pub spk: Option<crate::tx::ScriptPublicKey>,
+}
+
 /// The strike-affecting outcomes of folding one chain block: the misses it closes and the miners
 /// whose streak a served response reset. Both are persisted to the strike log once finality-deep.
 #[derive(Clone, Debug, Default)]
 pub struct FoldOutcome {
     pub misses: Vec<ServiceMiss>,
+    /// Inference rewards decided by this fold (first accepted response of a routed request).
+    pub rewards: Vec<ServiceReward>,
     /// Served-response streak resets as (identity, preserved last-strike daa). The preserved daa
     /// keeps the strike rate-limit armed across a serve; 0 before the v2 gate.
     pub resets: Vec<(Hash, u64)>,
@@ -406,6 +444,7 @@ pub struct LightSnapshot {
     first_seen: std::collections::BTreeMap<Hash, u64>,
     base: std::sync::Arc<std::collections::BTreeMap<Hash, StrikeEntry>>,
     first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>,
+    producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -434,6 +473,12 @@ pub struct ServiceLedger {
     /// Activation daa of the v2 service windows; `None` = not armed. Configuration, not folded
     /// state — installed on every fold entry, untouched by snapshots.
     window_v2_activation_daa: Option<u64>,
+    /// Activation daa of vault reward routing (requests accepted at or after it mint their
+    /// reward to the first accepted responder); `None` = not armed. Configuration, like above.
+    reward_routing_daa: Option<u64>,
+    /// Latest coinbase payout script seen per identity, folded from chain-block producers —
+    /// resolves a reward winner to a mintable script.
+    producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
 }
 
 impl ServiceLedger {
@@ -455,7 +500,24 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, responses, escrows, None, is_established, cohort)
+        self.fold_inner(daa, requests, &[], responses, escrows, &[], None, is_established, cohort)
+    }
+
+    /// [`Self::on_chain_block`] with the reward-routing inputs: per-request vaulted amounts and
+    /// the block's `(identity, payout script)` producers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_with_rewards(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        is_established: impl Fn(&Hash) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) -> FoldOutcome {
+        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, None, is_established, cohort)
     }
 
     /// Folds a chain block whose strike events are already persisted (daa at or below the store
@@ -471,20 +533,42 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, responses, escrows, Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, &[], responses, escrows, &[], Some(is_burned), |_| true, cohort);
     }
 
+    /// [`Self::on_chain_block_warmup`] with the reward-routing inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_warmup_with_rewards(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) {
+        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, Some(is_burned), |_| true, cohort);
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn fold_inner(
         &mut self,
         daa: u64,
         requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
         is_established: impl Fn(&Hash) -> bool,
         mut cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
         let warmup = warmup_burned.is_some();
+        for (identity, spk) in producers {
+            self.producer_spk.insert(*identity, spk.clone());
+        }
         let mut sightings: Vec<Hash> = Vec::new();
         let mut expired: Vec<(Hash, EscrowClaim)> = Vec::new();
         for (miner, claim) in escrows {
@@ -525,6 +609,8 @@ impl ServiceLedger {
                 tier: *tier,
                 max_tokens: *max_tokens,
                 accepted_daa: daa,
+                reward: request_rewards.iter().find(|(h, _)| h == rh).map(|(_, v)| *v).unwrap_or(0),
+                winner: None,
                 audit: None,
                 early_responders: Vec::new(),
             });
@@ -566,6 +652,9 @@ impl ServiceLedger {
                         served.push(identity);
                     }
                 }
+            }
+            if let Some(first) = served.first().copied() {
+                self.maybe_award(rh, first, warmup, &mut outcome);
             }
             for identity in served {
                 // A warmup fold leaves strikes alone: the baseline already carries this reset.
@@ -648,8 +737,12 @@ impl ServiceLedger {
                                 }
                             }
                         }
+                        let first_credit = responded.first().copied();
                         self.pending.get_mut(&rh).unwrap().audit =
                             Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window });
+                        if let Some(first) = first_credit {
+                            self.maybe_award(&rh, first, warmup, &mut outcome);
+                        }
                     }
                 }
                 None => {}
@@ -723,6 +816,29 @@ impl ServiceLedger {
         self.window_v2_activation_daa = Some(daa);
     }
 
+    /// Installs the reward-routing activation daa.
+    pub fn set_reward_routing_activation(&mut self, daa: u64) {
+        self.reward_routing_daa = Some(daa);
+    }
+
+    /// Awards `rh` to `identity` if the request is routed, unawarded, and carries a reward.
+    /// A warmup fold sets the winner without emitting — the reward row is already persisted.
+    fn maybe_award(&mut self, rh: &[u8; 32], identity: Hash, warmup: bool, outcome: &mut FoldOutcome) {
+        if self.reward_routing_daa.is_none() {
+            return;
+        }
+        let spk = self.producer_spk.get(&identity).cloned();
+        let routed_from = self.reward_routing_daa.unwrap();
+        let Some(req) = self.pending.get_mut(rh) else { return };
+        if req.accepted_daa < routed_from || req.winner.is_some() || req.reward == 0 {
+            return;
+        }
+        req.winner = Some(identity);
+        if !warmup {
+            outcome.rewards.push(ServiceReward { request_hash: *rh, winner: identity, amount: req.reward, spk });
+        }
+    }
+
     /// The small reorg-restore state: everything but the vault (whose restore goes through the
     /// per-block undo log — cloning a full burnable window per chain block does not scale).
     pub fn light_snapshot(&self) -> LightSnapshot {
@@ -733,6 +849,7 @@ impl ServiceLedger {
             first_seen: self.first_seen.clone(),
             base: self.base.clone(),
             first_seen_base: self.first_seen_base.clone(),
+            producer_spk: self.producer_spk.clone(),
         }
     }
 
@@ -744,6 +861,7 @@ impl ServiceLedger {
         self.first_seen = snap.first_seen.clone();
         self.base = snap.base.clone();
         self.first_seen_base = snap.first_seen_base.clone();
+        self.producer_spk = snap.producer_spk.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -800,7 +918,7 @@ impl ServiceLedger {
 mod tests {
     use super::{
         eligible_pairs, service_window_daa, service_window_daa_at, strike_penalty, strike_penalty_at, update_strikes,
-        FoldOutcome, ServiceLedger, ServicePenalty,
+        FoldOutcome, ServiceLedger, ServicePenalty, ServiceReward,
         StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_EARLY_RESPONSE_HORIZON_DAA, SERVICE_LEDGER_HORIZON_DAA,
         SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
@@ -844,6 +962,74 @@ mod tests {
         assert!(ledger.on_chain_block(103, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set)).misses.is_empty());
         assert!(ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
         assert_eq!(ledger.pending_len(), 0);
+    }
+
+    /// H8 routing: the first identity credited with an accepted response wins the reward,
+    /// exactly once, with its payout script resolved from the folded producers; later
+    /// responders win nothing, and pre-gate requests emit no reward.
+    #[test]
+    fn first_accepted_responder_wins_the_reward_once() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let set = [a, b];
+        let spk_a = crate::tx::ScriptPublicKey::from_vec(0, vec![0xAA; 34]);
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(200);
+
+        // Pre-gate request: routed emission stays off even with rewards supplied.
+        let rh_old = [6u8; 32];
+        let out = ledger.on_chain_block_with_rewards(
+            100,
+            &[(rh_old, 0, 256)],
+            &[(rh_old, 5_000)],
+            &[],
+            &[],
+            &[(a, spk_a.clone())],
+            |_| true,
+            cohort_of(&set),
+        );
+        assert!(out.rewards.is_empty());
+        let out =
+            ledger.on_chain_block_with_rewards(101, &[], &[], &[(rh_old, Some(a))], &[], &[], |_| true, cohort_of(&set));
+        assert!(out.rewards.is_empty());
+
+        // Post-gate request: the first credited responder wins, once, with a resolved script.
+        let rh = [7u8; 32];
+        let out = ledger.on_chain_block_with_rewards(
+            300,
+            &[(rh, 0, 256)],
+            &[(rh, 9_000)],
+            &[],
+            &[],
+            &[],
+            |_| true,
+            cohort_of(&set),
+        );
+        assert!(out.rewards.is_empty());
+        // First accepted response after arming: `b` wins (no known script — stays burned).
+        let out = ledger.on_chain_block_with_rewards(302, &[], &[], &[(rh, Some(b))], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(out.rewards.len(), 1);
+        assert_eq!(out.rewards[0], ServiceReward { request_hash: rh, winner: b, amount: 9_000, spk: None });
+        // A later responder wins nothing.
+        let out = ledger.on_chain_block_with_rewards(303, &[], &[], &[(rh, Some(a))], &[], &[], |_| true, cohort_of(&set));
+        assert!(out.rewards.is_empty());
+
+        // A winner with a folded producer script gets it resolved.
+        let rh2 = [8u8; 32];
+        ledger.on_chain_block_with_rewards(
+            310,
+            &[(rh2, 0, 256)],
+            &[(rh2, 4_000)],
+            &[],
+            &[],
+            &[(a, spk_a.clone())],
+            |_| true,
+            cohort_of(&set),
+        );
+        let out = ledger.on_chain_block_with_rewards(312, &[], &[], &[(rh2, Some(a))], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(out.rewards.len(), 1);
+        assert_eq!(out.rewards[0].spk, Some(spk_a));
     }
 
     #[test]

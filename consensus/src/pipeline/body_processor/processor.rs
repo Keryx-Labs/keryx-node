@@ -71,6 +71,7 @@ pub struct BlockBodyProcessor {
     /// `proof.final_state == header.pom_final_state` (the header commitment the block level
     /// and header-only PoW check derive from).
     pub(super) pom_level_activation: ForkActivation,
+    pub(super) reward_routing_activation: ForkActivation,
     /// H4 gate — when active at a block's daa_score, `check_pom_proof` uses the recompute-from-chunks
     /// verifier (`verify_pom_proof_v2`, all K transitions re-walked) instead of the 32/256 spot-check.
     /// Bundled into H4 alongside coin-age (same `coin_age_verification_activation` DAA).
@@ -238,6 +239,7 @@ impl BlockBodyProcessor {
             pom_activation: params.pom_activation,
             very_light_activation: params.very_light_activation,
             pom_level_activation: params.pom_level_activation,
+            reward_routing_activation: params.reward_routing_activation,
             coin_age_verification_activation: params.coin_age_verification_activation,
             h5_activation: params.h5_activation,
             h5_1_activation: params.h5_1_activation,
