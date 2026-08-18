@@ -1747,7 +1747,7 @@ pub const TESTNET_PARAMS: Params = Params {
     pom_v3_activation: ForkActivation::new(0),
     // H7 service-bond v2 — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
-    service_bond_v2_activation: ForkActivation::new(500),
+    service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(500),
     chain_anchor: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
