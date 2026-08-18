@@ -336,7 +336,16 @@ impl VirtualStateProcessor {
         }
         snapshot.lifetime_strikes = self.service_standing.read().lifetime_strikes();
         snapshot.lifetime_strikes.sort_unstable();
-        snapshot.suspended = self.service_suspended.read().iter().map(|(m, until)| (*m, *until)).collect();
+        // Only the suspensions in force at this POV: the map keeps every record ever flushed, so
+        // that re-validating an old POV reaches the verdict a live node reached. Reporting it raw
+        // leaves expired suspensions on display long after production resumed.
+        snapshot.suspended = self
+            .service_suspended
+            .read()
+            .iter()
+            .filter(|(_, until)| until.saturating_sub(SERVICE_SUSPENSION_DAA) <= virtual_daa_score && virtual_daa_score < **until)
+            .map(|(m, until)| (*m, *until))
+            .collect();
         snapshot.suspended.sort_unstable();
         snapshot
     }
