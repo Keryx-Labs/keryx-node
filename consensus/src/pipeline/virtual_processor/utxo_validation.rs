@@ -1486,11 +1486,22 @@ impl VirtualStateProcessor {
     /// If any of `outpoints` is a burned escrow outpoint, returns the full burned set formatted as
     /// space-separated `txid:index`. A claiming miner reads this to slash exactly the burned members
     /// and re-batch the rest instead of bisecting to find them. `None` when none are burned.
-    fn burned_outpoints_msg<'b>(&self, outpoints: impl Iterator<Item = &'b TransactionOutpoint>) -> Option<String> {
+    /// Burned outpoints among `outpoints` that a POV at `pov_daa_score` must already see.
+    ///
+    /// A burn enters the set once the sink reaches `event daa + finality`, and the flush runs after
+    /// that sink's own blocks are validated — so a live node first applies it strictly above that
+    /// score. The set itself carries no such bound, and a
+    /// node holding rows above the blocks it is replaying (fresh sync, restart catch-up) would
+    /// otherwise reject claims the network accepted before the burn existed.
+    fn burned_outpoints_msg<'b>(
+        &self,
+        outpoints: impl Iterator<Item = &'b TransactionOutpoint>,
+        pov_daa_score: u64,
+    ) -> Option<String> {
         let guard = self.service_burned.read();
         let mut msg = String::new();
         for o in outpoints {
-            if guard.contains(o) {
+            if guard.get(o).is_some_and(|&burn_daa| burn_daa.saturating_add(self.finality_depth) < pov_daa_score) {
                 if !msg.is_empty() {
                     msg.push(' ');
                 }
@@ -1520,7 +1531,8 @@ impl VirtualStateProcessor {
         // same verdict. Report the full burned set (not the first), so a claiming miner slashes
         // exactly those and re-batches the rest. A burned outpoint is still present in the view
         // (burn is an overlay, not a deletion), so this never masks a genuine missing-input.
-        if let Some(msg) = self.burned_outpoints_msg(transaction.inputs.iter().map(|i| &i.previous_outpoint)) {
+        if let Some(msg) = self.burned_outpoints_msg(transaction.inputs.iter().map(|i| &i.previous_outpoint), pov_daa_score) {
+            info!("Rejecting transaction {} at daa {}: spend of burned escrow {}", transaction.id(), pov_daa_score, msg);
             return Err(TxRuleError::SpendOfBurnedEscrow(msg));
         }
         let mut entries = Vec::with_capacity(transaction.inputs.len());
@@ -1584,7 +1596,7 @@ impl VirtualStateProcessor {
         args: &TransactionValidationArgs,
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
-        if let Some(msg) = self.burned_outpoints_msg(mutable_tx.tx.inputs.iter().map(|i| &i.previous_outpoint)) {
+        if let Some(msg) = self.burned_outpoints_msg(mutable_tx.tx.inputs.iter().map(|i| &i.previous_outpoint), pov_daa_score) {
             return Err(TxRuleError::SpendOfBurnedEscrow(msg));
         }
 

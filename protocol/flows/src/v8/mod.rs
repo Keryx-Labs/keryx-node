@@ -10,6 +10,7 @@ use crate::v7::{
     request_pp_proof::RequestPruningPointProofFlow,
     request_pruning_point_and_anticone::PruningPointAndItsAnticoneRequestsFlow,
     request_pruning_point_utxo_set::RequestPruningPointUtxoSetFlow,
+    request_service_state::RequestServiceStateFlow,
     txrelay::flow::{RelayTransactionsFlow, RequestTransactionsFlow},
 };
 pub(crate) mod request_block_bodies;
@@ -47,6 +48,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::UnexpectedPruningPoint,
                 KaspadMessagePayloadType::PruningPointUtxoSetChunk,
                 KaspadMessagePayloadType::DonePruningPointUtxoSetChunks,
+                KaspadMessagePayloadType::ServiceStateChunk,
+                KaspadMessagePayloadType::DoneServiceStateChunks,
             ]),
             relay_receiver,
             body_only_ibd_permitted,
@@ -94,6 +97,11 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::RequestPruningPointUtxoSet,
                 KaspadMessagePayloadType::RequestNextPruningPointUtxoSetChunk,
             ]),
+        )),
+        Box::new(RequestServiceStateFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![KaspadMessagePayloadType::RequestServiceState]),
         )),
         Box::new(HandleIbdBlockRequests::new(
             ctx.clone(),

@@ -423,7 +423,7 @@ impl VirtualStateProcessor {
         // burning miss is rate-limit-absorbed by the baseline.
         let escrows: Vec<(Hash, EscrowClaim)> = {
             let burned = self.service_burned.read();
-            self.service_escrows_of_chain_block(hash).into_iter().filter(|(_, c)| !burned.contains(&c.outpoint)).collect()
+            self.service_escrows_of_chain_block(hash).into_iter().filter(|(_, c)| !burned.contains_key(&c.outpoint)).collect()
         };
         if live && !requests.is_empty() {
             for (rh, tier, max_tokens) in requests.iter() {
@@ -458,7 +458,7 @@ impl VirtualStateProcessor {
                 &responses,
                 &escrows,
                 &producers,
-                &|op| burned.contains(op),
+                &|op| burned.contains_key(op),
                 cohort,
             );
             (FoldOutcome::default(), escrows)
@@ -692,7 +692,7 @@ impl VirtualStateProcessor {
                 }
                 ServiceEvent::Miss(miss) => {
                     for claim in miss.burned.iter() {
-                        if !self.service_burned.write().insert(claim.outpoint) {
+                        if self.service_burned.write().insert(claim.outpoint, daa).is_some() {
                             continue;
                         }
                         let key =
@@ -782,7 +782,7 @@ impl VirtualStateProcessor {
             let (key, daa) = entry.unwrap();
             let tx_id_bytes: [u8; 32] = key[..32].try_into().unwrap();
             let index = u32::from_le_bytes(key[32..36].try_into().unwrap());
-            set.insert(TransactionOutpoint::new(tx_id_bytes.into(), index));
+            set.insert(TransactionOutpoint::new(tx_id_bytes.into(), index), daa);
             rows.push((daa, service_commit::burn_row_bytes(tx_id_bytes.into(), index, daa).to_vec()));
             cursor = cursor.max(daa);
         }

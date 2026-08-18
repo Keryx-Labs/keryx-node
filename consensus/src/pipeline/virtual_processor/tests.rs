@@ -465,7 +465,7 @@ async fn burned_escrow_outpoint_spend_is_rejected() {
     let vp = tc.virtual_processor().clone();
 
     let outpoint = TransactionOutpoint::new(7u64.into(), 1);
-    vp.service_burned.write().insert(outpoint);
+    vp.service_burned.write().insert(outpoint, 0);
     let tx = Transaction::new(
         TX_VERSION,
         vec![TransactionInput::new(outpoint, vec![], 0, 0)],
@@ -475,7 +475,15 @@ async fn burned_escrow_outpoint_spend_is_rejected() {
         0,
         vec![],
     );
-    let res = vp.validate_transaction_in_utxo_context(&tx, &UtxoCollection::default(), 1, TxValidationFlags::Full);
+    // A burn binds POVs strictly past `event daa + finality`: the sink reaching that score flushes
+    // it only after its own blocks are validated, so the block AT that score is one the network
+    // accepted. A node holding the row while replaying below it (fresh sync / restart catch-up)
+    // must reach the same verdict.
+    let finality = vp.finality_depth;
+    let at_edge = vp.validate_transaction_in_utxo_context(&tx, &UtxoCollection::default(), finality, TxValidationFlags::Full);
+    assert!(matches!(at_edge, Err(TxRuleError::MissingTxOutpoints)), "burn must not bind at the flush edge");
+
+    let res = vp.validate_transaction_in_utxo_context(&tx, &UtxoCollection::default(), finality + 1, TxValidationFlags::Full);
     assert!(matches!(res, Err(TxRuleError::SpendOfBurnedEscrow(_))));
 
     // An untouched outpoint still fails only on the missing entry, proving the set is selective.

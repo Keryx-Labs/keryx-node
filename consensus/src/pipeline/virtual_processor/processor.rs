@@ -135,7 +135,8 @@ pub struct VirtualStateProcessor {
     /// RAM-only service-bond ledger (H6), folded along the committed selected chain.
     pub(super) service_ledger: parking_lot::Mutex<super::service_bond::ServiceLedgerSync>,
     /// Burned escrow outpoints (finality-deep misses), persisted counterpart in `service_burn_store`.
-    pub(super) service_burned: parking_lot::RwLock<std::collections::HashSet<keryx_consensus_core::tx::TransactionOutpoint>>,
+    pub(super) service_burned:
+        parking_lot::RwLock<std::collections::HashMap<keryx_consensus_core::tx::TransactionOutpoint, u64>>,
     pub(super) service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
     /// Finality-deep production suspensions (miner escrow key → deadline daa), persisted counterpart
     /// Consulted by block validation; rebuilt from the strike log at boot.
