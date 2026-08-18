@@ -798,6 +798,13 @@ const H6_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 7);
 /// monotonic-ordering note as above.
 const H7_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 8);
 
+/// Minimum keryxd peer version accepted once our virtual daa has crossed the H8 gate: past it a
+/// request is identified by its transaction id, its reward is locked in the keyless vault and
+/// minted by the coinbase, and a repeated identity no longer arms a second audit — all of which a
+/// pre-H8 build derives differently, so it disagrees with our blocks. Same monotonic-ordering note
+/// as above.
+const H8_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 9);
+
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
 /// (dnsseeder crawlers etc.), which are let through — the chain anchor and the ban-worthy
@@ -863,7 +870,9 @@ impl ConnectionInitializer for FlowContext {
         // gate, keyed on our own virtual daa so a node still catching up to the gate keeps peering
         // with the builds it needs to get there.
         let virtual_daa = self.consensus().unguarded_session_blocking().get_virtual_daa_score();
-        let min_version = if self.config.service_bond_v2_activation.is_active(virtual_daa) {
+        let min_version = if self.config.reward_routing_activation.is_active(virtual_daa) {
+            H8_MINIMUM_KERYXD_PEER_VERSION
+        } else if self.config.service_bond_v2_activation.is_active(virtual_daa) {
             H7_MINIMUM_KERYXD_PEER_VERSION
         } else if self.config.pom_v3_activation.is_active(virtual_daa) {
             H6_MINIMUM_KERYXD_PEER_VERSION
