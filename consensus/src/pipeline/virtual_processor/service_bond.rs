@@ -637,7 +637,13 @@ impl VirtualStateProcessor {
         for (k, h) in chain_path.added.iter().enumerate() {
             let idx = common + 1 + k as u64;
             let daa = self.headers_store.get_daa_score(*h).unwrap();
-            let (outcome, added) = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, pruning_point, true, false);
+            // Blocks at or below the persisted event frontier carry events the stores already
+            // hold (transferred sealed state, or this node's own earlier flush): folding them
+            // live would re-derive strikes on top of a baseline that already counts them, so the
+            // escalation runs away and burns vaults the network never burned. Mirrors the cold
+            // refold's own warmup rule.
+            let warmup = daa < sync.deep_cursor_daa;
+            let (outcome, added) = self.fold_service_chain_block(&mut sync.ledger, &*sc, *h, pruning_point, true, warmup);
             log_new_service_misses(&mut sync.logged, daa, &outcome.misses);
             sync.undo.insert(idx, VaultUndo { added, misses: outcome.misses.clone(), expired: outcome.expired });
             for miner in outcome.sightings {
