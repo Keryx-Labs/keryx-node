@@ -1089,15 +1089,23 @@ impl VirtualStateProcessor {
         own_pp: Hash,
         daa_bound: u64,
     ) -> u64 {
+        self.window_floor_in_retention(sc, header_pp, own_pp, daa_bound).unwrap_or_else(|| {
+            panic!("the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir")
+        })
+    }
+
+    /// Fallible form of [`Self::reward_window_floor`]: `None` when the window bottom itself sits
+    /// below retained history, so no local floor can reproduce the network's search.
+    pub(super) fn window_floor_in_retention(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        header_pp: Hash,
+        own_pp: Hash,
+        daa_bound: u64,
+    ) -> Option<u64> {
         match sc.get_by_hash(header_pp) {
-            Ok(idx) => idx,
-            Err(_) => {
-                assert!(
-                    self.headers_store.get_daa_score(own_pp).unwrap() <= daa_bound,
-                    "the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir"
-                );
-                sc.get_by_hash(own_pp).unwrap()
-            }
+            Ok(idx) => Some(idx),
+            Err(_) => (self.headers_store.get_daa_score(own_pp).unwrap() <= daa_bound).then(|| sc.get_by_hash(own_pp).unwrap()),
         }
     }
 

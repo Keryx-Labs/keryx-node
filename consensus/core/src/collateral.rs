@@ -220,6 +220,13 @@ pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
 /// response or an executed suspension.
 pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
 
+/// Ceiling, above a syncee's pruning point, for service rows it cannot re-derive itself: such
+/// events come from requests accepted at most an eligibility window above the pruning point
+/// (deeper cohort windows cross unretained history), and a request stops generating events one
+/// ledger horizon after acceptance. The service-state transfer ships every flushed row at or
+/// below `pruning_point + SERVICE_STATE_HANDOFF_DAA`; the syncee re-derives only above it.
+pub const SERVICE_STATE_HANDOFF_DAA: u64 = SERVICE_ELIGIBILITY_WINDOW_DAA + SERVICE_LEDGER_HORIZON_DAA;
+
 /// How long an authenticated response is held when its request has not been accepted yet. An
 /// AiResponse carries no inputs, so nothing orders its acceptance against its request's: the
 /// selected chain can accept it first. Sized on the consensus merge depth

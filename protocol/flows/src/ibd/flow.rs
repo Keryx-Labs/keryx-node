@@ -45,12 +45,24 @@ use super::{HeadersChunk, IBD_BATCH_SIZE, PruningPointUtxosetChunkStream, progre
 type BlockBody = Vec<Transaction>;
 
 /// Flow for managing IBD - Initial Block Download
+/// Event daa of a canonical service-state row, `None` for a malformed one. Mirrors the row
+/// layouts in `service_commit`.
+fn service_row_daa(row: &[u8]) -> Option<u64> {
+    match (*row.first()?, row.len()) {
+        (0x01, 45) => Some(u64::from_le_bytes(row[37..45].try_into().unwrap())),
+        (0x02, 53) => Some(u64::from_le_bytes(row[1..9].try_into().unwrap())),
+        (0x03, 41) => Some(u64::from_le_bytes(row[33..41].try_into().unwrap())),
+        _ => None,
+    }
+}
+
 pub struct IbdFlow {
     pub(super) ctx: FlowContext,
     pub(super) router: Arc<Router>,
     pub(super) incoming_route: IncomingRoute,
     pub(super) body_only_ibd_permitted: bool,
     header_format: HeaderFormat,
+    protocol_version: u32,
 
     // Receives relay blocks from relay flow which are out of orphan resolution range and hence trigger IBD
     relay_receiver: JobReceiver<Block>,
@@ -87,8 +99,9 @@ impl IbdFlow {
         relay_receiver: JobReceiver<Block>,
         body_only_ibd_permitted: bool,
         header_format: HeaderFormat,
+        protocol_version: u32,
     ) -> Self {
-        Self { ctx, router, incoming_route, relay_receiver, body_only_ibd_permitted, header_format }
+        Self { ctx, router, incoming_route, relay_receiver, body_only_ibd_permitted, header_format, protocol_version }
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
@@ -705,6 +718,12 @@ impl IbdFlow {
         if !keryx_consensus_core::pom::service_commit_active(pp_daa) {
             return Ok(());
         }
+        // Peers below v10 ship only rows at or below the pruning point: the handoff band above
+        // it would be silently missing, and the fold cannot re-derive it (its cohort windows
+        // cross unretained history) — the sync would wedge later instead of failing here.
+        if self.protocol_version < 10 {
+            return Err(ProtocolError::Other("peer cannot serve the service-state handoff window — sync from an upgraded peer"));
+        }
         // The expected commitment lives in headers whose own pruning point is the one we synced:
         // the relay header on the fresh-sync path, the local headers-selected-tip on the
         // recovery path (where the pruning point is the local one, not the syncer's).
@@ -725,14 +744,27 @@ impl IbdFlow {
                 RequestServiceStateMessage { pruning_point_hash: Some(pruning_point.into()) }
             ))
             .await?;
+        let handoff_cutoff = pp_daa + keryx_consensus_core::collateral::SERVICE_STATE_HANDOFF_DAA;
         let mut rows: Vec<Vec<u8>> = Vec::new();
+        let mut prefix_rows = 0usize;
         let mut acc = MuHash::new();
         loop {
             match tokio::time::timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
                 Ok(Some(msg)) => match msg.payload {
                     Some(Payload::ServiceStateChunk(chunk)) => {
                         for row in chunk.rows {
-                            acc.add_element(&row);
+                            let daa = service_row_daa(&row)
+                                .ok_or(ProtocolError::Other("malformed service-state row"))?;
+                            if daa > handoff_cutoff {
+                                return Err(ProtocolError::Other("service-state row beyond the handoff ceiling"));
+                            }
+                            // The pruning point's sealed commitment covers rows at or below it.
+                            // Handoff rows above it are vetted by the per-header commitments
+                            // that arrive as the chain grows past them.
+                            if daa <= pp_daa {
+                                acc.add_element(&row);
+                                prefix_rows += 1;
+                            }
                             rows.push(row);
                         }
                     }
@@ -750,16 +782,16 @@ impl IbdFlow {
         }
         // Mirror `commitment_at` exactly: no rows seals nothing, and the expected value is then
         // the zero hash.
-        let computed = if rows.is_empty() { Hash::default() } else { acc.finalize() };
+        let computed = if prefix_rows == 0 { Hash::default() } else { acc.finalize() };
         if computed != expected {
             return Err(ProtocolError::OtherOwned(format!(
                 "service-state verification failed: peer rows hash to {}, header commits {}",
                 computed, expected
             )));
         }
-        let count = rows.len();
+        let handoff_rows = rows.len() - prefix_rows;
         consensus.clone().spawn_blocking(move |c| c.import_service_state(rows)).await?;
-        info!("imported and verified {} sealed service-state rows", count);
+        info!("imported {} sealed service-state rows ({} verified, {} handoff)", prefix_rows + handoff_rows, prefix_rows, handoff_rows);
         Ok(())
     }
 

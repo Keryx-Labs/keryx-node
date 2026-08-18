@@ -1215,3 +1215,16 @@ async fn cohort_window_survives_a_pruned_header_pruning_point() {
     // must not probe below retention on the way there.
     assert!(vp.service_eligible_miners_windowed(tip, 0, 100).is_empty());
 }
+
+/// A cohort window that reaches below the pruned horizon arms empty instead of panicking:
+/// the fold crosses this band on every fresh IBD / restart catch-up, and the events such an
+/// audit could yield are already carried by the service-state transfer.
+#[tokio::test]
+async fn cohort_window_below_the_pruned_horizon_arms_empty() {
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+
+    let (tc, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+    let early = vp.selected_chain_store.read().get_by_index(6).unwrap();
+    assert!(vp.service_eligible_miners_windowed(early, 0, 100).is_empty());
+}

@@ -725,10 +725,15 @@ impl ConsensusApi for Consensus {
         let Some(pp_daa) = self.headers_store.get_daa_score(pruning_point).optional().unwrap() else {
             return Err(ConsensusError::HeaderNotFound(pruning_point));
         };
+        // Rows above the pruning point, up to the handoff ceiling, cover the events a syncee
+        // cannot re-derive (their cohort windows cross its unretained history). They are outside
+        // the pruning point's sealed commitment; the syncee vets them against the per-header
+        // commitments that arrive as the chain grows.
+        let cutoff = pp_daa + keryx_consensus_core::collateral::SERVICE_STATE_HANDOFF_DAA;
         let mut rows: Vec<Vec<u8>> = Vec::new();
         for entry in self.storage.service_burn_store.iterator() {
             let (key, daa) = entry.unwrap();
-            if daa > pp_daa {
+            if daa > cutoff {
                 continue;
             }
             let tx_id: [u8; 32] = key[..32].try_into().unwrap();
@@ -738,14 +743,14 @@ impl ConsensusApi for Consensus {
         for entry in self.storage.service_strike_store.iterator() {
             let (key, record) = entry.unwrap();
             let (daa, miner) = crate::model::stores::service_strike::StrikeLogKey::parse(&key);
-            if daa > pp_daa {
+            if daa > cutoff {
                 continue;
             }
             rows.push(crate::processes::service_commit::strike_row_bytes(daa, miner, record.count, record.last_daa).to_vec());
         }
         for entry in self.storage.service_first_seen_store.iterator() {
             let (key, daa) = entry.unwrap();
-            if daa > pp_daa {
+            if daa > cutoff {
                 continue;
             }
             let miner: [u8; 32] = key[..32].try_into().unwrap();

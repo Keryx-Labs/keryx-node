@@ -65,6 +65,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             relay_receiver,
             body_only_ibd_permitted,
             header_format,
+            7,
         )),
         Box::new(HandleRelayBlockRequests::new(
             ctx.clone(),

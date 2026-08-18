@@ -51,6 +51,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             relay_receiver,
             body_only_ibd_permitted,
             header_format,
+            protocol_version,
         )),
         Box::new(HandleRelayBlockRequests::new(
             ctx.clone(),

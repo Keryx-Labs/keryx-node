@@ -228,7 +228,13 @@ impl VirtualStateProcessor {
         };
         let seed_header = self.headers_store.get_header(seed).unwrap();
         let daa_bound = seed_header.daa_score.saturating_sub(window_daa);
-        let pruning_idx = self.reward_window_floor(sc, seed_header.pruning_point, own_pp, daa_bound);
+        // A window crossing below retained history only happens while re-validating blocks near
+        // the local pruning point (fresh IBD / restart catch-up). Every event such an audit could
+        // yield is finality-flushed and shipped by the service-state transfer, so the audit arms
+        // empty rather than with a cohort no local search can reproduce.
+        let Some(pruning_idx) = self.window_floor_in_retention(sc, seed_header.pruning_point, own_pp, daa_bound) else {
+            return vec![];
+        };
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, seed_idx, pruning_idx).max(pruning_idx);
         let mut recent = Vec::new();
         for i in (bottom + 1)..=seed_idx {
