@@ -93,6 +93,12 @@ impl Mempool {
                 return Err(NonStandardError::RejectScriptPublicKeyVersion(transaction_id, i));
             }
 
+            // The inference reward vault is unspendable by construction: it fits no script class
+            // and the dust rule counts it as dust.
+            if output.script_public_key.script() == &keryx_inference::INFERENCE_VAULT_SCRIPT[..] {
+                continue;
+            }
+
             if ScriptClass::from_script(&output.script_public_key) == ScriptClass::NonStandard {
                 return Err(NonStandardError::RejectOutputScriptClass(transaction_id, i));
             }
@@ -598,5 +604,46 @@ mod tests {
                 assert_eq!(res.is_ok(), test.is_standard, "ensuring transaction standard-ness is as expected");
             }
         }
+    }
+
+    /// The inference reward vault is unspendable and matches no script class, so both the class
+    /// rule and the dust rule would reject it. The exception is an exact-script match: a
+    /// look-alike OP_RETURN stays non-standard.
+    #[test]
+    fn inference_vault_output_is_standard() {
+        let dummy_prev_out = TransactionOutpoint::new(keryx_hashes::Hash::from_u64_word(1), 1);
+        let dummy_tx_input = TransactionInput::new(dummy_prev_out, vec![0u8; 65], MAX_TX_IN_SEQUENCE_NUM, 1);
+        let addr = Address::new(Prefix::Testnet, Version::PubKey, &vec![1u8; 32]);
+        let change = TransactionOutput::new(SOMPI_PER_KASPA, keryx_txscript::pay_to_address_script(&addr));
+
+        let with_escrow = |spk: ScriptPublicKey| {
+            let tx = Transaction::new(
+                TX_VERSION,
+                vec![dummy_tx_input.clone()],
+                vec![change.clone(), TransactionOutput::new(SOMPI_PER_KASPA, spk)],
+                0,
+                SUBNETWORK_ID_NATIVE,
+                0,
+                vec![],
+            );
+            let mut mtx = MutableTransaction::from_tx(tx);
+            mtx.calculated_non_contextual_masses = Some(NonContextualMasses::new(1000, 1000));
+            mtx
+        };
+
+        let params: Params = NetworkType::Mainnet.into();
+        let config = Config::build_default(params.target_time_per_block(), false, params.max_block_mass);
+        let mempool = Mempool::new(Arc::new(config), Arc::new(MiningCounters::default()));
+
+        let vault = ScriptPublicKey::new(0, ScriptVec::from_slice(&keryx_inference::INFERENCE_VAULT_SCRIPT));
+        assert!(mempool.check_transaction_standard_in_isolation(&with_escrow(vault)).is_ok());
+
+        let mut look_alike = vec![OpReturn, 0x07];
+        look_alike.extend_from_slice(b"aivaulu");
+        let look_alike = ScriptPublicKey::new(0, ScriptVec::from_vec(look_alike));
+        assert!(matches!(
+            mempool.check_transaction_standard_in_isolation(&with_escrow(look_alike)),
+            Err(NonStandardError::RejectOutputScriptClass(_, 1))
+        ));
     }
 }
