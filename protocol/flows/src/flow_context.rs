@@ -801,9 +801,10 @@ const H7_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 8);
 /// Minimum keryxd peer version accepted once our virtual daa has crossed the H8 gate: past it a
 /// request is identified by its transaction id, its reward is locked in the keyless vault and
 /// minted by the coinbase, and a repeated identity no longer arms a second audit — all of which a
-/// pre-H8 build derives differently, so it disagrees with our blocks. Same monotonic-ordering note
-/// as above.
-const H8_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 9);
+/// pre-H8 build derives differently, so it disagrees with our blocks. Earlier builds also refuse
+/// the vault output as non-standard, so they never relay an inference request. Same
+/// monotonic-ordering note as above.
+const H8_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 5, 0);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
