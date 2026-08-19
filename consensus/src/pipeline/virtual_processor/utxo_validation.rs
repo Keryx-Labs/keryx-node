@@ -2028,6 +2028,101 @@ mod tests {
         Transaction::new(0, vec![], outputs, 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize())
     }
 
+    fn vault_script() -> ScriptPublicKey {
+        ScriptPublicKey::new(0, keryx_inference::INFERENCE_VAULT_SCRIPT.to_vec().into())
+    }
+
+    /// Same shape as [`ai_request_with_reward`], with `outputs[1]` under the caller's script and
+    /// value — the two things the H8 routing branch decides on.
+    fn ai_request_with_escrow(model_id: [u8; 32], inference_reward: u64, value: u64, script: ScriptPublicKey) -> Transaction {
+        let req = AiRequestPayload::new(model_id, 100, inference_reward, 30_000_000, b"test prompt".to_vec());
+        let outputs =
+            vec![TransactionOutput::new(1, ScriptPublicKey::new(0, vec![].into())), TransactionOutput::new(value, script)];
+        Transaction::new(0, vec![], outputs, 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize())
+    }
+
+    /// Reward high enough to clear the effective minimum for `max_tokens = 100`.
+    fn routed_reward(base: u64) -> u64 {
+        base + 2 * INFERENCE_REWARD_TOKEN_STEP
+    }
+
+    #[test]
+    fn vault_escrow_is_accepted_past_the_routing_gate() {
+        let model_id = [0x77u8; 32];
+        let base = 400_000_000u64;
+        let reward = routed_reward(base);
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward, vault_script())];
+        assert!(check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true).is_ok());
+    }
+
+    /// The cutover is sharp in both directions: a client that keeps naming a miner past the gate
+    /// is refused, exactly as a client locking the vault before it.
+    #[test]
+    fn csv_escrow_is_rejected_past_the_routing_gate() {
+        let model_id = [0x77u8; 32];
+        let base = 400_000_000u64;
+        let reward = routed_reward(base);
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward, csv_p2pk_script())];
+        assert!(matches!(
+            check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true),
+            Err(AiRequestInvalidEscrowScript(_))
+        ));
+    }
+
+    #[test]
+    fn vault_escrow_is_rejected_before_the_routing_gate() {
+        let model_id = [0x77u8; 32];
+        let base = 400_000_000u64;
+        let reward = routed_reward(base);
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward, vault_script())];
+        assert!(matches!(
+            check_ai_request_payload_rules_all(&txs, &[(model_id, base)], false),
+            Err(AiRequestInvalidEscrowScript(_))
+        ));
+    }
+
+    /// The vault is matched on script *and* version: the coinbase mint reads the canonical form
+    /// only, so a look-alike at another version must not lock a reward.
+    #[test]
+    fn vault_escrow_at_a_nonzero_script_version_is_rejected() {
+        let model_id = [0x77u8; 32];
+        let base = 400_000_000u64;
+        let reward = routed_reward(base);
+        let odd_version = ScriptPublicKey::new(1, keryx_inference::INFERENCE_VAULT_SCRIPT.to_vec().into());
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward, odd_version)];
+        assert!(matches!(
+            check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true),
+            Err(AiRequestInvalidEscrowScript(_))
+        ));
+    }
+
+    /// The mint pays `inference_reward`, so a vault holding less than that would mint coins the
+    /// request never locked.
+    #[test]
+    fn underfunded_vault_is_rejected_past_the_routing_gate() {
+        let model_id = [0x77u8; 32];
+        let base = 400_000_000u64;
+        let reward = routed_reward(base);
+        let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward - 1, vault_script())];
+        assert!(matches!(
+            check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true),
+            Err(AiRequestEscrowBelowInferenceReward(_, _, _))
+        ));
+    }
+
+    #[test]
+    fn missing_escrow_output_is_rejected_past_the_routing_gate() {
+        let model_id = [0x77u8; 32];
+        let base = 400_000_000u64;
+        let req = AiRequestPayload::new(model_id, 100, routed_reward(base), 30_000_000, b"test prompt".to_vec());
+        let outputs = vec![TransactionOutput::new(1, ScriptPublicKey::new(0, vec![].into()))];
+        let tx = Transaction::new(0, vec![], outputs, 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize());
+        assert!(matches!(
+            check_ai_request_payload_rules_all(&[make_coinbase_no_caps(), tx], &[(model_id, base)], true),
+            Err(AiRequestMissingEscrowOutput(_))
+        ));
+    }
+
     #[test]
     fn reward_at_the_effective_minimum_is_accepted() {
         let model_id = [0x55u8; 32];
