@@ -148,6 +148,7 @@ impl ProofContext {
                     reachability_services[level].clone(),
                     level as BlockLevel,
                     ppm.max_block_level,
+                    ppm.pom_maxlevel_v4_activation,
                 )
             })
             .collect_vec();

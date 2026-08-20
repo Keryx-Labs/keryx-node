@@ -3,6 +3,7 @@ use std::sync::Arc;
 use keryx_consensus_core::{
     BlockHashMap, BlockLevel, BlueWorkType, HashMapCustomHasher,
     blockhash::{self, BlockHashExtensions, BlockHashes},
+    config::params::{ForkActivation, resolve_max_block_level},
 };
 use keryx_hashes::Hash;
 use keryx_utils::refs::Refs;
@@ -30,14 +31,14 @@ pub struct GhostdagManager<T: GhostdagStoreReader, S: RelationsStoreReader, U: R
     pub(super) headers_store: Arc<V>,
     pub(super) reachability_service: U,
 
-    /// Level work is a lower-bound for the amount of work represented by each block.
-    /// When running GD for higher-level sub-DAGs, this value should be set accordingly
-    /// to the work represented by that level, and then used as a lower bound
-    /// for the work calculated from header bits (which depends on current difficulty).
-    /// For instance, assuming level 80 (i.e., pow hash has at least 80 zeros) is always
-    /// above the difficulty target, all blocks in it should represent the same amount of
-    /// work regardless of whether current difficulty requires 20 zeros or 25 zeros.  
-    level_work: BlueWorkType,
+    /// GHOSTDAG level of this sub-DAG (0 for ordinary GD). Higher levels floor each block's work
+    /// at `level_work(level, anchor)` so blocks represent the same work regardless of difficulty.
+    /// The anchor is resolved per block from its DAA score (`resolve_max_block_level`), so it stays
+    /// consistent with the era's level assignment; `structural_max`/`level_anchor_activation` are
+    /// unused at level 0 (floor is always 0).
+    level: BlockLevel,
+    structural_max: BlockLevel,
+    level_anchor_activation: ForkActivation,
 }
 
 impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V: HeaderStoreReader> GhostdagManager<T, S, U, V> {
@@ -49,8 +50,18 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         headers_store: Arc<V>,
         reachability_service: U,
     ) -> Self {
-        // For ordinary GD, always keep level_work=0 so the lower bound is ineffective
-        Self { genesis_hash, k, ghostdag_store, relations_store, reachability_service, headers_store, level_work: 0.into() }
+        // For ordinary GD, level 0 keeps the floor at 0 so the lower bound is ineffective
+        Self {
+            genesis_hash,
+            k,
+            ghostdag_store,
+            relations_store,
+            reachability_service,
+            headers_store,
+            level: 0,
+            structural_max: 0,
+            level_anchor_activation: ForkActivation::never(),
+        }
     }
 
     pub fn with_level(
@@ -62,6 +73,7 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
         reachability_service: U,
         level: BlockLevel,
         max_block_level: BlockLevel,
+        level_anchor_activation: ForkActivation,
     ) -> Self {
         Self {
             genesis_hash,
@@ -70,7 +82,20 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             relations_store,
             reachability_service,
             headers_store,
-            level_work: level_work(level, max_block_level),
+            level,
+            structural_max: max_block_level,
+            level_anchor_activation,
+        }
+    }
+
+    /// Per-block work floor for this level, matching the era's level-assignment anchor
+    /// (`resolve_max_block_level`). Level 0 has no floor.
+    #[inline]
+    fn level_work_floor(&self, daa_score: u64) -> BlueWorkType {
+        if self.level == 0 {
+            0.into()
+        } else {
+            level_work(self.level, resolve_max_block_level(self.level_anchor_activation, self.structural_max, daa_score))
         }
     }
 
@@ -156,7 +181,14 @@ impl<T: GhostdagStoreReader, S: RelationsStoreReader, U: ReachabilityService, V:
             .mergeset_blues
             .iter()
             .cloned()
-            .map(|hash| calc_work(self.headers_store.get_bits(hash).unwrap()).max(self.level_work))
+            .map(|hash| {
+                let work = calc_work(self.headers_store.get_bits(hash).unwrap());
+                if self.level == 0 {
+                    work
+                } else {
+                    work.max(self.level_work_floor(self.headers_store.get_daa_score(hash).unwrap()))
+                }
+            })
             .sum();
         let blue_work: BlueWorkType = self.ghostdag_store.get_blue_work(selected_parent).unwrap() + added_blue_work;
 

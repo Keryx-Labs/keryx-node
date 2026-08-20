@@ -592,6 +592,7 @@ impl PruningProofManager {
             reachability_service.clone(),
             level,
             self.max_block_level,
+            self.pom_maxlevel_v4_activation,
         );
 
         // No need to initialize origin since we have a single root
