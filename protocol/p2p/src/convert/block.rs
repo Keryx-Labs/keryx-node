@@ -82,6 +82,8 @@ mod tests {
                 trace_path_after: vec![[9u8; 32]],
             }],
             steps_v2: None,
+            v3: None,
+            v4: None,
         }
     }
 
@@ -99,6 +101,8 @@ mod tests {
                 PomStep { chunk: [1u8; 32], weight_path: vec![[2u8; 32]] },
                 PomStep { chunk: [3u8; 32], weight_path: vec![[4u8; 32], [5u8; 32]] },
             ]),
+            v3: None,
+            v4: None,
         }
     }
 

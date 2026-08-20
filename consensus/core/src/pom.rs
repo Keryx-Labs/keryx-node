@@ -134,6 +134,11 @@ pub struct PomProof {
     /// (= the era pow fold of `final_state`). Trailing field with the same era-exact wire
     /// mechanism as `steps_v2`: proofs without it re-encode through `PomProofPreV3`.
     pub v3: Option<crate::pom_v3::PomProofV3>,
+    /// v4 re-walk witness (`pom_v4::verify_pom_proof_v4_container`). When present the legacy
+    /// fields and `v3` are canonical placeholders; `final_state` = the verifier-derived walk
+    /// result and `pow_value` = the v4 era fold (nonce-bound). Trailing field, same era-exact
+    /// wire mechanism as `v3`: proofs without it re-encode through `PomProofPreV4`.
+    pub v4: Option<crate::pom_v4::PomProofV4>,
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`). Decode-fallback target for legacy
@@ -168,6 +173,55 @@ pub struct PomProofPreV3 {
     pub steps_v2: Option<Vec<PomStep>>,
 }
 
+/// Exact pre-v4 layout of `PomProof` (through `v3`, no `v4`). Decode-fallback and byte-identical
+/// encode source for proofs without the v4 extension — same mechanism as `PomProofPreV3`.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PomProofPreV4 {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+    pub v3: Option<crate::pom_v3::PomProofV3>,
+}
+
+impl From<PomProofPreV4> for PomProof {
+    fn from(p: PomProofPreV4) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: p.v3,
+            v4: None,
+        }
+    }
+}
+
+impl From<&PomProof> for PomProofPreV4 {
+    fn from(p: &PomProof) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path.clone(),
+            final_trace_path: p.final_trace_path.clone(),
+            openings: p.openings.clone(),
+            steps_v2: p.steps_v2.clone(),
+            v3: p.v3.clone(),
+        }
+    }
+}
+
 impl From<PomProofPreV3> for PomProof {
     fn from(p: PomProofPreV3) -> Self {
         Self {
@@ -180,6 +234,7 @@ impl From<PomProofPreV3> for PomProof {
             openings: p.openings,
             steps_v2: p.steps_v2,
             v3: None,
+            v4: None,
         }
     }
 }
@@ -211,6 +266,7 @@ impl From<PomProofPreH4> for PomProof {
             openings: p.openings,
             steps_v2: None,
             v3: None,
+            v4: None,
         }
     }
 }
@@ -246,7 +302,8 @@ impl PomProof {
         let steps: usize =
             self.steps_v2.as_ref().map_or(0, |steps| steps.iter().map(|s| 32 + path_bytes(&s.weight_path)).sum());
         let v3: usize = self.v3.as_ref().map_or(0, |v3| v3.approx_bytes());
-        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps + v3
+        let v4: usize = self.v4.as_ref().map_or(0, |v4| v4.approx_bytes());
+        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps + v3 + v4
     }
 
     /// Canonical wire (borsh) encoding, era-exact: a proof without the v3 extension encodes
@@ -254,8 +311,10 @@ impl PomProof {
     /// layout), so re-served older blocks stay readable by not-yet-updated peers. ALL borsh
     /// encode sites MUST use this instead of `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        if self.v3.is_some() {
+        if self.v4.is_some() {
             borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.v3.is_some() {
+            borsh::to_vec(&PomProofPreV4::from(self)).expect("PomProof borsh serialize")
         } else if self.steps_v2.is_some() {
             borsh::to_vec(&PomProofPreV3::from(self)).expect("PomProof borsh serialize")
         } else {
@@ -269,6 +328,7 @@ impl PomProof {
     /// the layouts can never be confused. ALL borsh decode sites MUST use this.
     pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreV4>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
@@ -460,6 +520,31 @@ pub fn pom_pow_value(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
 /// H3-era pow value: same fold over the salted pre_pow_hash words.
 pub fn pom_pow_value_h3(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
     pom_pow_value_from_words(final_state, &pph_words_h3(pre_pow_hash))
+}
+
+/// v4 seed/pow salts. sha256("keryx-v4-pph-salt") / sha256("keryx-v4-pow-nonce-salt").
+pub const POM_V4_PPH_SALT: [u64; 4] = [0x7D7BC84C8D18DE80, 0xDE48EE16AE3F1541, 0x3305F1952B30384A, 0xF78C133968D388B7];
+pub const POM_V4_POW_NONCE_SALT: u64 = 0xD1507C9337DBF7D8;
+
+#[inline]
+fn pph_words_v4(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
+    let mut w = pph_words(pre_pow_hash);
+    for (wi, si) in w.iter_mut().zip(POM_V4_PPH_SALT.iter()) {
+        *wi ^= si;
+    }
+    w
+}
+
+/// v4-era block seed: fold over the v4-salted pre_pow_hash words (nonce already folded in).
+pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_from_words(&pph_words_v4(pre_pow_hash), timestamp, nonce)
+}
+
+/// v4-era pow value: folds the nonce into `final_state` before the word fold, so a given
+/// `final_state` cannot be replayed across nonces.
+pub fn pom_pow_value_v4(final_state: u64, pre_pow_hash: &[u8; 32], nonce: u64) -> [u8; 32] {
+    let fs = mix64(final_state ^ mix64(nonce ^ POM_V4_POW_NONCE_SALT));
+    pom_pow_value_from_words(fs, &pph_words_v4(pre_pow_hash))
 }
 
 /// Pre-H5 possession transition (FROZEN — validates all blocks below `h5_activation`). The 4 chunk
@@ -820,6 +905,7 @@ mod verify_tests {
             openings,
             steps_v2: None,
             v3: None,
+            v4: None,
         };
         (proof, r_t, seed)
     }
@@ -850,6 +936,7 @@ mod verify_tests {
             openings: vec![],
             steps_v2: Some(steps),
             v3: None,
+            v4: None,
         };
         (proof, r_t)
     }

@@ -412,6 +412,7 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
             openings: vec![],
             steps_v2: None,
             v3: None,
+            v4: None,
         }
     }
 
@@ -523,6 +524,7 @@ async fn service_cohort_from_recent_tier_producers() {
             openings: vec![],
             steps_v2: None,
             v3: None,
+            v4: None,
         }
     }
 

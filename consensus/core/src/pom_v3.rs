@@ -752,6 +752,7 @@ mod tests {
             openings: vec![],
             steps_v2: None,
             v3: Some(v3),
+            v4: None,
         };
         let target = [0xFFu8; 32]; // trivial target: this test is not about the lottery
         assert_eq!(
