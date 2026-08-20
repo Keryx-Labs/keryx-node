@@ -786,4 +786,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsampled_state_root_is_not_bound() {
+        // REGRESSION for the nonce-replay flaw — see docs/security/pom_v3_nonce_replay.md.
+        //
+        // verify_pom_proof_v3 opens only POM_V3_CHECKS (32) single entries out of the K=256
+        // PROVER-committed state roots. roots[0] is pinned to S_0(seed) and roots[K] feeds the
+        // lottery, but any intermediate root the PRF does not sample is NEVER opened — so it
+        // can carry arbitrary garbage and the proof still verifies. That un-bound middle is the
+        // enabler for the observed attack: a prover keeps one real walk's endpoint (final_state)
+        // while presenting it under many distinct nonces/seeds, because only the endpoint + 32
+        // samples are checked and the chain between them is free. Difficulty (pom_pow_value) is a
+        // function of final_state only (no nonce), so the replay clears any target and vardiff
+        // cannot throttle it. Observed live: 39 distinct nonces -> 1 final_state, all accepted,
+        // including under force_possession.
+        //
+        // This test currently PASSES (Ok) — i.e. it documents the flaw. Under a correct fix
+        // (bind the whole chain roots[0..=K], e.g. recompute-from-chunks like v2) it must flip
+        // to rejecting the corrupted proof.
+        let (blob, leaves) = test_blob(16);
+        let root = rt_root(&leaves);
+        let n_chunks = (blob.len() / POM_V3_CHUNK_BYTES) as u64;
+        let walk = v3_walk(SEED, &blob).unwrap();
+        let honest_roots: Vec<[u8; 32]> = walk.states.iter().map(v3_state_root).collect();
+
+        // Corrupt a mid-chain state commitment (not 0, not K). Grid-search a garbage value whose
+        // resulting PRF sampling avoids tstar and tstar+1, so no opening references the corrupted
+        // state and every opening below can be built honestly.
+        let tstar = POM_V3_K / 2;
+        let mut roots = honest_roots.clone();
+        let mut found = false;
+        for c in 0u64..8192 {
+            roots[tstar] = blake(&c.to_le_bytes());
+            let pts = v3_check_points(&PPH, NONCE, &roots, &walk.snippets);
+            if pts.iter().all(|&(t, _, _)| t as usize != tstar && t as usize != tstar + 1) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "could not place the corruption on an unsampled step");
+        assert_ne!(roots[tstar], honest_roots[tstar], "corruption must change the mid-chain root");
+
+        // Build openings honestly for the (corruption-dependent) sampled points. None reference
+        // states[tstar] because the sampling avoids tstar / tstar+1.
+        let points = v3_check_points(&PPH, NONCE, &roots, &walk.snippets);
+        let mut proof = PomProofV3 {
+            tier: 0,
+            roots,
+            snippets: walk.snippets.clone(),
+            checks: vec![
+                PomV3Opening {
+                    row_before: vec![0; POM_V3_D], path_before: vec![],
+                    row_after: vec![0; POM_V3_D], path_after: vec![],
+                    tile_col: vec![0; POM_V3_D], col_path: vec![], snippet_path: vec![],
+                };
+                POM_V3_CHECKS
+            ],
+        };
+        for (open, &(t, x, _)) in proof.checks.iter_mut().zip(points.iter()) {
+            let (ti, xi) = (t as usize, x as usize);
+            open.row_before = walk.states[ti - 1][xi * POM_V3_D..(xi + 1) * POM_V3_D].to_vec();
+            open.path_before = v3_state_row_path(&walk.states[ti - 1], xi);
+            open.row_after = walk.states[ti][xi * POM_V3_D..(xi + 1) * POM_V3_D].to_vec();
+            open.path_after = v3_state_row_path(&walk.states[ti], xi);
+        }
+        let full = v3_prove_at_points(&points, &walk, &blob, &leaves, &mut proof.clone());
+
+        // THE FLAW: verify accepts a proof carrying a garbage intermediate state commitment.
+        // A sound scheme must bind the WHOLE state chain, not endpoint + 32 samples.
+        assert_eq!(
+            verify_pom_proof_v3(&PPH, NONCE, SEED, &full, &root, n_chunks),
+            Ok(()),
+            "verify accepted a proof whose mid-chain state root is garbage — chain is not bound"
+        );
+    }
+
 }
