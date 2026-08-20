@@ -319,27 +319,25 @@ pub const POM_OPENINGS: usize = 32;
 /// locator reaches ~2^9 = 512 blocks), and `check_orphan_ibd_conditions` hands over to IBD as soon
 /// as the orphan leaves `[ibd_daa - max_orphans/10, ibd_daa + max_orphans/2)` with
 /// `max_orphans = MAX_ORPHANS_UPPER_BOUND = 1024`. The real horizon is therefore ~1 024 DAA; this
-/// value keeps a ~5x margin over it. A value set too low is self-detecting rather than silent:
+/// value keeps a ~1.5x margin over it. A value set too low is self-detecting rather than silent:
 /// `warn_if_serving_naked_pom_block` raises an `error!` the first time a block inside the window
 /// would be served naked — the wedge condition, caught before it cascades.
-pub const POM_PROOF_SERVE_DEPTH_DAA: u64 = 5_000;
+pub const POM_PROOF_SERVE_DEPTH_DAA: u64 = 1_500;
 
 /// Selected-chain depth, in CHAIN BLOCKS, behind which a persisted `PomProof` may be
 /// garbage-collected. Deliberately a different unit from [`POM_PROOF_SERVE_DEPTH_DAA`], and
-/// deliberately NOT the same horizon: the GC must retain a strict SUPERSET of what serving can
-/// still be asked for, or it deletes a proof the node is about to ship — exactly the naked-block
-/// wedge of 2026-06-29. At 10 BPS a chain block lands roughly every ~10 DAA, so this value spans
-/// ~15 000 DAA, still ~3x the serving threshold. Keep GC ≫ serve when tuning either; equalising
-/// them would remove that safety margin, not tidy it up.
+/// deliberately NOT the same horizon: the GC must retain a SUPERSET of what serving can still be
+/// asked for (`POM_PROOF_SERVE_DEPTH_DAA`), or it deletes a proof the node is about to ship —
+/// exactly the naked-block wedge of 2026-06-29. On this chain the selected-chain daa advances
+/// ~1 per chain block, so this value must stay above the serve depth in DAA, or it reopens the
+/// wedge the guard-rail warns about.
 ///
-/// Lowered 25_000 → 5_000 at the H5.3 relaunch, then → 1_500 at the v4 relaunch (larger proofs,
-/// smaller window). A coordinated upgrade, which this needs: a node that GCs earlier than its
-/// peers serves proofless blocks inside the window they still expect.
+/// Lowered 25_000 → 5_000 at the H5.3 relaunch, → 2_000 (serve depth 1_500) at the v4 relaunch.
 ///
 /// Deleting a proof can never corrupt consensus state: it is not part of the UTXO set, and the
 /// header `utxo_commitment` already pins the state. The GC pass runs unconditionally on every node
 /// (see the pruning processor) — no flag, transparent — so pruned datadirs stay bounded by design.
-pub const POM_PROOF_GC_DEPTH_CHAIN_BLOCKS: u64 = 1_500;
+pub const POM_PROOF_GC_DEPTH_CHAIN_BLOCKS: u64 = 2_000;
 
 /// Level-derivation anchor at/after `pom_maxlevel_v4_activation`. Must exceed the largest
 /// `target.bits()` the chain runs at (239 at `genesis.bits = 0x1e7fffff`) with margin, and stay
