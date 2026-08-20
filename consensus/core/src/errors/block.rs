@@ -108,6 +108,9 @@ pub enum RuleError {
     #[error("invalid PoM v3 (H6 matrix-walk) proof: {0:?}")]
     BadPomProofV3(crate::pom_v3::PomV3VerifyError),
 
+    #[error("invalid PoM v4 (re-walk) proof: {0:?}")]
+    BadPomProofV4(crate::pom_v4::PomV4VerifyError),
+
     #[error("header pom_final_state {0} does not match the possession proof final state {1}")]
     PomFinalStateMismatch(u64, u64),
 

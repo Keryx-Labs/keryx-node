@@ -1119,6 +1119,11 @@ pub struct Params {
     /// `max_block_level_at(daa_score)`. `never()` to disable.
     pub pom_maxlevel_v4_activation: ForkActivation,
 
+    /// PoM proof-format v4 (re-walk) hardfork activation DAA score. At/after this score the
+    /// block PoM witness is verified by `verify_pom_proof_v4_container` (re-walk) instead of
+    /// the v3 spot-check. Node+miner lockstep. `never()` to disable.
+    pub pom_v4_activation: ForkActivation,
+
     /// Ratio-reward (holder-weighted miner-cut bonus) activation DAA score. At/after this score
     /// the coinbase miner cut is scaled by the producer's holder ratio bracket (`RATIO_REWARD_BPS`,
     /// computed by the node from the balance + windowed-production indexes). DAA-gated so IBD
@@ -1448,6 +1453,7 @@ impl Params {
             pow_salt_v4_activation: self.pow_salt_v4_activation,
 
             pom_maxlevel_v4_activation: self.pom_maxlevel_v4_activation,
+            pom_v4_activation: self.pom_v4_activation,
 
             ratio_reward_activation: self.ratio_reward_activation,
             ratio_verification_activation: self.ratio_verification_activation,
@@ -1608,6 +1614,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
     pom_maxlevel_v4_activation: ForkActivation::never(),
+    pom_v4_activation: ForkActivation::never(),
 
     // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
     // 2026-06-26 18:00 UTC at 10 BPS (measured: DAA 34_950_043 at 2026-06-23 11:24 UTC; +282_960 s
@@ -1752,6 +1759,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
     pow_salt_v4_activation: ForkActivation::new(0),
     pom_maxlevel_v4_activation: ForkActivation::never(),
+    pom_v4_activation: ForkActivation::never(),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
     ratio_reward_activation: ForkActivation::new(0),
@@ -1851,6 +1859,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
+    pom_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
@@ -1928,6 +1937,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
+    pom_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),

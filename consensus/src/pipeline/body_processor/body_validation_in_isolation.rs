@@ -13,10 +13,11 @@ use keryx_consensus_core::{
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
     pom::{
-        PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_pow_value, pom_pow_value_h3,
-        verify_pom_proof, verify_pom_proof_v2,
+        PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_block_seed_v4, pom_pow_value,
+        pom_pow_value_h3, pom_pow_value_v4, verify_pom_proof, verify_pom_proof_v2,
     },
     pom_v3::verify_pom_proof_v3_container,
+    pom_v4::verify_pom_proof_v4_container,
     tx::TransactionOutpoint,
 };
 use keryx_database::prelude::StoreError;
@@ -247,6 +248,7 @@ impl BlockBodyProcessor {
         // own daa_score so archival/IBD recomputation stays canonical. H4 co-activates with the
         // recompute-from-chunks verifier; H5 rides the same v2 verifier with the non-foldable walk.
         let pom_v3 = self.pom_v3_activation.is_active(header.daa_score);
+        let pom_v4 = self.pom_v4_activation.is_active(header.daa_score);
         let tiers = pom_tiers(
             pom_v3,
             self.h5_activation.is_active(header.daa_score),
@@ -272,7 +274,9 @@ impl BlockBodyProcessor {
         // H5.2 (chain anchoring): salt v3 for the walk seed at/after the gate — same forced-update
         // mechanism as H5.1, capping every pre-gate fork point of the relaunched chain.
         let h5_2 = self.h5_2_activation.is_active(header.daa_score);
-        let seed = if h5_2 {
+        let seed = if pom_v4 {
+            pom_block_seed_v4(&pre_pow_hash, header.timestamp, header.nonce)
+        } else if h5_2 {
             pom_block_seed_h5_2(&pre_pow_hash, header.timestamp, header.nonce)
         } else if h5_1 {
             pom_block_seed_h5_1(&pre_pow_hash, header.timestamp, header.nonce)
@@ -282,7 +286,15 @@ impl BlockBodyProcessor {
             pom_block_seed(&pre_pow_hash, header.timestamp, header.nonce)
         };
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
-        let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
+        let final_hash = |s: u64| {
+            if pom_v4 {
+                pom_pow_value_v4(s, &pre_pow_hash, header.nonce)
+            } else if h3 {
+                pom_pow_value_h3(s, &pre_pow_hash)
+            } else {
+                pom_pow_value(s, &pre_pow_hash)
+            }
+        };
 
         // H6: matrix-walk witness (pom_v3). The verifier NEVER re-walks (that would be
         // K * D^3 = 4.3 GMACs per block — IBD in days, the H3 lesson): it re-derives the offset
@@ -291,6 +303,11 @@ impl BlockBodyProcessor {
         // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
         // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
         // later), so the pin check above already ran.
+        if pom_v4 {
+            return verify_pom_proof_v4_container(seed, proof, tier.chunks, &tier.root, &target, final_hash)
+                .map_err(RuleError::BadPomProofV4);
+        }
+
         if pom_v3 {
             return verify_pom_proof_v3_container(
                 &pre_pow_hash,
