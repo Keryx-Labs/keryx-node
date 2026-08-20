@@ -522,9 +522,8 @@ pub fn pom_pow_value_h3(final_state: u64, pre_pow_hash: &[u8; 32]) -> [u8; 32] {
     pom_pow_value_from_words(final_state, &pph_words_h3(pre_pow_hash))
 }
 
-/// v4 seed/pow salts. sha256("keryx-v4-pph-salt") / sha256("keryx-v4-pow-nonce-salt").
+/// v4 seed salt. sha256("keryx-v4-pph-salt").
 pub const POM_V4_PPH_SALT: [u64; 4] = [0x7D7BC84C8D18DE80, 0xDE48EE16AE3F1541, 0x3305F1952B30384A, 0xF78C133968D388B7];
-pub const POM_V4_POW_NONCE_SALT: u64 = 0xD1507C9337DBF7D8;
 
 #[inline]
 fn pph_words_v4(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
@@ -540,12 +539,6 @@ pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) ->
     pom_block_seed_from_words(&pph_words_v4(pre_pow_hash), timestamp, nonce)
 }
 
-/// v4-era pow value: folds the nonce into `final_state` before the word fold, so a given
-/// `final_state` cannot be replayed across nonces.
-pub fn pom_pow_value_v4(final_state: u64, pre_pow_hash: &[u8; 32], nonce: u64) -> [u8; 32] {
-    let fs = mix64(final_state ^ mix64(nonce ^ POM_V4_POW_NONCE_SALT));
-    pom_pow_value_from_words(fs, &pph_words_v4(pre_pow_hash))
-}
 
 /// Pre-H5 possession transition (FROZEN — validates all blocks below `h5_activation`). The 4 chunk
 /// words are XOR-folded into a single 64-bit accumulator before one `mix64`, so only their XOR

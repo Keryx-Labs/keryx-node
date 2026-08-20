@@ -425,11 +425,11 @@ mod tests {
         let n_chunks = (blob.len() / POM_V4_CHUNK_BYTES) as u64;
         let seed = 0x5151_5151_5151_5151;
         let pph = [3u8; 32];
-        let nonce = 99u64;
+        let _nonce = 99u64;
 
         let v4 = v4_prove(seed, 2, &blob, &leaves).unwrap();
         let fs = verify_pom_proof_v4(seed, &v4, &r_t, n_chunks).unwrap();
-        let final_hash = |s: u64| crate::pom::pom_pow_value_v4(s, &pph, nonce);
+        let final_hash = |s: u64| crate::pom::pom_pow_value_h3(s, &pph);
         let pow = final_hash(fs);
         let target = [0xffu8; 32];
         let proof = container(v4, fs, pow);
@@ -443,11 +443,11 @@ mod tests {
         let n_chunks = (blob.len() / POM_V4_CHUNK_BYTES) as u64;
         let seed = 0x2626_2626_2626_2626;
         let pph = [8u8; 32];
-        let nonce = 5u64;
+        let _nonce = 5u64;
 
         let v4 = v4_prove(seed, 2, &blob, &leaves).unwrap();
         let fs = verify_pom_proof_v4(seed, &v4, &r_t, n_chunks).unwrap();
-        let final_hash = |s: u64| crate::pom::pom_pow_value_v4(s, &pph, nonce);
+        let final_hash = |s: u64| crate::pom::pom_pow_value_h3(s, &pph);
         // Claim a final_state that isn't what the walk derives.
         let bad = fs ^ 1;
         let proof = container(v4, bad, final_hash(bad));
