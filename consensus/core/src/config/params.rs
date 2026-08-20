@@ -204,22 +204,24 @@ pub const H5_4_ACTIVATION_DAA: u64 = 63_280_622;
 /// DAG knows the block — or, after the anchor gets pruned, once the local pruning point sits
 /// at/above the anchor daa (only the anchored chain validates past the H5.2 gate, so a
 /// post-anchor pruning point witnesses it). Fresh-bootstrap nodes are never affected.
-/// Selected-chain block 9d68af87fa9f312f33b6a2dd4009b3ed33bb42556cf2bcf643a56ec759ddbb48,
-/// pinned 2026-08-15 on the H6 (v1.4.7) relaunch chain. It MUST sit above the score where the
-/// abandoned branch diverged (the H6 relaunch snapshot tip, DAA 76_316_622): both branches
+/// Selected-chain block 4a67afe0d5ccd72df90f24f67dac8fcce8bf968ca1cdbf969262237724768359,
+/// pinned 2026-08-20 on the v4 relaunch chain. It MUST sit above the score where the
+/// abandoned branch diverged (the v4 relaunch frontier, DAA 79_210_000): both branches
 /// share every block below that score, so only a block above it discriminates. Re-pin it whenever
 /// the relaunch base is rebuilt — an anchor absent from the local DAG leaves `anchor_witnessed`
 /// false, which disarms the check silently rather than breaking it.
-/// (Previous anchors: bb184bbc384e45ea2c0113bb51dcf95226eaadca89387760a60f5299023cc4f4, daa
+/// (Previous anchors: 9d68af87fa9f312f33b6a2dd4009b3ed33bb42556cf2bcf643a56ec759ddbb48, daa
+/// 76_317_223, pinned 2026-08-15 for the H6 (v1.4.7) relaunch;
+/// bb184bbc384e45ea2c0113bb51dcf95226eaadca89387760a60f5299023cc4f4, daa
 /// 63_277_286, pinned 2026-07-31 for the H5.4 relaunch;
 /// d5f19559ff7cc7c482e5ae6c06d5c3d5f7988daf815b17dd41e93974fa09696f, daa
 /// 63_257_773, pinned 2026-07-30 for the H5.3 relaunch;
 /// 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce, daa 59_192_679, pinned
 /// 2026-07-25 for the H5.2 relaunch.)
-pub const CHAIN_ANCHOR_DAA: u64 = 76_317_223;
+pub const CHAIN_ANCHOR_DAA: u64 = 79_216_325;
 pub const CHAIN_ANCHOR_HASH: Hash = Hash::from_bytes([
-    0x9d, 0x68, 0xaf, 0x87, 0xfa, 0x9f, 0x31, 0x2f, 0x33, 0xb6, 0xa2, 0xdd, 0x40, 0x09, 0xb3, 0xed,
-    0x33, 0xbb, 0x42, 0x55, 0x6c, 0xf2, 0xbc, 0xf6, 0x43, 0xa5, 0x6e, 0xc7, 0x59, 0xdd, 0xbb, 0x48,
+    0x4a, 0x67, 0xaf, 0xe0, 0xd5, 0xcc, 0xd7, 0x2d, 0xf9, 0x0f, 0x24, 0xf6, 0x7d, 0xac, 0x8f, 0xcc,
+    0xe8, 0xbf, 0x96, 0x8c, 0xa1, 0xcd, 0xbf, 0x96, 0x92, 0x62, 0x23, 0x77, 0x24, 0x76, 0x83, 0x59,
 ]);
 
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
