@@ -193,6 +193,7 @@ impl ConsensusServices {
             params.skip_proof_of_work,
             params.pom_activation,
             params.pom_level_activation,
+            params.pom_maxlevel_v4_activation,
             is_consensus_exiting,
         ));
 

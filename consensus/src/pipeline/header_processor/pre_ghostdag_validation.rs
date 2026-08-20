@@ -4,6 +4,7 @@ use crate::errors::{BlockProcessResult, RuleError};
 use crate::model::services::reachability::ReachabilityService;
 use crate::model::stores::statuses::StatusesStoreReader;
 use keryx_consensus_core::BlockLevel;
+use keryx_consensus_core::config::params::resolve_max_block_level;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_consensus_core::blockstatus::BlockStatus::StatusInvalid;
 use keryx_consensus_core::header::Header;
@@ -110,7 +111,8 @@ impl HeaderProcessor {
         // is cheap to grind); the walk is still enforced in `check_pom_proof`, which also pins
         // `proof.final_state == header.pom_final_state`.
         if self.pom_level_activation.is_active(header.daa_score) {
-            let (block_level, passed) = keryx_pow::calc_pom_block_level_check_pow(header, self.max_block_level);
+            let anchor = resolve_max_block_level(self.pom_maxlevel_v4_activation, self.max_block_level, header.daa_score);
+            let (block_level, passed) = keryx_pow::calc_pom_block_level_check_pow(header, anchor, self.max_block_level);
             return if passed || self.skip_proof_of_work { Ok(block_level) } else { Err(RuleError::InvalidPoW) };
         }
         // Proof-of-Model dead zone [pom_activation, pom_level_activation): the PoW is the

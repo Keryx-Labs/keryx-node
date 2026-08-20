@@ -124,11 +124,14 @@ pub fn calc_pom_pow(header: &Header) -> Uint256 {
 /// H3 block level + target check from the header alone. The exact PoM-era mirror of
 /// `calc_block_level_check_pow` — every consumer of post-H3 levels must go through this
 /// so real-time validation, pruning-proof build/apply and header import all agree.
-pub fn calc_pom_block_level_check_pow(header: &Header, max_block_level: BlockLevel) -> (BlockLevel, bool) {
+/// `anchor` is the level-derivation constant (per-era; see `resolve_max_block_level`);
+/// `structural_max` is the network's `max_block_level` and bounds both the genesis level and the
+/// clamp ceiling, so the level count / genesis anchor never change while the anchor rises.
+pub fn calc_pom_block_level_check_pow(header: &Header, anchor: BlockLevel, structural_max: BlockLevel) -> (BlockLevel, bool) {
     if header.parents_by_level.is_empty() {
-        return (max_block_level, true); // Genesis has the max block level
+        return (structural_max, true); // Genesis anchors the top structural level
     }
     let pow = calc_pom_pow(header);
     let passed = pow <= Uint256::from_compact_target_bits(header.bits);
-    (calc_level_from_pow(pow, max_block_level), passed)
+    (calc_level_from_pow(pow, anchor).min(structural_max), passed)
 }

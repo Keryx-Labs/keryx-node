@@ -114,6 +114,7 @@ pub struct HeaderProcessor {
     /// the PoW value is re-checked against the target header-only and the block level is
     /// derived from it again (see `check_pow_and_calc_block_level`).
     pub(super) pom_level_activation: ForkActivation,
+    pub(super) pom_maxlevel_v4_activation: ForkActivation,
     pub(super) max_block_level: BlockLevel,
 
     // DB
@@ -202,6 +203,7 @@ impl HeaderProcessor {
             skip_proof_of_work: params.skip_proof_of_work,
             pom_activation: params.pom_activation,
             pom_level_activation: params.pom_level_activation,
+            pom_maxlevel_v4_activation: params.pom_maxlevel_v4_activation,
             max_block_level: params.max_block_level,
         }
     }

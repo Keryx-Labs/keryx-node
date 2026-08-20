@@ -178,7 +178,7 @@ impl PruningProofManager {
                 // happen (see `pom_aware_block_level`'s doc comment for the same reasoning behind
                 // the sibling fix in `import_pruning_points`).
                 let block_level =
-                    super::pom_aware_block_level(&header, self.max_block_level, self.pom_activation, self.pom_level_activation);
+                    super::pom_aware_block_level(&header, self.max_block_level, self.pom_activation, self.pom_level_activation, self.pom_maxlevel_v4_activation);
                 self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
 
                 let mut parents = BlockHashSet::with_capacity(header.direct_parents().len() * 2);

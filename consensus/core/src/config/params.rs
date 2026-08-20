@@ -340,6 +340,20 @@ pub const POM_PROOF_SERVE_DEPTH_DAA: u64 = 5_000;
 /// (see the pruning processor) — no flag, transparent — so pruned datadirs stay bounded by design.
 pub const POM_PROOF_GC_DEPTH_CHAIN_BLOCKS: u64 = 5_000;
 
+/// Level-derivation anchor at/after `pom_maxlevel_v4_activation`. Must exceed the largest
+/// `target.bits()` the chain runs at (239 at `genesis.bits = 0x1e7fffff`) with margin, and stay
+/// within `BlockLevel` (u8) and below `MAX_WORK_LEVEL` headroom.
+pub const POM_MAXLEVEL_V4: BlockLevel = 250;
+
+/// Single source of truth for the per-era level-derivation anchor. Callers without a `Params`
+/// (level-assignment and `level_work` sites) resolve the anchor through this; `structural_max`
+/// is the network's `max_block_level` (unchanged level count / genesis anchor / clamp ceiling).
+#[inline]
+#[must_use]
+pub fn resolve_max_block_level(activation: ForkActivation, structural_max: BlockLevel, daa_score: u64) -> BlockLevel {
+    if activation.is_active(daa_score) { POM_MAXLEVEL_V4.max(structural_max) } else { structural_max }
+}
+
 /// Per-tier possession anchors `R_T` (32 B-chunk blake3 Merkle root) + `N` (chunk count),
 /// produced offline by `pom-rt-builder` (canonical: name-sorted GGUF tensors). Tier index =
 /// slice position; `model_id` ties the tier to the declared model. Difficulty stays global
@@ -1096,6 +1110,15 @@ pub struct Params {
     /// stock difficulty (no genesis reset). Same forced-update mechanism as v2.
     pub pow_salt_v4_activation: ForkActivation,
 
+    /// Block-level anchor hardfork (v4). At/after this score the level-derivation anchor used
+    /// by `calc_level_from_pow`/`level_work` switches from `max_block_level` to
+    /// `POM_MAXLEVEL_V4`, so that at post-reset difficulty (`target.bits() ~ 239` at
+    /// `genesis.bits`) the anchor exceeds the target and the level distribution is no longer
+    /// clamped to 0 — re-populating the higher GHOSTDAG levels the pruning proof needs.
+    /// Structural level count and genesis anchor stay at `max_block_level`. Resolve through
+    /// `max_block_level_at(daa_score)`. `never()` to disable.
+    pub pom_maxlevel_v4_activation: ForkActivation,
+
     /// Ratio-reward (holder-weighted miner-cut bonus) activation DAA score. At/after this score
     /// the coinbase miner cut is scaled by the producer's holder ratio bracket (`RATIO_REWARD_BPS`,
     /// computed by the node from the balance + windowed-production indexes). DAA-gated so IBD
@@ -1225,6 +1248,13 @@ pub struct Params {
 }
 
 impl Params {
+    /// Level-derivation anchor at/after `pom_maxlevel_v4_activation` (see the field doc).
+    #[inline]
+    #[must_use]
+    pub fn max_block_level_at(&self, daa_score: u64) -> BlockLevel {
+        resolve_max_block_level(self.pom_maxlevel_v4_activation, self.max_block_level, daa_score)
+    }
+
     /// Returns the past median time sample rate
     #[inline]
     #[must_use]
@@ -1417,6 +1447,8 @@ impl Params {
 
             pow_salt_v4_activation: self.pow_salt_v4_activation,
 
+            pom_maxlevel_v4_activation: self.pom_maxlevel_v4_activation,
+
             ratio_reward_activation: self.ratio_reward_activation,
             ratio_verification_activation: self.ratio_verification_activation,
             difficulty_reset_activation: self.difficulty_reset_activation,
@@ -1575,6 +1607,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // forking cleanly away from the abandoned SALT-v3 / diff-1-spiral chain. Same DAA as the
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
+    pom_maxlevel_v4_activation: ForkActivation::never(),
 
     // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
     // 2026-06-26 18:00 UTC at 10 BPS (measured: DAA 34_950_043 at 2026-06-23 11:24 UTC; +282_960 s
@@ -1718,6 +1751,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoW SALT v4: active from genesis on testnet to mirror the live mainnet PoW (salt v4)
     // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
     pow_salt_v4_activation: ForkActivation::new(0),
+    pom_maxlevel_v4_activation: ForkActivation::never(),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
     ratio_reward_activation: ForkActivation::new(0),
@@ -1816,6 +1850,7 @@ pub const SIMNET_PARAMS: Params = Params {
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    pom_maxlevel_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
@@ -1892,6 +1927,7 @@ pub const DEVNET_PARAMS: Params = Params {
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
     pow_salt_v2_activation: ForkActivation::never(),
     pow_salt_v4_activation: ForkActivation::never(),
+    pom_maxlevel_v4_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),

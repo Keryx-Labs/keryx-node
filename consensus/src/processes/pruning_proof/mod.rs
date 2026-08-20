@@ -17,7 +17,7 @@ use rocksdb::WriteBatch;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, BlockLevel, HashMapCustomHasher, KType,
     blockhash::{self, BlockHashExtensions},
-    config::params::ForkActivation,
+    config::params::{ForkActivation, resolve_max_block_level},
     errors::{
         consensus::{ConsensusError, ConsensusResult},
         pruning::{PruningImportError, PruningImportResult},
@@ -124,6 +124,8 @@ pub struct PruningProofManager {
     // H3: from this score headers commit to `pom_final_state` and the PoW value / block level
     // are header-only derivable again — see `pom_aware_block_level`.
     pom_level_activation: ForkActivation,
+    // v4: from this score the level-derivation anchor rises (see `resolve_max_block_level`).
+    pom_maxlevel_v4_activation: ForkActivation,
 
     is_consensus_exiting: Arc<AtomicBool>,
 }
@@ -146,6 +148,7 @@ impl PruningProofManager {
         skip_proof_of_work: bool,
         pom_activation: ForkActivation,
         pom_level_activation: ForkActivation,
+        pom_maxlevel_v4_activation: ForkActivation,
         is_consensus_exiting: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -182,6 +185,7 @@ impl PruningProofManager {
             skip_proof_of_work,
             pom_activation,
             pom_level_activation,
+            pom_maxlevel_v4_activation,
 
             is_consensus_exiting,
         }
@@ -212,7 +216,7 @@ impl PruningProofManager {
                 continue;
             }
 
-            let block_level = pom_aware_block_level(header, self.max_block_level, self.pom_activation, self.pom_level_activation);
+            let block_level = pom_aware_block_level(header, self.max_block_level, self.pom_activation, self.pom_level_activation, self.pom_maxlevel_v4_activation);
             self.headers_store.insert(header.hash, header.clone(), block_level).unwrap();
         }
 
@@ -439,9 +443,11 @@ fn pom_aware_block_level(
     max_block_level: BlockLevel,
     pom_activation: ForkActivation,
     pom_level_activation: ForkActivation,
+    pom_maxlevel_v4_activation: ForkActivation,
 ) -> BlockLevel {
     if pom_level_activation.is_active(header.daa_score) {
-        keryx_pow::calc_pom_block_level_check_pow(header, max_block_level).0
+        let anchor = resolve_max_block_level(pom_maxlevel_v4_activation, max_block_level, header.daa_score);
+        keryx_pow::calc_pom_block_level_check_pow(header, anchor, max_block_level).0
     } else if pom_activation.is_active(header.daa_score) {
         0
     } else {
@@ -468,12 +474,12 @@ mod tests {
         let raw = calc_block_level(&header, 225);
 
         // Before activation: behaves exactly like the raw, non-PoM-aware calculation.
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::never(), ForkActivation::never()), raw);
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_001), ForkActivation::never()), raw);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::never(), ForkActivation::never(), ForkActivation::never()), raw);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_001), ForkActivation::never(), ForkActivation::never()), raw);
 
         // At and after activation: forced to 0 regardless of what the raw PoW-derived level is.
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_000), ForkActivation::never()), 0);
-        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::always(), ForkActivation::never()), 0);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::new(1_000), ForkActivation::never(), ForkActivation::never()), 0);
+        assert_eq!(pom_aware_block_level(&header, 225, ForkActivation::always(), ForkActivation::never(), ForkActivation::never()), 0);
     }
 
     #[test]
@@ -486,10 +492,10 @@ mod tests {
 
         let before = header_with_daa_score(37_779_999);
         let raw_before = calc_block_level(&before, 225);
-        assert_eq!(pom_aware_block_level(&before, 225, activation, ForkActivation::never()), raw_before);
+        assert_eq!(pom_aware_block_level(&before, 225, activation, ForkActivation::never(), ForkActivation::never()), raw_before);
 
         let at = header_with_daa_score(37_780_000);
-        assert_eq!(pom_aware_block_level(&at, 225, activation, ForkActivation::never()), 0);
+        assert_eq!(pom_aware_block_level(&at, 225, activation, ForkActivation::never(), ForkActivation::never()), 0);
     }
 
     #[test]
@@ -502,12 +508,29 @@ mod tests {
 
         let mut header = header_with_daa_score(2_000);
         header.pom_final_state = 0xdead_beef_cafe_f00d;
-        let expected = keryx_pow::calc_pom_block_level_check_pow(&header, 225).0;
-        assert_eq!(pom_aware_block_level(&header, 225, pom, h3), expected);
+        let expected = keryx_pow::calc_pom_block_level_check_pow(&header, 225, 225).0;
+        assert_eq!(pom_aware_block_level(&header, 225, pom, h3, ForkActivation::never()), expected);
 
         // One score below H3: still the dead-zone 0.
         let mut before = header_with_daa_score(1_999);
         before.pom_final_state = 0xdead_beef_cafe_f00d;
-        assert_eq!(pom_aware_block_level(&before, 225, pom, h3), 0);
+        assert_eq!(pom_aware_block_level(&before, 225, pom, h3, ForkActivation::never()), 0);
+    }
+
+    #[test]
+    fn pom_maxlevel_v4_raises_anchor_within_structural_clamp() {
+        // v4 raises the level-derivation anchor (225 -> 250) but never the structural max:
+        // a higher anchor can only raise or keep the derived level, always clamped to 225,
+        // and genesis stays at the structural max.
+        let pom = ForkActivation::new(1_000);
+        let h3 = ForkActivation::new(2_000);
+        let v4 = ForkActivation::new(3_000);
+
+        let mut header = header_with_daa_score(3_000);
+        header.pom_final_state = 0xdead_beef_cafe_f00d;
+        let lvl_pre = pom_aware_block_level(&header, 225, pom, h3, ForkActivation::never());
+        let lvl_post = pom_aware_block_level(&header, 225, pom, h3, v4);
+        assert!(lvl_post >= lvl_pre);
+        assert!(lvl_post <= 225);
     }
 }

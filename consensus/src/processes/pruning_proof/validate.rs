@@ -168,7 +168,7 @@ impl ProofContext {
         // Must mirror the builder's `pp_header.block_level` (headers_store, PoM-aware): the
         // level anchoring checks below compare against the level the builder actually used.
         let proof_pp_level =
-            super::pom_aware_block_level(&proof_pp_header, ppm.max_block_level, ppm.pom_activation, ppm.pom_level_activation);
+            super::pom_aware_block_level(&proof_pp_header, ppm.max_block_level, ppm.pom_activation, ppm.pom_level_activation, ppm.pom_maxlevel_v4_activation);
         let proof_pp = proof_pp_header.hash;
 
         //
@@ -201,7 +201,12 @@ impl ProofContext {
                 //   (same trust model as the skip in `check_pow_and_calc_block_level`).
                 // - Pre-PoM history: fully kHeavyHash-validated as always.
                 let (header_level, pow_passes) = if ppm.pom_level_activation.is_active(header.daa_score) {
-                    keryx_pow::calc_pom_block_level_check_pow(header, ppm.max_block_level)
+                    let anchor = super::resolve_max_block_level(
+                        ppm.pom_maxlevel_v4_activation,
+                        ppm.max_block_level,
+                        header.daa_score,
+                    );
+                    keryx_pow::calc_pom_block_level_check_pow(header, anchor, ppm.max_block_level)
                 } else if ppm.pom_activation.is_active(header.daa_score) {
                     (0, true)
                 } else {
