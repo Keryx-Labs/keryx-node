@@ -327,18 +327,17 @@ pub const POM_PROOF_SERVE_DEPTH_DAA: u64 = 5_000;
 /// deliberately NOT the same horizon: the GC must retain a strict SUPERSET of what serving can
 /// still be asked for, or it deletes a proof the node is about to ship — exactly the naked-block
 /// wedge of 2026-06-29. At 10 BPS a chain block lands roughly every ~10 DAA, so this value spans
-/// ~50 000 DAA, an order of magnitude above the serving threshold. Keep GC ≫ serve when tuning
-/// either; equalising them would remove that safety margin, not tidy it up.
+/// ~15 000 DAA, still ~3x the serving threshold. Keep GC ≫ serve when tuning either; equalising
+/// them would remove that safety margin, not tidy it up.
 ///
-/// Lowered 25_000 → 5_000 at the H5.3 relaunch (a coordinated upgrade, which this needs: a node
-/// that GCs earlier than its peers serves proofless blocks inside the window they still expect).
-/// v2 proofs record the full K=256-step walk (~228 KB each, ~2.7x the v1 spot-check), so this takes
-/// the pruned proof store from ~6 GB to ~1.2 GB and the bootstrap snapshot with it.
+/// Lowered 25_000 → 5_000 at the H5.3 relaunch, then → 1_500 at the v4 relaunch (larger proofs,
+/// smaller window). A coordinated upgrade, which this needs: a node that GCs earlier than its
+/// peers serves proofless blocks inside the window they still expect.
 ///
 /// Deleting a proof can never corrupt consensus state: it is not part of the UTXO set, and the
 /// header `utxo_commitment` already pins the state. The GC pass runs unconditionally on every node
 /// (see the pruning processor) — no flag, transparent — so pruned datadirs stay bounded by design.
-pub const POM_PROOF_GC_DEPTH_CHAIN_BLOCKS: u64 = 5_000;
+pub const POM_PROOF_GC_DEPTH_CHAIN_BLOCKS: u64 = 1_500;
 
 /// Level-derivation anchor at/after `pom_maxlevel_v4_activation`. Must exceed the largest
 /// `target.bits()` the chain runs at (239 at `genesis.bits = 0x1e7fffff`) with margin, and stay
