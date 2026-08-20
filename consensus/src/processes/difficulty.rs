@@ -160,6 +160,7 @@ pub struct SampledDifficultyManager<T: HeaderStoreReader, U: GhostdagStoreReader
     difficulty_reset_activation_h5_3: ForkActivation,
     difficulty_reset_activation_h5_4: ForkActivation,
     difficulty_reset_activation_h6: ForkActivation,
+    difficulty_reset_activation_v4: ForkActivation,
     h6_reset_bits: Option<u32>,
 }
 
@@ -181,6 +182,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
         difficulty_reset_activation_h5_3: ForkActivation,
         difficulty_reset_activation_h5_4: ForkActivation,
         difficulty_reset_activation_h6: ForkActivation,
+        difficulty_reset_activation_v4: ForkActivation,
         h6_reset_bits: Option<u32>,
     ) -> Self {
         Self::check_min_difficulty_window_size(difficulty_window_size, min_difficulty_window_size);
@@ -200,6 +202,7 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
             difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4,
             difficulty_reset_activation_h6,
+            difficulty_reset_activation_v4,
             h6_reset_bits,
         }
     }
@@ -218,13 +221,16 @@ impl<T: HeaderStoreReader, U: GhostdagStoreReader> SampledDifficultyManager<T, U
             || self.difficulty_reset_activation_h5_3.is_within_range_from_activation(daa_score, range)
             || self.difficulty_reset_activation_h5_4.is_within_range_from_activation(daa_score, range)
             || self.difficulty_reset_activation_h6.is_within_range_from_activation(daa_score, range)
+            || self.difficulty_reset_activation_v4.is_within_range_from_activation(daa_score, range)
     }
 
     /// The target every reset window pins, or `None` outside all of them. The H6 window is checked
     /// first: it may carry its own target rather than the genesis one.
     fn reset_target_bits(&self, daa_score: u64) -> Option<u32> {
         let range = self.difficulty_full_window_size();
-        if self.difficulty_reset_activation_h6.is_within_range_from_activation(daa_score, range) {
+        if self.difficulty_reset_activation_h6.is_within_range_from_activation(daa_score, range)
+            || self.difficulty_reset_activation_v4.is_within_range_from_activation(daa_score, range)
+        {
             return Some(self.h6_reset_bits.unwrap_or(self.genesis_bits));
         }
         self.in_any_reset_window(daa_score).then_some(self.genesis_bits)

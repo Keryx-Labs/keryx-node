@@ -1180,6 +1180,10 @@ pub struct Params {
     /// Sixth difficulty-reset window. MUST be set to the same score as `pom_v3_activation`.
     pub difficulty_reset_activation_h6: ForkActivation,
 
+    /// Seventh difficulty-reset window, for the v4 relaunch. Same self-contained semantics; pins
+    /// the same reset bits as `h6_reset_bits` so a single GPU can mine the first post-gate blocks.
+    pub difficulty_reset_activation_v4: ForkActivation,
+
     /// Target the H6 reset window pins. `None` keeps `genesis.bits`. Read by both the template
     /// builder and block validation — they MUST agree or every mined block is rejected.
     pub h6_reset_bits: Option<u32>,
@@ -1463,6 +1467,7 @@ impl Params {
             difficulty_reset_activation_h5_3: self.difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4: self.difficulty_reset_activation_h5_4,
             difficulty_reset_activation_h6: self.difficulty_reset_activation_h6,
+            difficulty_reset_activation_v4: self.difficulty_reset_activation_v4,
             h6_reset_bits: self.h6_reset_bits,
             h5_activation: self.h5_activation,
             h5_1_activation: self.h5_1_activation,
@@ -1658,6 +1663,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // testnet H6 value: sized for the hashrate present at a cold restart, not a live crossing.
     // The difficulty window re-converges upward as miners return.
     difficulty_reset_activation_h6: ForkActivation::new(76_316_623),
+    difficulty_reset_activation_v4: ForkActivation::new(79_210_000),
     h6_reset_bits: Some(0x1f7fffff),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
@@ -1777,6 +1783,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // exponent step, i.e. 256x harder than the reset target, which starves a single-GPU testnet.
     // At 1 the window covers [1, 26_441), far past the H7 gate.
     difficulty_reset_activation_h6: ForkActivation::new(1),
+    difficulty_reset_activation_v4: ForkActivation::new(500),
     h6_reset_bits: Some(0x1f7fffff),
     h5_activation: ForkActivation::new(0),
     h5_1_activation: ForkActivation::new(0),
@@ -1868,6 +1875,7 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
     difficulty_reset_activation_h6: ForkActivation::never(),
+    difficulty_reset_activation_v4: ForkActivation::never(),
     h6_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
@@ -1946,6 +1954,7 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
     difficulty_reset_activation_h6: ForkActivation::never(),
+    difficulty_reset_activation_v4: ForkActivation::never(),
     h6_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),

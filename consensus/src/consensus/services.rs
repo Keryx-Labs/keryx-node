@@ -108,6 +108,7 @@ impl ConsensusServices {
             params.difficulty_reset_activation_h5_3,
             params.difficulty_reset_activation_h5_4,
             params.difficulty_reset_activation_h6,
+            params.difficulty_reset_activation_v4,
             params.h6_reset_bits,
             params.h5_activation,
         );
