@@ -1613,8 +1613,8 @@ pub const MAINNET_PARAMS: Params = Params {
     // forking cleanly away from the abandoned SALT-v3 / diff-1-spiral chain. Same DAA as the
     // old v3 gate so a datadir restored from before this point continues seamlessly into v4.
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
-    pom_maxlevel_v4_activation: ForkActivation::never(),
-    pom_v4_activation: ForkActivation::never(),
+    pom_maxlevel_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
+    pom_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
 
     // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
     // 2026-06-26 18:00 UTC at 10 BPS (measured: DAA 34_950_043 at 2026-06-23 11:24 UTC; +282_960 s
@@ -1670,7 +1670,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // H7 service-bond v2. Scheduled for 2026-08-17 20:00 CEST: measured from daa 77_196_191 at
     // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
     service_bond_v2_activation: ForkActivation::new(77_525_000),
-    reward_routing_activation: ForkActivation::new(79_251_000),
+    reward_routing_activation: ForkActivation::new(79_210_000),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
@@ -1758,8 +1758,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoW SALT v4: active from genesis on testnet to mirror the live mainnet PoW (salt v4)
     // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
     pow_salt_v4_activation: ForkActivation::new(0),
-    pom_maxlevel_v4_activation: ForkActivation::never(),
-    pom_v4_activation: ForkActivation::never(),
+    pom_maxlevel_v4_activation: ForkActivation::new(500),
+    pom_v4_activation: ForkActivation::new(500),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
     ratio_reward_activation: ForkActivation::new(0),
