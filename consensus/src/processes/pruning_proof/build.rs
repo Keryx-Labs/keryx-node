@@ -1,8 +1,10 @@
 use std::{
+    cell::Cell,
     cmp::Reverse,
     collections::{BinaryHeap, VecDeque},
     ops::DerefMut,
     sync::Arc,
+    time::Instant,
 };
 
 use itertools::Itertools;
@@ -12,7 +14,7 @@ use keryx_consensus_core::{
     header::Header,
     pruning::PruningPointProof,
 };
-use keryx_core::{debug, trace};
+use keryx_core::{debug, info, trace, warn};
 use keryx_database::prelude::*;
 use keryx_hashes::Hash;
 use keryx_utils::binary_heap::TopK;
@@ -24,7 +26,7 @@ use crate::{
         stores::{
             ghostdag::{DbGhostdagStore, GhostdagStore, GhostdagStoreReader},
             headers::{HeaderStoreReader, HeaderWithBlockLevel},
-            pruning::{PruningProofDescriptor, PruningStoreReader},
+            pruning::{PruningProofDescriptor, PruningProofHashIndex, PruningStoreReader},
             reachability::{DbReachabilityStore, ReachabilityStoreReader},
             relations::{DbRelationsStore, RelationsStoreReader},
         },
@@ -147,12 +149,82 @@ impl PruningProofManager {
     /// Temporary stores are used during construction, and headers are shared (via arcs)
     /// across levels in the final proof.
     pub(crate) fn build_pruning_point_proof(&self, pp: Hash) -> PruningPointProof {
-        let descriptor = self.pruning_point_store.read().pruning_proof_descriptor().optional().unwrap();
+        // Sanity rebuilding must remain independent of the persisted materialization cache.
+        self.build_pruning_point_proof_inner(pp, super::next_pp_build_diag_id(), false)
+    }
+
+    pub(crate) fn build_pruning_point_proof_with_diag_id(&self, pp: Hash, build_id: u64) -> PruningPointProof {
+        self.build_pruning_point_proof_inner(pp, build_id, true)
+    }
+
+    fn build_pruning_point_proof_inner(&self, pp: Hash, build_id: u64, allow_persisted_index: bool) -> PruningPointProof {
+        let total_started = Instant::now();
+        info!("PP-BUILD-DIAG id={} stage=build_enter pruning_point={}", build_id, pp);
+
+        let descriptor_lock_started = Instant::now();
+        info!("PP-BUILD-DIAG id={} stage=descriptor_lock_wait_start", build_id);
+        let pruning_point_read = self.pruning_point_store.read();
+        info!(
+            "PP-BUILD-DIAG id={} stage=descriptor_lock_acquired elapsed_ms={}",
+            build_id,
+            descriptor_lock_started.elapsed().as_millis()
+        );
+        let descriptor = pruning_point_read.pruning_proof_descriptor().optional().unwrap();
+        drop(pruning_point_read);
+        info!(
+            "PP-BUILD-DIAG id={} stage=proof_descriptor_check present={} matches_pruning_point={} external={} elapsed_ms={}",
+            build_id,
+            descriptor.is_some(),
+            descriptor.as_ref().is_some_and(|descriptor| descriptor.pruning_point == pp),
+            descriptor.as_ref().is_some_and(|descriptor| descriptor.external),
+            total_started.elapsed().as_millis()
+        );
         if let Some(descriptor) = descriptor.as_ref() {
             // Use a locally built descriptor (when it matches the current pruning point) for fast reconstruction.
             // Otherwise, recalculate the descriptor to optimize proof size.
             if descriptor.pruning_point == pp && !descriptor.external {
-                return self.proof_from_descriptor(descriptor);
+                if allow_persisted_index {
+                    let persisted_index = self.pruning_point_store.read().pruning_proof_hash_index().optional();
+                    match persisted_index {
+                        Ok(Some(index)) if index.matches_descriptor(descriptor) => {
+                            let load_started = Instant::now();
+                            info!("PP-BUILD-DIAG id={} stage=local_hash_index_load_start", build_id);
+                            match self.proof_from_hash_index(index.as_ref()) {
+                                Ok(proof) => {
+                                    info!(
+                                        "PP-BUILD-DIAG id={} stage=local_hash_index_load_complete headers={} elapsed_ms={}",
+                                        build_id,
+                                        proof.iter().map(|level| level.len()).sum::<usize>(),
+                                        load_started.elapsed().as_millis()
+                                    );
+                                    return proof;
+                                }
+                                Err(err) => warn!(
+                                    "PP-BUILD-DIAG id={} stage=local_hash_index_load_failed error={} fallback=descriptor",
+                                    build_id, err
+                                ),
+                            }
+                        }
+                        Ok(Some(_)) => info!("PP-BUILD-DIAG id={} stage=local_hash_index_mismatch fallback=descriptor", build_id),
+                        Ok(None) => info!("PP-BUILD-DIAG id={} stage=local_hash_index_missing fallback=descriptor", build_id),
+                        Err(err) => {
+                            warn!("PP-BUILD-DIAG id={} stage=local_hash_index_read_failed error={} fallback=descriptor", build_id, err)
+                        }
+                    }
+                }
+
+                info!("PP-BUILD-DIAG id={} stage=local_descriptor_rebuild_start", build_id);
+                let proof = self.proof_from_descriptor(descriptor, build_id, allow_persisted_index);
+                if allow_persisted_index {
+                    self.persist_local_hash_index(descriptor, &proof, build_id);
+                }
+                info!(
+                    "PP-BUILD-DIAG id={} stage=local_descriptor_rebuild_complete headers={} elapsed_ms={}",
+                    build_id,
+                    proof.iter().map(|level| level.len()).sum::<usize>(),
+                    total_started.elapsed().as_millis()
+                );
+                return proof;
             }
         }
 
@@ -164,12 +236,40 @@ impl PruningProofManager {
             }
             false => {
                 // General case
-                self.calc_new_proof(pp, descriptor.as_deref())
+                info!("PP-BUILD-DIAG id={} stage=root_calculation_start pruning_point={}", build_id, pp);
+                let descriptor = self.calc_new_proof(pp, descriptor.as_deref(), build_id);
+                info!(
+                    "PP-BUILD-DIAG id={} stage=root_calculation_complete elapsed_ms={}",
+                    build_id,
+                    total_started.elapsed().as_millis()
+                );
+                descriptor
             }
         };
 
-        let proof = self.proof_from_descriptor(&new_descriptor);
-        self.pruning_point_store.write().set_pruning_proof_descriptor(new_descriptor).unwrap();
+        info!("PP-BUILD-DIAG id={} stage=proof_finalization_start", build_id);
+        let proof = self.proof_from_descriptor(&new_descriptor, build_id, false);
+        info!(
+            "PP-BUILD-DIAG id={} stage=proof_finalization_complete headers={} elapsed_ms={}",
+            build_id,
+            proof.iter().map(|level| level.len()).sum::<usize>(),
+            total_started.elapsed().as_millis()
+        );
+
+        let descriptor_write_started = Instant::now();
+        info!("PP-BUILD-DIAG id={} stage=descriptor_write_lock_wait_start", build_id);
+        let mut pruning_point_write = self.pruning_point_store.write();
+        info!(
+            "PP-BUILD-DIAG id={} stage=descriptor_write_lock_acquired elapsed_ms={}",
+            build_id,
+            descriptor_write_started.elapsed().as_millis()
+        );
+        pruning_point_write.set_pruning_proof_descriptor(new_descriptor.clone()).unwrap();
+        if allow_persisted_index {
+            pruning_point_write.set_pruning_proof_hash_index(PruningProofHashIndex::from_proof(&proof, &new_descriptor)).unwrap();
+        }
+        drop(pruning_point_write);
+        info!("PP-BUILD-DIAG id={} stage=build_complete elapsed_ms={}", build_id, total_started.elapsed().as_millis());
 
         proof
     }
@@ -178,32 +278,84 @@ impl PruningProofManager {
     /// and collecting, per level, the blocks in `future(root) ∩ past(tip)`.
     ///
     /// Uses a local header-arc cache to deduplicate headers shared across levels.
-    fn proof_from_descriptor(&self, descriptor: &PruningProofDescriptor) -> PruningPointProof {
+    fn proof_from_descriptor(
+        &self,
+        descriptor: &PruningProofDescriptor,
+        build_id: u64,
+        fast_local_level_zero: bool,
+    ) -> PruningPointProof {
+        let phase_started = Instant::now();
+        info!(
+            "PP-BUILD-DIAG id={} stage=descriptor_reconstruction_start pruning_point={} levels={} external={}",
+            build_id,
+            descriptor.pruning_point,
+            descriptor.tips.len(),
+            descriptor.external
+        );
         // The pruning proof can contain many duplicate headers (across levels), so we use a local cache in order
         // to make sure we hold a single Arc per header
         let mut cache: BlockHashMap<Arc<Header>> = BlockHashMap::with_capacity(4 * self.pruning_proof_m as usize);
         let mut get_header = |hash| cache.entry(hash).or_insert_with_key(|&hash| self.headers_store.get_header(hash).unwrap()).clone();
 
+        let temp_db_started = Instant::now();
+        info!("PP-BUILD-DIAG id={} stage=temp_db_create_start phase=descriptor_reconstruction", build_id);
         let (_db_lifetime, temp_db) = keryx_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        info!(
+            "PP-BUILD-DIAG id={} stage=temp_db_create_complete phase=descriptor_reconstruction elapsed_ms={}",
+            build_id,
+            temp_db_started.elapsed().as_millis()
+        );
         let cache_policy = CachePolicy::Count(2 * self.pruning_proof_m as usize);
 
-        (0..=self.max_block_level)
+        let proof: PruningPointProof = (0..=self.max_block_level)
             .map(|level| {
+                let level_started = Instant::now();
                 let level_idx = level as usize;
                 let tip = descriptor.tips[level_idx];
                 let root = descriptor.roots[level_idx];
                 let expected_count = descriptor.counts[level_idx];
+                info!(
+                    "PP-BUILD-DIAG id={} stage=descriptor_level_start level={} root={} tip={} expected_headers={}",
+                    build_id, level, root, tip, expected_count
+                );
+
+                if level == 0 && fast_local_level_zero {
+                    return self.proof_level_zero_from_local_relations(root, tip, expected_count, build_id, &mut get_header);
+                }
+
+                let reachability_probe_started = Instant::now();
+                info!("PP-BUILD-DIAG id={} stage=reachability_lock_wait_start phase=descriptor level={}", build_id, level);
+                let reachability_probe = self.reachability_store.read();
+                info!(
+                    "PP-BUILD-DIAG id={} stage=reachability_lock_acquired phase=descriptor level={} elapsed_ms={}",
+                    build_id,
+                    level,
+                    reachability_probe_started.elapsed().as_millis()
+                );
+                drop(reachability_probe);
 
                 let mut headers = VecDeque::with_capacity(2 * self.pruning_proof_m as usize);
                 let mut relations_store = DbRelationsStore::new_temp(temp_db.clone(), level, 0, cache_policy, cache_policy);
 
                 let mut queue = BinaryHeap::<SortableBlock>::new();
                 let mut visited = BlockHashSet::new();
+                let mut parent_edges = 0usize;
                 queue.push(SortableBlock::new(tip, get_header(tip).blue_work));
 
                 while let Some(SortableBlock { hash: current, .. }) = queue.pop() {
                     if !visited.insert(current) {
                         continue;
+                    }
+                    if visited.len() % 10_000 == 0 {
+                        info!(
+                            "PP-BUILD-DIAG id={} stage=descriptor_backward_walk_progress level={} visited={} queued={} parent_edges={} elapsed_ms={}",
+                            build_id,
+                            level,
+                            visited.len(),
+                            queue.len(),
+                            parent_edges,
+                            level_started.elapsed().as_millis()
+                        );
                     }
 
                     // We are only interested in the exact diamond future(root) ⋂ past(tip)
@@ -213,6 +365,7 @@ impl PruningProofManager {
 
                     let header = get_header(current);
                     let parents: BlockHashes = self.reachable_parents_at_level(level, &header).collect::<Vec<_>>().into();
+                    parent_edges += parents.len();
                     for parent in parents.iter().copied() {
                         queue.push(SortableBlock::new(parent, get_header(parent).blue_work));
                     }
@@ -222,11 +375,24 @@ impl PruningProofManager {
                 // Bottom-up traversal from root using the relations collected above
                 let mut bottom_up_queue: BinaryHeap<_> = Default::default();
                 let mut bottom_up_visited = BlockHashSet::new();
+                let mut child_edges = 0usize;
                 bottom_up_queue.push(Reverse(SortableBlock::new(root, get_header(root).blue_work)));
 
                 while let Some(Reverse(SortableBlock { hash: current, .. })) = bottom_up_queue.pop() {
                     if !bottom_up_visited.insert(current) {
                         continue;
+                    }
+                    if bottom_up_visited.len() % 10_000 == 0 {
+                        info!(
+                            "PP-BUILD-DIAG id={} stage=descriptor_forward_walk_progress level={} visited={} queued={} headers={} child_edges={} elapsed_ms={}",
+                            build_id,
+                            level,
+                            bottom_up_visited.len(),
+                            bottom_up_queue.len(),
+                            headers.len(),
+                            child_edges,
+                            level_started.elapsed().as_millis()
+                        );
                     }
 
                     if !self.reachability_service.is_dag_ancestor_of(current, tip) {
@@ -235,7 +401,9 @@ impl PruningProofManager {
 
                     headers.push_back(get_header(current));
 
-                    for &child in relations_store.get_children(current).unwrap().read().iter() {
+                    let children = relations_store.get_children(current).unwrap();
+                    child_edges += children.read().len();
+                    for &child in children.read().iter() {
                         bottom_up_queue.push(Reverse(SortableBlock::new(child, get_header(child).blue_work)));
                     }
                 }
@@ -248,21 +416,136 @@ impl PruningProofManager {
                     headers.len(),
                     expected_count
                 );
+                info!(
+                    "PP-BUILD-DIAG id={} stage=descriptor_level_complete level={} headers={} backward_visited={} forward_visited={} parent_edges={} child_edges={} elapsed_ms={}",
+                    build_id,
+                    level,
+                    headers.len(),
+                    visited.len(),
+                    bottom_up_visited.len(),
+                    parent_edges,
+                    child_edges,
+                    level_started.elapsed().as_millis()
+                );
                 headers.into()
+            })
+            .collect();
+        drop(get_header);
+        info!(
+            "PP-BUILD-DIAG id={} stage=descriptor_reconstruction_complete headers={} unique_headers={} elapsed_ms={}",
+            build_id,
+            proof.iter().map(|level| level.len()).sum::<usize>(),
+            cache.len(),
+            phase_started.elapsed().as_millis()
+        );
+        proof
+    }
+
+    /// Materializes the level-0 descriptor diamond directly from the canonical local relations
+    /// store. This produces the same bottom-up `future(root) ∩ past(tip)` ordering as the generic
+    /// reconstruction, without first walking the entire diamond backwards to rebuild temporary
+    /// parent/child relations.
+    fn proof_level_zero_from_local_relations(
+        &self,
+        root: Hash,
+        tip: Hash,
+        expected_count: u64,
+        build_id: u64,
+        get_header: &mut impl FnMut(Hash) -> Arc<Header>,
+    ) -> Vec<Arc<Header>> {
+        let started = Instant::now();
+        let relations_store = self.relations_store.read().clone();
+        let mut headers = Vec::with_capacity(expected_count.try_into().unwrap_or(usize::MAX));
+        let mut queue = BinaryHeap::new();
+        let mut discovered = BlockHashSet::new();
+        discovered.insert(root);
+        queue.push(Reverse(SortableBlock::new(root, get_header(root).blue_work)));
+
+        while let Some(Reverse(SortableBlock { hash: current, .. })) = queue.pop() {
+            headers.push(get_header(current));
+            for &child in relations_store.get_children(current).unwrap().read().iter() {
+                // A non-ancestor of `tip` cannot have an ancestor-of-`tip` descendant. Check each
+                // candidate only once even when it has many parents in the descriptor diamond.
+                if discovered.insert(child) && self.reachability_service.is_dag_ancestor_of(child, tip) {
+                    queue.push(Reverse(SortableBlock::new(child, get_header(child).blue_work)));
+                }
+            }
+        }
+
+        assert_eq!(
+            headers.len() as u64,
+            expected_count,
+            "fast local descriptor reconstruction count mismatch: expected {}, got {}",
+            expected_count,
+            headers.len()
+        );
+        info!(
+            "PP-BUILD-DIAG id={} stage=local_descriptor_level_zero_complete headers={} elapsed_ms={}",
+            build_id,
+            headers.len(),
+            started.elapsed().as_millis()
+        );
+        headers
+    }
+
+    fn proof_from_hash_index(&self, index: &PruningProofHashIndex) -> StoreResult<PruningPointProof> {
+        const HEADER_LOAD_CHUNK_SIZE: usize = 8_192;
+        index
+            .levels()
+            .iter()
+            .map(|level| {
+                let mut headers = Vec::with_capacity(level.len());
+                for chunk in level.chunks(HEADER_LOAD_CHUNK_SIZE) {
+                    headers.extend(self.headers_store.get_headers_many(chunk)?);
+                }
+                Ok(headers)
             })
             .collect()
     }
 
+    fn persist_local_hash_index(&self, descriptor: &PruningProofDescriptor, proof: &PruningPointProof, build_id: u64) {
+        debug_assert!(!descriptor.external);
+        let started = Instant::now();
+        self.pruning_point_store.write().set_pruning_proof_hash_index(PruningProofHashIndex::from_proof(proof, descriptor)).unwrap();
+        info!("PP-BUILD-DIAG id={} stage=local_hash_index_persist_complete elapsed_ms={}", build_id, started.elapsed().as_millis());
+    }
+
     /// Computes level-proof contexts for all levels, processing levels from high to low to satisfy
     /// MLS inter-level constraints, and aggregates the results into a pruning-proof descriptor.
-    fn calc_new_proof(&self, pp: Hash, prev_descriptor: Option<&PruningProofDescriptor>) -> PruningProofDescriptor {
+    fn calc_new_proof(&self, pp: Hash, prev_descriptor: Option<&PruningProofDescriptor>, build_id: u64) -> PruningProofDescriptor {
+        let calculation_started = Instant::now();
+        info!(
+            "PP-BUILD-DIAG id={} stage=calculate_descriptor_start pruning_point={} previous_descriptor={} previous_external={}",
+            build_id,
+            pp,
+            prev_descriptor.is_some(),
+            prev_descriptor.is_some_and(|descriptor| descriptor.external)
+        );
+        info!("PP-BUILD-DIAG id={} stage=temp_db_create_start phase=calculate_descriptor", build_id);
         let (_db_lifetime, temp_db) = keryx_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        info!(
+            "PP-BUILD-DIAG id={} stage=temp_db_create_complete phase=calculate_descriptor elapsed_ms={}",
+            build_id,
+            calculation_started.elapsed().as_millis()
+        );
+        let pp_header_started = Instant::now();
+        info!("PP-BUILD-DIAG id={} stage=pruning_point_header_read_start pruning_point={}", build_id, pp);
         let pp_header = self.headers_store.get_header_with_block_level(pp).unwrap();
+        info!(
+            "PP-BUILD-DIAG id={} stage=pruning_point_header_read_complete pruning_point={} selected_tip={} block_level={} elapsed_ms={}",
+            build_id,
+            pp,
+            pp_header.header.hash,
+            pp_header.block_level,
+            pp_header_started.elapsed().as_millis()
+        );
 
         let mut level_proof_ctxs: Vec<Option<LevelProofContext>> = vec![None; (self.max_block_level + 1).into()];
 
         for level in (0..=self.max_block_level).rev() {
+            let level_started = Instant::now();
             let level_idx = level as usize;
+            info!("PP-BUILD-DIAG id={} stage=level_start level={}", build_id, level);
             let required_block = if level != self.max_block_level {
                 let LevelProofContext { ghostdag_store: next_level_gd_store, tip: next_level_tip, .. } =
                     level_proof_ctxs[level_idx + 1].as_ref().unwrap();
@@ -275,21 +558,35 @@ impl PruningProofManager {
             } else {
                 None
             };
-            level_proof_ctxs[level_idx] = Some(
-                self.calc_level_proof_context(
+            let level_ctx = self
+                .calc_level_proof_context(
                     &pp_header,
                     level,
                     required_block,
                     prev_descriptor.as_ref().map(|d| d.tips[level_idx]),
                     prev_descriptor.as_ref().map(|d| d.roots[level_idx]),
                     temp_db.clone(),
+                    build_id,
                 )
-                .unwrap_or_else(|e| panic!("calc_level_proof_context failed for level {level}: {e}")),
+                .unwrap_or_else(|e| panic!("calc_level_proof_context failed for level {level}: {e}"));
+            info!(
+                "PP-BUILD-DIAG id={} stage=level_complete level={} root={} tip={} headers={} elapsed_ms={}",
+                build_id,
+                level,
+                level_ctx.root,
+                level_ctx.tip,
+                level_ctx.count,
+                level_started.elapsed().as_millis()
             );
+            level_proof_ctxs[level_idx] = Some(level_ctx);
         }
 
         let (tips, roots, counts) = level_proof_ctxs.into_iter().map(Option::unwrap).map(|l| (l.tip, l.root, l.count)).multiunzip();
-
+        info!(
+            "PP-BUILD-DIAG id={} stage=calculate_descriptor_complete elapsed_ms={}",
+            build_id,
+            calculation_started.elapsed().as_millis()
+        );
         PruningProofDescriptor::new(pp, tips, roots, counts)
     }
 
@@ -322,10 +619,28 @@ impl PruningProofManager {
         prev_tip: Option<Hash>,
         prev_root: Option<Hash>,
         db: Arc<DB>,
+        build_id: u64,
     ) -> ProofInternalResult<LevelProofContext> {
+        let level_started = Instant::now();
+        info!(
+            "PP-BUILD-DIAG id={} stage=root_calculation_level_start level={} previous_tip={:?} previous_root={:?} required_block={:?}",
+            build_id, level, prev_tip, prev_root, required_block
+        );
+        let reachability_probe_started = Instant::now();
+        info!("PP-BUILD-DIAG id={} stage=reachability_lock_wait_start phase=root_calculation level={}", build_id, level);
+        let reachability_probe = self.reachability_store.read();
+        info!(
+            "PP-BUILD-DIAG id={} stage=reachability_lock_acquired phase=root_calculation level={} elapsed_ms={}",
+            build_id,
+            level,
+            reachability_probe_started.elapsed().as_millis()
+        );
+        drop(reachability_probe);
+
         // Select the tip at this level:
         // - If the pruning point level >= level, use it.
         // - Otherwise, use the approximate selected parent at level.
+        info!("PP-BUILD-DIAG id={} stage=level_tip_selection_start level={}", build_id, level);
         let tip = if pp_header.block_level >= level {
             pp_header.header.hash
         } else {
@@ -340,6 +655,13 @@ impl PruningProofManager {
                 .ok_or_else(|| ProofInternalError::NotEnoughHeadersToBuildProof("no reachable parents".to_string()))?
                 .hash
         };
+        info!(
+            "PP-BUILD-DIAG id={} stage=level_tip_selection_complete level={} tip={} elapsed_ms={}",
+            build_id,
+            level,
+            tip,
+            level_started.elapsed().as_millis()
+        );
 
         // Base-level blue score of the selected tip, taken directly from the header.
         // This is distinct from the *locally computed* blue score later derived from
@@ -370,6 +692,9 @@ impl PruningProofManager {
 
         // For each visited block, store the size of its (known) future up to `tip`.
         let mut future_sizes_map = BlockHashMap::<u64>::new();
+        let mut traversal_count = 0usize;
+        let mut parent_edges = 0usize;
+        let root_attempts = Cell::new(0usize);
 
         // Each ghostdag attempt uses a fresh temp store namespace (indexed internally by `retries`).
         let mut ghostdag_factory = GhostdagStoreFactory::new(db.clone(), cache_policy, level);
@@ -380,6 +705,13 @@ impl PruningProofManager {
 
         // Try to realize a level-proof from a candidate root
         let mut try_root = |relations_store: &DbRelationsStore, root: Hash, future_size: u64| -> Option<LevelProofContext> {
+            let attempt = root_attempts.get() + 1;
+            root_attempts.set(attempt);
+            let attempt_started = Instant::now();
+            info!(
+                "PP-BUILD-DIAG id={} stage=root_attempt_start level={} attempt={} root={} tip={} future_size={} required={}",
+                build_id, level, attempt, root, tip, future_size, required
+            );
             // Populate ghostdag for `future(root) ∩ past(tip)` and test depth requirements.
             let (ghostdag_store, has_required_block, count) = self.populate_level_proof_ghostdag_data(
                 relations_store,
@@ -390,10 +722,23 @@ impl PruningProofManager {
                 required,
                 level,
                 self.ghostdag_k,
+                build_id,
+                attempt,
             );
 
             // Realized blue depth for this root, computed from the level-specific ghostdag
             let current_level_score = ghostdag_store.get_blue_score(tip).unwrap();
+            info!(
+                "PP-BUILD-DIAG id={} stage=root_attempt_complete level={} attempt={} root={} headers={} has_required={} blue_score={} elapsed_ms={}",
+                build_id,
+                level,
+                attempt,
+                root,
+                count,
+                has_required_block,
+                current_level_score,
+                attempt_started.elapsed().as_millis()
+            );
 
             // Log all non-trivial cases
             if tip != self.genesis_hash {
@@ -418,6 +763,19 @@ impl PruningProofManager {
             if !visited.insert(current) {
                 continue;
             }
+            traversal_count += 1;
+            if traversal_count % 10_000 == 0 {
+                info!(
+                    "PP-BUILD-DIAG id={} stage=level_walk_progress level={} headers={} queued={} parent_edges={} root_attempts={} elapsed_ms={}",
+                    build_id,
+                    level,
+                    traversal_count,
+                    queue.len(),
+                    parent_edges,
+                    root_attempts.get(),
+                    level_started.elapsed().as_millis()
+                );
+            }
 
             if let Some(prev_root) = prev_root {
                 // When advancing from a previous descriptor, use `prev_root` as a boundary for root selection.
@@ -430,12 +788,13 @@ impl PruningProofManager {
 
             // Collect reachable parents at this level
             let parents: BlockHashes = self.reachable_parents_at_level(level, &header).collect::<Vec<_>>().into();
+            parent_edges += parents.len();
 
             // Persist relations for `current`
             relations_store.insert(current, parents.clone()).unwrap();
 
             trace!("Level: {} | Counting future size of {}", level, current);
-            let future_size = self.count_future_size(&relations_store, current, &future_sizes_map);
+            let future_size = self.count_future_size(&relations_store, current, &future_sizes_map, build_id, level);
             future_sizes_map.insert(current, future_size);
             trace!("Level: {} | Hash: {} | Future Size: {}", level, current, future_size);
 
@@ -509,10 +868,19 @@ impl PruningProofManager {
     /// (effectively a traversal over the reversed mergeset).
     ///
     /// Assumes `future_sizes` is populated for all children of `current` (caller is expected to be doing a topological BFS).
-    fn count_future_size(&self, relations: &DbRelationsStore, current: Hash, future_sizes: &BlockHashMap<u64>) -> u64 {
+    fn count_future_size(
+        &self,
+        relations: &DbRelationsStore,
+        current: Hash,
+        future_sizes: &BlockHashMap<u64>,
+        build_id: u64,
+        level: BlockLevel,
+    ) -> u64 {
+        let started = Instant::now();
         // Seed the BFS queue with all children of the current hash
         let mut queue: VecDeque<_> = relations.get_children(current).unwrap().read().iter().copied().collect();
         let mut visited = BlockHashSet::new();
+        let mut relation_edges = 0usize;
 
         struct Entry {
             child: Hash,
@@ -544,10 +912,37 @@ impl PruningProofManager {
                 }
 
                 count += 1;
-                for &child in relations.get_children(hash).unwrap().read().iter() {
+                let children = relations.get_children(hash).unwrap();
+                relation_edges += children.read().len();
+                for &child in children.read().iter() {
                     queue.push_back(child);
                 }
+                if visited.len() % 10_000 == 0 {
+                    info!(
+                        "PP-BUILD-DIAG id={} stage=future_size_walk_progress level={} root={} visited={} queued={} relation_edges={} elapsed_ms={}",
+                        build_id,
+                        level,
+                        current,
+                        visited.len(),
+                        queue.len(),
+                        relation_edges,
+                        started.elapsed().as_millis()
+                    );
+                }
             }
+        }
+
+        if visited.len() >= 10_000 {
+            info!(
+                "PP-BUILD-DIAG id={} stage=future_size_walk_complete level={} root={} visited={} relation_edges={} future_size={} elapsed_ms={}",
+                build_id,
+                level,
+                current,
+                visited.len(),
+                relation_edges,
+                count,
+                started.elapsed().as_millis()
+            );
         }
 
         trace!("Counted future size of {} as {}", current, count);
@@ -568,7 +963,14 @@ impl PruningProofManager {
         required_block: Hash,
         level: BlockLevel,
         ghostdag_k: KType,
+        build_id: u64,
+        attempt: usize,
     ) -> (Arc<DbGhostdagStore>, bool, u64) {
+        let started = Instant::now();
+        info!(
+            "PP-BUILD-DIAG id={} stage=ghostdag_population_start level={} attempt={} root={} tip={} required={}",
+            build_id, level, attempt, root, tip, required_block
+        );
         debug!("Populating GD for root {} at level {} (retry {})", root, level, ghostdag_factory.retries.saturating_sub(1));
 
         let ghostdag_store = ghostdag_factory.new_store();
@@ -621,6 +1023,19 @@ impl PruningProofManager {
 
             has_required_block |= current == required_block;
             count += 1;
+            if count % 10_000 == 0 {
+                info!(
+                    "PP-BUILD-DIAG id={} stage=ghostdag_population_progress level={} attempt={} root={} headers={} queued={} visited={} elapsed_ms={}",
+                    build_id,
+                    level,
+                    attempt,
+                    root,
+                    count,
+                    queue.len(),
+                    visited.len(),
+                    started.elapsed().as_millis()
+                );
+            }
 
             let parents = relations_view.get_parents(current).unwrap();
             assert!(!parents.is_empty(), "non-root blocks must have parents");
@@ -656,6 +1071,16 @@ impl PruningProofManager {
         }
 
         // Returned for sanity testing by the caller
+        info!(
+            "PP-BUILD-DIAG id={} stage=ghostdag_population_complete level={} attempt={} root={} headers={} has_required={} elapsed_ms={}",
+            build_id,
+            level,
+            attempt,
+            root,
+            count,
+            has_required_block,
+            started.elapsed().as_millis()
+        );
         (ghostdag_store, has_required_block, count)
     }
 

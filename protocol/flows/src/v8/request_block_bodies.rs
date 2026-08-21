@@ -1,9 +1,12 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
+use keryx_consensus_core::errors::consensus::ConsensusResult;
 use keryx_core::debug;
 use keryx_p2p_lib::{
     IncomingRoute, Router, common::ProtocolError, dequeue_with_request_id, make_response, pb::kaspad_message::Payload,
 };
 use std::sync::Arc;
+
+const CONSENSUS_READ_BATCH_SIZE: usize = 32;
 
 pub struct HandleBlockBodyRequests {
     ctx: FlowContext,
@@ -34,23 +37,35 @@ impl HandleBlockBodyRequests {
             debug!("got request for {} blocks bodies", hashes.len());
             let session = self.ctx.consensus().unguarded_session();
 
-            for hash in hashes {
-                // Fetch the full block (not just the body) so the proven PoM tier AND the
-                // possession proof travel with the body: a syncing peer needs the tier to validate
-                // the coinbase tier-reward split, and the proof so the block it persists can later
-                // be relayed to proof-enforcing peers (otherwise it is served "naked" and rejected
-                // with "PoM possession proof missing"). Always ship the proof when we have it:
-                // depth-stripping it against OUR virtual is unsound, since the receiver's virtual
-                // lags behind ours during IBD — a block "deep" for us can still be recent for the
-                // receiver, which would persist it naked and later be rejected by proof-enforcing
-                // relay peers (the 2026-07-31 naked-band wedge).
-                let block = session.async_get_block(hash).await?;
-                self.ctx.warn_if_serving_naked_pom_block(&block);
-                let mut body_msg: keryx_p2p_lib::pb::BlockBodyMessage = block.transactions.as_ref().into();
-                body_msg.pom_tier =
-                    block.pom_tier.map(|t| t as u32).or_else(|| block.pom_proof.as_ref().map(|p| p.tier as u32));
-                body_msg.pom_proof = block.pom_proof.as_ref().map(|p| p.to_wire_bytes());
-                self.router.enqueue(make_response!(Payload::BlockBody, body_msg, request_id)).await?;
+            // Keep both database reads and potentially-large PoM serialization off the async
+            // runtime. A bounded group amortizes spawn_blocking overhead without letting one peer
+            // pin the consensus reader or allocate an unbounded response buffer.
+            for hash_batch in hashes.chunks(CONSENSUS_READ_BATCH_SIZE) {
+                let hashes = hash_batch.to_vec();
+                let ctx = self.ctx.clone();
+                let body_messages = session
+                    .clone()
+                    .spawn_blocking(move |c| {
+                        hashes
+                            .into_iter()
+                            .map(|hash| {
+                                let block = c.get_block(hash)?;
+                                ctx.warn_if_serving_naked_pom_block(&block);
+                                let mut body_msg: keryx_p2p_lib::pb::BlockBodyMessage = block.transactions.as_ref().into();
+                                body_msg.pom_tier = block
+                                    .pom_tier
+                                    .map(|tier| tier as u32)
+                                    .or_else(|| block.pom_proof.as_ref().map(|proof| proof.tier as u32));
+                                body_msg.pom_proof = block.pom_proof.as_ref().map(|proof| proof.to_wire_bytes());
+                                Ok(body_msg)
+                            })
+                            .collect::<ConsensusResult<Vec<_>>>()
+                    })
+                    .await?;
+
+                for body_msg in body_messages {
+                    self.router.enqueue(make_response!(Payload::BlockBody, body_msg, request_id)).await?;
+                }
             }
         }
     }

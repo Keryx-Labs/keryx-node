@@ -58,6 +58,53 @@ impl PruningProofDescriptor {
     }
 }
 
+/// Restart-persistent ordered membership for a locally-built pruning proof.
+///
+/// This is deliberately stored separately from [`PruningProofDescriptor`] so existing descriptor
+/// records remain binary-compatible. The descriptor is still the authority for pruning-point,
+/// root, tip, and count matching; this item only avoids rediscovering the same ordered hashes.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct PruningProofHashIndex {
+    format_version: u8,
+    pruning_point: Hash,
+    levels: Vec<Vec<Hash>>,
+}
+
+impl PruningProofHashIndex {
+    const FORMAT_VERSION: u8 = 1;
+
+    pub(crate) fn from_proof(proof: &PruningPointProof, descriptor: &PruningProofDescriptor) -> Self {
+        assert!(!descriptor.external, "external proof descriptors must not be persisted as local hash indexes");
+        Self {
+            format_version: Self::FORMAT_VERSION,
+            pruning_point: descriptor.pruning_point,
+            levels: proof.iter().map(|level| level.iter().map(|header| header.hash).collect()).collect(),
+        }
+    }
+
+    pub(crate) fn matches_descriptor(&self, descriptor: &PruningProofDescriptor) -> bool {
+        if self.format_version != Self::FORMAT_VERSION
+            || descriptor.external
+            || self.pruning_point != descriptor.pruning_point
+            || self.levels.len() != descriptor.counts.len()
+            || descriptor.counts.len() != descriptor.roots.len()
+            || descriptor.roots.len() != descriptor.tips.len()
+        {
+            return false;
+        }
+
+        self.levels.iter().enumerate().all(|(level, hashes)| {
+            hashes.len() as u64 == descriptor.counts[level]
+                && hashes.first() == Some(&descriptor.roots[level])
+                && hashes.last() == Some(&descriptor.tips[level])
+        })
+    }
+
+    pub(crate) fn levels(&self) -> &[Vec<Hash>] {
+        &self.levels
+    }
+}
+
 /// Reader API for `PruningStore`.
 pub trait PruningStoreReader {
     fn pruning_point(&self) -> StoreResult<Hash>;
@@ -99,6 +146,7 @@ pub struct DbPruningStore {
     retention_checkpoint_access: CachedDbItem<Hash>,
     retention_period_root_access: CachedDbItem<Hash>,
     pruning_proof_descriptor_access: CachedDbItem<Arc<PruningProofDescriptor>>,
+    pruning_proof_hash_index_access: CachedDbItem<Arc<PruningProofHashIndex>>,
 }
 
 impl DbPruningStore {
@@ -108,7 +156,8 @@ impl DbPruningStore {
             access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::PruningPoint.into()),
             retention_checkpoint_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::RetentionCheckpoint.into()),
             retention_period_root_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::RetentionPeriodRoot.into()),
-            pruning_proof_descriptor_access: CachedDbItem::new(db, DatabaseStorePrefixes::PruningProofDescriptor.into()),
+            pruning_proof_descriptor_access: CachedDbItem::new(db.clone(), DatabaseStorePrefixes::PruningProofDescriptor.into()),
+            pruning_proof_hash_index_access: CachedDbItem::new(db, DatabaseStorePrefixes::PruningProofHashIndex.into()),
         }
     }
 
@@ -130,6 +179,14 @@ impl DbPruningStore {
 
     pub fn set_pruning_proof_descriptor(&mut self, descriptor: PruningProofDescriptor) -> StoreResult<()> {
         self.pruning_proof_descriptor_access.write(DirectDbWriter::new(&self.db), &Arc::new(descriptor))
+    }
+
+    pub(crate) fn set_pruning_proof_hash_index(&mut self, index: PruningProofHashIndex) -> StoreResult<()> {
+        self.pruning_proof_hash_index_access.write(DirectDbWriter::new(&self.db), &Arc::new(index))
+    }
+
+    pub(crate) fn pruning_proof_hash_index(&self) -> StoreResult<Arc<PruningProofHashIndex>> {
+        self.pruning_proof_hash_index_access.read()
     }
 }
 
@@ -156,6 +213,40 @@ impl PruningStoreReader for DbPruningStore {
 
     fn pruning_proof_descriptor(&self) -> StoreResult<Arc<PruningProofDescriptor>> {
         self.pruning_proof_descriptor_access.read()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_consensus_core::header::Header;
+
+    fn proof_for_hashes(levels: &[Vec<Hash>]) -> PruningPointProof {
+        levels
+            .iter()
+            .map(|level| level.iter().copied().map(|hash| Arc::new(Header::from_precomputed_hash(hash, vec![]))).collect())
+            .collect()
+    }
+
+    #[test]
+    fn local_hash_index_requires_an_exact_descriptor_match() {
+        let levels = vec![vec![Hash::from_u64_word(1), Hash::from_u64_word(2)], vec![Hash::from_u64_word(3)]];
+        let proof = proof_for_hashes(&levels);
+        let descriptor = PruningProofDescriptor::from_proof(&proof, levels[0][1], false);
+        let index = PruningProofHashIndex::from_proof(&proof, &descriptor);
+        assert!(index.matches_descriptor(&descriptor));
+
+        let mut changed_count = descriptor.clone();
+        changed_count.counts[0] += 1;
+        assert!(!index.matches_descriptor(&changed_count));
+
+        let mut changed_root = descriptor.clone();
+        changed_root.roots[0] = Hash::from_u64_word(4);
+        assert!(!index.matches_descriptor(&changed_root));
+
+        let mut external = descriptor;
+        external.external = true;
+        assert!(!index.matches_descriptor(&external));
     }
 }
 

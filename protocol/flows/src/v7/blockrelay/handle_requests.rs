@@ -1,5 +1,5 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use keryx_core::debug;
+use keryx_core::{debug, warn};
 use keryx_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
@@ -45,7 +45,30 @@ impl HandleRelayBlockRequests {
             let session = self.ctx.consensus().unguarded_session();
 
             for hash in hashes {
-                let block = session.async_get_block(hash).await?;
+                // A peer may request a block for which we still retain the header/status while the
+                // body has already been pruned or is temporarily unavailable during IBD recovery.
+                // `async_get_block(...)?` used to turn this local storage condition into a protocol
+                // error, which sent a Reject and tore down an otherwise healthy P2P connection.
+                // Check body availability first and simply decline to serve such requests. The
+                // requester can retry the hash from another peer instead of both sides entering a
+                // reconnect loop.
+                if !session.async_get_block_status(hash).await.is_some_and(|status| status.has_block_body()) {
+                    debug!("relay request for {} from peer {} cannot be served: full block body is not available locally", hash, self.router);
+                    continue;
+                }
+
+                let block = match session.async_get_block(hash).await {
+                    Ok(block) => block,
+                    Err(err) => {
+                        // Status/body stores can race pruning. Treat the race as a local serving
+                        // miss, not as peer misbehaviour and not as a reason to kill the connection.
+                        warn!(
+                            "relay request for {} from peer {} became unavailable while reading the full block: {} — keeping peer connected",
+                            hash, self.router, err
+                        );
+                        continue;
+                    }
+                };
                 self.ctx.warn_if_serving_naked_pom_block(&block);
                 self.router.enqueue(make_response!(Payload::Block, (self.header_format, &block).into(), request_id)).await?;
                 debug!("relayed block with hash {} to peer {}", hash, self.router);

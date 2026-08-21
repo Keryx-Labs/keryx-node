@@ -23,6 +23,13 @@ use tokio::time::timeout;
 
 pub const IBD_BATCH_SIZE: usize = 99;
 
+// The wire protocol sends pruning UTXOs in relatively small chunks. Importing each physical
+// chunk separately causes one consensus spawn_blocking/lock transition per message. Coalesce a
+// bounded number of wire chunks before handing them to the importer. With the current 1,000-entry
+// server chunk this caps the logical import batch at roughly 8,000 UTXOs while reducing scheduling
+// overhead by up to 8x.
+const UTXO_IMPORT_BATCH_CHUNKS: usize = 8;
+
 pub struct TrustedEntryStream<'a, 'b> {
     router: &'a Router,
     incoming_route: &'b mut IncomingRoute,
@@ -67,7 +74,7 @@ impl<'a, 'b> TrustedEntryStream<'a, 'b> {
         // Request the next batch only if the stream is still live
         if let Ok(Some(_)) = res {
             self.i += 1;
-            if self.i.is_multiple_of(IBD_BATCH_SIZE) {
+            if self.i % IBD_BATCH_SIZE == 0 {
                 info!("Downloaded {} blocks from the pruning point anticone", self.i - 1);
                 self.router
                     .enqueue(make_message!(
@@ -142,62 +149,70 @@ pub type UtxosetChunk = Vec<(TransactionOutpoint, UtxoEntry)>;
 pub struct PruningPointUtxosetChunkStream<'a, 'b> {
     router: &'a Router,
     incoming_route: &'b mut IncomingRoute,
-    i: usize, // Chunk index
+    i: usize, // Physical wire chunk index
     utxo_count: usize,
+    done: bool,
 }
 
 impl<'a, 'b> PruningPointUtxosetChunkStream<'a, 'b> {
     pub fn new(router: &'a Router, incoming_route: &'b mut IncomingRoute) -> Self {
-        Self { router, incoming_route, i: 0, utxo_count: 0 }
+        Self { router, incoming_route, i: 0, utxo_count: 0, done: false }
     }
 
     pub async fn next(&mut self) -> Result<Option<UtxosetChunk>, ProtocolError> {
-        let res: Result<Option<UtxosetChunk>, ProtocolError> = match timeout(DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
-            Ok(op) => {
-                if let Some(msg) = op {
-                    match msg.payload {
-                        Some(Payload::PruningPointUtxoSetChunk(payload)) => Ok(Some(payload.try_into()?)),
-                        Some(Payload::DonePruningPointUtxoSetChunks(_)) => {
-                            info!("Finished receiving the UTXO set. Total UTXOs: {}", self.utxo_count);
-                            Ok(None)
-                        }
-                        Some(Payload::UnexpectedPruningPoint(_)) => {
-                            // Although this can happen also to an honest syncer (if his pruning point moves during the sync),
-                            // we prefer erring and disconnecting to avoid possible exploits by a syncer repeating this failure
-                            Err(ProtocolError::ConsensusError(ConsensusError::UnexpectedPruningPoint))
-                        }
-                        _ => Err(ProtocolError::UnexpectedMessage(
-                            stringify!(
-                                Payload::PruningPointUtxoSetChunk
-                                    | Payload::DonePruningPointUtxoSetChunks
-                                    | Payload::UnexpectedPruningPoint
-                            ),
-                            msg.payload.as_ref().map(|v| v.into()),
-                        )),
+        if self.done {
+            return Ok(None);
+        }
+
+        let mut import_batch = UtxosetChunk::new();
+
+        for _ in 0..UTXO_IMPORT_BATCH_CHUNKS {
+            let msg = match timeout(DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => return Err(ProtocolError::ConnectionClosed),
+                Err(_) => return Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
+            };
+
+            match msg.payload {
+                Some(Payload::PruningPointUtxoSetChunk(payload)) => {
+                    let mut chunk: UtxosetChunk = payload.try_into()?;
+                    self.i += 1;
+                    self.utxo_count += chunk.len();
+                    import_batch.append(&mut chunk);
+
+                    if self.i % IBD_BATCH_SIZE == 0 {
+                        info!("Received {} UTXO set chunks so far, totaling in {} UTXOs", self.i, self.utxo_count);
+                        self.router
+                            .enqueue(make_message!(
+                                Payload::RequestNextPruningPointUtxoSetChunk,
+                                RequestNextPruningPointUtxoSetChunkMessage {}
+                            ))
+                            .await?;
                     }
-                } else {
-                    Err(ProtocolError::ConnectionClosed)
+                }
+                Some(Payload::DonePruningPointUtxoSetChunks(_)) => {
+                    info!("Finished receiving the UTXO set. Total UTXOs: {}", self.utxo_count);
+                    self.done = true;
+                    break;
+                }
+                Some(Payload::UnexpectedPruningPoint(_)) => {
+                    // Although this can happen also to an honest syncer (if his pruning point moves during the sync),
+                    // we prefer erring and disconnecting to avoid possible exploits by a syncer repeating this failure
+                    return Err(ProtocolError::ConsensusError(ConsensusError::UnexpectedPruningPoint));
+                }
+                _ => {
+                    return Err(ProtocolError::UnexpectedMessage(
+                        stringify!(
+                            Payload::PruningPointUtxoSetChunk
+                                | Payload::DonePruningPointUtxoSetChunks
+                                | Payload::UnexpectedPruningPoint
+                        ),
+                        msg.payload.as_ref().map(|v| v.into()),
+                    ));
                 }
             }
-            Err(_) => Err(ProtocolError::Timeout(DEFAULT_TIMEOUT)),
-        };
-
-        // Request the next batch only if the stream is still live
-        if let Ok(Some(chunk)) = res {
-            self.i += 1;
-            self.utxo_count += chunk.len();
-            if self.i.is_multiple_of(IBD_BATCH_SIZE) {
-                info!("Received {} UTXO set chunks so far, totaling in {} UTXOs", self.i, self.utxo_count);
-                self.router
-                    .enqueue(make_message!(
-                        Payload::RequestNextPruningPointUtxoSetChunk,
-                        RequestNextPruningPointUtxoSetChunkMessage {}
-                    ))
-                    .await?;
-            }
-            Ok(Some(chunk))
-        } else {
-            res
         }
+
+        if import_batch.is_empty() && self.done { Ok(None) } else { Ok(Some(import_batch)) }
     }
 }

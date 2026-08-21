@@ -77,7 +77,6 @@ pub enum DatabaseStorePrefixes {
     // ---- Ratio-reward (cont.) ----
     // 44 retired: the legacy `WindowedProduction` running-sum index, superseded by the path-independent
     // prefix-sum index below (`WindowedProductionPrefix`). Do not reuse this discriminant.
-
     /// Fast-sync catch-up: virtual selected-chain index at which the windowed-production index was last
     /// reset by a pruning-point UTXO import (see `import_pruning_point_utxo_set`). Single value, no key.
     ProductionIndexSeededAt = 45,
@@ -107,6 +106,10 @@ pub enum DatabaseStorePrefixes {
     /// Coin-age promotion watermark (single key): the highest virtual daa score up to which the
     /// maturation queue has been swept. A decrease (deep reorg) triggers a full coin-age rebuild.
     CoinAgeWatermark = 51,
+
+    /// Ordered block hashes for a locally-built pruning proof. This is a restart-persistent
+    /// materialization cache; it is never populated from an external proof descriptor.
+    PruningProofHashIndex = 52,
 
     // ---- Retention Period Root ----
     RetentionPeriodRoot = 50,

@@ -304,6 +304,30 @@ impl DbHeadersStore {
         self.headers_access.has_with_fallback(self.fallback_prefix.as_ref(), hash)
     }
 
+    /// Loads many headers with one primary-store multi-get, while retaining all legacy decode
+    /// fallbacks for old datadirs. Results preserve the input order.
+    pub(crate) fn get_headers_many(&self, hashes: &[Hash]) -> StoreResult<Vec<Arc<Header>>> {
+        let records = match self.headers_access.read_many(hashes) {
+            Ok((records, _, _)) => records,
+            // A legacy value can fail the current-layout batch decoder. Fall back to the existing
+            // per-header compatibility decoder for the whole chunk in that uncommon case.
+            Err(_) => return hashes.iter().map(|&hash| self.get_header(hash)).collect(),
+        };
+
+        hashes
+            .iter()
+            .copied()
+            .zip(records)
+            .map(|(hash, record)| match record {
+                Some(record) if record.header.hash == hash => Ok(record.header),
+                Some(record) => {
+                    Err(StoreError::DataInconsistency(format!("header hash index requested {hash} but loaded {}", record.header.hash)))
+                }
+                None => self.get_header(hash),
+            })
+            .collect()
+    }
+
     pub fn insert_batch(
         &self,
         batch: &mut WriteBatch,

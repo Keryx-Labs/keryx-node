@@ -20,6 +20,16 @@ pub struct ChainNegotiationOutput {
     pub syncer_pruning_point: Hash,
 }
 
+/// Mirrors the explicit unsafe operator opt-in consumed by `IbdFlow::trust_sync_from_tip`.
+///
+/// Chain-anchor enforcement runs during negotiation, before `determine_ibd_type` gets a chance to
+/// select the trusted forward-sync fallback. Without this matching gate, a node which has already
+/// witnessed the anchor rejects the exact `highest_known = None` condition that the fallback was
+/// designed to recover from, making `KERYX_TRUST_SYNC_FROM_TIP=1` unreachable after pruning.
+fn trust_sync_from_tip_enabled() -> bool {
+    matches!(std::env::var("KERYX_TRUST_SYNC_FROM_TIP").as_deref(), Ok("1"))
+}
+
 impl IbdFlow {
     pub(super) async fn negotiate_missing_syncer_chain_segment(
         &mut self,
@@ -53,10 +63,18 @@ impl IbdFlow {
         let mut negotiation_zoom_counts = 0;
         let mut initial_locator_len = locator_hashes.len();
         loop {
+            // Locator size is bounded to 64. Query all statuses under one blocking consensus call
+            // instead of paying one Tokio spawn_blocking transition per hash on every zoom step.
+            let hashes = locator_hashes.clone();
+            let statuses = consensus
+                .clone()
+                .spawn_blocking(move |c| hashes.into_iter().map(|hash| (hash, c.get_block_status(hash))).collect::<Vec<_>>())
+                .await;
+
             let mut lowest_unknown_syncer_chain_hash: Option<Hash> = None;
             let mut current_highest_known_syncer_chain_hash: Option<Hash> = None;
-            for &syncer_chain_hash in locator_hashes.iter() {
-                match consensus.async_get_block_status(syncer_chain_hash).await {
+            for (syncer_chain_hash, status) in statuses {
+                match status {
                     None => {
                         // Log the unknown block and continue to the next iteration
                         lowest_unknown_syncer_chain_hash = Some(syncer_chain_hash);
@@ -201,6 +219,17 @@ impl IbdFlow {
                             syncer_virtual_selected_parent, anchor_hash, anchor_daa
                         )));
                     }
+                }
+                // Explicit trusted-forward-sync is the one exception to the inconclusive-anchor
+                // refusal below. The operator has deliberately selected a known-good archival
+                // source because the peer's locator is pruned above our tip; `determine_ibd_type`
+                // needs this `None` result intact to enter the forward-sync path. This does NOT
+                // weaken the default policy and positive proof of divergence above still wins.
+                None if trust_sync_from_tip_enabled() => {
+                    warn!(
+                        "KERYX_TRUST_SYNC_FROM_TIP: no shared locator block with {} while chain anchor {} (daa {}) is witnessed — deferring anchor placement to explicit trusted forward sync",
+                        self.router, anchor_hash, anchor_daa
+                    );
                 }
                 // No shared chain block at all proves nothing about the syncer's chain — it is an
                 // ambiguous negotiation outcome, and negotiation is at its most fragile exactly

@@ -22,6 +22,7 @@ pub const POM_V4_TILE_CHUNKS: u64 = (POM_V4_TILE_BYTES / POM_V4_CHUNK_BYTES) as 
 pub const POM_V4_SNIPPET_BYTES: usize = 32;
 /// Aligned-subtree depth of a whole tile (`log2(POM_V4_TILE_CHUNKS)` = log2(32) = 5).
 const TILE_SUBTREE_DEPTH: u32 = 5;
+const TILE_LEAVES: usize = POM_V4_TILE_BYTES / POM_V4_CHUNK_BYTES;
 
 /// Domain salts. Derivation: sha256(label), first 8 bytes read as little-endian u64
 /// (same convention as the v3 / H3 / H5 salts).
@@ -128,11 +129,13 @@ pub fn v4_next_offset(seed: u64, step: u64, snippet: &[u8; POM_V4_SNIPPET_BYTES]
     mix64(seed ^ (step + 1).wrapping_mul(POM_V4_OFFSET_STEP_SALT) ^ snippet_fold(snippet)) % n_tiles
 }
 
-/// One walk transition: S_t = rho(S_{t-1} x tile), entrywise, column j of the tile being
-/// `tile[j*D .. (j+1)*D]`.
-pub fn v4_transition(state: &V4State, tile: &[u8], step: u32) -> V4State {
+/// One walk transition written into a caller-provided state buffer. The verifier uses this
+/// allocation-free form for all K steps; `v4_transition` remains the simple reference wrapper.
+#[inline]
+fn v4_transition_into(state: &[u8], tile: &[u8], step: u32, next: &mut [u8]) {
+    debug_assert_eq!(state.len(), POM_V4_TILE_BYTES);
     debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
-    let mut next = vec![0u8; POM_V4_D * POM_V4_D];
+    debug_assert_eq!(next.len(), POM_V4_TILE_BYTES);
     for x in 0..POM_V4_D {
         let row = &state[x * POM_V4_D..(x + 1) * POM_V4_D];
         for j in 0..POM_V4_D {
@@ -140,15 +143,33 @@ pub fn v4_transition(state: &V4State, tile: &[u8], step: u32) -> V4State {
             next[x * POM_V4_D + j] = rho8(v4_dot_i8(row, col), rho_tweak(step, x as u32, j as u32));
         }
     }
+}
+
+/// One walk transition: S_t = rho(S_{t-1} x tile), entrywise, column j of the tile being
+/// `tile[j*D .. (j+1)*D]`.
+pub fn v4_transition(state: &V4State, tile: &[u8], step: u32) -> V4State {
+    let mut next = vec![0u8; POM_V4_TILE_BYTES];
+    v4_transition_into(state, tile, step, &mut next);
     next
 }
 
 /// Merkle root over the D rows of a state (leaf = blake3(row); D = 32 is a power of two so the
-/// tree is complete, no duplicate-last).
+/// tree is complete, no duplicate-last). The fixed scratch array avoids heap allocation in the
+/// verifier's final-state fold.
 pub fn v4_state_root(state: &V4State) -> [u8; 32] {
-    let mut level: Vec<[u8; 32]> = (0..POM_V4_D).map(|r| blake(&state[r * POM_V4_D..(r + 1) * POM_V4_D])).collect();
-    while level.len() > 1 {
-        level = level.chunks(2).map(|p| hash_pair(&p[0], &p[1])).collect();
+    debug_assert_eq!(state.len(), POM_V4_TILE_BYTES);
+    let mut level = [[0u8; 32]; POM_V4_D];
+    for (r, slot) in level.iter_mut().enumerate() {
+        *slot = blake(&state[r * POM_V4_D..(r + 1) * POM_V4_D]);
+    }
+    let mut width = POM_V4_D;
+    while width > 1 {
+        for i in 0..width / 2 {
+            let left = level[i * 2];
+            let right = level[i * 2 + 1];
+            level[i] = hash_pair(&left, &right);
+        }
+        width /= 2;
     }
     level[0]
 }
@@ -167,10 +188,22 @@ fn fold_level(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
 
 /// Fold a whole tile's `POM_V4_TILE_CHUNKS` chunk leaves into its aligned subtree root
 /// (depth `TILE_SUBTREE_DEPTH`, always complete since `POM_V4_TILE_CHUNKS` is a power of two).
+/// Uses fixed scratch storage because this function runs 256 times for every v4 verification.
 pub fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
-    let mut level: Vec<[u8; 32]> = tile.chunks(POM_V4_CHUNK_BYTES).map(blake).collect();
-    for _ in 0..TILE_SUBTREE_DEPTH {
-        level = fold_level(&level);
+    debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
+    debug_assert_eq!(TILE_LEAVES, 1usize << TILE_SUBTREE_DEPTH);
+    let mut level = [[0u8; 32]; TILE_LEAVES];
+    for (slot, chunk) in level.iter_mut().zip(tile.chunks_exact(POM_V4_CHUNK_BYTES)) {
+        *slot = blake(chunk);
+    }
+    let mut width = TILE_LEAVES;
+    while width > 1 {
+        for i in 0..width / 2 {
+            let left = level[i * 2];
+            let right = level[i * 2 + 1];
+            level[i] = hash_pair(&left, &right);
+        }
+        width /= 2;
     }
     level[0]
 }
@@ -194,7 +227,11 @@ pub fn verify_pom_proof_v4(
         return Err(PomV4VerifyError::BlobTooSmall);
     }
 
+    // Two 1 KiB buffers are reused for the full walk. The previous implementation allocated a
+    // fresh Vec on every one of the 256 transitions, which amplified allocator pressure when many
+    // recent IBD/relay proofs were verified concurrently.
     let mut state = v4_initial_state(seed);
+    let mut next = vec![0u8; POM_V4_TILE_BYTES];
     let mut off = v4_first_offset(seed, n_tiles);
     for step in 1..=POM_V4_K {
         let tile = &proof.tiles[step - 1];
@@ -204,7 +241,8 @@ pub fn verify_pom_proof_v4(
         if !verify_merkle(v4_tile_subtree_root(tile), off, &proof.merkle[step - 1].path, r_t) {
             return Err(PomV4VerifyError::BadTilePath);
         }
-        state = v4_transition(&state, tile, step as u32);
+        v4_transition_into(&state, tile, step as u32, &mut next);
+        std::mem::swap(&mut state, &mut next);
         if step < POM_V4_K {
             let snippet: [u8; POM_V4_SNIPPET_BYTES] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
             off = v4_next_offset(seed, step as u64, &snippet, n_tiles);
@@ -340,6 +378,37 @@ mod tests {
             level = fold_level(&level);
         }
         level[0]
+    }
+
+    fn reference_state_root(state: &V4State) -> [u8; 32] {
+        let mut level: Vec<[u8; 32]> =
+            (0..POM_V4_D).map(|r| blake(&state[r * POM_V4_D..(r + 1) * POM_V4_D])).collect();
+        while level.len() > 1 {
+            level = fold_level(&level);
+        }
+        level[0]
+    }
+
+    fn reference_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
+        let mut level: Vec<[u8; 32]> = tile.chunks(POM_V4_CHUNK_BYTES).map(blake).collect();
+        for _ in 0..TILE_SUBTREE_DEPTH {
+            level = fold_level(&level);
+        }
+        level[0]
+    }
+
+    #[test]
+    fn fixed_scratch_helpers_match_reference() {
+        let (blob, _) = test_blob(2);
+        let tile = &blob[..POM_V4_TILE_BYTES];
+        let state = v4_initial_state(0xA5A5_5A5A_1234_5678);
+        assert_eq!(v4_tile_subtree_root(tile), reference_tile_subtree_root(tile));
+        assert_eq!(v4_state_root(&state), reference_state_root(&state));
+
+        let expected = v4_transition(&state, tile, 17);
+        let mut actual = vec![0u8; POM_V4_TILE_BYTES];
+        v4_transition_into(&state, tile, 17, &mut actual);
+        assert_eq!(actual, expected);
     }
 
     #[test]
