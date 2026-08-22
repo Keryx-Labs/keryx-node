@@ -411,8 +411,10 @@ impl IbdFlow {
         let staging_session = staging.session().await;
 
         let pruning_point = self.sync_and_validate_pruning_proof(&staging_session, relay_block).await?;
-        self.sync_headers(&staging_session, syncer_virtual_selected_parent, pruning_point, relay_block).await?;
-        staging_session.async_validate_pruning_points(syncer_virtual_selected_parent).await?;
+        // Validate against the tip actually inserted: under a sync ceiling the syncer's sink is
+        // above the ceiling and is never stored, so it has no reachability entry.
+        let headers_tip = self.sync_headers(&staging_session, syncer_virtual_selected_parent, pruning_point, relay_block).await?;
+        staging_session.async_validate_pruning_points(headers_tip).await?;
         self.validate_staging_timestamps(&self.ctx.consensus().session().await, &staging_session).await?;
         Ok(())
     }
