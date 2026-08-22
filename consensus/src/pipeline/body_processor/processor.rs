@@ -39,6 +39,7 @@ use keryx_consensus_notify::{
     root::ConsensusNotificationRoot,
 };
 use keryx_consensusmanager::SessionLock;
+use keryx_database::prelude::StoreError;
 use keryx_hashes::Hash;
 use keryx_notify::notifier::Notify;
 use parking_lot::RwLock;
@@ -425,7 +426,12 @@ impl BlockBodyProcessor {
         // the tier travels separately (`block.pom_tier`) — persist it so the coinbase tier-reward
         // split is reconstructible. `proof.tier` is authoritative when a proof is present.
         if let Some(proof) = &pom_proof {
-            self.pom_proof_store.insert_batch(&mut batch, hash, proof).unwrap();
+            // `adopt_pom_proof` accepts a header-only block, so a re-proof can store this block's
+            // proof before its body reaches this commit.
+            match self.pom_proof_store.insert_batch(&mut batch, hash, proof) {
+                Ok(()) | Err(StoreError::HashAlreadyExists(_)) => {}
+                Err(e) => panic!("PoM proof store error for {hash}: {e}"),
+            }
             self.pom_tier_store.insert_batch(&mut batch, hash, proof.tier).unwrap();
         } else if let Some(tier) = pom_tier {
             self.pom_tier_store.insert_batch(&mut batch, hash, tier).unwrap();

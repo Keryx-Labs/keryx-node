@@ -193,7 +193,10 @@ impl RocksDbPreset {
             opts.set_blob_file_size(64 * 1024 * 1024);
             opts.set_blob_compression_type(rocksdb::DBCompressionType::Lz4);
             opts.set_enable_blob_gc(true);
-            opts.set_blob_gc_age_cutoff(0.9);
+            // Fraction of the oldest blob files eligible for relocation during compaction. At 0.9
+            // nearly every file qualifies, and live blobs are rewritten far faster than they are
+            // created.
+            opts.set_blob_gc_age_cutoff(0.25);
             opts.set_blob_gc_force_threshold(0.2);
         }
 
@@ -307,7 +310,7 @@ impl RocksDbPreset {
             opts.set_blob_file_size(256 * 1024 * 1024); // 256MB blob files
             opts.set_blob_compression_type(DBCompressionType::Zstd); // Compress blobs
             opts.set_enable_blob_gc(true); // Enable garbage collection
-            opts.set_blob_gc_age_cutoff(0.9); // GC blobs when 90% old
+            opts.set_blob_gc_age_cutoff(0.25); // oldest 25% of blob files are relocation-eligible
             opts.set_blob_gc_force_threshold(0.1); // Force GC at 10% garbage
             opts.set_blob_compaction_readahead_size(8 * 1024 * 1024); // 8 MB blob readahead
         }
