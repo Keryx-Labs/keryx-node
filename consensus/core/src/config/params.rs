@@ -196,6 +196,11 @@ pub const H5_3_ACTIVATION_DAA: u64 = 63_250_000;
 /// blocks above it carrying the inherited (decayed) bits are rejected by upgraded nodes.
 pub const H5_4_ACTIVATION_DAA: u64 = 63_280_622;
 
+/// H9 relaunch difficulty reset. MUST equal the virtual_daa_score of the frozen relaunch base:
+/// a template inherits the virtual's daa (not virtual+1), so the reset fires on the very first
+/// re-mined block. Update before building the relaunch binary.
+pub const H9_ACTIVATION_DAA: u64 = 81_030_425;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -1187,6 +1192,14 @@ pub struct Params {
     /// builder and block validation — they MUST agree or every mined block is rejected.
     pub h6_reset_bits: Option<u32>,
 
+    /// Eighth difficulty-reset window, for the H9 relaunch. Carries its own target rather than
+    /// reusing `h6_reset_bits`, which is calibrated for a PoM v3 walk.
+    pub difficulty_reset_activation_h9: ForkActivation,
+
+    /// Target the H9 reset window pins. `None` keeps `genesis.bits`. Read by both the template
+    /// builder and block validation — they MUST agree or every mined block is rejected.
+    pub h9_reset_bits: Option<u32>,
+
     /// Single H5 bundle activation, keyed on the selected parent's DAA score. Drives every H5
     /// feature (parallel-block cap now; non-foldable walk + tier-0 swap when they land). Driven by
     /// `H5_ACTIVATION_DAA`. `never()` on nets where H5 does not apply.
@@ -1468,6 +1481,8 @@ impl Params {
             difficulty_reset_activation_h6: self.difficulty_reset_activation_h6,
             difficulty_reset_activation_v4: self.difficulty_reset_activation_v4,
             h6_reset_bits: self.h6_reset_bits,
+            difficulty_reset_activation_h9: self.difficulty_reset_activation_h9,
+            h9_reset_bits: self.h9_reset_bits,
             h5_activation: self.h5_activation,
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
@@ -1664,6 +1679,9 @@ pub const MAINNET_PARAMS: Params = Params {
     difficulty_reset_activation_h6: ForkActivation::new(76_316_623),
     difficulty_reset_activation_v4: ForkActivation::new(79_210_000),
     h6_reset_bits: Some(0x1f7fffff),
+    difficulty_reset_activation_h9: ForkActivation::new(H9_ACTIVATION_DAA),
+    // D = 25 000: one GPU at 500 kH/s under a PoM v4 walk.
+    h9_reset_bits: Some(0x1f014f8b),
     // H5 bundle gate — set to the relaunch tip DAA. Every H5 feature flips at this score.
     h5_activation: ForkActivation::new(H5_ACTIVATION_DAA),
     // H5.1 emergency relaunch — gate = virtual daa of the isolated base (2026-07-24).
@@ -1784,6 +1802,8 @@ pub const TESTNET_PARAMS: Params = Params {
     difficulty_reset_activation_h6: ForkActivation::new(1),
     difficulty_reset_activation_v4: ForkActivation::new(500),
     h6_reset_bits: Some(0x1f7fffff),
+    difficulty_reset_activation_h9: ForkActivation::never(),
+    h9_reset_bits: None,
     h5_activation: ForkActivation::new(0),
     h5_1_activation: ForkActivation::new(0),
     h5_2_activation: ForkActivation::new(0),
@@ -1876,6 +1896,8 @@ pub const SIMNET_PARAMS: Params = Params {
     difficulty_reset_activation_h6: ForkActivation::never(),
     difficulty_reset_activation_v4: ForkActivation::never(),
     h6_reset_bits: None,
+    difficulty_reset_activation_h9: ForkActivation::never(),
+    h9_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
@@ -1955,6 +1977,8 @@ pub const DEVNET_PARAMS: Params = Params {
     difficulty_reset_activation_h6: ForkActivation::never(),
     difficulty_reset_activation_v4: ForkActivation::never(),
     h6_reset_bits: None,
+    difficulty_reset_activation_h9: ForkActivation::never(),
+    h9_reset_bits: None,
     h5_activation: ForkActivation::never(),
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
