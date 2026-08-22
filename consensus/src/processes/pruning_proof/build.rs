@@ -12,7 +12,7 @@ use keryx_consensus_core::{
     header::Header,
     pruning::PruningPointProof,
 };
-use keryx_core::{debug, trace};
+use keryx_core::{debug, info, trace};
 use keryx_database::prelude::*;
 use keryx_hashes::Hash;
 use keryx_utils::binary_heap::TopK;
@@ -39,6 +39,12 @@ use crate::{
 
 use super::{ProofInternalResult, PruningProofManager};
 use crate::model::services::reachability::MTReachabilityService;
+
+/// Pruning-proof build counters, emitted only when `KERYX_PRUNING_PROOF_DEBUG=1`.
+fn proof_build_debug() -> bool {
+    static PROOF_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROOF_DEBUG.get_or_init(|| matches!(std::env::var("KERYX_PRUNING_PROOF_DEBUG").as_deref(), Ok("1")))
+}
 
 #[derive(Clone)]
 struct LevelProofContext {
@@ -453,6 +459,18 @@ impl PruningProofManager {
                 if current == self.genesis_hash
                     || (future_size >= required_future_size && base_level_depth >= required_base_level_depth)
                 {
+                    if proof_build_debug() {
+                        info!(
+                            "ROOTPICK level {} : root={} future_size={} base_level_depth={} (min future>={} depth>={}) visited={}",
+                            level,
+                            current,
+                            future_size,
+                            base_level_depth,
+                            required_future_size,
+                            required_base_level_depth,
+                            visited.len()
+                        );
+                    }
                     let root = current;
                     if let Some(level_ctx) = try_root(&relations_store, root, future_size) {
                         return Ok(level_ctx);
@@ -609,13 +627,34 @@ impl PruningProofManager {
         let mut has_required_block = root == required_block;
         let mut reachability_tip = root;
 
+        let mut it_pops = 0u64;
+        let mut it_dup = 0u64;
+        let mut it_out_of_past = 0u64;
+        let t_start = std::time::Instant::now();
+
         while let Some(Reverse(SortableBlock { hash: current, .. })) = queue.pop() {
+            it_pops += 1;
+            if it_pops % 100_000 == 0 && proof_build_debug() {
+                info!(
+                    "TRAVERSAL level {} : pops={} dup={} out_of_past={} kept={} queue={} elapsed={:.0}s",
+                    level,
+                    it_pops,
+                    it_dup,
+                    it_out_of_past,
+                    count,
+                    queue.len(),
+                    t_start.elapsed().as_secs_f64()
+                );
+            }
+
             if !visited.insert(current) {
+                it_dup += 1;
                 continue;
             }
 
             // We only care about `future(root) ∩ past(tip)`
             if !self.reachability_service.is_dag_ancestor_of(current, tip) {
+                it_out_of_past += 1;
                 continue;
             }
 
@@ -653,6 +692,19 @@ impl PruningProofManager {
             for child in relations_view.get_children(current).unwrap().read().iter().copied() {
                 queue.push(Reverse(SortableBlock { hash: child, blue_work: self.headers_store.get_header(child).unwrap().blue_work }));
             }
+        }
+
+        if proof_build_debug() {
+            info!(
+                "TRAVERSAL level {} DONE : pops={} dup={} out_of_past={} kept(count)={} ratio={:.1}:1 elapsed={:.1}s",
+                level,
+                it_pops,
+                it_dup,
+                it_out_of_past,
+                count,
+                it_pops as f64 / count.max(1) as f64,
+                t_start.elapsed().as_secs_f64()
+            );
         }
 
         // Returned for sanity testing by the caller
