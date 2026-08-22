@@ -174,6 +174,7 @@ pub(super) fn witness_scoped_error(e: &RuleError) -> bool {
         e,
         RuleError::BadPomProof(_)
             | RuleError::BadPomProofV3(_)
+            | RuleError::BadPomProofV4(_)
             | RuleError::PomFinalStateMismatch(_, _)
             | RuleError::PomUnknownTier(_)
     )
@@ -460,6 +461,7 @@ mod tests {
     use super::*;
     use keryx_consensus_core::pom::PomVerifyError;
     use keryx_consensus_core::pom_v3::PomV3VerifyError;
+    use keryx_consensus_core::pom_v4::PomV4VerifyError;
 
     #[test]
     fn test_witness_errors_never_mark_the_block_invalid_post_gate() {
@@ -468,6 +470,7 @@ mod tests {
         let witness_scoped = [
             RuleError::BadPomProof(PomVerifyError::TargetNotMet),
             RuleError::BadPomProofV3(PomV3VerifyError::MissingV3),
+            RuleError::BadPomProofV4(PomV4VerifyError::MissingV4),
             RuleError::PomFinalStateMismatch(1, 2),
             RuleError::PomUnknownTier(7),
         ];
