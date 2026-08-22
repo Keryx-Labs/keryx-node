@@ -199,7 +199,7 @@ pub const H5_4_ACTIVATION_DAA: u64 = 63_280_622;
 /// H9 relaunch difficulty reset. MUST equal the virtual_daa_score of the frozen relaunch base:
 /// a template inherits the virtual's daa (not virtual+1), so the reset fires on the very first
 /// re-mined block. Update before building the relaunch binary.
-pub const H9_ACTIVATION_DAA: u64 = 81_030_425;
+pub const H9_ACTIVATION_DAA: u64 = 80_932_000;
 
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
