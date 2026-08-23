@@ -804,6 +804,11 @@ const H7_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 4, 8);
 /// and can only churn IBD noise. Same monotonic-ordering note as above.
 const H8_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 5, 1);
 
+/// Minimum keryxd peer version accepted once our virtual daa has crossed the H9 gate: past it the
+/// difficulty is pinned by the H9 reset window and the chain anchor discriminates the relaunch
+/// chain, so a pre-1.5.3 build follows an abandoned branch. Same monotonic-ordering note as above.
+const H9_MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 5, 3);
+
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
 /// (dnsseeder crawlers etc.), which are let through — the chain anchor and the ban-worthy
@@ -869,7 +874,9 @@ impl ConnectionInitializer for FlowContext {
         // gate, keyed on our own virtual daa so a node still catching up to the gate keeps peering
         // with the builds it needs to get there.
         let virtual_daa = self.consensus().unguarded_session_blocking().get_virtual_daa_score();
-        let min_version = if self.config.reward_routing_activation.is_active(virtual_daa) {
+        let min_version = if self.config.difficulty_reset_activation_h9.is_active(virtual_daa) {
+            H9_MINIMUM_KERYXD_PEER_VERSION
+        } else if self.config.reward_routing_activation.is_active(virtual_daa) {
             H8_MINIMUM_KERYXD_PEER_VERSION
         } else if self.config.service_bond_v2_activation.is_active(virtual_daa) {
             H7_MINIMUM_KERYXD_PEER_VERSION
