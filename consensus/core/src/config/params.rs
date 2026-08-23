@@ -209,13 +209,15 @@ pub const H9_ACTIVATION_DAA: u64 = 80_932_000;
 /// DAG knows the block — or, after the anchor gets pruned, once the local pruning point sits
 /// at/above the anchor daa (only the anchored chain validates past the H5.2 gate, so a
 /// post-anchor pruning point witnesses it). Fresh-bootstrap nodes are never affected.
-/// Selected-chain block 4a67afe0d5ccd72df90f24f67dac8fcce8bf968ca1cdbf969262237724768359,
-/// pinned 2026-08-20 on the v4 relaunch chain. It MUST sit above the score where the
-/// abandoned branch diverged (the v4 relaunch frontier, DAA 79_210_000): both branches
+/// Selected-chain block e6c79b3a8f243fff463518dd65b49854b81a24d310c095816dd05fab521cf784,
+/// pinned 2026-08-23 on the H9 relaunch chain. It MUST sit above the score where the
+/// abandoned branch diverged (the H9 relaunch base tip, DAA 80_922_655): both branches
 /// share every block below that score, so only a block above it discriminates. Re-pin it whenever
 /// the relaunch base is rebuilt — an anchor absent from the local DAG leaves `anchor_witnessed`
 /// false, which disarms the check silently rather than breaking it.
-/// (Previous anchors: 9d68af87fa9f312f33b6a2dd4009b3ed33bb42556cf2bcf643a56ec759ddbb48, daa
+/// (Previous anchors: 4a67afe0d5ccd72df90f24f67dac8fcce8bf968ca1cdbf969262237724768359, daa
+/// 79_216_325, pinned 2026-08-20 for the v4 relaunch;
+/// 9d68af87fa9f312f33b6a2dd4009b3ed33bb42556cf2bcf643a56ec759ddbb48, daa
 /// 76_317_223, pinned 2026-08-15 for the H6 (v1.4.7) relaunch;
 /// bb184bbc384e45ea2c0113bb51dcf95226eaadca89387760a60f5299023cc4f4, daa
 /// 63_277_286, pinned 2026-07-31 for the H5.4 relaunch;
@@ -223,10 +225,10 @@ pub const H9_ACTIVATION_DAA: u64 = 80_932_000;
 /// 63_257_773, pinned 2026-07-30 for the H5.3 relaunch;
 /// 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce, daa 59_192_679, pinned
 /// 2026-07-25 for the H5.2 relaunch.)
-pub const CHAIN_ANCHOR_DAA: u64 = 79_216_325;
+pub const CHAIN_ANCHOR_DAA: u64 = 80_934_094;
 pub const CHAIN_ANCHOR_HASH: Hash = Hash::from_bytes([
-    0x4a, 0x67, 0xaf, 0xe0, 0xd5, 0xcc, 0xd7, 0x2d, 0xf9, 0x0f, 0x24, 0xf6, 0x7d, 0xac, 0x8f, 0xcc,
-    0xe8, 0xbf, 0x96, 0x8c, 0xa1, 0xcd, 0xbf, 0x96, 0x92, 0x62, 0x23, 0x77, 0x24, 0x76, 0x83, 0x59,
+    0xe6, 0xc7, 0x9b, 0x3a, 0x8f, 0x24, 0x3f, 0xff, 0x46, 0x35, 0x18, 0xdd, 0x65, 0xb4, 0x98, 0x54,
+    0xb8, 0x1a, 0x24, 0xd3, 0x10, 0xc0, 0x95, 0x81, 0x6d, 0xd0, 0x5f, 0xab, 0x52, 0x1c, 0xf7, 0x84,
 ]);
 
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
