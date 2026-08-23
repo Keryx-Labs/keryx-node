@@ -541,6 +541,11 @@ impl FlowContext {
                 Ok(_) => {
                     unorphaned_blocks.push((block, virtual_state_task));
                 }
+                // Retryable, not a validation failure: queue the re-fetch instead of dropping the block.
+                Err(RuleError::PomProofMissing) => {
+                    self.enqueue_pom_reproof(block.hash());
+                    debug!("Orphan block {} unorphaned without its possession proof — queued for re-fetch", block.hash());
+                }
                 Err(e) => warn!("Validation failed for orphan block {}: {}", block.hash(), e),
             }
         }

@@ -295,7 +295,7 @@ impl HandleRelayInvsFlow {
                 // banning peers over a propagation hole is how 2026-07-24/25 became a wedge.
                 // `PomProofMissing` never marks the block invalid (body processor), so the block
                 // stays retryable and enters as soon as any peer serves it proof-carrying.
-                Err(RuleError::PomProofMissing) if proof_required => {
+                Err(RuleError::PomProofMissing) => {
                     self.ctx.enqueue_pom_reproof(inv.hash);
                     debug!("Relay: recent orphan root {} arrived without its possession proof — queued for re-fetch", inv.hash);
                     continue;
@@ -311,9 +311,12 @@ impl HandleRelayInvsFlow {
                                 session.validate_and_insert_block(block.clone())
                             };
                         virtual_state_task = virtual_state_task_inner;
-                        for block_task in ancestor_batch.block_tasks.take().unwrap() {
+                        let ancestor_tasks = ancestor_batch.block_tasks.take().unwrap();
+                        for (ancestor, block_task) in ancestor_batch.blocks.iter().zip(ancestor_tasks) {
                             match block_task.await {
                                 Ok(_) => {}
+                                // Retryable, and never the relaying peer's doing: queue the re-fetch and keep the peer.
+                                Err(RuleError::PomProofMissing) => self.ctx.enqueue_pom_reproof(ancestor.hash()),
                                 // We disconnect on invalidness even though this is not a direct relay from this peer, because
                                 // current relay is a descendant of this block (i.e. this peer claims all its ancestors are valid)
                                 Err(rule_error) => return Err(rule_error.into()),
@@ -329,7 +332,7 @@ impl HandleRelayInvsFlow {
                                 }
                             },
                             // Same soft skip as the first attempt (see above).
-                            Err(RuleError::PomProofMissing) if proof_required => {
+                            Err(RuleError::PomProofMissing) => {
                                 self.ctx.enqueue_pom_reproof(inv.hash);
                                 debug!("Relay: retried orphan root {} still proofless — queued for re-fetch", inv.hash);
                                 continue;
