@@ -3,6 +3,11 @@
 //! `pom-rt-builder`). A tile is `POM_V4_TILE_CHUNKS` consecutive canonical chunks, opened as an
 //! aligned subtree of depth `TILE_SUBTREE_DEPTH`. The transition is integer-only and the miner
 //! GPU kernel must reproduce this module byte-for-byte.
+//!
+//! Verifier hot path (must stay well under 10 ms per block at 10 BPS):
+//!   1. sequential offset chain from seed + tile snippets (no matrix work)
+//!   2. parallel Merkle range proofs (rayon, wasm sequential)
+//!   3. double-buffered in-place re-walk (zero heap alloc, SIMD i8 dots)
 
 use crate::pom::{blake, hash_pair, mix64, verify_merkle};
 use crate::pom_v3::{fold64, rho8, rho_tweak, snippet_fold};
@@ -34,6 +39,8 @@ pub const POM_V4_OFFSET_STEP_SALT: u64 = 0x89050E78D34609EF;
 
 /// One walk state: a D x D int8 matrix, row-major (`state[row * D + col]`).
 pub type V4State = Vec<u8>; // POM_V4_D * POM_V4_D bytes
+/// Stack-sized walk buffer used by the zero-alloc verifier.
+pub type V4StateBuf = [u8; POM_V4_TILE_BYTES];
 
 /// Merkle range proof for one tile: the path from the tile's aligned-subtree root (folded from
 /// the tile's own 32 chunk leaves at depth `TILE_SUBTREE_DEPTH`) up to `R_T`. The tile bytes are
@@ -96,23 +103,142 @@ pub enum PomV4VerifyError {
 
 /// Signed int8 dot product of a state row and a tile column (both D bytes).
 /// No overflow: |acc| <= D * 128 * 128 < 2^19 at D = 32.
+///
+/// Result is bit-identical across scalar / SSE4.1 / AVX2 / NEON. The GPU kernel uses the
+/// same wrapping i8×i8 → i32 accumulation.
 #[inline]
 pub fn v4_dot_i8(row: &[u8], col: &[u8]) -> i32 {
     debug_assert_eq!(row.len(), POM_V4_D);
     debug_assert_eq!(col.len(), POM_V4_D);
-    row.iter().zip(col.iter()).map(|(&a, &b)| (a as i8 as i32) * (b as i8 as i32)).sum()
+    v4_dot_i8_dispatch(row, col)
+}
+
+/// Reference scalar reduction. Used as the fallback and as the SIMD oracle in tests.
+#[inline]
+pub fn v4_dot_i8_scalar(row: &[u8], col: &[u8]) -> i32 {
+    debug_assert_eq!(row.len(), POM_V4_D);
+    debug_assert_eq!(col.len(), POM_V4_D);
+    let mut acc = 0i32;
+    // Manual unroll: LLVM vectorises this even without explicit SIMD.
+    let mut i = 0;
+    while i < POM_V4_D {
+        acc += (row[i] as i8 as i32) * (col[i] as i8 as i32);
+        acc += (row[i + 1] as i8 as i32) * (col[i + 1] as i8 as i32);
+        acc += (row[i + 2] as i8 as i32) * (col[i + 2] as i8 as i32);
+        acc += (row[i + 3] as i8 as i32) * (col[i + 3] as i8 as i32);
+        acc += (row[i + 4] as i8 as i32) * (col[i + 4] as i8 as i32);
+        acc += (row[i + 5] as i8 as i32) * (col[i + 5] as i8 as i32);
+        acc += (row[i + 6] as i8 as i32) * (col[i + 6] as i8 as i32);
+        acc += (row[i + 7] as i8 as i32) * (col[i + 7] as i8 as i32);
+        i += 8;
+    }
+    acc
+}
+
+#[inline]
+fn v4_dot_i8_dispatch(row: &[u8], col: &[u8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Feature detect once per call is cheap (cached by the runtime) relative to 32 muls,
+        // but the walk prefers `v4_transition_into` which detects once per step-matrix.
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { v4_dot_i8_avx2(row, col) };
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            return unsafe { v4_dot_i8_sse41(row, col) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { v4_dot_i8_neon(row, col) };
+    }
+    #[allow(unreachable_code)]
+    v4_dot_i8_scalar(row, col)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn v4_dot_i8_avx2(row: &[u8], col: &[u8]) -> i32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        // 16 i8 → 16 i16, madd pairwise → 8 i32. Repeat for the high 16 bytes.
+        let r0 = _mm_loadu_si128(row.as_ptr() as *const __m128i);
+        let c0 = _mm_loadu_si128(col.as_ptr() as *const __m128i);
+        let p0 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(r0), _mm256_cvtepi8_epi16(c0));
+        let r1 = _mm_loadu_si128(row.as_ptr().add(16) as *const __m128i);
+        let c1 = _mm_loadu_si128(col.as_ptr().add(16) as *const __m128i);
+        let p1 = _mm256_madd_epi16(_mm256_cvtepi8_epi16(r1), _mm256_cvtepi8_epi16(c1));
+        let sum = _mm256_add_epi32(p0, p1);
+        let hi = _mm256_extracti128_si256(sum, 1);
+        let lo = _mm256_castsi256_si128(sum);
+        let s = _mm_add_epi32(lo, hi);
+        let s = _mm_add_epi32(s, _mm_srli_si128(s, 8));
+        let s = _mm_add_epi32(s, _mm_srli_si128(s, 4));
+        _mm_cvtsi128_si32(s)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn v4_dot_i8_sse41(row: &[u8], col: &[u8]) -> i32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Four groups of 8 i8 → 8 i16 → 4 i32 via madd_epi16.
+        let mut acc = _mm_setzero_si128();
+        let mut off = 0;
+        while off < POM_V4_D {
+            let r = _mm_loadl_epi64(row.as_ptr().add(off) as *const __m128i);
+            let c = _mm_loadl_epi64(col.as_ptr().add(off) as *const __m128i);
+            let r16 = _mm_cvtepi8_epi16(r);
+            let c16 = _mm_cvtepi8_epi16(c);
+            acc = _mm_add_epi32(acc, _mm_madd_epi16(r16, c16));
+            off += 8;
+        }
+        let acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 8));
+        let acc = _mm_add_epi32(acc, _mm_srli_si128(acc, 4));
+        _mm_cvtsi128_si32(acc)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn v4_dot_i8_neon(row: &[u8], col: &[u8]) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        fn half(row: *const i8, col: *const i8) -> int32x4_t {
+            let a = vld1q_s8(row);
+            let b = vld1q_s8(col);
+            let a_lo = vmovl_s8(vget_low_s8(a));
+            let a_hi = vmovl_s8(vget_high_s8(a));
+            let b_lo = vmovl_s8(vget_low_s8(b));
+            let b_hi = vmovl_s8(vget_high_s8(b));
+            let p0 = vmull_s16(vget_low_s16(a_lo), vget_low_s16(b_lo));
+            let p1 = vmull_high_s16(a_lo, b_lo);
+            let p2 = vmull_s16(vget_low_s16(a_hi), vget_low_s16(b_hi));
+            let p3 = vmull_high_s16(a_hi, b_hi);
+            vaddq_s32(vaddq_s32(p0, p1), vaddq_s32(p2, p3))
+        }
+        let s0 = half(row.as_ptr() as *const i8, col.as_ptr() as *const i8);
+        let s1 = half(row.as_ptr().add(16) as *const i8, col.as_ptr().add(16) as *const i8);
+        vaddvq_s32(vaddq_s32(s0, s1))
+    }
 }
 
 /// S_0 from the canonical block seed: row r is a mix64 keystream, 4 little-endian bytes per squeeze.
-pub fn v4_initial_state(seed: u64) -> V4State {
-    let mut s = vec![0u8; POM_V4_D * POM_V4_D];
+pub fn v4_initial_state_into(dst: &mut [u8], seed: u64) {
+    debug_assert_eq!(dst.len(), POM_V4_TILE_BYTES);
     for r in 0..POM_V4_D {
         let mut h = mix64(seed ^ POM_V4_S0_ROW_SALT.wrapping_add(r as u64));
         for k4 in 0..POM_V4_D / 4 {
             h = mix64(h);
-            s[r * POM_V4_D + k4 * 4..r * POM_V4_D + k4 * 4 + 4].copy_from_slice(&(h as u32).to_le_bytes());
+            let off = r * POM_V4_D + k4 * 4;
+            dst[off..off + 4].copy_from_slice(&(h as u32).to_le_bytes());
         }
     }
+}
+
+pub fn v4_initial_state(seed: u64) -> V4State {
+    let mut s = vec![0u8; POM_V4_TILE_BYTES];
+    v4_initial_state_into(&mut s, seed);
     s
 }
 
@@ -128,27 +254,71 @@ pub fn v4_next_offset(seed: u64, step: u64, snippet: &[u8; POM_V4_SNIPPET_BYTES]
     mix64(seed ^ (step + 1).wrapping_mul(POM_V4_OFFSET_STEP_SALT) ^ snippet_fold(snippet)) % n_tiles
 }
 
-/// One walk transition: S_t = rho(S_{t-1} x tile), entrywise, column j of the tile being
-/// `tile[j*D .. (j+1)*D]`.
-pub fn v4_transition(state: &V4State, tile: &[u8], step: u32) -> V4State {
+/// In-place transition: `dst = rho(src × tile)`. `dst` and `src` must not alias.
+pub fn v4_transition_into(dst: &mut [u8], src: &[u8], tile: &[u8], step: u32) {
+    debug_assert_eq!(dst.len(), POM_V4_TILE_BYTES);
+    debug_assert_eq!(src.len(), POM_V4_TILE_BYTES);
     debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
-    let mut next = vec![0u8; POM_V4_D * POM_V4_D];
+    debug_assert!(!std::ptr::eq(dst.as_ptr(), src.as_ptr()));
+
+    // Detect SIMD once per matrix, not once per cell.
+    #[cfg(target_arch = "x86_64")]
+    let avx2 = is_x86_feature_detected!("avx2");
+    #[cfg(target_arch = "x86_64")]
+    let sse41 = !avx2 && is_x86_feature_detected!("sse4.1");
+
     for x in 0..POM_V4_D {
-        let row = &state[x * POM_V4_D..(x + 1) * POM_V4_D];
+        let row = &src[x * POM_V4_D..(x + 1) * POM_V4_D];
         for j in 0..POM_V4_D {
             let col = &tile[j * POM_V4_D..(j + 1) * POM_V4_D];
-            next[x * POM_V4_D + j] = rho8(v4_dot_i8(row, col), rho_tweak(step, x as u32, j as u32));
+            let dot = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if avx2 {
+                        unsafe { v4_dot_i8_avx2(row, col) }
+                    } else if sse41 {
+                        unsafe { v4_dot_i8_sse41(row, col) }
+                    } else {
+                        v4_dot_i8_scalar(row, col)
+                    }
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    unsafe { v4_dot_i8_neon(row, col) }
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    v4_dot_i8_scalar(row, col)
+                }
+            };
+            dst[x * POM_V4_D + j] = rho8(dot, rho_tweak(step, x as u32, j as u32));
         }
     }
+}
+
+/// One walk transition: S_t = rho(S_{t-1} x tile), entrywise, column j of the tile being
+/// `tile[j*D .. (j+1)*D]`. Allocating wrapper kept for tests and the reference prover.
+pub fn v4_transition(state: &V4State, tile: &[u8], step: u32) -> V4State {
+    debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
+    let mut next = vec![0u8; POM_V4_TILE_BYTES];
+    v4_transition_into(&mut next, state, tile, step);
     next
 }
 
 /// Merkle root over the D rows of a state (leaf = blake3(row); D = 32 is a power of two so the
-/// tree is complete, no duplicate-last).
-pub fn v4_state_root(state: &V4State) -> [u8; 32] {
-    let mut level: Vec<[u8; 32]> = (0..POM_V4_D).map(|r| blake(&state[r * POM_V4_D..(r + 1) * POM_V4_D])).collect();
-    while level.len() > 1 {
-        level = level.chunks(2).map(|p| hash_pair(&p[0], &p[1])).collect();
+/// tree is complete, no duplicate-last). Stack-buffered: no heap traffic on the verify path.
+pub fn v4_state_root(state: &[u8]) -> [u8; 32] {
+    debug_assert_eq!(state.len(), POM_V4_TILE_BYTES);
+    let mut level: [[u8; 32]; POM_V4_D] = [[0u8; 32]; POM_V4_D];
+    for r in 0..POM_V4_D {
+        level[r] = blake(&state[r * POM_V4_D..(r + 1) * POM_V4_D]);
+    }
+    let mut n = POM_V4_D;
+    while n > 1 {
+        n /= 2;
+        for i in 0..n {
+            level[i] = hash_pair(&level[i * 2], &level[i * 2 + 1]);
+        }
     }
     level[0]
 }
@@ -168,9 +338,18 @@ fn fold_level(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
 /// Fold a whole tile's `POM_V4_TILE_CHUNKS` chunk leaves into its aligned subtree root
 /// (depth `TILE_SUBTREE_DEPTH`, always complete since `POM_V4_TILE_CHUNKS` is a power of two).
 pub fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
-    let mut level: Vec<[u8; 32]> = tile.chunks(POM_V4_CHUNK_BYTES).map(blake).collect();
+    debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
+    let mut level: [[u8; 32]; 32] = [[0u8; 32]; 32];
+    for i in 0..32 {
+        let off = i * POM_V4_CHUNK_BYTES;
+        level[i] = blake(&tile[off..off + POM_V4_CHUNK_BYTES]);
+    }
+    let mut n = 32usize;
     for _ in 0..TILE_SUBTREE_DEPTH {
-        level = fold_level(&level);
+        n /= 2;
+        for i in 0..n {
+            level[i] = hash_pair(&level[i * 2], &level[i * 2 + 1]);
+        }
     }
     level[0]
 }
@@ -193,24 +372,61 @@ pub fn verify_pom_proof_v4(
     if n_tiles == 0 {
         return Err(PomV4VerifyError::BlobTooSmall);
     }
-
-    let mut state = v4_initial_state(seed);
-    let mut off = v4_first_offset(seed, n_tiles);
-    for step in 1..=POM_V4_K {
-        let tile = &proof.tiles[step - 1];
+    for tile in &proof.tiles {
         if tile.len() != POM_V4_TILE_BYTES {
             return Err(PomV4VerifyError::WrongTileShape);
         }
-        if !verify_merkle(v4_tile_subtree_root(tile), off, &proof.merkle[step - 1].path, r_t) {
-            return Err(PomV4VerifyError::BadTilePath);
-        }
-        state = v4_transition(&state, tile, step as u32);
-        if step < POM_V4_K {
-            let snippet: [u8; POM_V4_SNIPPET_BYTES] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
-            off = v4_next_offset(seed, step as u64, &snippet, n_tiles);
-        }
     }
-    Ok(fold64(&v4_state_root(&state)))
+
+    // Offset chain depends only on seed + snippets (tile[0..32]), not on the matrix walk.
+    // Precompute it so Merkle checks can run in parallel.
+    let mut offs = [0u64; POM_V4_K];
+    offs[0] = v4_first_offset(seed, n_tiles);
+    for step in 1..POM_V4_K {
+        let tile = &proof.tiles[step - 1];
+        let snippet: [u8; POM_V4_SNIPPET_BYTES] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
+        offs[step] = v4_next_offset(seed, step as u64, &snippet, n_tiles);
+    }
+
+    if !verify_tile_merkle_parallel(proof, &offs, r_t) {
+        return Err(PomV4VerifyError::BadTilePath);
+    }
+
+    // Zero-alloc double-buffer walk. Merkle already accepted every tile.
+    let mut a = [0u8; POM_V4_TILE_BYTES];
+    let mut b = [0u8; POM_V4_TILE_BYTES];
+    v4_initial_state_into(&mut a, seed);
+    let mut src_is_a = true;
+    for step in 1..=POM_V4_K {
+        let tile = &proof.tiles[step - 1];
+        if src_is_a {
+            v4_transition_into(&mut b, &a, tile, step as u32);
+        } else {
+            v4_transition_into(&mut a, &b, tile, step as u32);
+        }
+        src_is_a = !src_is_a;
+    }
+    let final_buf: &[u8] = if src_is_a { &a } else { &b };
+    Ok(fold64(&v4_state_root(final_buf)))
+}
+
+fn verify_tile_merkle_parallel(proof: &PomProofV4, offs: &[u64; POM_V4_K], r_t: &[u8; 32]) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        return !proof.tiles.par_iter().enumerate().any(|(i, tile)| {
+            !verify_merkle(v4_tile_subtree_root(tile), offs[i], &proof.merkle[i].path, r_t)
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        for i in 0..POM_V4_K {
+            if !verify_merkle(v4_tile_subtree_root(&proof.tiles[i]), offs[i], &proof.merkle[i].path, r_t) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Full v4 validation of a container `PomProof`, mirroring the v3 container's role in
@@ -456,5 +672,37 @@ mod tests {
             verify_pom_proof_v4_container(seed, &proof, n_chunks, &r_t, &target, final_hash),
             Err(PomV4VerifyError::FinalStateMismatch)
         );
+    }
+
+    #[test]
+    fn simd_dot_matches_scalar() {
+        let mut h = 0xC0FFEE_u64;
+        for _ in 0..256 {
+            let mut row = [0u8; POM_V4_D];
+            let mut col = [0u8; POM_V4_D];
+            for i in 0..POM_V4_D {
+                h = mix64(h);
+                row[i] = h as u8;
+                h = mix64(h);
+                col[i] = h as u8;
+            }
+            assert_eq!(v4_dot_i8(&row, &col), v4_dot_i8_scalar(&row, &col));
+        }
+    }
+
+    #[test]
+    fn transition_into_matches_allocating_wrapper() {
+        let seed = 0x1111_2222_3333_4444;
+        let src = v4_initial_state(seed);
+        let mut tile = vec![0u8; POM_V4_TILE_BYTES];
+        let mut h = seed;
+        for b in tile.iter_mut() {
+            h = mix64(h);
+            *b = h as u8;
+        }
+        let allocated = v4_transition(&src, &tile, 7);
+        let mut dst = [0u8; POM_V4_TILE_BYTES];
+        v4_transition_into(&mut dst, &src, &tile, 7);
+        assert_eq!(&allocated[..], &dst[..]);
     }
 }

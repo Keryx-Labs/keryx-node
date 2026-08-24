@@ -4,7 +4,7 @@
 //! Merkle leaf hashing. Synthetic tiles: the cost is structural, not data-dependent.
 
 use keryx_consensus_core::pom_v4::{
-    POM_V4_K, POM_V4_TILE_BYTES, v4_initial_state, v4_state_root, v4_tile_subtree_root, v4_transition,
+    POM_V4_K, POM_V4_TILE_BYTES, v4_initial_state_into, v4_state_root, v4_tile_subtree_root, v4_transition_into,
 };
 use std::time::Instant;
 
@@ -29,20 +29,36 @@ fn main() {
     let reps: usize = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(20);
     let tl = tiles(POM_V4_K);
 
+    let mut a = [0u8; POM_V4_TILE_BYTES];
+    let mut b = [0u8; POM_V4_TILE_BYTES];
+
     // warm
-    let mut st = v4_initial_state(1);
+    v4_initial_state_into(&mut a, 1);
+    let mut src_is_a = true;
     for (i, t) in tl.iter().enumerate() {
-        st = v4_transition(&st, t, i as u32);
+        if src_is_a {
+            v4_transition_into(&mut b, &a, t, i as u32);
+        } else {
+            v4_transition_into(&mut a, &b, t, i as u32);
+        }
+        src_is_a = !src_is_a;
     }
-    std::hint::black_box(&st);
+    std::hint::black_box(if src_is_a { &a } else { &b });
 
     let t0 = Instant::now();
     for r in 0..reps {
-        let mut s = v4_initial_state(r as u64);
+        v4_initial_state_into(&mut a, r as u64);
+        let mut src_is_a = true;
         for (i, t) in tl.iter().enumerate() {
-            s = v4_transition(&s, t, i as u32);
+            if src_is_a {
+                v4_transition_into(&mut b, &a, t, i as u32);
+            } else {
+                v4_transition_into(&mut a, &b, t, i as u32);
+            }
+            src_is_a = !src_is_a;
         }
-        std::hint::black_box(v4_state_root(&s));
+        let st: &[u8] = if src_is_a { &a } else { &b };
+        std::hint::black_box(v4_state_root(st));
     }
     let walk = t0.elapsed().as_secs_f64() / reps as f64;
 
