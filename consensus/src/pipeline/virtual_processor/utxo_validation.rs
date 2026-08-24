@@ -1304,10 +1304,18 @@ impl VirtualStateProcessor {
     /// caller must run a full `rebuild_age_buckets_index` after the commit instead.
     pub(super) fn sweep_maturation_queue(&self, batch: &mut rocksdb::WriteBatch, new_daa_score: u64, diff: &UtxoDiff) -> bool {
         let watermark = self.maturation_queue_store.get_watermark().unwrap().unwrap_or(new_daa_score);
+
         if new_daa_score < watermark {
             if watermark - new_daa_score > self.coin_age_retention {
                 return true;
             }
+
+            // Fold all demotions by SPK first. The old implementation performed one
+            // age-bucket read/modify/write per queued coin; during IBD re-anchors this
+            // can serialize a large maturation range on the virtual-processor thread.
+            let mut demotions: std::collections::HashMap<ScriptPublicKey, (u64, u128)> =
+                std::collections::HashMap::new();
+
             for (raw, due) in self.maturation_queue_store.due_range(new_daa_score, watermark) {
                 // Pure re-add (spent-after-maturing restore) — skip, `apply_age_diff` re-adds the
                 // coin on the immature side. In add AND remove (same outpoint re-anchored with a
@@ -1317,47 +1325,83 @@ impl VirtualStateProcessor {
                 if diff.add.contains_key(&outpoint) && !diff.remove.contains_key(&outpoint) {
                     continue;
                 }
-                let b = self.age_buckets_store.get(&due.script_public_key).unwrap();
-                if b.b_mat < due.amount {
-                    warn!(
-                        "coin-age sweep: demotion underflows b_mat ({} < {}, anchor {}) — clamping; queue entry with no backing coin (ghost)",
-                        b.b_mat, due.amount, due.anchor
-                    );
-                }
-                let next = AgeBuckets {
-                    b_mat: b.b_mat.saturating_sub(due.amount),
-                    b_imm: b.b_imm.saturating_add(due.amount),
-                    a_imm: b.a_imm.saturating_add(due.amount as u128 * due.anchor as u128),
-                };
-                self.age_buckets_store.set_batch(batch, &due.script_public_key, next).unwrap();
-                // The entry stays queued: the next forward sweep past its due re-promotes it.
+
+                let d = demotions.entry(due.script_public_key.clone()).or_default();
+                d.0 = d.0.saturating_add(due.amount);
+                d.1 = d.1.saturating_add((due.amount as u128).saturating_mul(due.anchor as u128));
             }
+
+            if !demotions.is_empty() {
+                let spks: Vec<ScriptPublicKey> = demotions.keys().cloned().collect();
+                let (buckets, hits, misses) = self.age_buckets_store.get_many(&spks).unwrap();
+                self.counters.age_buckets_cache_hits.fetch_add(hits, std::sync::atomic::Ordering::Relaxed);
+                self.counters.age_buckets_cache_misses.fetch_add(misses, std::sync::atomic::Ordering::Relaxed);
+
+                for (spk, b) in spks.iter().zip(buckets) {
+                    let (amount, weighted_anchor) = demotions[spk];
+
+                    if b.b_mat < amount {
+                        warn!(
+                            "coin-age sweep: demotion underflows b_mat ({} < {}) — clamping; queue entries with no backing coin (ghost)",
+                            b.b_mat, amount
+                        );
+                    }
+
+                    let next = AgeBuckets {
+                        b_mat: b.b_mat.saturating_sub(amount),
+                        b_imm: b.b_imm.saturating_add(amount),
+                        a_imm: b.a_imm.saturating_add(weighted_anchor),
+                    };
+                    self.age_buckets_store.set_batch(batch, spk, next).unwrap();
+                }
+            }
+
             self.maturation_queue_store.set_watermark_batch(batch, new_daa_score).unwrap();
             return false;
         }
+
+        // Fold all promotions by SPK, then read/modify/write each age bucket once.
+        let mut promotions: std::collections::HashMap<ScriptPublicKey, (u64, u128)> =
+            std::collections::HashMap::new();
+
         for (_, due) in self.maturation_queue_store.due_range(watermark, new_daa_score) {
-            // Consecutive read-modify-writes on the same SPK stay coherent through the store's
-            // write-through cache (set_batch inserts the cache before the batch lands).
-            let b = self.age_buckets_store.get(&due.script_public_key).unwrap();
-            if b.b_imm < due.amount || b.a_imm < due.amount as u128 * due.anchor as u128 {
-                warn!(
-                    "coin-age sweep: promotion underflows the immature bucket (b_imm {} < {} or a_imm {} < {}) — clamping; queue entry with no backing coin (ghost)",
-                    b.b_imm,
-                    due.amount,
-                    b.a_imm,
-                    due.amount as u128 * due.anchor as u128
-                );
-            }
-            let next = AgeBuckets {
-                b_mat: b.b_mat.saturating_add(due.amount),
-                b_imm: b.b_imm.saturating_sub(due.amount),
-                a_imm: b.a_imm.saturating_sub(due.amount as u128 * due.anchor as u128),
-            };
-            self.age_buckets_store.set_batch(batch, &due.script_public_key, next).unwrap();
+            let d = promotions.entry(due.script_public_key.clone()).or_default();
+            d.0 = d.0.saturating_add(due.amount);
+            d.1 = d.1.saturating_add((due.amount as u128).saturating_mul(due.anchor as u128));
+
             // NOTE: the promoted entry is NOT deleted — it is retained for `coin_age_retention`
             // scores so the read path can DEMOTE when a POV falls below the watermark (side
             // chains, see `eff_balance_for_spk`). Retention pruning below reclaims it.
         }
+
+        if !promotions.is_empty() {
+            let spks: Vec<ScriptPublicKey> = promotions.keys().cloned().collect();
+            let (buckets, hits, misses) = self.age_buckets_store.get_many(&spks).unwrap();
+            self.counters.age_buckets_cache_hits.fetch_add(hits, std::sync::atomic::Ordering::Relaxed);
+            self.counters.age_buckets_cache_misses.fetch_add(misses, std::sync::atomic::Ordering::Relaxed);
+
+            for (spk, b) in spks.iter().zip(buckets) {
+                let (amount, weighted_anchor) = promotions[spk];
+
+                if b.b_imm < amount || b.a_imm < weighted_anchor {
+                    warn!(
+                        "coin-age sweep: promotion underflows the immature bucket (b_imm {} < {} or a_imm {} < {}) — clamping; queue entries with no backing coin (ghost)",
+                        b.b_imm,
+                        amount,
+                        b.a_imm,
+                        weighted_anchor
+                    );
+                }
+
+                let next = AgeBuckets {
+                    b_mat: b.b_mat.saturating_add(amount),
+                    b_imm: b.b_imm.saturating_sub(amount),
+                    a_imm: b.a_imm.saturating_sub(weighted_anchor),
+                };
+                self.age_buckets_store.set_batch(batch, spk, next).unwrap();
+            }
+        }
+
         self.maturation_queue_store.prune_below(batch, new_daa_score.saturating_sub(self.coin_age_retention)).unwrap();
         self.maturation_queue_store.set_watermark_batch(batch, new_daa_score).unwrap();
         false
