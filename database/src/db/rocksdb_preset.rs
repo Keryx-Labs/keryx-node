@@ -24,7 +24,7 @@ fn blob_files_disabled() -> bool {
 /// Values at/above this size are written to blob files instead of being carried inline in the LSM
 /// (RocksDB key-value separation, aka BlobDB).
 ///
-/// The node writes one ~228 KB `PomProof` per block at 10 BPS. Inline, every one of those is
+/// The node writes one ~296 KB v4 `PomProof` per block at 10 BPS. Inline, every one of those is
 /// rewritten by every compaction that touches its SST — an order-of-magnitude write amplification
 /// on a value that is written once, read rarely (relay re-serve only) and deleted wholesale by the
 /// proof GC. Separated, the LSM carries only a small pointer, so compaction moves metadata instead
@@ -38,6 +38,16 @@ const BLOB_MIN_VALUE_BYTES: u64 = 4 * 1024;
 /// ~50x the CPU of level 6 for a few percent of size on already-compact binary records, and on a
 /// spinning disk the bottleneck is compaction throughput, not the last few percent of space.
 const HDD_BOTTOMMOST_ZSTD_LEVEL: i32 = 6;
+
+/// Default blob-file size for the SSD preset. A v4 proof is ~296 KB; 128 MB files hold ~430
+/// proofs each, matching the 1500-DAA serve window without creating a swarm of tiny blob files.
+const SSD_BLOB_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Floor for the dedicated blob cache. ~296 KB × 1500 DAA serve-window proofs ≈ 450 MB if every
+/// DAA carried one proof; at 10 BPS the selected-chain window of 2000 chain blocks is ~2000
+/// live proofs ≈ 600 MB. We cannot pin the whole window on a 4 GB box, but 256 MB keeps the
+/// hottest ~850 proofs off the SST LRU so header/UTXO reads stay in cache during catch-up.
+pub const DA_1500_BLOB_CACHE_MIN_BYTES: usize = 256 * 1024 * 1024;
 
 /// Default background-write rate limit for the HDD preset, in bytes/s.
 ///
@@ -59,7 +69,7 @@ pub const DEFAULT_HDD_RATE_LIMIT_BYTES_PER_SEC: u64 = 48 * 1024 * 1024;
 #[derive(Clone)]
 pub struct RocksDbResources {
     block_cache: Cache,
-    /// Dedicated blob cache so ~228 KB PoM proofs do not evict hot SST blocks from `block_cache`.
+    /// Dedicated blob cache so ~296 KB v4 PoM proofs do not evict hot SST blocks from `block_cache`.
     blob_cache: Cache,
     write_buffer_manager: WriteBufferManager,
     rate_limit_bytes_per_sec: Option<u64>,
@@ -79,10 +89,11 @@ impl RocksDbResources {
     ///   rather than stalling writers when the budget is reached (`allow_stall = false`).
     /// * `rate_limit_bytes_per_sec` — background-write rate limit (HDD presets only).
     ///
-    /// The blob cache is sized at 1/4 of the block cache (min 64 MB) so proof bytes stay out of the
-    /// hot-block LRU without needing a separate operator flag.
+    /// The blob cache is sized at 3/4 of the block cache, floored at
+    /// [`DA_1500_BLOB_CACHE_MIN_BYTES`], so the 1500-DAA proof window does not flush UTXO/header
+    /// SST blocks. No extra operator flag — `--rocksdb-cache-size` / `--ram-scale` grow both.
     pub fn new(block_cache_bytes: usize, write_buffer_bytes: usize, rate_limit_bytes_per_sec: Option<u64>) -> Self {
-        let blob_cache_bytes = (block_cache_bytes / 4).max(64 * 1024 * 1024);
+        let blob_cache_bytes = (block_cache_bytes.saturating_mul(3) / 4).max(DA_1500_BLOB_CACHE_MIN_BYTES);
         Self {
             block_cache: Cache::new_lru_cache(block_cache_bytes),
             blob_cache: Cache::new_lru_cache(blob_cache_bytes),
@@ -190,12 +201,12 @@ impl RocksDbPreset {
         if !blob_files_disabled() {
             opts.set_enable_blob_files(true);
             opts.set_min_blob_size(BLOB_MIN_VALUE_BYTES);
-            opts.set_blob_file_size(64 * 1024 * 1024);
+            opts.set_blob_file_size(SSD_BLOB_FILE_BYTES);
             opts.set_blob_compression_type(rocksdb::DBCompressionType::Lz4);
             opts.set_enable_blob_gc(true);
             // Fraction of the oldest blob files eligible for relocation during compaction. At 0.9
             // nearly every file qualifies, and live blobs are rewritten far faster than they are
-            // created.
+            // created. 0.25 keeps the 1500-DAA live window (proofs still being re-served) out of GC.
             opts.set_blob_gc_age_cutoff(0.25);
             opts.set_blob_gc_force_threshold(0.2);
         }
@@ -204,6 +215,11 @@ impl RocksDbPreset {
             opts.set_blob_cache(&resources.blob_cache);
             opts.set_write_buffer_manager(&resources.write_buffer_manager);
         }
+
+        // Smooth the 10 BPS × ~296 KB proof write stream so flushes do not stall the body processor.
+        opts.set_bytes_per_sync(2 * 1024 * 1024);
+        opts.set_wal_bytes_per_sync(2 * 1024 * 1024);
+        opts.set_avoid_unnecessary_blocking_io(true);
     }
 
     /// Apply HDD preset configuration (HDD-optimized settings)

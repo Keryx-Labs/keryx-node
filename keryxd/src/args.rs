@@ -447,8 +447,8 @@ a large RAM (~64GB) can set this value to ~3.0-4.0 and gain superior performance
                 .env("KERYXD_ROCKSDB_CACHE_SIZE")
                 .require_equals(true)
                 .value_parser(clap::value_parser!(usize))
-                .help("RocksDB block cache size in MB, shared by all databases the node opens. Default: 256MB \
-                       (scales with --ram-scale). Increase for public RPC nodes with heavy query loads. \
+                .help("RocksDB block cache size in MB, shared by all databases the node opens. Default: 512MB \
+                       (scales with --ram-scale). Sized for the 1500-DAA PoM-v4 proof window; increase for public RPC. \
                        Example: --rocksdb-cache-size=2048 for 2GB cache.")
         )
         .arg(

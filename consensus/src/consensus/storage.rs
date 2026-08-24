@@ -132,13 +132,14 @@ impl ConsensusStorage {
         let ghostdag_budget = scaled(80_000_000); // x 2 for levels
         let headers_budget = scaled(80_000_000);
         let transactions_budget = scaled(40_000_000);
-        let utxo_diffs_budget = scaled(40_000_000);
+        let utxo_diffs_budget = scaled(80_000_000);
         let block_window_budget = scaled(200_000_000); // x 2 for difficulty and median time
         let acceptance_data_budget = scaled(40_000_000);
-        // PoM proofs are ~228 KB each (K=256 walk steps, each with a Merkle path). A count-based
+        // PoM v4 proofs are ~296 KB each (K=256 tiles + range proofs). A count-based
         // policy of 10_000 items — what this store used to share with the header-data caches —
-        // reaches ~2.3 GB and, since item counts are not scaled, ignores `--ram-scale` entirely.
-        let pom_proof_budget = scaled(64_000_000);
+        // reaches ~3 GB and, since item counts are not scaled, ignores `--ram-scale` entirely.
+        // 192 MB holds ~650 hottest proofs of the 1500-DAA / 2000-chain-block window.
+        let pom_proof_budget = scaled(192_000_000);
         // Ratio-reward / coin-age indexes are SPK-keyed over a UTXO-scale keyspace. The old
         // Count(10_000) shared with the UTXO set cache had near-zero hit rate; every virtual-commit
         // RMW then paid a random HDD read (~9 ms). Budget by bytes so `--ram-scale` actually grows
@@ -205,7 +206,7 @@ impl ConsensusStorage {
         let utxo_diffs_builder = PolicyBuilder::new().bytes_budget(utxo_diffs_budget).tracked_bytes();
         let block_data_builder = PolicyBuilder::new().max_items(perf_params.block_data_cache_size).untracked();
         let header_data_builder = PolicyBuilder::new().max_items(perf_params.header_data_cache_size).untracked();
-        let utxo_set_builder = PolicyBuilder::new().max_items(perf_params.utxo_set_cache_size).untracked();
+        let utxo_set_builder = PolicyBuilder::new().max_items(scaled(perf_params.utxo_set_cache_size).max(32_000)).untracked();
         let address_index_builder = PolicyBuilder::new()
             .bytes_budget(address_index_budget)
             .unit_bytes(address_index_unit_bytes)

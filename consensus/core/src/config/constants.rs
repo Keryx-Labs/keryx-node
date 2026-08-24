@@ -109,7 +109,9 @@ pub mod perf {
     const BASELINE_HEADER_DATA_CACHE_SIZE: usize = 10_000;
     const BASELINE_BLOCK_DATA_CACHE_SIZE: usize = 200;
     const BASELINE_BLOCK_WINDOW_CACHE_SIZE: usize = 2_000;
-    const BASELINE_UTXOSET_CACHE_SIZE: usize = 10_000;
+    /// Hot UTXO entries. 10k was a 1-BPS leftover and thrashed at 10 BPS near tip
+    /// (every mergeset apply missed). 32k × bps-clamp(10) = 320k at mainnet 10 BPS.
+    const BASELINE_UTXOSET_CACHE_SIZE: usize = 32_000;
 
     #[derive(Clone, Debug)]
     pub struct PerfParams {
@@ -154,7 +156,9 @@ pub mod perf {
     impl PerfParams {
         pub fn adjust_to_consensus_params(&mut self, consensus_params: &Params) {
             // Allow caching up to 10x over the baseline
-            self.block_data_cache_size *= consensus_params.bps().clamp(1, 10) as usize;
+            let bps = consensus_params.bps().clamp(1, 10) as usize;
+            self.block_data_cache_size *= bps;
+            self.utxo_set_cache_size *= bps;
         }
     }
 }

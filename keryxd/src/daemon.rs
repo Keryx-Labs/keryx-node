@@ -214,7 +214,9 @@ pub fn create_core(args: Args, fd_total_budget: i32) -> (Arc<Core>, Arc<RpcCoreS
 }
 
 /// Baseline process-wide RocksDB block cache, before `--ram-scale`.
-const BASE_ROCKSDB_CACHE_BYTES: usize = 256 * 1024 * 1024;
+/// Raised 256 → 512 MB so 10 BPS + ~296 KB v4 proofs in the 1500-DAA serve window
+/// leave room for header/UTXO SST blocks after the dedicated blob cache takes its share.
+const BASE_ROCKSDB_CACHE_BYTES: usize = 512 * 1024 * 1024;
 /// Floor for the process-wide block cache, however low `--ram-scale` is set.
 const MIN_ROCKSDB_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Baseline process-wide memtable budget, before `--ram-scale`. Sized per preset: the HDD preset
