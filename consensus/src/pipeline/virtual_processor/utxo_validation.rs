@@ -1326,6 +1326,7 @@ impl VirtualStateProcessor {
                     continue;
                 }
 
+                debug!("coin-age sweep: demote {} anchor {} spk {}", due.amount, due.anchor, hex::encode(due.script_public_key.script()));
                 let d = demotions.entry(due.script_public_key.clone()).or_default();
                 d.0 = d.0.saturating_add(due.amount);
                 d.1 = d.1.saturating_add((due.amount as u128).saturating_mul(due.anchor as u128));
@@ -1365,6 +1366,7 @@ impl VirtualStateProcessor {
             std::collections::HashMap::new();
 
         for (_, due) in self.maturation_queue_store.due_range(watermark, new_daa_score) {
+            debug!("coin-age sweep: promote {} anchor {} spk {}", due.amount, due.anchor, hex::encode(due.script_public_key.script()));
             let d = promotions.entry(due.script_public_key.clone()).or_default();
             d.0 = d.0.saturating_add(due.amount);
             d.1 = d.1.saturating_add((due.amount as u128).saturating_mul(due.anchor as u128));
