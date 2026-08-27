@@ -24,7 +24,8 @@ fn blob_files_disabled() -> bool {
 /// Values at/above this size are written to blob files instead of being carried inline in the LSM
 /// (RocksDB key-value separation, aka BlobDB).
 ///
-/// The node writes one ~296 KB v4 `PomProof` per block at 10 BPS. Inline, every one of those is
+/// The node writes one ~442 KiB v4 `PomProof` per block at 10 BPS (tier 0; ~458 KiB on tier 4).
+/// Inline, every one of those is
 /// rewritten by every compaction that touches its SST — an order-of-magnitude write amplification
 /// on a value that is written once, read rarely (relay re-serve only) and deleted wholesale by the
 /// proof GC. Separated, the LSM carries only a small pointer, so compaction moves metadata instead
@@ -39,14 +40,14 @@ const BLOB_MIN_VALUE_BYTES: u64 = 4 * 1024;
 /// spinning disk the bottleneck is compaction throughput, not the last few percent of space.
 const HDD_BOTTOMMOST_ZSTD_LEVEL: i32 = 6;
 
-/// Default blob-file size for the SSD preset. A v4 proof is ~296 KB; 128 MB files hold ~430
+/// Default blob-file size for the SSD preset. A v4 proof is ~442 KiB; 128 MB files hold ~290
 /// proofs each, matching the 1500-DAA serve window without creating a swarm of tiny blob files.
 const SSD_BLOB_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Floor for the dedicated blob cache. ~296 KB × 1500 DAA serve-window proofs ≈ 450 MB if every
+/// Floor for the dedicated blob cache. ~442 KiB × 1500 DAA serve-window proofs ≈ 660 MB if every
 /// DAA carried one proof; at 10 BPS the selected-chain window of 2000 chain blocks is ~2000
-/// live proofs ≈ 600 MB. We cannot pin the whole window on a 4 GB box, but 256 MB keeps the
-/// hottest ~850 proofs off the SST LRU so header/UTXO reads stay in cache during catch-up.
+/// live proofs ≈ 880 MB. We cannot pin the whole window on a 4 GB box, but 256 MB keeps the
+/// hottest ~580 proofs off the SST LRU so header/UTXO reads stay in cache during catch-up.
 pub const DA_1500_BLOB_CACHE_MIN_BYTES: usize = 256 * 1024 * 1024;
 
 /// Default background-write rate limit for the HDD preset, in bytes/s.
@@ -69,7 +70,7 @@ pub const DEFAULT_HDD_RATE_LIMIT_BYTES_PER_SEC: u64 = 48 * 1024 * 1024;
 #[derive(Clone)]
 pub struct RocksDbResources {
     block_cache: Cache,
-    /// Dedicated blob cache so ~296 KB v4 PoM proofs do not evict hot SST blocks from `block_cache`.
+    /// Dedicated blob cache so ~442 KiB v4 PoM proofs do not evict hot SST blocks from `block_cache`.
     blob_cache: Cache,
     write_buffer_manager: WriteBufferManager,
     rate_limit_bytes_per_sec: Option<u64>,
@@ -216,7 +217,7 @@ impl RocksDbPreset {
             opts.set_write_buffer_manager(&resources.write_buffer_manager);
         }
 
-        // Smooth the 10 BPS × ~296 KB proof write stream so flushes do not stall the body processor.
+        // Smooth the 10 BPS × ~442 KiB proof write stream so flushes do not stall the body processor.
         opts.set_bytes_per_sync(2 * 1024 * 1024);
         opts.set_wal_bytes_per_sync(2 * 1024 * 1024);
         opts.set_avoid_unnecessary_blocking_io(true);
