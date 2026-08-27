@@ -32,7 +32,10 @@ use keryx_notify::notifier::Notify;
 use keryx_p2p_lib::{
     ConnectionInitializer, Hub, KaspadHandshake, PeerKey, PeerProperties, Router,
     common::ProtocolError,
-    convert::model::version::Version,
+    convert::{
+        block::{EncodedPomProof, PomWireFormat, encode_pom_proof},
+        model::version::Version,
+    },
     make_message,
     pb::{InvRelayBlockMessage, kaspad_message::Payload},
 };
@@ -61,7 +64,12 @@ use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use uuid::Uuid;
 
 /// The P2P protocol version.
-const PROTOCOL_VERSION: u32 = 10;
+///
+/// 11 adds the compact multiproof encoding for v4 possession proofs
+/// (`BlockMessage.pom_proof_deduped`) and the requester-declared proof horizon
+/// (`RequestIBDBlocksMessage.pom_proof_min_daa`). Both are negotiated per peer, so a v11 node
+/// still serves the full-path encoding to everything older.
+const PROTOCOL_VERSION: u32 = 11;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -240,6 +248,10 @@ pub struct FlowContextInner {
     // service window (FIFO + dedup, bounded). Drained by the relay flow, which re-fetches each
     // block from a peer and adopts the proof — the self-healing counterpart of the guard-rail.
     pom_reproof_queue: Mutex<(VecDeque<Hash>, HashSet<Hash>)>,
+    // Compact (multiproof) proof encodings, computed once per block and reused across peers.
+    // Building one costs ~1.3 ms of hashing — affordable once a block, but not once per peer per
+    // block, which at 10 BPS with 8 peers would be ~10% of a core. FIFO-bounded.
+    pom_wire_cache: Mutex<(HashMap<Hash, Arc<Vec<u8>>>, VecDeque<Hash>)>,
 }
 
 #[derive(Clone)]
@@ -344,6 +356,44 @@ impl FlowContext {
         naked
     }
 
+    /// A block's proof encoded for one peer, reusing the compact form when the same block goes out
+    /// to several peers — the common case on relay, where every peer asks for the block within
+    /// milliseconds of the same inv.
+    ///
+    /// Falls back to the legacy bytes whenever the compact form cannot be built, exactly as
+    /// [`encode_pom_proof`] does on its own; the cache only ever changes cost, never content.
+    pub fn encode_pom_proof_cached(&self, format: PomWireFormat, block: &Block) -> EncodedPomProof {
+        /// ~370 KB per entry, so this bounds the cache at roughly 12 MB.
+        const POM_WIRE_CACHE_CAP: usize = 32;
+
+        if format != PomWireFormat::Deduped || block.pom_proof.is_none() {
+            return encode_pom_proof(format, block.header.as_ref(), block.pom_proof.as_ref());
+        }
+        let hash = block.hash();
+        if let Some(hit) = self.pom_wire_cache.lock().0.get(&hash) {
+            return EncodedPomProof { legacy: None, deduped: Some(hit.as_ref().clone()) };
+        }
+        let encoded = encode_pom_proof(format, block.header.as_ref(), block.pom_proof.as_ref());
+        let Some(bytes) = encoded.deduped else {
+            // Compact encoding refused (non-v4 proof, unknown tier, ...). Nothing to cache.
+            return EncodedPomProof { legacy: encoded.legacy, deduped: None };
+        };
+        let shared = Arc::new(bytes);
+        {
+            let mut guard = self.pom_wire_cache.lock();
+            let (map, order) = &mut *guard;
+            if map.insert(hash, shared.clone()).is_none() {
+                if order.len() >= POM_WIRE_CACHE_CAP {
+                    if let Some(evicted) = order.pop_front() {
+                        map.remove(&evicted);
+                    }
+                }
+                order.push_back(hash);
+            }
+        }
+        EncodedPomProof { legacy: None, deduped: Some(shared.as_ref().clone()) }
+    }
+
     /// Queues a block whose possession proof is missing while still within the proof service
     /// window, for re-fetching by the relay flow. FIFO with dedup; bounded — under a mass naked
     /// band the oldest entries are dropped first, and the guard-rail re-queues any block that is
@@ -414,6 +464,7 @@ impl FlowContext {
                 config,
                 mining_rule_engine,
                 pom_reproof_queue: Mutex::new((VecDeque::new(), HashSet::new())),
+                pom_wire_cache: Mutex::new((HashMap::new(), VecDeque::new())),
             }),
         }
     }
@@ -904,6 +955,9 @@ impl ConnectionInitializer for FlowContext {
         // Register all flows according to version
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
             v if v >= PROTOCOL_VERSION => (v8::register(self.clone(), router.clone(), PROTOCOL_VERSION), PROTOCOL_VERSION),
+            // Explicit arm for the previous version: with PROTOCOL_VERSION at 11 the catch-all
+            // above no longer covers v10, and without this every v10 peer gets VersionMismatch.
+            10 => (v8::register(self.clone(), router.clone(), 10), 10),
             9 => (v8::register(self.clone(), router.clone(), 9), 9),
             8 => (v8::register(self.clone(), router.clone(), 8), 8),
             7 => (v7::register(self.clone(), router.clone()), 7),

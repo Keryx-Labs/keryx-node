@@ -11,7 +11,6 @@ use keryx_consensus_core::{
     block::Block,
     config::params::POM_PROOF_SERVE_DEPTH_DAA,
     header::Header,
-    pom::PomProof,
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
     trusted::TrustedBlock,
     tx::Transaction,
@@ -24,6 +23,7 @@ use keryx_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
     convert::{
+        block::decode_pom_proof,
         header::{HeaderFormat, Versioned},
         model::trusted::TrustedDataPackage,
     },
@@ -905,28 +905,33 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             self.router
                 .enqueue(make_message!(
                     Payload::RequestBlockBodies,
-                    RequestBlockBodiesMessage { hashes: chunk.iter().map(|h| h.into()).collect() }
+                    RequestBlockBodiesMessage {
+                        hashes: chunk.iter().map(|h| h.into()).collect(),
+                        // This path discards proofs unconditionally (below), so ask for none:
+                        // a horizon above every possible daa_score means "tier only".
+                        pom_proof_min_daa: Some(u64::MAX),
+                    }
                 ))
                 .await?;
             let mut jobs = Vec::with_capacity(chunk.len());
 
             for &hash in chunk.iter() {
                 let msg = dequeue_with_timeout!(self.incoming_route, Payload::BlockBody)?;
-                let pom_tier = msg.pom_tier.map(|tier| tier as u8);
-                let pom_proof = msg
-                    .pom_proof
-                    .as_deref()
-                    .map(PomProof::from_wire_bytes)
-                    .transpose()
-                    .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for trusted block {}", hash)))?
-                    .map(Arc::new);
-                let blk_body: BlockBody = msg.try_into()?;
+                // Header first: the compact proof encoding omits the walk seed and tree shape,
+                // which are re-derived from the header, so decoding needs it. Handling both
+                // encodings here keeps this path independent of the peer honouring the horizon
+                // we asked for above.
                 // TODO (relaxed): make header queries in a batch.
                 let blk_header = consensus.async_get_header(hash).await.map_err(|err| {
                     // Conceptually this indicates local inconsistency, since we received the expected hashes via a local
                     // get_missing_block_body_hashes call. However for now we fail gracefully and only disconnect from this peer.
                     ProtocolError::OtherOwned(format!("syncee inconsistency: missing block header for {}, err: {}", hash, err))
                 })?;
+                let pom_tier = msg.pom_tier.map(|tier| tier as u8);
+                let pom_proof = decode_pom_proof(&blk_header, msg.pom_proof.clone(), msg.pom_proof_deduped.clone())
+                    .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for trusted block {}", hash)))?
+                    .map(Arc::new);
+                let blk_body: BlockBody = msg.try_into()?;
                 if blk_body.is_empty() {
                     return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", hash)));
                 }
@@ -958,7 +963,12 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             self.router
                 .enqueue(make_message!(
                     Payload::RequestIbdBlocks,
-                    RequestIbdBlocksMessage { hashes: chunk.iter().map(|h| h.into()).collect() }
+                    RequestIbdBlocksMessage {
+                        hashes: chunk.iter().map(|h| h.into()).collect(),
+                        // This path discards proofs unconditionally (below), so ask for none:
+                        // a horizon above every possible daa_score means "tier only".
+                        pom_proof_min_daa: Some(u64::MAX),
+                    }
                 ))
                 .await?;
             let mut jobs = Vec::with_capacity(chunk.len());
@@ -1070,7 +1080,13 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         self.router
             .enqueue(make_message!(
                 Payload::RequestIbdBlocks,
-                RequestIbdBlocksMessage { hashes: chunk.iter().map(|h| h.into()).collect() }
+                RequestIbdBlocksMessage {
+                    hashes: chunk.iter().map(|h| h.into()).collect(),
+                    // Tell the server our own proof horizon so it stops shipping proofs we would
+                    // strip on arrival anyway (below). Stating it ourselves is sound where the
+                    // server guessing it is not: it is our policy, applied at the source.
+                    pom_proof_min_daa: Some(high_daa.saturating_sub(POM_PROOF_SERVE_DEPTH_DAA)),
+                }
             ))
             .await?;
         for &expected_hash in chunk {
@@ -1110,7 +1126,13 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         self.router
             .enqueue(make_request!(
                 Payload::RequestBlockBodies,
-                RequestBlockBodiesMessage { hashes: chunk.iter().map(|h| h.into()).collect() },
+                RequestBlockBodiesMessage {
+                    hashes: chunk.iter().map(|h| h.into()).collect(),
+                    // Tell the server our own proof horizon so it stops shipping proofs we would
+                    // strip on arrival anyway (below). Stating it ourselves is sound where the
+                    // server guessing it is not: it is our policy, applied at the source.
+                    pom_proof_min_daa: Some(high_daa.saturating_sub(POM_PROOF_SERVE_DEPTH_DAA)),
+                },
                 self.incoming_route.id()
             ))
             .await?;
@@ -1121,19 +1143,17 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
             // block can later be relayed to proof-enforcing peers (otherwise it is served "naked"
             // and rejected with "PoM possession proof missing").
             let pom_tier = msg.pom_tier.map(|t| t as u8);
-            let pom_proof = msg
-                .pom_proof
-                .as_deref()
-                .map(PomProof::from_wire_bytes)
-                .transpose()
-                .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for block {}", expected_hash)))?
-                .map(Arc::new);
+            // The header has to come first: the compact proof encoding omits the walk seed and the
+            // tree shape precisely because both are re-derivable from the header.
             // TODO (relaxed): make header queries in a batch.
             let blk_header = consensus.async_get_header(expected_hash).await.map_err(|err| {
                 // Conceptually this indicates local inconsistency, since we received the expected hashes via a local
                 // get_missing_block_body_hashes call. However for now we fail gracefully and only disconnect from this peer.
                 ProtocolError::OtherOwned(format!("syncee inconsistency: missing block header for {}, err: {}", expected_hash, err))
             })?;
+            let pom_proof = decode_pom_proof(&blk_header, msg.pom_proof.clone(), msg.pom_proof_deduped.clone())
+                .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for block {}", expected_hash)))?
+                .map(Arc::new);
             let blk_body: BlockBody = msg.try_into()?;
             if blk_body.is_empty() {
                 return Err(ProtocolError::OtherOwned(format!("sent empty block body for block {}", expected_hash)));

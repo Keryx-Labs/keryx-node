@@ -15,7 +15,10 @@ use crate::v7::{
     txrelay::flow::{RelayTransactionsFlow, RequestTransactionsFlow},
 };
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use keryx_p2p_lib::{KaspadMessagePayloadType, Router, SharedIncomingRoute, convert::header::HeaderFormat};
+use keryx_p2p_lib::{
+    KaspadMessagePayloadType, Router, SharedIncomingRoute,
+    convert::{block::PomWireFormat, header::HeaderFormat},
+};
 use keryx_utils::channel;
 use std::sync::Arc;
 
@@ -40,6 +43,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
     let body_only_ibd_permitted = false;
     // P2P header format prior to v9 is not compressed (legacy)
     let header_format = HeaderFormat::Legacy;
+    // A v7 peer is pre-v11 by definition, so it only understands the full-path encoding.
+    let pom_format = PomWireFormat::Legacy;
     let mut flows: Vec<Box<dyn Flow>> = vec![
         Box::new(IbdFlow::new(
             ctx.clone(),
@@ -72,6 +77,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestRelayBlocks]),
             header_format,
+            pom_format,
         )),
         Box::new(ReceivePingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![KaspadMessagePayloadType::Ping]))),
         Box::new(SendPingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![KaspadMessagePayloadType::Pong]))),
@@ -100,6 +106,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
                 KaspadMessagePayloadType::RequestNextPruningPointAndItsAnticoneBlocks,
             ]),
             header_format,
+            pom_format,
         )),
         Box::new(RequestPruningPointUtxoSetFlow::new(
             ctx.clone(),
@@ -119,6 +126,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestIbdBlocks]),
             header_format,
+            pom_format,
         )),
         Box::new(HandleAntipastRequests::new(
             ctx.clone(),

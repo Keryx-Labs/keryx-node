@@ -68,6 +68,12 @@ message BlockMessage{
   // unavailable (legacy blocks have a stored tier but no proof). Consensus-critical: scales
   // the coinbase tier-reward split. Absent before pom_activation.
   optional uint32 pom_tier = 4;
+  // Same v4 proof as pom_proof, in the compact multiproof encoding (pom_v4_wire): the K tile
+  // Merkle paths share their upper levels, so ~40% of the sibling hashes in pom_proof are
+  // redundant. Sent INSTEAD of pom_proof to peers at protocol version >= 11; exactly one of the
+  // two is ever set. Decoding rebuilds a byte-identical PomProof, so what gets verified, stored
+  // and re-served to older peers is unchanged.
+  optional bytes pom_proof_deduped = 5;
 }
 
 message BlockBodyMessage{
@@ -79,6 +85,9 @@ message BlockBodyMessage{
   // can later be relayed to proof-enforcing peers (otherwise they are served "naked" and
   // rejected with "PoM possession proof missing"). Absent before pom_activation.
   optional bytes pom_proof = 3;
+  // Compact multiproof encoding of the same v4 proof — see BlockMessage.pom_proof_deduped.
+  // Sent instead of pom_proof to peers at protocol version >= 11.
+  optional bytes pom_proof_deduped = 4;
 }
 
 message BlockHeader{
@@ -212,10 +221,21 @@ message DonePruningPointUtxoSetChunksMessage {
 
 message RequestIBDBlocksMessage{
   repeated Hash hashes = 1;
+  // Lowest daa_score for which the REQUESTER still wants possession proofs; blocks below it are
+  // served with pom_tier only. The requester states its own horizon because the server cannot
+  // safely infer it: depth-stripping against the SERVER's virtual is unsound during IBD, since the
+  // receiver's virtual lags and a block that is deep for the server may still be recent for the
+  // receiver, leaving it with a band of proof-less blocks that wedges its own serving. Applied at
+  // the source it is just the receiver's own policy, so nothing is stripped that the receiver would
+  // have kept. Absent => send proofs for everything, i.e. the pre-v11 behaviour.
+  optional uint64 pom_proof_min_daa = 2;
 }
 
 message RequestBlockBodiesMessage{
   repeated Hash hashes = 1;
+  // Lowest daa_score for which the REQUESTER still wants possession proofs — see
+  // RequestIBDBlocksMessage.pom_proof_min_daa.
+  optional uint64 pom_proof_min_daa = 2;
 }
 
 message UnexpectedPruningPointMessage{

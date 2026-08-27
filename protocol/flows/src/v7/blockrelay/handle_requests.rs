@@ -3,7 +3,7 @@ use keryx_core::debug;
 use keryx_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
-    convert::header::HeaderFormat,
+    convert::{block::PomWireFormat, header::HeaderFormat},
     dequeue_with_request_id, make_message, make_response,
     pb::{InvRelayBlockMessage, kaspad_message::Payload},
 };
@@ -14,6 +14,7 @@ pub struct HandleRelayBlockRequests {
     router: Arc<Router>,
     incoming_route: IncomingRoute,
     header_format: HeaderFormat,
+    pom_format: PomWireFormat,
 }
 
 #[async_trait::async_trait]
@@ -28,8 +29,14 @@ impl Flow for HandleRelayBlockRequests {
 }
 
 impl HandleRelayBlockRequests {
-    pub fn new(ctx: FlowContext, router: Arc<Router>, incoming_route: IncomingRoute, header_format: HeaderFormat) -> Self {
-        Self { ctx, router, incoming_route, header_format }
+    pub fn new(
+        ctx: FlowContext,
+        router: Arc<Router>,
+        incoming_route: IncomingRoute,
+        header_format: HeaderFormat,
+        pom_format: PomWireFormat,
+    ) -> Self {
+        Self { ctx, router, incoming_route, header_format, pom_format }
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
@@ -47,7 +54,13 @@ impl HandleRelayBlockRequests {
             for hash in hashes {
                 let block = session.async_get_block(hash).await?;
                 self.ctx.warn_if_serving_naked_pom_block(&block);
-                self.router.enqueue(make_response!(Payload::Block, (self.header_format, &block).into(), request_id)).await?;
+                self.router
+                    .enqueue(make_response!(
+                        Payload::Block,
+                        (self.header_format, self.ctx.encode_pom_proof_cached(self.pom_format, &block), &block).into(),
+                        request_id
+                    ))
+                    .await?;
                 debug!("relayed block with hash {} to peer {}", hash, self.router);
             }
         }
