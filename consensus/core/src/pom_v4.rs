@@ -70,7 +70,11 @@ impl PomProofV4 {
     pub fn approx_bytes(&self) -> usize {
         let tiles: usize = self.tiles.iter().map(|t| t.len()).sum();
         let paths: usize = self.merkle.iter().map(|m| m.path.len() * 32).sum();
-        1 + tiles + paths
+        // Include the length prefixes: one per `Vec` plus one per element of the two outer vectors.
+        // At K = 256 that is ~2 KB, and leaving it out biased the byte-tracked cache policy in
+        // `pom_proof_budget` low on every entry.
+        let prefixes = 4 + self.tiles.len() * 4 + 4 + self.merkle.len() * 4;
+        1 + tiles + paths + prefixes
     }
 }
 
@@ -330,6 +334,55 @@ pub fn v4_n_tiles(n_chunks: u64) -> u64 {
     n_chunks / POM_V4_TILE_CHUNKS
 }
 
+/// Size of the tile-root level: the level of the `R_T` tree whose nodes are whole-tile subtree
+/// roots. `fold_level` ceil-halves and repeated ceil-halving is a single ceil, so this is
+/// `ceil(n_chunks / POM_V4_TILE_CHUNKS)`.
+///
+/// Deliberately NOT [`v4_n_tiles`], which FLOORS. When `n_chunks` is not a multiple of
+/// `POM_V4_TILE_CHUNKS` the tile level carries one extra partial node that no walk offset ever
+/// addresses — tier 4 (`chunks = 927_994_064`) is exactly that case, 28_999_814 addressable tiles
+/// under a level of 28_999_815 nodes. The two must not be conflated: the tree SHAPE follows this
+/// function, the offset RANGE follows `v4_n_tiles`.
+#[inline]
+pub fn v4_tile_level_len(n_chunks: u64) -> u64 {
+    n_chunks.div_ceil(POM_V4_TILE_CHUNKS)
+}
+
+/// Merkle path length from a tile-subtree root up to `R_T`: the number of `fold_level` steps taking
+/// the tile level down to a single root. Mirrors the `while level.len() > 1` loop in `v4_tile_path`.
+#[inline]
+pub fn v4_tile_path_len(mut level_len: u64) -> usize {
+    let mut n = 0;
+    while level_len > 1 {
+        level_len = level_len.div_ceil(2);
+        n += 1;
+    }
+    n
+}
+
+/// The walk's tile-offset chain, derived from the seed and the tiles' leading snippets alone.
+///
+/// This is the hinge the compact p2p encoding turns on: a receiver can recover every tile's leaf
+/// index without being told, so tile positions never need to go on the wire. Extracted from
+/// [`verify_pom_proof_v4`] so the wire encoder and the verifier cannot drift apart — if they ever
+/// derived different offsets, the reconstructed Merkle paths would be silently wrong and blocks
+/// would be rejected with no obvious cause.
+///
+/// `tiles` must already be shape-checked (`POM_V4_K` entries of `POM_V4_TILE_BYTES`) and `n_tiles`
+/// must be non-zero; both are the caller's responsibility.
+pub fn v4_offset_chain(seed: u64, tiles: &[Vec<u8>], n_tiles: u64) -> [u64; POM_V4_K] {
+    debug_assert_eq!(tiles.len(), POM_V4_K);
+    debug_assert!(n_tiles > 0);
+    let mut offs = [0u64; POM_V4_K];
+    offs[0] = v4_first_offset(seed, n_tiles);
+    for step in 1..POM_V4_K {
+        let tile = &tiles[step - 1];
+        let snippet: [u8; POM_V4_SNIPPET_BYTES] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
+        offs[step] = v4_next_offset(seed, step as u64, &snippet, n_tiles);
+    }
+    offs
+}
+
 /// Fold a full leaf level up one level (duplicate-last on an odd count — matches `pom-rt-builder`).
 fn fold_level(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
     level.chunks(2).map(|p| if p.len() == 2 { hash_pair(&p[0], &p[1]) } else { hash_pair(&p[0], &p[0]) }).collect()
@@ -380,13 +433,7 @@ pub fn verify_pom_proof_v4(
 
     // Offset chain depends only on seed + snippets (tile[0..32]), not on the matrix walk.
     // Precompute it so Merkle checks can run in parallel.
-    let mut offs = [0u64; POM_V4_K];
-    offs[0] = v4_first_offset(seed, n_tiles);
-    for step in 1..POM_V4_K {
-        let tile = &proof.tiles[step - 1];
-        let snippet: [u8; POM_V4_SNIPPET_BYTES] = tile[..POM_V4_SNIPPET_BYTES].try_into().unwrap();
-        offs[step] = v4_next_offset(seed, step as u64, &snippet, n_tiles);
-    }
+    let offs = v4_offset_chain(seed, &proof.tiles, n_tiles);
 
     if !verify_tile_merkle_parallel(proof, &offs, r_t) {
         return Err(PomV4VerifyError::BadTilePath);
