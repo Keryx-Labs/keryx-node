@@ -52,6 +52,9 @@ workflow-wasm.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 bincode.workspace = true
+# `pom_v4_size` example: measures what the tonic gzip already applied to every p2p channel
+# actually buys on a PoM v4 proof. Same codec as the wire, so the number is comparable.
+flate2.workspace = true
 wasm-bindgen-test.workspace = true
 web-sys.workspace = true
 
