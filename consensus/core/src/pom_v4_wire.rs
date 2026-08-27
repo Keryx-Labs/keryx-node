@@ -203,10 +203,10 @@ pub fn encode_v4_deduped(proof: &PomProof, seed: u64, n_chunks: u64) -> Result<V
             let v = v4.merkle[i].path[level];
             // Tiles meeting at the same ancestor must agree; otherwise the proof has no single
             // well-defined compact form and we refuse it.
-            if let Some(prev) = claimed.insert(anc, v) {
-                if prev != v {
-                    return Err(PomWireError::InconsistentPaths);
-                }
+            if let Some(prev) = claimed.insert(anc, v)
+                && prev != v
+            {
+                return Err(PomWireError::InconsistentPaths);
             }
         }
 
@@ -285,7 +285,7 @@ pub fn decode_v4_deduped(bytes: &[u8], seed: u64, n_chunks: u64) -> Result<PomPr
     // which is the check that is authoritative anyway.
     let level0 = tile_level(&offsets, &tiles);
 
-    let mut paths: Vec<Vec<[u8; 32]>> = vec![Vec::with_capacity(plen); POM_V4_K];
+    let mut paths: Vec<Vec<[u8; 32]>> = (0..POM_V4_K).map(|_| Vec::with_capacity(plen)).collect();
     let mut cursor = 0usize;
     walk_levels(level0, level0_len, plen, |level, level_len, known| {
         let mut full = known.clone();
@@ -448,9 +448,9 @@ mod tests {
     fn wrong_seed_does_not_reconstruct() {
         let (proof, n_chunks) = real_proof(21, 400, 21);
         let enc = encode_v4_deduped(&proof, 21, n_chunks).unwrap();
-        match decode_v4_deduped(&enc, 22, n_chunks) {
-            Ok(dec) => assert_ne!(proof.to_wire_bytes(), dec.to_wire_bytes(), "different seed must not reconstruct"),
-            Err(_) => {} // refusing outright is equally fine
+        // Refusing outright is equally fine; what must not happen is a matching reconstruction.
+        if let Ok(dec) = decode_v4_deduped(&enc, 22, n_chunks) {
+            assert_ne!(proof.to_wire_bytes(), dec.to_wire_bytes(), "different seed must not reconstruct");
         }
     }
 

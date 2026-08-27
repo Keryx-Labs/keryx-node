@@ -17,7 +17,10 @@ pub(crate) mod request_block_bodies;
 use crate::{flow_context::FlowContext, flow_trait::Flow};
 
 use crate::ibd::IbdFlow;
-use keryx_p2p_lib::{KaspadMessagePayloadType, Router, SharedIncomingRoute, convert::header::HeaderFormat};
+use keryx_p2p_lib::{
+    KaspadMessagePayloadType, Router, SharedIncomingRoute,
+    convert::{block::PomWireFormat, header::HeaderFormat},
+};
 use keryx_utils::channel;
 use request_block_bodies::HandleBlockBodyRequests;
 use std::sync::Arc;
@@ -28,6 +31,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
     let (ibd_sender, relay_receiver) = channel::job();
     let body_only_ibd_permitted = true;
     let header_format = HeaderFormat::from(protocol_version);
+    // Compact multiproof proof encoding from v11 on; older peers keep the full-path form.
+    let pom_format = PomWireFormat::from(protocol_version);
     let mut flows: Vec<Box<dyn Flow>> = vec![
         Box::new(IbdFlow::new(
             ctx.clone(),
@@ -61,6 +66,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestRelayBlocks]),
             header_format,
+            pom_format,
         )),
         Box::new(ReceivePingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![KaspadMessagePayloadType::Ping]))),
         Box::new(SendPingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![KaspadMessagePayloadType::Pong]))),
@@ -89,6 +95,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::RequestNextPruningPointAndItsAnticoneBlocks,
             ]),
             header_format,
+            pom_format,
         )),
         Box::new(RequestPruningPointUtxoSetFlow::new(
             ctx.clone(),
@@ -108,11 +115,13 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestIbdBlocks]),
             header_format,
+            pom_format,
         )),
         Box::new(HandleBlockBodyRequests::new(
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestBlockBodies]),
+            pom_format,
         )),
         Box::new(HandleAntipastRequests::new(
             ctx.clone(),
