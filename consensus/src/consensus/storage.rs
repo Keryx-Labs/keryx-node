@@ -135,10 +135,12 @@ impl ConsensusStorage {
         let utxo_diffs_budget = scaled(80_000_000);
         let block_window_budget = scaled(200_000_000); // x 2 for difficulty and median time
         let acceptance_data_budget = scaled(40_000_000);
-        // PoM v4 proofs are ~296 KB each (K=256 tiles + range proofs). A count-based
+        // PoM v4 proofs are ~442 KiB each on tier 0 and ~458 KiB on tier 4 (K=256 tiles of 1 KB,
+        // 58%, plus one Merkle range proof per tile, 42%) — see
+        // `consensus/core/examples/pom_v4_size.rs`, which computes this per tier. A count-based
         // policy of 10_000 items — what this store used to share with the header-data caches —
-        // reaches ~3 GB and, since item counts are not scaled, ignores `--ram-scale` entirely.
-        // 192 MB holds ~650 hottest proofs of the 1500-DAA / 2000-chain-block window.
+        // reaches ~4.4 GB and, since item counts are not scaled, ignores `--ram-scale` entirely.
+        // 192 MB holds ~435 of the hottest proofs of the 1500-DAA / 2000-chain-block window.
         let pom_proof_budget = scaled(192_000_000);
         // Ratio-reward / coin-age indexes are SPK-keyed over a UTXO-scale keyspace. The old
         // Count(10_000) shared with the UTXO set cache had near-zero hit rate; every virtual-commit
