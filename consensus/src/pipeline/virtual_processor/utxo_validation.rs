@@ -313,7 +313,7 @@ impl VirtualStateProcessor {
         // distance from the committed virtual — computing it per block turns a long re-validation
         // walk quadratic, so a trusted transition must not pay for a comparison it discards.
         let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase();
-        if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
+        if enforce || (std::env::var("KERYX_RATIO_DEBUG").is_ok() && !self.trust_coinbase()) {
             self.verify_coinbase_transaction(
                 &txs[0],
                 header.daa_score,
