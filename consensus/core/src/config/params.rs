@@ -225,6 +225,15 @@ pub const H9_ACTIVATION_DAA: u64 = 80_932_000;
 /// 63_257_773, pinned 2026-07-30 for the H5.3 relaunch;
 /// 3461d9178083b24dadb13618758b5c4c92faa7c3c5dc1acdcd6a6abe5300e2ce, daa 59_192_679, pinned
 /// 2026-07-25 for the H5.2 relaunch.)
+/// Sealed service-state checkpoint: the commitment over every service-bond row with event daa at
+/// or below `SERVICE_STATE_CHECKPOINT_DAA`, pinned 2026-08-28. Local peering policy: a synced
+/// service state must reproduce it to be imported.
+pub const SERVICE_STATE_CHECKPOINT_DAA: u64 = 84_318_294;
+pub const SERVICE_STATE_CHECKPOINT: Hash = Hash::from_bytes([
+    0xe7, 0x9e, 0xc6, 0x0a, 0x3c, 0x09, 0x13, 0xc1, 0x71, 0x66, 0x3e, 0x79, 0x2d, 0x92, 0x2f, 0x82,
+    0x7e, 0xaf, 0x42, 0xfb, 0xd3, 0x71, 0x6d, 0xc4, 0xc3, 0xf9, 0x40, 0x53, 0xb4, 0xaa, 0x43, 0x01,
+]);
+
 pub const CHAIN_ANCHOR_DAA: u64 = 80_934_094;
 pub const CHAIN_ANCHOR_HASH: Hash = Hash::from_bytes([
     0xe6, 0xc7, 0x9b, 0x3a, 0x8f, 0x24, 0x3f, 0xff, 0x46, 0x35, 0x18, 0xdd, 0x65, 0xb4, 0x98, 0x54,
@@ -1239,6 +1248,9 @@ pub struct Params {
     /// Chain-anchor checkpoint `(hash, daa_score)` — local peering policy, see `CHAIN_ANCHOR_HASH`.
     /// `None` disables enforcement (all nets but mainnet).
     pub chain_anchor: Option<(Hash, u64)>,
+    /// Sealed service-state checkpoint `(daa_score, commitment)` — local peering policy, see
+    /// `SERVICE_STATE_CHECKPOINT`. `None` disables it (all nets but mainnet).
+    pub service_state_checkpoint: Option<(u64, Hash)>,
 
     /// Length (in blocks) of the trailing selected-chain window over which a payout address's
     /// production (base coinbase miner-cut earned) is summed for the ratio-reward denominator.
@@ -1493,6 +1505,7 @@ impl Params {
             reward_routing_activation: self.reward_routing_activation,
 
             chain_anchor: self.chain_anchor,
+            service_state_checkpoint: self.service_state_checkpoint,
 
             ratio_reward_window: self.ratio_reward_window,
             ratio_reward_window_daa: self.ratio_reward_window_daa,
@@ -1697,6 +1710,7 @@ pub const MAINNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
+    service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1820,6 +1834,7 @@ pub const TESTNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(500),
     chain_anchor: None,
+    service_state_checkpoint: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
     // the 24h mainnet value, so the holder ratio climbs through its brackets within a test session
     // rather than ~30 days. Still well under pruning_depth. Same shrink for the H3 daa window.
@@ -1907,6 +1922,7 @@ pub const SIMNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     chain_anchor: None,
+    service_state_checkpoint: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
@@ -1988,6 +2004,7 @@ pub const DEVNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     chain_anchor: None,
+    service_state_checkpoint: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
     ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
 
