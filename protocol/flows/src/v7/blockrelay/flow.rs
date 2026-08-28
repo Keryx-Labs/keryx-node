@@ -174,7 +174,14 @@ impl HandleRelayInvsFlow {
                 OrphanOutput::NoRoots(_) => continue, // Existing orphan w/o missing roots
                 OrphanOutput::Roots(roots) => {
                     // Known orphan with roots to enqueue
-                    self.enqueue_orphan_roots(inv.hash, roots, inv.known_within_range);
+                    if let Some(orphan) = self.ctx.get_orphan_block(inv.hash).await
+                        && self.roots_beyond_pruning_depth(&session, &roots, orphan.header.daa_score).await
+                    {
+                        warn!("orphan {} has header-only roots below the pruning horizon; triggering IBD instead of requesting them", inv.hash);
+                        self.try_trigger_ibd(orphan)?;
+                    } else {
+                        self.enqueue_orphan_roots(inv.hash, roots, inv.known_within_range);
+                    }
                     continue;
                 }
             }
@@ -486,6 +493,7 @@ impl HandleRelayInvsFlow {
 
         if should_orphan {
             let hash = block.hash();
+            let relay = block.clone();
             match self.ctx.add_orphan(consensus, block).await {
                 // There is a sync gap between consensus and the orphan pool, meaning that consensus might have indicated
                 // that this block is orphan, but by the time it got to the orphan pool we discovered it no longer has missing roots.
@@ -497,8 +505,13 @@ impl HandleRelayInvsFlow {
                     return Ok(Some(ancestor_batch));
                 }
                 Some(OrphanOutput::Roots(roots)) => {
-                    self.ctx.log_block_event(BlockLogEvent::Orphaned(hash, roots.len()));
-                    self.enqueue_orphan_roots(hash, roots, known_within_range)
+                    if self.roots_beyond_pruning_depth(consensus, &roots, relay.header.daa_score).await {
+                        warn!("orphan {} has header-only roots below the pruning horizon; triggering IBD instead of requesting them", hash);
+                        self.try_trigger_ibd(relay)?;
+                    } else {
+                        self.ctx.log_block_event(BlockLogEvent::Orphaned(hash, roots.len()));
+                        self.enqueue_orphan_roots(hash, roots, known_within_range)
+                    }
                 }
                 None | Some(OrphanOutput::Unknown) => {}
             }
@@ -586,6 +599,24 @@ impl HandleRelayInvsFlow {
         } else {
             Err("missing R&D allocation output")
         }
+    }
+
+    /// Whether any root is a header-only block more than a pruning depth below `relay_daa`:
+    /// no peer still serves such bodies, only a pruning catch-up gets past them.
+    async fn roots_beyond_pruning_depth(&self, consensus: &ConsensusProxy, roots: &[Hash], relay_daa: u64) -> bool {
+        let depth = self.ctx.config.pruning_depth();
+        for root in roots {
+            let Some(status) = consensus.async_get_block_status(*root).await else { continue };
+            if !status.is_header_only() {
+                continue;
+            }
+            if let Ok(header) = consensus.async_get_header(*root).await
+                && header.daa_score + depth <= relay_daa
+            {
+                return true;
+            }
+        }
+        false
     }
 
     // Send the block to IBD flow via the dedicated job channel. If the channel has a pending job, we prefer

@@ -579,6 +579,10 @@ impl FlowContext {
         self.orphans_pool.read().await.is_known_orphan(hash)
     }
 
+    pub async fn get_orphan_block(&self, hash: Hash) -> Option<Block> {
+        self.orphans_pool.read().await.get_orphan_block(hash)
+    }
+
     pub async fn get_orphan_roots_if_known(&self, consensus: &ConsensusProxy, orphan: Hash) -> OrphanOutput {
         self.orphans_pool.read().await.get_orphan_roots_if_known(consensus, orphan).await
     }

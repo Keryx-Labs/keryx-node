@@ -137,6 +137,10 @@ impl OrphanBlocksPool {
     /// Returns the orphan roots of the provided orphan. Orphan roots are ancestors of this orphan which are
     /// not in the orphan pool AND do not exist consensus-wise or are header-only. Given an orphan relayed by
     /// a peer, these blocks should be the next-in-line to be requested from that peer.
+    pub fn get_orphan_block(&self, hash: Hash) -> Option<Block> {
+        self.orphans.get(&hash).map(|entry| entry.block.clone())
+    }
+
     pub async fn get_orphan_roots_if_known(&self, consensus: &ConsensusProxy, orphan: Hash) -> OrphanOutput {
         if let Some(orphan_block) = self.orphans.get(&orphan) {
             match self.get_orphan_roots(consensus, orphan_block.block.header.direct_parents().iter().copied().collect()).await {
