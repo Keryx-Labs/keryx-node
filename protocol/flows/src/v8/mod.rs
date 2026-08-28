@@ -109,6 +109,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestServiceState]),
+            protocol_version,
         )),
         Box::new(HandleIbdBlockRequests::new(
             ctx.clone(),

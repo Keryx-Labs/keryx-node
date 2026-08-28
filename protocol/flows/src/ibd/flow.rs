@@ -767,7 +767,7 @@ impl IbdFlow {
                 RequestServiceStateMessage { pruning_point_hash: Some(pruning_point.into()) }
             ))
             .await?;
-        let handoff_cutoff = pp_daa + keryx_consensus_core::collateral::SERVICE_STATE_HANDOFF_DAA;
+        let handoff_cutoff = pp_daa.saturating_add(crate::v7::request_service_state::service_state_handoff_daa(self.protocol_version));
         let mut rows: Vec<Vec<u8>> = Vec::new();
         let mut prefix_rows = 0usize;
         let mut acc = MuHash::new();

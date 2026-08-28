@@ -721,7 +721,7 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.service_strikes_snapshot(self.lkg_virtual_state.load().daa_score)
     }
 
-    fn get_service_state_rows(&self, pruning_point: Hash) -> ConsensusResult<Vec<Vec<u8>>> {
+    fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {
         let Some(pp_daa) = self.headers_store.get_daa_score(pruning_point).optional().unwrap() else {
             return Err(ConsensusError::HeaderNotFound(pruning_point));
         };
@@ -729,7 +729,7 @@ impl ConsensusApi for Consensus {
         // cannot re-derive (their cohort windows cross its unretained history). They are outside
         // the pruning point's sealed commitment; the syncee vets them against the per-header
         // commitments that arrive as the chain grows.
-        let cutoff = pp_daa + keryx_consensus_core::collateral::SERVICE_STATE_HANDOFF_DAA;
+        let cutoff = pp_daa.saturating_add(handoff_daa);
         let mut rows: Vec<Vec<u8>> = Vec::new();
         for entry in self.storage.service_burn_store.iterator() {
             let (key, daa) = entry.unwrap();

@@ -17,6 +17,7 @@ pub struct RequestServiceStateFlow {
     ctx: FlowContext,
     router: Arc<Router>,
     incoming_route: IncomingRoute,
+    protocol_version: u32,
 }
 
 #[async_trait::async_trait]
@@ -31,8 +32,8 @@ impl Flow for RequestServiceStateFlow {
 }
 
 impl RequestServiceStateFlow {
-    pub fn new(ctx: FlowContext, router: Arc<Router>, incoming_route: IncomingRoute) -> Self {
-        Self { ctx, router, incoming_route }
+    pub fn new(ctx: FlowContext, router: Arc<Router>, incoming_route: IncomingRoute, protocol_version: u32) -> Self {
+        Self { ctx, router, incoming_route, protocol_version }
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
@@ -45,7 +46,9 @@ impl RequestServiceStateFlow {
     async fn handle_request(&mut self, pruning_point: Hash) -> Result<(), ProtocolError> {
         let consensus = self.ctx.consensus();
         let session = consensus.session().await;
-        let rows = session.async_get_service_state_rows(pruning_point).await?;
+        // v11 peers take every flushed row; older peers only the handoff band they accept.
+        let handoff_daa = service_state_handoff_daa(self.protocol_version);
+        let rows = session.async_get_service_state_rows(pruning_point, handoff_daa).await?;
         drop(session);
         debug!("Serving {} service-state rows for pruning point {}", rows.len(), pruning_point);
         for chunk in rows.chunks(SERVICE_STATE_CHUNK_ROWS) {
@@ -56,4 +59,10 @@ impl RequestServiceStateFlow {
         self.router.enqueue(make_message!(Payload::DoneServiceStateChunks, DoneServiceStateChunksMessage {})).await?;
         Ok(())
     }
+}
+
+/// Event-daa span above the pruning point a peer of `protocol_version` ships and accepts as
+/// service-state handoff rows.
+pub fn service_state_handoff_daa(protocol_version: u32) -> u64 {
+    if protocol_version >= 11 { u64::MAX } else { keryx_consensus_core::collateral::SERVICE_STATE_HANDOFF_DAA }
 }

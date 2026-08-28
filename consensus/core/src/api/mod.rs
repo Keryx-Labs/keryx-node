@@ -121,8 +121,8 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     /// Every finality-flushed service-bond row (canonical commitment byte form) with event daa
-    /// at or below `pruning_point`'s daa — what a fresh node downloads at IBD.
-    fn get_service_state_rows(&self, pruning_point: Hash) -> ConsensusResult<Vec<Vec<u8>>> {
+    /// at or below `pruning_point`'s daa plus `handoff_daa` — what a fresh node downloads at IBD.
+    fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {
         unimplemented!()
     }
 

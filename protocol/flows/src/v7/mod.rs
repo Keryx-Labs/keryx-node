@@ -120,6 +120,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![KaspadMessagePayloadType::RequestServiceState]),
+            7,
         )),
         Box::new(HandleIbdBlockRequests::new(
             ctx.clone(),

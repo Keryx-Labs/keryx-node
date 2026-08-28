@@ -456,8 +456,8 @@ impl ConsensusSessionOwned {
             .await
     }
 
-    pub async fn async_get_service_state_rows(&self, pruning_point: Hash) -> ConsensusResult<Vec<Vec<u8>>> {
-        self.clone().spawn_blocking(move |c| c.get_service_state_rows(pruning_point)).await
+    pub async fn async_get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {
+        self.clone().spawn_blocking(move |c| c.get_service_state_rows(pruning_point, handoff_daa)).await
     }
 
     pub async fn async_import_service_state(&self, rows: Vec<Vec<u8>>) -> ConsensusResult<()> {
