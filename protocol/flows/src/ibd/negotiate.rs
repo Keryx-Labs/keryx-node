@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use super::IbdFlow;
-use keryx_consensus_core::blockstatus::BlockStatus;
+use keryx_consensus_core::{blockstatus::BlockStatus, header::Header};
 use keryx_consensusmanager::ConsensusProxy;
 use keryx_core::{debug, warn};
 use keryx_hashes::Hash;
@@ -24,6 +24,7 @@ impl IbdFlow {
     pub(super) async fn negotiate_missing_syncer_chain_segment(
         &mut self,
         consensus: &ConsensusProxy,
+        relay_header: &Header,
     ) -> Result<ChainNegotiationOutput, ProtocolError> {
         /*
             Algorithm:
@@ -207,11 +208,24 @@ impl IbdFlow {
                 // when a healthy node returns from downtime and needs IBD. Refuse this syncer for
                 // now, but do NOT ban: a single unlucky negotiation must not cut an honest node
                 // off from the seed. See `ProtocolError::is_ban_worthy`.
+                // Unless our own tip is provably stale — more than a pruning depth behind the
+                // relayed block — in which case a healthy syncer legitimately shares nothing with
+                // us, and the headers-proof sync re-establishes the anchor through validation
+                // exactly as a fresh bootstrap does.
                 None => {
-                    return Err(ProtocolError::OtherOwned(format!(
-                        "no chain block in common with syncer (sink {}), cannot place the chain anchor {} (daa {})",
-                        syncer_virtual_selected_parent, anchor_hash, anchor_daa
-                    )));
+                    let hst_header = consensus.async_get_header(consensus.async_get_headers_selected_tip().await).await?;
+                    let stale = relay_header.blue_score >= hst_header.blue_score + self.ctx.config.pruning_depth()
+                        && relay_header.blue_work > hst_header.blue_work;
+                    if !stale {
+                        return Err(ProtocolError::OtherOwned(format!(
+                            "no chain block in common with syncer (sink {}), cannot place the chain anchor {} (daa {})",
+                            syncer_virtual_selected_parent, anchor_hash, anchor_daa
+                        )));
+                    }
+                    warn!(
+                        "no chain block in common with syncer {} and our tip is beyond the pruning depth behind its relay block — syncing with headers proof",
+                        self.router
+                    );
                 }
             }
         }

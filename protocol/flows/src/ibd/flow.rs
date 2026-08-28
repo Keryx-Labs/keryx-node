@@ -133,7 +133,7 @@ impl IbdFlow {
     async fn ibd(&mut self, relay_block: Block) -> Result<(), ProtocolError> {
         let mut session = self.ctx.consensus().session().await;
 
-        let negotiation_output = self.negotiate_missing_syncer_chain_segment(&session).await?;
+        let negotiation_output = self.negotiate_missing_syncer_chain_segment(&session, &relay_block.header).await?;
         let ibd_type = self
             .determine_ibd_type(
                 &session,
