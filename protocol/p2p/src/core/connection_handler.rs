@@ -77,8 +77,15 @@ impl ConnectionHandler {
                 .send_compressed(tonic::codec::CompressionEncoding::Gzip)
                 .max_decoding_message_size(P2P_MAX_MESSAGE_SIZE);
 
-            // TODO: check whether we should set tcp_keepalive
+            // Inbound connections had no keepalive at all, so a NAT or firewall dropping its state
+            // left a half-open connection that only the 30s ping flow would eventually notice —
+            // and that flow is the one which disconnects and counts strikes towards a ban.
+            // HTTP/2 PING is a transport frame every hyper/tonic peer answers, so this needs no
+            // protocol change and interoperates with unpatched nodes.
             let serve_result = TonicServer::builder()
+                .tcp_keepalive(Some(Duration::from_millis(Self::keep_alive())))
+                .http2_keepalive_interval(Some(Duration::from_millis(Self::http2_keep_alive_interval())))
+                .http2_keepalive_timeout(Some(Duration::from_millis(Self::http2_keep_alive_timeout())))
                 .layer(MapRequestBodyLayer::new(move |body| CountBytesBody::new(body, bytes_rx.clone()).boxed_unsync()))
                 .layer(MapResponseBodyLayer::new(move |body| CountBytesBody::new(body, bytes_tx.clone())))
                 .add_service(proto_server)
@@ -104,6 +111,9 @@ impl ConnectionHandler {
             .timeout(Duration::from_millis(Self::communication_timeout()))
             .connect_timeout(Duration::from_millis(Self::connect_timeout()))
             .tcp_keepalive(Some(Duration::from_millis(Self::keep_alive())))
+            .http2_keep_alive_interval(Duration::from_millis(Self::http2_keep_alive_interval()))
+            .keep_alive_timeout(Duration::from_millis(Self::http2_keep_alive_timeout()))
+            .keep_alive_while_idle(true)
             .connect()
             .await?;
 
@@ -181,16 +191,35 @@ impl ConnectionHandler {
         (1 << 17) + 256
     }
 
+    /// Wait for a request's response headers. Note this is a tower per-request timeout: for the
+    /// long-lived `message_stream` streaming RPC it bounds the handshake of the stream, not its
+    /// lifetime.
     fn communication_timeout() -> u64 {
-        10_000
+        30_000
     }
 
     fn keep_alive() -> u64 {
-        10_000
+        30_000
     }
 
+    /// Interval between HTTP/2 PING frames on an otherwise idle connection.
+    fn http2_keep_alive_interval() -> u64 {
+        30_000
+    }
+
+    /// How long we wait for the peer to answer an HTTP/2 PING before considering the connection dead.
+    fn http2_keep_alive_timeout() -> u64 {
+        20_000
+    }
+
+    /// TCP + HTTP/2 + gRPC connection establishment budget.
+    ///
+    /// One second is below a single SYN retransmit, so any packet loss — or simply a peer more than
+    /// a few hundred milliseconds away — failed deterministically. Each such failure is recorded
+    /// against the address, and since `Adaptor::connect_peer` makes exactly one attempt per round,
+    /// a handful of unlucky rounds used to write an honest intercontinental peer off entirely.
     fn connect_timeout() -> u64 {
-        1_000
+        8_000
     }
 }
 
