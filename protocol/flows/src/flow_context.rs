@@ -893,6 +893,9 @@ impl ConnectionInitializer for FlowContext {
         if let Some((major, minor, patch)) = parse_keryxd_user_agent_version(&peer_version.user_agent)
             && (major, minor, patch) < min_version
         {
+            if self.ban_peer_automatically(router.net_address().ip()).await {
+                warn!("Banned peer {} for 24h: obsolete keryxd version {}.{}.{}", router, major, minor, patch);
+            }
             return Err(ProtocolError::OtherOwned(format!(
                 "obsolete keryxd version {}.{}.{} (minimum accepted: {}.{}.{})",
                 major, minor, patch, min_version.0, min_version.1, min_version.2
