@@ -36,6 +36,7 @@ use keryx_p2p_lib::{
 };
 use keryx_utils::channel::JobReceiver;
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -698,9 +699,9 @@ impl IbdFlow {
         // A better solution could be to create a copy of the old utxo state for some sort of fallback rather than delete it.
         consensus.async_clear_pruning_utxo_set().await; // this deletes the old pruning utxoset and also sets the pruning utxo as invalidated
         self.sync_pruning_point_utxoset(consensus, pruning_point).await?;
+        self.sync_service_state(consensus, pruning_point, relay_header).await?;
         // Only if the function has reached here, will the utxo be considered "final"
         consensus.async_set_pruning_utxoset_stable().await;
-        self.sync_service_state(consensus, pruning_point, relay_header).await?;
         // Once a new utxoset is stored, the utxoindex needs to be resynced as well. This happens through the reset handler mechanism.
         let consensus_manager = self.ctx.consensus_manager.clone();
         spawn_blocking(move || consensus_manager.invoke_consensus_reset_handlers()).await.unwrap();
@@ -708,9 +709,38 @@ impl IbdFlow {
         Ok(())
     }
 
+    /// The sealed service-state commitment headers anchored at `pruning_point` agree on: a
+    /// majority over the selected-parent chain below the headers-selected tip, falling back to
+    /// the relay header when no chain header carries that pruning point yet.
+    async fn expected_service_commitment(
+        &self,
+        consensus: &ConsensusProxy,
+        pruning_point: Hash,
+        relay_header: &Header,
+    ) -> Result<Hash, ProtocolError> {
+        const VOTE_DEPTH: usize = 512;
+        let mut votes: HashMap<Hash, usize> = HashMap::new();
+        let mut hash = consensus.async_get_headers_selected_tip().await;
+        for _ in 0..VOTE_DEPTH {
+            let header = consensus.async_get_header(hash).await?;
+            if header.pruning_point == pruning_point {
+                *votes.entry(header.service_state_hash).or_default() += 1;
+            }
+            let Ok(ghostdag) = consensus.async_get_ghostdag_data(hash).await else { break };
+            hash = ghostdag.selected_parent;
+        }
+        if let Some((commitment, _)) = votes.into_iter().max_by_key(|(commitment, count)| (*count, *commitment)) {
+            return Ok(commitment);
+        }
+        if relay_header.pruning_point == pruning_point {
+            return Ok(relay_header.service_state_hash);
+        }
+        Err(ProtocolError::Other("no validated header anchors the negotiated pruning point"))
+    }
+
     /// Downloads the sealed service-bond state (every finality-flushed row up to the new pruning
-    /// point) and verifies its MuHash against `service_state_hash` of the already-validated relay
-    /// header before importing. No-op below the H6 gate.
+    /// point) and verifies its MuHash against the commitment the chain's headers carry for it
+    /// before importing. No-op below the H6 gate.
     async fn sync_service_state(
         &mut self,
         consensus: &ConsensusProxy,
@@ -727,19 +757,7 @@ impl IbdFlow {
         if self.protocol_version < 10 {
             return Err(ProtocolError::Other("peer cannot serve the service-state handoff window — sync from an upgraded peer"));
         }
-        // The expected commitment lives in headers whose own pruning point is the one we synced:
-        // the relay header on the fresh-sync path, the local headers-selected-tip on the
-        // recovery path (where the pruning point is the local one, not the syncer's).
-        let expected = if relay_header.pruning_point == pruning_point {
-            relay_header.service_state_hash
-        } else {
-            let hst = consensus.async_get_headers_selected_tip().await;
-            let hst_header = consensus.async_get_header(hst).await?;
-            if hst_header.pruning_point != pruning_point {
-                return Err(ProtocolError::Other("no validated header anchors the negotiated pruning point"));
-            }
-            hst_header.service_state_hash
-        };
+        let expected = self.expected_service_commitment(consensus, pruning_point, relay_header).await?;
         info!("downloading the sealed service state for pruning point {}", pruning_point);
         self.router
             .enqueue(make_message!(
