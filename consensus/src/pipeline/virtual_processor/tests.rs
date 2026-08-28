@@ -1238,3 +1238,48 @@ async fn cohort_window_below_the_pruned_horizon_arms_empty() {
     let early = vp.selected_chain_store.read().get_by_index(6).unwrap();
     assert!(vp.service_eligible_miners_windowed(early, 0, 100).is_empty());
 }
+
+#[tokio::test]
+async fn reward_mint_window_is_the_same_off_the_committed_chain() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::tx::ScriptPublicKey;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.reward_routing_activation = ForkActivation::new(0);
+            p.finality_depth = 5;
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    let mut chain = Vec::new();
+    for _ in 0..20 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await;
+        chain.push(*ctx.current_tips.iter().next().unwrap());
+    }
+    let fork = chain[9];
+    let on_chain = chain[10];
+
+    // A side block on `fork`: it never joins the committed selected chain, which stays on `chain`.
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+    let side = ctx.build_block_with_parents(vec![fork], 7, ctx.simulated_time);
+    let side_hash = side.header.hash;
+    ctx.validate_and_insert_block(side.to_immutable()).await;
+
+    let vp = ctx.consensus.virtual_processor().clone();
+    assert!(vp.selected_chain_store.read().get_by_hash(side_hash).is_err());
+    let side_daa = vp.headers_store.get_daa_score(side_hash).unwrap();
+    assert_eq!(side_daa, vp.headers_store.get_daa_score(on_chain).unwrap());
+    let f = vp.finality_depth;
+    assert!(side_daa > vp.headers_store.get_daa_score(fork).unwrap() && side_daa > f);
+
+    // A finalized win whose event daa sits in the window `(fork.daa - f, side.daa - f]`.
+    let spk = ScriptPublicKey::from_vec(0, vec![0x20; 34]);
+    vp.service_reward_recent.write().entry(side_daa - f).or_default().push(([9u8; 32], 123_456, Some(spk.clone())));
+
+    let off_chain = vp.service_reward_mints_for(side_hash);
+    assert_eq!(off_chain, vec![(spk, 123_456)]);
+    assert_eq!(vp.service_reward_mints_for(on_chain), off_chain);
+}

@@ -13,6 +13,7 @@ use keryx_consensus_core::collateral::{
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
+use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{info, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
@@ -851,22 +852,20 @@ impl VirtualStateProcessor {
     /// Coinbase mint expectation for a block whose selected parent is `sp`: the reward wins
     /// finalized exactly by `sp`'s fold — event daa in `(parent(sp).daa − finality, sp.daa −
     /// finality]` — in `(daa, request hash)` order. Wins with no payout script stay burned.
+    /// `parent(sp)` is `sp`'s own selected parent: the committed selected chain is not consulted,
+    /// so the expectation is the same on every chain candidate and from every node's point of view.
     pub(super) fn service_reward_mints_for(&self, sp: Hash) -> Vec<(ScriptPublicKey, u64)> {
         let sp_daa = self.headers_store.get_daa_score(sp).unwrap();
         if !self.reward_routing_activation.is_active(sp_daa) {
             return Vec::new();
         }
-        let sc = self.selected_chain_store.read();
-        let Ok(sp_idx) = sc.get_by_hash(sp) else { return Vec::new() };
-        let parent_daa = if sp_idx == 0 {
-            0
-        } else {
-            match sc.get_by_index(sp_idx - 1) {
-                Ok(h) => self.headers_store.get_daa_score(h).unwrap(),
-                Err(_) => return Vec::new(),
-            }
-        };
-        drop(sc);
+        let parent_daa = self
+            .ghostdag_store
+            .get_selected_parent(sp)
+            .ok()
+            .filter(|parent| !parent.is_origin())
+            .and_then(|parent| self.headers_store.get_daa_score(parent).ok())
+            .unwrap_or(0);
         let lo = parent_daa.saturating_sub(self.finality_depth);
         let hi = sp_daa.saturating_sub(self.finality_depth);
         if hi <= lo {
