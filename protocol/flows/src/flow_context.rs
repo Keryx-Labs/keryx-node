@@ -947,6 +947,12 @@ impl ConnectionInitializer for FlowContext {
         });
         router.set_properties(peer_properties);
 
+        // Remember the version we actually negotiated — not the one advertised — so outbound dialing
+        // can prefer peers that serve the compact proof encoding, keeping older ones as a fallback.
+        if let Some(connection_manager) = self.connection_manager() {
+            connection_manager.record_peer_protocol_version(router.net_address().ip(), applied_protocol_version);
+        }
+
         // Send and receive the ready signal
         handshake.exchange_ready_messages().await?;
 

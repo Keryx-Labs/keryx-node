@@ -27,6 +27,18 @@ use tokio::{
 const PING_TIMEOUT_BAN_THRESHOLD: u32 = 3;
 const PING_TIMEOUT_WINDOW: Duration = Duration::from_secs(600); // 10 minutes
 
+/// How long a protocol version learned from a handshake is trusted for outbound preference.
+/// A peer that upgrades must be able to stop looking old, so the observation expires.
+const KNOWN_PROTOCOL_TTL: Duration = Duration::from_secs(86400); // 24 hours
+/// Hard ceiling on the version map, mirroring `MAX_ADDRESSES` in the address store. The map is keyed
+/// by remote-supplied IPs, so it needs a bound.
+const MAX_KNOWN_PROTOCOL_ENTRIES: usize = 4096;
+/// The first protocol version that encodes a v4 PoM proof as a compact multiproof. Older peers
+/// serve the same proof in the legacy encoding — correct, just several times heavier on the wire.
+const COMPACT_POM_PROTOCOL_VERSION: u32 = 11;
+/// How many candidates to draw per free outbound slot before ranking them by protocol preference.
+const CANDIDATE_POOL_FACTOR: usize = 3;
+
 fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(ip)),
@@ -56,6 +68,9 @@ pub struct ConnectionManager {
     force_next_iteration: UnboundedSender<()>,
     shutdown_signal: SingleTrigger,
     ping_timeout_tracker: ParkingLotMutex<HashMap<IpAddr, PingTimeoutRecord>>,
+    /// Last protocol version negotiated with each IP, plus the instant it was learned. Used to
+    /// prefer peers that serve the compact proof encoding while keeping older ones dialable.
+    known_protocols: ParkingLotMutex<HashMap<IpAddr, (u32, Instant)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,10 +109,54 @@ impl ConnectionManager {
             ban_exempt_seeders,
             default_port,
             ping_timeout_tracker: Default::default(),
+            known_protocols: Default::default(),
         });
         manager.clone().start_event_loop(rx);
         manager.force_next_iteration.send(()).unwrap();
         manager
+    }
+
+    /// Records the protocol version actually negotiated with `ip`. Called from the handshake path;
+    /// best-effort and never blocks the flow.
+    pub fn record_peer_protocol_version(&self, ip: IpAddr, version: u32) {
+        let ip = canonical_ip(ip);
+        let now = Instant::now();
+        let mut known = self.known_protocols.lock();
+        if known.len() >= MAX_KNOWN_PROTOCOL_ENTRIES && !known.contains_key(&ip) {
+            // Full, and this is a new IP: drop what already expired, and if that frees nothing, drop
+            // the oldest observation. Either way a peer cycling through addresses cannot grow the map.
+            known.retain(|_, (_, learned_at)| now.duration_since(*learned_at) <= KNOWN_PROTOCOL_TTL);
+            if known.len() >= MAX_KNOWN_PROTOCOL_ENTRIES
+                && let Some(oldest) = known.iter().min_by_key(|(_, (_, learned_at))| *learned_at).map(|(ip, _)| *ip)
+            {
+                known.remove(&oldest);
+            }
+        }
+        known.insert(ip, (version, now));
+    }
+
+    /// Dial preference, lowest first. Every version here serves a valid v4 PoM proof; v11 differs
+    /// only in encoding it as a compact multiproof, so this ranks peers by what a block costs on the
+    /// wire, not by what they are capable of. It is therefore a preference over a candidate pool and
+    /// **not** a filter: an older peer is still dialed when nothing better is on offer, which is what
+    /// keeps the network from partitioning along the version line while v11 adoption is partial.
+    fn peer_protocol_preference(ip: IpAddr, known: &HashMap<IpAddr, (u32, Instant)>, now: Instant) -> u8 {
+        let version = known
+            .get(&canonical_ip(ip))
+            .filter(|(_, learned_at)| now.duration_since(*learned_at) <= KNOWN_PROTOCOL_TTL)
+            .map(|(version, _)| *version);
+        match version {
+            Some(v) if v >= COMPACT_POM_PROTOCOL_VERSION => 0, // compact multiproof encoding
+            None => 1,                                         // never met, or the observation expired
+            Some(10) => 2,                                     // legacy encoding, deliberately still dialed
+            Some(_) => 3,                                      // older
+        }
+    }
+
+    /// Drops expired protocol observations. Without this the map grows over the process lifetime.
+    fn gc_known_protocols(&self) {
+        let now = Instant::now();
+        self.known_protocols.lock().retain(|_, (_, learned_at)| now.duration_since(*learned_at) <= KNOWN_PROTOCOL_TTL);
     }
 
     fn start_event_loop(self: Arc<Self>, mut rx: UnboundedReceiver<()>) {
@@ -126,6 +185,7 @@ impl ConnectionManager {
         self.handle_connection_requests(&peer_by_address).await;
         self.handle_outbound_connections(&peer_by_address).await;
         self.handle_inbound_connections(&peer_by_address).await;
+        self.gc_known_protocols();
     }
 
     pub async fn add_connection_request(&self, address: SocketAddr, is_permanent: bool) {
@@ -199,13 +259,27 @@ impl ConnectionManager {
             if self.shutdown_signal.trigger.is_triggered() {
                 return;
             }
-            let mut addrs_to_connect = Vec::with_capacity(missing_connections);
-            let mut jobs = Vec::with_capacity(missing_connections);
-            for _ in 0..missing_connections {
+            // Gather a pool larger than needed and rank it by proof encoding: a node whose outbound
+            // slots all went to pre-v11 peers still syncs, but pays the legacy proof encoding on every
+            // block — which is the bandwidth the v4 proof made expensive in the first place.
+            let mut candidates = Vec::with_capacity(missing_connections * CANDIDATE_POOL_FACTOR);
+            while candidates.len() < missing_connections * CANDIDATE_POOL_FACTOR {
                 let Some(net_addr) = addr_iter.next() else {
                     connecting = false;
                     break;
                 };
+                candidates.push(net_addr);
+            }
+            // `sort_by_key` is stable, so the failure-weighted random order the address store handed
+            // us survives inside each preference tier — the ranking re-orders tiers, it does not
+            // replace the selection policy.
+            let now = Instant::now();
+            let known = self.known_protocols.lock().clone();
+            candidates.sort_by_key(|net_addr| Self::peer_protocol_preference(net_addr.ip.into(), &known, now));
+
+            let mut addrs_to_connect = Vec::with_capacity(missing_connections);
+            let mut jobs = Vec::with_capacity(missing_connections);
+            for net_addr in candidates.into_iter().take(missing_connections) {
                 let socket_addr = SocketAddr::new(net_addr.ip.into(), net_addr.port).to_string();
                 debug!("Connecting to {}", &socket_addr);
                 addrs_to_connect.push(net_addr);
@@ -413,5 +487,58 @@ mod tests {
         assert!(is_fixed_seed_ip(seeders, "192.0.2.1".parse().unwrap()));
         assert!(is_fixed_seed_ip(seeders, "::ffff:192.0.2.1".parse().unwrap()));
         assert!(!is_fixed_seed_ip(seeders, "127.0.0.1".parse().unwrap()));
+    }
+
+    /// v10 serves a perfectly valid v4 PoM proof, just in the legacy encoding rather than the compact
+    /// multiproof v11 added — so this ranks by wire cost, and v10 must stay dialable. A peer we have
+    /// never met also ranks above one known to be old: it may well be v11.
+    #[test]
+    fn outbound_dialing_prefers_v11_but_keeps_v10() {
+        let now = Instant::now();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let known: HashMap<IpAddr, (u32, Instant)> = [
+            (ip("1.1.1.1"), (11u32, now)),
+            (ip("2.2.2.2"), (10u32, now)),
+            (ip("3.3.3.3"), (9u32, now)),
+            (ip("4.4.4.4"), (12u32, now)),
+        ]
+        .into_iter()
+        .collect();
+
+        let pref = |s: &str| ConnectionManager::peer_protocol_preference(ip(s), &known, now);
+        assert!(pref("1.1.1.1") < pref("5.5.5.5"), "a known v11 peer is dialed before an unknown one");
+        assert!(pref("5.5.5.5") < pref("2.2.2.2"), "an unknown peer is dialed before a known v10 one");
+        assert!(pref("2.2.2.2") < pref("3.3.3.3"), "v10 is a fallback, still ahead of anything older");
+        assert_eq!(pref("4.4.4.4"), pref("1.1.1.1"), "anything at or above v11 ranks the same");
+    }
+
+    /// v4-mapped and plain forms must land on the same entry, or the preference silently misses.
+    #[test]
+    fn protocol_observations_match_v4_mapped_addresses() {
+        let now = Instant::now();
+        let known: HashMap<IpAddr, (u32, Instant)> = [("1.1.1.1".parse::<IpAddr>().unwrap(), (11u32, now))].into_iter().collect();
+
+        assert_eq!(
+            ConnectionManager::peer_protocol_preference("::ffff:1.1.1.1".parse().unwrap(), &known, now),
+            0,
+            "a v4-mapped address must resolve to the same observation"
+        );
+    }
+
+    /// A stale entry must not pin a peer to an old version forever: a peer that upgrades has to
+    /// become indistinguishable from one we have never met.
+    #[test]
+    fn a_stale_protocol_observation_is_ignored() {
+        let now = Instant::now();
+        let learned_at = now - KNOWN_PROTOCOL_TTL - Duration::from_secs(1);
+        let ip: IpAddr = "2.2.2.2".parse().unwrap();
+        let known: HashMap<IpAddr, (u32, Instant)> = [(ip, (10u32, learned_at))].into_iter().collect();
+        let unknown = HashMap::new();
+
+        assert_eq!(
+            ConnectionManager::peer_protocol_preference(ip, &known, now),
+            ConnectionManager::peer_protocol_preference(ip, &unknown, now),
+            "an expired observation must rank as unknown, not as known-old"
+        );
     }
 }
