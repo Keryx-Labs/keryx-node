@@ -451,6 +451,63 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
     assert!(miner_floor < miner_top, "serving a heavier model must pay the miner strictly more");
 }
 
+/// A body synced without its possession proof (IBD path, nothing in `pom_tier_store`) is paid
+/// by the next block exactly as the same block validated live with its proof: the tier comes
+/// from the committed header.
+#[tokio::test]
+async fn ibd_body_without_proof_is_paid_by_its_header_tier() {
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::pom::PomProof;
+
+    fn proof_with_tier(tier: u8) -> PomProof {
+        PomProof {
+            tier,
+            trace_root: [0; 32],
+            pow_value: [0; 32],
+            final_state: 0,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: None,
+            v3: None,
+            v4: None,
+        }
+    }
+
+    // Miner payout of the block merging A, A inserted through the IBD path (no proof) or live.
+    async fn payout(tier: u8, ibd: bool) -> u64 {
+        let mut params = MAINNET_PARAMS;
+        params.pom_activation = ForkActivation::always();
+        params.pom_v3_activation = ForkActivation::always();
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let mut ctx = TestContext::new(TestConsensus::new(&config));
+        let miner_spk = ctx.miner_data.script_public_key.clone();
+
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+        let mut a = ctx.build_block_template(0, ctx.simulated_time).block;
+        a.header.pom_tier = tier;
+        let a = a.to_immutable();
+        let a_hash = a.hash();
+        if ibd {
+            ctx.consensus.validate_and_insert_block_ibd(a).virtual_state_task.await.unwrap();
+            assert!(!ctx.consensus.pom_tier_store().has(a_hash).unwrap());
+        } else {
+            ctx.consensus.validate_and_insert_block(a.with_pom_proof(proof_with_tier(tier))).virtual_state_task.await.unwrap();
+            assert!(ctx.consensus.pom_tier_store().has(a_hash).unwrap());
+        }
+
+        ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+        let template_b = ctx.build_block_template(0, ctx.simulated_time);
+        template_b.block.transactions[0].outputs.iter().filter(|o| o.script_public_key == miner_spk).map(|o| o.value).sum()
+    }
+
+    for tier in [0u8, 3] {
+        let live = payout(tier, false).await;
+        assert!(live > 0);
+        assert_eq!(payout(tier, true).await, live, "tier {tier}: IBD-synced body must be paid like the live-validated one");
+    }
+}
+
 /// A transaction spending a burned escrow outpoint is rejected in the UTXO context, before any
 /// entry lookup — the spend-level enforcement of a finality-deep service miss.
 #[tokio::test]

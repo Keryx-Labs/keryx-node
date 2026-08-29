@@ -708,18 +708,25 @@ impl VirtualStateProcessor {
         // probation. Before service_bond_v2 a strike as of the lagged anchor also demotes.
         let standing_gate = self.pom_v3_activation.is_active(pov_daa_score);
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
-            if let Some(tier) = self.pom_tier_store.get(*blue).optional().unwrap() {
-                let mut bps = schedule.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
-                if standing_gate {
-                    let txs = self.block_transactions_store.get(*blue).unwrap();
-                    let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
-                    let identity = keryx_consensus_core::collateral::miner_key(&coinbase.miner_data.script_public_key);
-                    if !self.service_standing_at(&identity, pov_daa_score) {
-                        bps = schedule[0];
-                    }
+            // At/after H6 the tier is committed in the header (bound to the proof by body
+            // validation), so bodies synced without their proof still resolve it.
+            let header = self.headers_store.get_header(*blue).unwrap();
+            let tier = if self.pom_v3_activation.is_active(header.daa_score) {
+                Some(header.pom_tier)
+            } else {
+                self.pom_tier_store.get(*blue).optional().unwrap()
+            };
+            let Some(tier) = tier else { continue };
+            let mut bps = schedule.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+            if standing_gate {
+                let txs = self.block_transactions_store.get(*blue).unwrap();
+                let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+                let identity = keryx_consensus_core::collateral::miner_key(&coinbase.miner_data.script_public_key);
+                if !self.service_standing_at(&identity, pov_daa_score) {
+                    bps = schedule[0];
                 }
-                map.insert(*blue, bps);
             }
+            map.insert(*blue, bps);
         }
         map
     }
