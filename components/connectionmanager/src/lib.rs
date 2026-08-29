@@ -52,6 +52,9 @@ const MAX_ACCOUNTABLE_DIAL_FAILURES: u32 = 5;
 /// How often the peering health line is logged.
 const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Minimum spacing between two DNS seeder queries, whatever the loop cadence.
+const DNS_SEED_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// How long an inbound peer may stay connected without ever answering a pong before it is treated
 /// as a silent squatter for eviction purposes. Comfortably above two ping intervals.
 const INBOUND_SILENCE_GRACE: Duration = Duration::from_secs(300);
@@ -162,6 +165,7 @@ pub struct ConnectionManager {
     ping_timeout_tracker: ParkingLotMutex<HashMap<IpAddr, PingTimeoutRecord>>,
     dial_cooldown: ParkingLotMutex<DialCooldown>,
     last_health_log: ParkingLotMutex<Instant>,
+    last_dns_seed: ParkingLotMutex<Option<Instant>>,
     /// Last known protocol version per IP, learned from successful handshakes, with the instant it
     /// was learned. Used to prefer v11 peers while keeping v10 as fallback; expired by
     /// `KNOWN_PROTOCOL_TTL` so a peer that upgrades is not written off forever.
@@ -206,6 +210,7 @@ impl ConnectionManager {
             ping_timeout_tracker: Default::default(),
             dial_cooldown: Default::default(),
             last_health_log: ParkingLotMutex::new(Instant::now()),
+            last_dns_seed: Default::default(),
             known_protocols: Default::default(),
         });
         manager.clone().start_event_loop(rx);
@@ -532,6 +537,13 @@ impl ConnectionManager {
 
         if self.dns_seeders.is_empty() {
             return;
+        }
+        {
+            let mut last = self.last_dns_seed.lock();
+            if last.is_some_and(|at| at.elapsed() < DNS_SEED_MIN_INTERVAL) {
+                return;
+            }
+            *last = Some(Instant::now());
         }
         let learned = if exhausted || missing_connections > self.outbound_target / 2 {
             // If the store is exhausted, or we are missing more than half of our target, query all
