@@ -918,6 +918,14 @@ impl BlockrateParams {
         self.merge_depth = merge_depth;
         self
     }
+
+    /// Test networks only: denser window sampling, so the difficulty and median-time windows span
+    /// fewer blocks than the finality depth.
+    pub const fn with_sample_rates(mut self, past_median_time_sample_rate: u64, difficulty_sample_rate: u64) -> Self {
+        self.past_median_time_sample_rate = past_median_time_sample_rate;
+        self.difficulty_sample_rate = difficulty_sample_rate;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1778,7 +1786,7 @@ pub const TESTNET_PARAMS: Params = Params {
     max_block_level: 250,
     pruning_proof_m: 1000,
 
-    blockrate: BlockrateParams::new::<10>().with_depths(2_000, 7_000, 2_000),
+    blockrate: BlockrateParams::new::<10>().with_depths(6_000, 33_000, 6_000).with_sample_rates(10, 4),
 
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
@@ -1852,7 +1860,7 @@ pub const TESTNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(500),
     service_ledger_activation: ForkActivation::new(500),
-    service_burnable_window_daa: 2_000,
+    service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of

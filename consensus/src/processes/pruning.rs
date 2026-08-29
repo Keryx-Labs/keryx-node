@@ -347,6 +347,13 @@ mod tests {
             // Assert P is not a multiple of F +- noise(K)
             let mod_after = pruning_depth % finality_depth;
             assert!((ghostdag_k as u64) < mod_after && mod_after < finality_depth - ghostdag_k as u64);
+
+            // The pruning proof builds the DAA and median-time windows of each new pruning point from
+            // data above the previous one, so both windows must fit within one finality epoch.
+            let daa_window_span = params.difficulty_window_size as u64 * params.difficulty_sample_rate();
+            let median_time_window_span = params.past_median_time_window_size as u64 * params.past_median_time_sample_rate();
+            assert!(daa_window_span < finality_depth, "{net}: DAA window span {daa_window_span} >= finality depth {finality_depth}");
+            assert!(median_time_window_span < finality_depth);
         }
     }
 }
