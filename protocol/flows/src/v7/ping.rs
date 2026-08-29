@@ -137,13 +137,38 @@ impl SendPingsFlow {
                 Err(e) => return Err(e),
                 Ok(p) => p,
             };
-            let Some(&(_, sent_at)) = outstanding.iter().find(|(sent_nonce, _)| *sent_nonce == pong.nonce) else {
+            let Some(sent_at) = settle_pong(&mut outstanding, pong.nonce) else {
                 return Err(ProtocolError::Other("nonce mismatch between ping and pong"));
             };
             debug!("Successful ping with peer {} (nonce: {})", self.peer, pong.nonce);
             consecutive_timeouts = 0;
-            outstanding.clear();
             router.set_last_ping_duration(sent_at.elapsed().as_millis() as u64);
         }
+    }
+}
+
+/// Matches a pong against the outstanding window: drops the matched ping and every older one,
+/// keeps the newer pings in flight, and returns the matched ping's send instant.
+fn settle_pong(outstanding: &mut VecDeque<(u64, Instant)>, nonce: u64) -> Option<Instant> {
+    let idx = outstanding.iter().position(|(sent_nonce, _)| *sent_nonce == nonce)?;
+    let (_, sent_at) = outstanding[idx];
+    outstanding.drain(..=idx);
+    Some(sent_at)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_late_pong_keeps_newer_pings_outstanding() {
+        let now = Instant::now();
+        let mut outstanding: VecDeque<(u64, Instant)> = [(1u64, now), (2u64, now), (3u64, now)].into_iter().collect();
+
+        assert_eq!(settle_pong(&mut outstanding, 1), Some(now));
+        assert_eq!(outstanding.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(settle_pong(&mut outstanding, 3), Some(now));
+        assert!(outstanding.is_empty());
+        assert_eq!(settle_pong(&mut outstanding, 2), None);
     }
 }
