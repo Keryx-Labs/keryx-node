@@ -844,6 +844,9 @@ impl ConsensusApi for Consensus {
     }
 
     fn get_service_ledger_snapshot(&self, sample: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        if sample == self.config.genesis.hash {
+            return Ok(Some(keryx_consensus_core::collateral::ServiceLedgerSnapshot::default().to_bytes()));
+        }
         Ok(self.storage.service_ledger_snapshot_store.get(sample).unwrap())
     }
 

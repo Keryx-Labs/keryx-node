@@ -1357,6 +1357,8 @@ async fn ledger_snapshots_are_persisted_at_pruning_samples() {
     let mut stored: Vec<Hash> = vp.service_ledger_snapshot_store.entries().into_iter().map(|(h, _)| h).collect();
     stored.sort();
     assert_eq!(stored, expected);
+    assert_eq!(vp.service_ledger_hash_at(config.genesis.hash), Some(ServiceLedgerSnapshot::default().hash()));
+    assert_eq!(vp.service_ledger_hash_at(Hash::from(11u64)), None);
 
     tc.shutdown(handles);
 }

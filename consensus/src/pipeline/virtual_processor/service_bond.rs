@@ -925,7 +925,11 @@ impl VirtualStateProcessor {
     }
 
     /// Canonical hash of the persisted ledger snapshot at `sample`, if this node holds it.
+    /// Genesis carries the empty ledger.
     pub(super) fn service_ledger_hash_at(&self, sample: Hash) -> Option<Hash> {
+        if sample == self.genesis.hash {
+            return Some(ServiceLedgerSnapshot::default().hash());
+        }
         self.service_ledger_hashes.read().get(&sample).copied()
     }
 
