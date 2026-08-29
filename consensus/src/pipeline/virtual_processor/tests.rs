@@ -1112,7 +1112,7 @@ async fn coin_age_maturation_choreography_adversarial() {
 /// blocks under (re)validation: the DAG is 8 blocks wide (daa outruns the chain index, the shape
 /// of every freshly initialized store), and the index is pruned below chain index 5 with the
 /// pruning point moved there — what a node that pruned ahead of a restart catch-up holds.
-async fn pruned_floor_fixture() -> (TestConsensus, Vec<JoinHandle<()>>) {
+async fn pruned_floor_fixture() -> (TestConsensus, std::sync::Arc<keryx_database::prelude::DB>, Vec<JoinHandle<()>>) {
     use crate::model::stores::pruning::PruningStore;
     use crate::model::stores::selected_chain::{SelectedChainStore, SelectedChainStoreReader};
     use keryx_consensus_core::config::params::ForkActivation;
@@ -1162,7 +1162,7 @@ async fn pruned_floor_fixture() -> (TestConsensus, Vec<JoinHandle<()>>) {
         let (tip_idx, _) = sc.get_tip().unwrap();
         assert!(tip_idx < 200, "the chain index must sit inside the daa window for the floor to matter");
     }
-    (tc, handles)
+    (tc, db, handles)
 }
 
 #[tokio::test]
@@ -1171,7 +1171,7 @@ async fn reward_window_floor_survives_a_pruned_header_pruning_point() {
     use crate::model::stores::selected_chain::SelectedChainStoreReader;
     use crate::pipeline::virtual_processor::utxo_validation::ProductionWindowCtx;
 
-    let (tc, _handles) = pruned_floor_fixture().await;
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
     let vp = tc.virtual_processor().clone();
 
     let sc = vp.selected_chain_store.read();
@@ -1204,7 +1204,7 @@ async fn reward_window_floor_survives_a_pruned_header_pruning_point() {
 async fn reward_window_below_the_pruned_horizon_fails_loud() {
     use crate::model::stores::selected_chain::SelectedChainStoreReader;
 
-    let (tc, _handles) = pruned_floor_fixture().await;
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
     let vp = tc.virtual_processor().clone();
 
     // An early chain block: its whole daa window sits below the pruned horizon, so no local
@@ -1215,7 +1215,7 @@ async fn reward_window_below_the_pruned_horizon_fails_loud() {
 
 #[tokio::test]
 async fn cohort_window_survives_a_pruned_header_pruning_point() {
-    let (tc, _handles) = pruned_floor_fixture().await;
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
     let vp = tc.virtual_processor().clone();
     let tip = {
         use crate::model::stores::selected_chain::SelectedChainStoreReader;
@@ -1233,7 +1233,7 @@ async fn cohort_window_survives_a_pruned_header_pruning_point() {
 async fn cohort_window_below_the_pruned_horizon_arms_empty() {
     use crate::model::stores::selected_chain::SelectedChainStoreReader;
 
-    let (tc, _handles) = pruned_floor_fixture().await;
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
     let vp = tc.virtual_processor().clone();
     let early = vp.selected_chain_store.read().get_by_index(6).unwrap();
     assert!(vp.service_eligible_miners_windowed(early, 0, 100).is_empty());
@@ -1282,4 +1282,45 @@ async fn reward_mint_window_is_the_same_off_the_committed_chain() {
     let off_chain = vp.service_reward_mints_for(side_hash);
     assert_eq!(off_chain, vec![(spk, 123_456)]);
     assert_eq!(vp.service_reward_mints_for(on_chain), off_chain);
+}
+
+/// Inside the post-import catch-up window the node trusts the coinbase: a window floor below
+/// retention clamps at the pruning point instead of panicking (the debug dump path), while the
+/// template path anchors its window at the node's own pruning point, which the selected-chain
+/// index always retains — so the clamp is never consulted there.
+#[tokio::test]
+async fn trusted_node_clamps_the_window_floor_and_the_template_never_needs_it() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::production_seed::ProductionIndexSeedStore;
+    use crate::model::stores::pruning::PruningStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use crate::pipeline::virtual_processor::utxo_validation::ProductionWindowCtx;
+    use rocksdb::WriteBatch;
+
+    let (tc, db, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+    assert!(!vp.trust_coinbase(), "the fixture must start outside every trust window");
+
+    // Seed the production index at the tip: fewer than a window of chain blocks since import.
+    let (tip_idx, tip) = vp.selected_chain_store.read().get_tip().unwrap();
+    let mut batch = WriteBatch::default();
+    vp.production_index_seed_store.write().set_batch(&mut batch, tip_idx).unwrap();
+    db.write(batch).unwrap();
+    assert!(vp.trust_coinbase());
+
+    // The window below the pruned horizon now clamps at the pruning point instead of panicking.
+    let pp = vp.pruning_point_store.read().pruning_point().unwrap();
+    let pp_idx = vp.selected_chain_store.read().get_by_hash(pp).unwrap();
+    let early = vp.selected_chain_store.read().get_by_index(6).unwrap();
+    match vp.production_window_ctx(early, 0) {
+        ProductionWindowCtx::OnChain { bottom, .. } => assert_eq!(bottom, pp_idx),
+        _ => panic!("a committed chain block must resolve as an on-chain window"),
+    }
+
+    // The template's window is anchored at the node's own pruning point, always retained: the
+    // fallible floor resolves for any daa bound, so the clamp above is never reached there.
+    let sc = vp.selected_chain_store.read();
+    let tip_daa = vp.headers_store.get_daa_score(tip).unwrap();
+    assert_eq!(vp.window_floor_in_retention(&*sc, pp, pp, tip_daa.saturating_sub(vp.ratio_reward_window_daa)), Some(pp_idx));
+    assert_eq!(vp.window_floor_in_retention(&*sc, pp, pp, 0), Some(pp_idx));
 }
