@@ -7,7 +7,7 @@ use crate::{
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
             AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
-            BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext,
+            BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingServiceLedgerSnapshot,
             WrongHeaderPruningPoint,
         },
     },
@@ -332,7 +332,15 @@ impl VirtualStateProcessor {
         // utxo-commitment-pinned chain instead.
         if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase() {
             let pp_daa = self.headers_store.get_daa_score(header.pruning_point).unwrap();
-            let expected = self.service_commit_index.commitment_at(pp_daa);
+            let rows = self.service_commit_index.commitment_at(pp_daa);
+            let expected = if self.service_ledger_activation.is_active(header.daa_score) {
+                let Some(ledger) = self.service_ledger_hash_at(header.pruning_point) else {
+                    return Err(MissingServiceLedgerSnapshot(header.pruning_point));
+                };
+                keryx_consensus_core::collateral::service_commitment_v2(rows, ledger)
+            } else {
+                rows
+            };
             if header.service_state_hash != expected {
                 return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
             }

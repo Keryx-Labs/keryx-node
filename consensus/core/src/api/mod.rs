@@ -133,6 +133,17 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The canonical service-ledger snapshot persisted at pruning sample `sample`, if held.
+    fn get_service_ledger_snapshot(&self, sample: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        unimplemented!()
+    }
+
+    /// Installs a verified ledger snapshot for `sample` (the imported pruning point): persists
+    /// it and restarts the live ledger fold from it. Rows MUST have been imported first.
+    fn import_service_ledger_snapshot(&self, sample: Hash, bytes: Vec<u8>) -> ConsensusResult<()> {
+        unimplemented!()
+    }
+
     fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
         unimplemented!()
     }

@@ -7,6 +7,7 @@ use crate::model::stores::{
 };
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
+    ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
@@ -233,14 +234,29 @@ impl VirtualStateProcessor {
         let seed_header = self.headers_store.get_header(seed).unwrap();
         let daa_bound = seed_header.daa_score.saturating_sub(window_daa);
         // A window crossing below retained history only happens while re-validating blocks near
-        // the local pruning point (fresh IBD / restart catch-up). Every event such an audit could
-        // yield is finality-flushed and shipped by the service-state transfer, so the audit arms
+        // the local pruning point (fresh IBD / restart catch-up). Past the ledger gate the part
+        // below the pruning point is read from the imported snapshot; before it the audit arms
         // empty rather than with a cohort no local search can reproduce.
-        let Some(pruning_idx) = self.window_floor_in_retention(sc, seed_header.pruning_point, own_pp, daa_bound) else {
-            return vec![];
+        let (pruning_idx, below) = match self.window_floor_in_retention(sc, seed_header.pruning_point, own_pp, daa_bound) {
+            Some(idx) => (idx, false),
+            None if self.service_ledger_activation.is_active(seed_header.daa_score) => match sc.get_by_hash(own_pp) {
+                Ok(idx) => (idx, true),
+                Err(_) => return vec![],
+            },
+            None => return vec![],
         };
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, seed_idx, pruning_idx).max(pruning_idx);
         let mut recent = Vec::new();
+        if below {
+            let pp_daa = self.headers_store.get_daa_score(own_pp).unwrap();
+            recent.extend(
+                self.service_imported_producers
+                    .read()
+                    .iter()
+                    .filter(|(daa, _, _, _)| *daa > daa_bound && *daa <= pp_daa)
+                    .map(|(_, id, tier, escrow)| (*id, *tier, *escrow)),
+            );
+        }
         for i in (bottom + 1)..=seed_idx {
             recent.extend(self.service_producers_of_chain_block(sc.get_by_index(i).unwrap()));
         }
@@ -550,7 +566,28 @@ impl VirtualStateProcessor {
         let start = if cursor_daa > 0 { cursor_daa } else { to_daa.saturating_sub(self.finality_depth) };
         let daa_bound = start.saturating_sub(SERVICE_BURNABLE_WINDOW_DAA);
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
-        let bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
+        let mut bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
+        // A persisted sample snapshot at or below `to` is the exact state there: restore it and
+        // fold only what lies above.
+        let sample = self
+            .service_ledger_hashes
+            .read()
+            .keys()
+            .filter_map(|h| sc.get_by_hash(*h).ok().filter(|idx| *idx <= to).map(|idx| (idx, *h)))
+            .max();
+        if let Some((sample_idx, sample_hash)) = sample {
+            let restored = self
+                .service_ledger_snapshot_store
+                .get(sample_hash)
+                .ok()
+                .flatten()
+                .and_then(|bytes| ServiceLedgerSnapshot::from_bytes(&bytes).ok());
+            if let Some(snapshot) = restored {
+                ledger.restore_snapshot(&snapshot);
+                bottom = sample_idx;
+                info!("service-bond: refold from the snapshot at chain index {} (daa {})", sample_idx, self.headers_store.get_daa_score(sample_hash).unwrap());
+            }
+        }
         if bottom == pruning_idx && pruning_idx > 0 {
             let bottom_daa = self.headers_store.get_daa_score(sc.get_by_index(bottom).unwrap()).unwrap();
             if bottom_daa > daa_bound {
@@ -644,6 +681,12 @@ impl VirtualStateProcessor {
         }
         sync.snapshots.split_off(&(common + 1));
         sync.undo.split_off(&(common + 1));
+        for removed in chain_path.removed.iter() {
+            if self.service_ledger_hashes.write().remove(removed).is_some() {
+                self.service_ledger_snapshot_store.delete(*removed).unwrap();
+            }
+        }
+        let mut sampled = false;
         for (k, h) in chain_path.added.iter().enumerate() {
             let idx = common + 1 + k as u64;
             let daa = self.headers_store.get_daa_score(*h).unwrap();
@@ -670,6 +713,17 @@ impl VirtualStateProcessor {
             }
             let snapshot = sync.ledger.light_snapshot();
             sync.snapshots.insert(idx, snapshot);
+            if self.is_pruning_sample_block(*h) {
+                let mut snapshot = sync.ledger.snapshot();
+                snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa);
+                let bytes = snapshot.to_bytes();
+                self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
+                self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
+                sampled = true;
+            }
+        }
+        if sampled {
+            self.gc_service_ledger_snapshots(pruning_point);
         }
         while sync.snapshots.len() > SERVICE_SNAPSHOT_CAP {
             sync.snapshots.pop_first();
@@ -786,6 +840,95 @@ impl VirtualStateProcessor {
         }
     }
 
+    /// Producers of the chain blocks with daa in `(daa − SERVICE_ELIGIBILITY_WINDOW_DAA, daa]`
+    /// ending at chain index `idx`, chain order.
+    fn recent_producers_below(&self, sc: &impl SelectedChainStoreReader, idx: u64, daa: u64) -> Vec<(u64, Hash, u8, Hash)> {
+        let bound = daa.saturating_sub(SERVICE_ELIGIBILITY_WINDOW_DAA);
+        let mut out = Vec::new();
+        let mut i = idx;
+        loop {
+            let Ok(h) = sc.get_by_index(i) else { break };
+            let block_daa = self.headers_store.get_daa_score(h).unwrap();
+            if block_daa <= bound {
+                break;
+            }
+            for (id, tier, escrow) in self.service_producers_of_chain_block(h) {
+                out.push((block_daa, id, tier, escrow));
+            }
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+        }
+        out.reverse();
+        out
+    }
+
+    /// Whether `hash` opens a new finality epoch on its selected chain — the blocks a pruning
+    /// point can be chosen among.
+    pub(super) fn is_pruning_sample_block(&self, hash: Hash) -> bool {
+        let Ok(sp) = self.ghostdag_store.get_selected_parent(hash) else { return false };
+        if sp.is_origin() {
+            return false;
+        }
+        let blue = self.headers_store.get_blue_score(hash).unwrap();
+        let sp_blue = self.headers_store.get_blue_score(sp).unwrap();
+        sp_blue / self.finality_depth < blue / self.finality_depth
+    }
+
+    /// Drops sample snapshots more than one finality depth below the pruning point.
+    fn gc_service_ledger_snapshots(&self, pruning_point: Hash) {
+        let floor = self.headers_store.get_blue_score(pruning_point).unwrap().saturating_sub(self.finality_depth);
+        let samples: Vec<Hash> = self.service_ledger_hashes.read().keys().copied().collect();
+        for sample in samples {
+            let stale = match self.headers_store.get_blue_score(sample) {
+                Ok(blue) => blue < floor,
+                Err(_) => true,
+            };
+            if stale {
+                self.service_ledger_hashes.write().remove(&sample);
+                self.service_ledger_snapshot_store.delete(sample).unwrap();
+            }
+        }
+    }
+
+    /// Installs an imported ledger snapshot taken at chain block `sample` (the new pruning
+    /// point): persists it and restarts the fold from it, so every event above `sample` is
+    /// re-derived locally.
+    pub(crate) fn install_service_ledger_snapshot(
+        &self,
+        sample: Hash,
+        bytes: Vec<u8>,
+        snapshot: ServiceLedgerSnapshot,
+    ) -> keryx_consensus_core::errors::consensus::ConsensusResult<()> {
+        let sample_idx = self
+            .selected_chain_store
+            .read()
+            .get_by_hash(sample)
+            .map_err(|_| keryx_consensus_core::errors::consensus::ConsensusError::General("snapshot sample is not a chain block"))?;
+        let sample_daa = self.headers_store.get_daa_score(sample).unwrap();
+        self.service_ledger_hashes.write().insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
+        self.service_ledger_snapshot_store.set(sample, bytes).unwrap();
+        *self.service_imported_producers.write() = snapshot.recent_producers.clone();
+        let mut sync = self.service_ledger.lock();
+        let mut ledger = ServiceLedger::default();
+        ledger.restore_snapshot(&snapshot);
+        sync.ledger = ledger;
+        sync.snapshots.clear();
+        sync.undo.clear();
+        sync.queue.clear();
+        sync.logged.clear();
+        sync.tip = Some(sample_idx);
+        sync.deep_cursor_daa = sync.deep_cursor_daa.max(sample_daa);
+        info!("service-bond: ledger restored from the snapshot at {} (daa {})", sample, sample_daa);
+        Ok(())
+    }
+
+    /// Canonical hash of the persisted ledger snapshot at `sample`, if this node holds it.
+    pub(super) fn service_ledger_hash_at(&self, sample: Hash) -> Option<Hash> {
+        self.service_ledger_hashes.read().get(&sample).copied()
+    }
+
     /// Boot-time load of the persisted burned outpoints into the RAM set consulted by transaction
     /// validation, of the suspensions (re-derived from the strike log) into the RAM map consulted
     /// by block validation, and of the deep cursor — the persisted event frontier bounding the
@@ -847,6 +990,17 @@ impl VirtualStateProcessor {
         }
         self.service_commit_index.rebuild(rows);
         self.service_ledger.lock().deep_cursor_daa = cursor;
+        let own_pp = self.pruning_point_store.read().pruning_point().ok();
+        let mut hashes = self.service_ledger_hashes.write();
+        hashes.clear();
+        for (sample, bytes) in self.service_ledger_snapshot_store.entries() {
+            hashes.insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
+            if Some(sample) == own_pp {
+                if let Ok(snapshot) = ServiceLedgerSnapshot::from_bytes(&bytes) {
+                    *self.service_imported_producers.write() = snapshot.recent_producers;
+                }
+            }
+        }
     }
 
     /// Coinbase mint expectation for a block whose selected parent is `sp`: the reward wins

@@ -147,6 +147,8 @@ pub enum DatabaseStorePrefixes {
     /// Inference-reward wins (finality-deep, append-once): request hash → (winner identity,
     /// amount, event daa). Mint dedup and commitment rebuild.
     ServiceReward = 200,
+    /// Canonical service-ledger snapshot at each pruning sample: block hash → encoded state.
+    ServiceLedgerSnapshot = 201,
 
     // ---- Separator ----
     /// Reserved as a separator

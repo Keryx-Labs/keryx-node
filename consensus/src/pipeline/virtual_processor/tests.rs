@@ -1122,6 +1122,7 @@ async fn pruned_floor_fixture() -> (TestConsensus, std::sync::Arc<keryx_database
         .skip_proof_of_work()
         .edit_consensus_params(|p| {
             p.pom_level_activation = ForkActivation::always();
+            p.service_ledger_activation = ForkActivation::always();
             p.ratio_reward_window_daa = 200;
         })
         .build();
@@ -1323,4 +1324,62 @@ async fn trusted_node_clamps_the_window_floor_and_the_template_never_needs_it() 
     let tip_daa = vp.headers_store.get_daa_score(tip).unwrap();
     assert_eq!(vp.window_floor_in_retention(&*sc, pp, pp, tip_daa.saturating_sub(vp.ratio_reward_window_daa)), Some(pp_idx));
     assert_eq!(vp.window_floor_in_retention(&*sc, pp, pp, 0), Some(pp_idx));
+}
+
+/// Every chain block opening a finality epoch gets its service-ledger snapshot persisted, and
+/// nothing else does.
+#[tokio::test]
+async fn ledger_snapshots_are_persisted_at_pruning_samples() {
+    use keryx_consensus_core::collateral::ServiceLedgerSnapshot;
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let mut params = MAINNET_PARAMS;
+    params.pom_v3_activation = ForkActivation::always();
+    params.blockrate.finality_depth = 10;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let mut parent = config.genesis.hash;
+    for n in 1..=45u64 {
+        let hash: Hash = n.into();
+        tc.add_utxo_valid_block_with_parents(hash, vec![parent], vec![]).await.unwrap();
+        parent = hash;
+    }
+
+    let vp = tc.virtual_processor().clone();
+    let expected: Vec<Hash> = (1..=45u64).map(Hash::from).filter(|h| vp.is_pruning_sample_block(*h)).collect();
+    assert_eq!(expected, vec![Hash::from(10u64), Hash::from(20u64), Hash::from(30u64), Hash::from(40u64)]);
+    for h in expected.iter() {
+        let bytes = vp.service_ledger_snapshot_store.get(*h).unwrap().expect("a sample must carry its snapshot");
+        assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap().to_bytes(), bytes);
+    }
+    let mut stored: Vec<Hash> = vp.service_ledger_snapshot_store.entries().into_iter().map(|(h, _)| h).collect();
+    stored.sort();
+    assert_eq!(stored, expected);
+
+    tc.shutdown(handles);
+}
+
+/// Below the pruning point, a cohort walk past the ledger gate reads the producers carried by the
+/// imported snapshot instead of arming empty.
+#[tokio::test]
+async fn cohort_below_the_pruned_horizon_reads_the_imported_producers() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::pruning::PruningStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+    let early = vp.selected_chain_store.read().get_by_index(6).unwrap();
+    let pp = vp.pruning_point_store.read().pruning_point().unwrap();
+    let pp_daa = vp.headers_store.get_daa_score(pp).unwrap();
+    let id = Hash::from_bytes([0xAAu8; 32]);
+    let escrow = Hash::from_bytes([0xBBu8; 32]);
+
+    assert!(vp.service_eligible_miners_windowed(early, 0, 100).is_empty());
+    *vp.service_imported_producers.write() = vec![(pp_daa, id, 0, escrow), (pp_daa, id, 1, escrow)];
+    assert_eq!(vp.service_eligible_miners_windowed(early, 0, 100), vec![(id, escrow)]);
+    assert_eq!(vp.service_eligible_miners_windowed(early, 1, 100), vec![(id, escrow)]);
+    assert!(vp.service_eligible_miners_windowed(early, 2, 100).is_empty());
 }

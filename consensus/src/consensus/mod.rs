@@ -843,6 +843,16 @@ impl ConsensusApi for Consensus {
         Ok(())
     }
 
+    fn get_service_ledger_snapshot(&self, sample: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        Ok(self.storage.service_ledger_snapshot_store.get(sample).unwrap())
+    }
+
+    fn import_service_ledger_snapshot(&self, sample: Hash, bytes: Vec<u8>) -> ConsensusResult<()> {
+        let snapshot = keryx_consensus_core::collateral::ServiceLedgerSnapshot::from_bytes(&bytes)
+            .map_err(|_| ConsensusError::General("malformed service-ledger snapshot"))?;
+        self.virtual_processor.install_service_ledger_snapshot(sample, bytes, snapshot)
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         self.lkg_virtual_state.load().bits
     }

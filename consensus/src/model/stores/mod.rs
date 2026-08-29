@@ -5,6 +5,7 @@ pub mod maturation_queue;
 pub mod ai_slash;
 pub mod service_burn;
 pub mod service_reward;
+pub mod service_ledger_snapshot;
 pub mod service_first_seen;
 pub mod service_strike;
 pub mod collateral;

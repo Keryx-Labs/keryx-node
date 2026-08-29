@@ -464,6 +464,14 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(move |c| c.import_service_state(rows)).await
     }
 
+    pub async fn async_get_service_ledger_snapshot(&self, sample: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        self.clone().spawn_blocking(move |c| c.get_service_ledger_snapshot(sample)).await
+    }
+
+    pub async fn async_import_service_ledger_snapshot(&self, sample: Hash, bytes: Vec<u8>) -> ConsensusResult<()> {
+        self.clone().spawn_blocking(move |c| c.import_service_ledger_snapshot(sample, bytes)).await
+    }
+
     pub async fn async_get_missing_block_body_hashes(&self, high: Hash) -> ConsensusResult<Vec<Hash>> {
         self.clone().spawn_blocking(move |c| c.get_missing_block_body_hashes(high)).await
     }

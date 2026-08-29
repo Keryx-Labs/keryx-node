@@ -1244,6 +1244,9 @@ pub struct Params {
     /// accepted responder once the win is finality-deep. Changes coinbase validation and the
     /// sealed service state — must be armed above every live tip before the binary ships.
     pub reward_routing_activation: ForkActivation,
+    /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
+    /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
+    pub service_ledger_activation: ForkActivation,
 
     /// Chain-anchor checkpoint `(hash, daa_score)` — local peering policy, see `CHAIN_ANCHOR_HASH`.
     /// `None` disables enforcement (all nets but mainnet).
@@ -1503,6 +1506,7 @@ impl Params {
             pom_v3_activation: self.pom_v3_activation,
             service_bond_v2_activation: self.service_bond_v2_activation,
             reward_routing_activation: self.reward_routing_activation,
+            service_ledger_activation: self.service_ledger_activation,
 
             chain_anchor: self.chain_anchor,
             service_state_checkpoint: self.service_state_checkpoint,
@@ -1709,6 +1713,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
+    service_ledger_activation: ForkActivation::never(),
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
@@ -1833,6 +1838,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // flipping it below already-folded history splits the testnet.
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(500),
+    service_ledger_activation: ForkActivation::never(),
     chain_anchor: None,
     service_state_checkpoint: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
@@ -1921,6 +1927,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pom_v3_activation: ForkActivation::never(),
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
+    service_ledger_activation: ForkActivation::never(),
     chain_anchor: None,
     service_state_checkpoint: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
@@ -2003,6 +2010,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pom_v3_activation: ForkActivation::never(),
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
+    service_ledger_activation: ForkActivation::never(),
     chain_anchor: None,
     service_state_checkpoint: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,

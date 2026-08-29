@@ -353,7 +353,7 @@ pub struct ServiceMiss {
     pub burned: Vec<EscrowClaim>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingRequest {
     tier: u8,
     max_tokens: u32,
@@ -374,7 +374,7 @@ struct PendingRequest {
 /// closes; the silent ones are struck when it does. `cohort` holds the sorted identities
 /// (payout-SPK keys); `delegations` maps each delegated escrow key back to its identities, so
 /// a response signed by the hot escrow key credits the right identity.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Audit {
     cohort: Vec<Hash>,
     delegations: Vec<(Hash, Hash)>,
@@ -941,6 +941,332 @@ impl ServiceLedger {
     }
 }
 
+/// Self-contained image of the ledger after one chain block: the effective state, baselines
+/// folded in, so two nodes holding the same state encode the same bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceLedgerSnapshot {
+    vault: std::collections::BTreeMap<Hash, Vec<EscrowClaim>>,
+    pending: std::collections::BTreeMap<[u8; 32], PendingRequest>,
+    early_responses: std::collections::BTreeMap<[u8; 32], (u64, Vec<Hash>)>,
+    strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
+    first_seen: std::collections::BTreeMap<Hash, u64>,
+    audited: std::collections::BTreeMap<[u8; 32], u64>,
+    producer_spk: std::collections::BTreeMap<Hash, ScriptPublicKey>,
+    /// `(chain daa, identity, tier, escrow key)` of the paid blues of the chain blocks inside
+    /// the eligibility window ending at the snapshot block, chain order — what a cohort walk
+    /// below the pruning point reads.
+    pub recent_producers: Vec<(u64, Hash, u8, Hash)>,
+}
+
+const SNAPSHOT_ENCODING_VERSION: u8 = 1;
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        let end = self.pos.checked_add(n).ok_or("length overflow")?;
+        let slice = self.bytes.get(self.pos..end).ok_or("truncated snapshot")?;
+        self.pos = end;
+        Ok(slice)
+    }
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn hash(&mut self) -> Result<Hash, String> {
+        Ok(Hash::from_bytes(self.take(32)?.try_into().unwrap()))
+    }
+    fn key(&mut self) -> Result<[u8; 32], String> {
+        Ok(self.take(32)?.try_into().unwrap())
+    }
+    fn hashes(&mut self) -> Result<Vec<Hash>, String> {
+        let n = self.u32()? as usize;
+        (0..n).map(|_| self.hash()).collect()
+    }
+}
+
+fn put_hashes(out: &mut Vec<u8>, hashes: &[Hash]) {
+    out.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
+    for h in hashes {
+        out.extend_from_slice(&h.as_bytes());
+    }
+}
+
+impl ServiceLedgerSnapshot {
+    /// Canonical byte form; the input of [`Self::hash`] and of the sync transfer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(SNAPSHOT_ENCODING_VERSION);
+        out.extend_from_slice(&(self.vault.len() as u32).to_le_bytes());
+        for (miner, claims) in self.vault.iter() {
+            out.extend_from_slice(&miner.as_bytes());
+            out.extend_from_slice(&(claims.len() as u32).to_le_bytes());
+            for c in claims {
+                out.extend_from_slice(&c.outpoint.transaction_id.as_bytes());
+                out.extend_from_slice(&c.outpoint.index.to_le_bytes());
+                out.extend_from_slice(&c.value.to_le_bytes());
+                out.extend_from_slice(&c.daa.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&(self.pending.len() as u32).to_le_bytes());
+        for (rh, r) in self.pending.iter() {
+            out.extend_from_slice(rh);
+            out.push(r.tier);
+            out.extend_from_slice(&r.max_tokens.to_le_bytes());
+            out.extend_from_slice(&r.accepted_daa.to_le_bytes());
+            out.extend_from_slice(&r.reward.to_le_bytes());
+            match r.winner {
+                Some(w) => {
+                    out.push(1);
+                    out.extend_from_slice(&w.as_bytes());
+                }
+                None => out.push(0),
+            }
+            match &r.audit {
+                Some(a) => {
+                    out.push(1);
+                    put_hashes(&mut out, &a.cohort);
+                    out.extend_from_slice(&(a.delegations.len() as u32).to_le_bytes());
+                    for (e, id) in a.delegations.iter() {
+                        out.extend_from_slice(&e.as_bytes());
+                        out.extend_from_slice(&id.as_bytes());
+                    }
+                    put_hashes(&mut out, &a.responded);
+                    out.extend_from_slice(&a.window_end_daa.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+            put_hashes(&mut out, &r.early_responders);
+        }
+        out.extend_from_slice(&(self.early_responses.len() as u32).to_le_bytes());
+        for (rh, (seen, keys)) in self.early_responses.iter() {
+            out.extend_from_slice(rh);
+            out.extend_from_slice(&seen.to_le_bytes());
+            put_hashes(&mut out, keys);
+        }
+        out.extend_from_slice(&(self.strikes.len() as u32).to_le_bytes());
+        for (m, e) in self.strikes.iter() {
+            out.extend_from_slice(&m.as_bytes());
+            out.extend_from_slice(&e.count.to_le_bytes());
+            out.extend_from_slice(&e.last_daa.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.first_seen.len() as u32).to_le_bytes());
+        for (m, daa) in self.first_seen.iter() {
+            out.extend_from_slice(&m.as_bytes());
+            out.extend_from_slice(&daa.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.audited.len() as u32).to_le_bytes());
+        for (rh, daa) in self.audited.iter() {
+            out.extend_from_slice(rh);
+            out.extend_from_slice(&daa.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.producer_spk.len() as u32).to_le_bytes());
+        for (m, spk) in self.producer_spk.iter() {
+            out.extend_from_slice(&m.as_bytes());
+            out.extend_from_slice(&spk.version().to_le_bytes());
+            out.extend_from_slice(&(spk.script().len() as u16).to_le_bytes());
+            out.extend_from_slice(spk.script());
+        }
+        out.extend_from_slice(&(self.recent_producers.len() as u32).to_le_bytes());
+        for (daa, id, tier, escrow) in self.recent_producers.iter() {
+            out.extend_from_slice(&daa.to_le_bytes());
+            out.extend_from_slice(&id.as_bytes());
+            out.push(*tier);
+            out.extend_from_slice(&escrow.as_bytes());
+        }
+        out
+    }
+
+    /// Parses [`Self::to_bytes`] output; rejects malformed, unordered or trailing data.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut r = Reader { bytes, pos: 0 };
+        if r.u8()? != SNAPSHOT_ENCODING_VERSION {
+            return Err("unsupported snapshot encoding".into());
+        }
+        let mut snap = Self::default();
+        let n = r.u32()?;
+        for _ in 0..n {
+            let miner = r.hash()?;
+            let k = r.u32()?;
+            let mut claims = Vec::with_capacity(k.min(1 << 16) as usize);
+            for _ in 0..k {
+                let txid = r.hash()?;
+                let index = r.u32()?;
+                let value = r.u64()?;
+                let daa = r.u64()?;
+                claims.push(EscrowClaim { outpoint: crate::tx::TransactionOutpoint::new(txid, index), value, daa });
+            }
+            if claims.is_empty() || snap.vault.insert(miner, claims).is_some() {
+                return Err("malformed vault".into());
+            }
+        }
+        let n = r.u32()?;
+        for _ in 0..n {
+            let rh = r.key()?;
+            let tier = r.u8()?;
+            let max_tokens = r.u32()?;
+            let accepted_daa = r.u64()?;
+            let reward = r.u64()?;
+            let winner = match r.u8()? {
+                0 => None,
+                1 => Some(r.hash()?),
+                _ => return Err("malformed winner".into()),
+            };
+            let audit = match r.u8()? {
+                0 => None,
+                1 => {
+                    let cohort = r.hashes()?;
+                    let k = r.u32()? as usize;
+                    let mut delegations = Vec::with_capacity(k.min(1 << 16));
+                    for _ in 0..k {
+                        let e = r.hash()?;
+                        let id = r.hash()?;
+                        delegations.push((e, id));
+                    }
+                    let responded = r.hashes()?;
+                    let window_end_daa = r.u64()?;
+                    Some(Audit { cohort, delegations, responded, window_end_daa })
+                }
+                _ => return Err("malformed audit".into()),
+            };
+            let early_responders = r.hashes()?;
+            let req = PendingRequest { tier, max_tokens, accepted_daa, reward, winner, audit, early_responders };
+            if snap.pending.insert(rh, req).is_some() {
+                return Err("malformed pending".into());
+            }
+        }
+        let n = r.u32()?;
+        for _ in 0..n {
+            let rh = r.key()?;
+            let seen = r.u64()?;
+            let keys = r.hashes()?;
+            if snap.early_responses.insert(rh, (seen, keys)).is_some() {
+                return Err("malformed early responses".into());
+            }
+        }
+        let n = r.u32()?;
+        for _ in 0..n {
+            let m = r.hash()?;
+            let count = r.u32()?;
+            let last_daa = r.u64()?;
+            if snap.strikes.insert(m, StrikeEntry { count, last_daa }).is_some() {
+                return Err("malformed strikes".into());
+            }
+        }
+        let n = r.u32()?;
+        for _ in 0..n {
+            let m = r.hash()?;
+            let daa = r.u64()?;
+            if snap.first_seen.insert(m, daa).is_some() {
+                return Err("malformed first_seen".into());
+            }
+        }
+        let n = r.u32()?;
+        for _ in 0..n {
+            let rh = r.key()?;
+            let daa = r.u64()?;
+            if snap.audited.insert(rh, daa).is_some() {
+                return Err("malformed audited".into());
+            }
+        }
+        let n = r.u32()?;
+        for _ in 0..n {
+            let m = r.hash()?;
+            let version = r.u16()?;
+            let len = r.u16()? as usize;
+            let script = r.take(len)?;
+            if snap.producer_spk.insert(m, ScriptPublicKey::from_vec(version, script.to_vec())).is_some() {
+                return Err("malformed producer_spk".into());
+            }
+        }
+        let n = r.u32()?;
+        for _ in 0..n {
+            let daa = r.u64()?;
+            let id = r.hash()?;
+            let tier = r.u8()?;
+            let escrow = r.hash()?;
+            snap.recent_producers.push((daa, id, tier, escrow));
+        }
+        if r.pos != bytes.len() {
+            return Err("trailing bytes".into());
+        }
+        if snap.to_bytes() != bytes {
+            return Err("non-canonical snapshot".into());
+        }
+        Ok(snap)
+    }
+
+    /// Domain-separated digest of the canonical bytes.
+    pub fn hash(&self) -> Hash {
+        Self::hash_of_bytes(&self.to_bytes())
+    }
+
+    /// [`Self::hash`] over bytes already encoded.
+    pub fn hash_of_bytes(bytes: &[u8]) -> Hash {
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).personal(b"KeryxLedgerSnap").to_state();
+        hasher.update(bytes);
+        Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
+    }
+}
+
+/// Header service-state commitment past `service_ledger_activation`: the sealed rows and the
+/// ledger snapshot, both at the header's pruning point.
+pub fn service_commitment_v2(rows: Hash, ledger: Hash) -> Hash {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).personal(b"KeryxSvcCommit").to_state();
+    hasher.update(&rows.as_bytes());
+    hasher.update(&ledger.as_bytes());
+    Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
+}
+
+impl ServiceLedger {
+    /// The effective state as a canonical snapshot: strike and sighting baselines folded into
+    /// their deltas, vault claims in chain order.
+    pub fn snapshot(&self) -> ServiceLedgerSnapshot {
+        let mut strikes = self.base.as_ref().clone();
+        for (m, e) in self.strikes.iter() {
+            strikes.insert(*m, *e);
+        }
+        let mut first_seen = self.first_seen_base.as_ref().clone();
+        for (m, d) in self.first_seen.iter() {
+            first_seen.insert(*m, *d);
+        }
+        ServiceLedgerSnapshot {
+            vault: self.vault.iter().map(|(m, c)| (*m, c.iter().copied().collect())).collect(),
+            pending: self.pending.clone(),
+            early_responses: self.early_responses.clone(),
+            strikes,
+            first_seen,
+            audited: self.audited.clone(),
+            producer_spk: self.producer_spk.clone(),
+            recent_producers: Vec::new(),
+        }
+    }
+
+    /// Replaces the folded state with `snap`; configuration (activation daas) is kept.
+    pub fn restore_snapshot(&mut self, snap: &ServiceLedgerSnapshot) {
+        self.vault = snap.vault.iter().map(|(m, c)| (*m, c.iter().copied().collect())).collect();
+        self.pending = snap.pending.clone();
+        self.early_responses = snap.early_responses.clone();
+        self.strikes = snap.strikes.clone();
+        self.base = std::sync::Arc::new(Default::default());
+        self.first_seen = snap.first_seen.clone();
+        self.first_seen_base = std::sync::Arc::new(Default::default());
+        self.audited = snap.audited.clone();
+        self.producer_spk = snap.producer_spk.clone();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1495,8 +1821,12 @@ mod tests {
         // "Persist" everything up to and including round 2's events (the store frontier).
         let cursor = rounds[1].0 + 2 + w;
         let mut base = std::collections::BTreeMap::new();
+        let mut first_seen_base = std::collections::BTreeMap::new();
         let mut burned_set = std::collections::HashSet::new();
         for (d, outcome) in trace.iter().filter(|(d, _)| *d <= cursor) {
+            for miner in outcome.sightings.iter() {
+                first_seen_base.entry(*miner).or_insert(*d);
+            }
             for miss in outcome.misses.iter() {
                 let record = if miss.penalty == ServicePenalty::Suspend {
                     StrikeEntry { count: 0, last_daa: *d }
@@ -1516,6 +1846,7 @@ mod tests {
         // Refold: baseline + warmup below the frontier, normal fold above it.
         let mut refolded = ServiceLedger::default();
         refolded.set_base(std::sync::Arc::new(base));
+        refolded.set_first_seen_base(std::sync::Arc::new(first_seen_base));
         let is_burned = |op: &TransactionOutpoint| burned_set.contains(op);
         let mut replayed: Vec<(u64, FoldOutcome)> = Vec::new();
         for &(d, n, served) in rounds.iter() {
@@ -1537,6 +1868,24 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(events_above(&trace), events_above(&replayed), "events above the frontier must replay identically");
+
+        // The effective state is the same image from both paths, byte for byte.
+        let snap = inc.snapshot();
+        assert_eq!(snap, refolded.snapshot());
+        let bytes = snap.to_bytes();
+        let decoded = super::ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, snap);
+        assert_eq!(decoded.hash(), refolded.snapshot().hash());
+        assert!(super::ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+
+        // A ledger restored from the image continues exactly like the incremental one.
+        let mut restored = ServiceLedger::default();
+        restored.restore_snapshot(&snap);
+        let d = rounds.last().unwrap().0 + i + 10;
+        let from_inc = fold_round(&mut inc, d, 9, false, None);
+        let from_restored = fold_round(&mut restored, d, 9, false, None);
+        assert_eq!(events_above(&from_inc), events_above(&from_restored));
+        assert_eq!(inc.snapshot(), restored.snapshot());
     }
 
     #[test]
