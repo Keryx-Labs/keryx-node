@@ -55,6 +55,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>, protocol_version: u32) ->
                 KaspadMessagePayloadType::DonePruningPointUtxoSetChunks,
                 KaspadMessagePayloadType::ServiceStateChunk,
                 KaspadMessagePayloadType::DoneServiceStateChunks,
+                KaspadMessagePayloadType::ServiceLedgerSnapshotChunk,
+                KaspadMessagePayloadType::DoneServiceLedgerSnapshotChunks,
             ]),
             relay_receiver,
             body_only_ibd_permitted,
