@@ -24,7 +24,7 @@ use keryx_core::{
     kaspad_env::{name, version},
     task::tick::TickService,
 };
-use keryx_core::{error, time::unix_now, warn};
+use keryx_core::{time::unix_now, warn};
 use keryx_hashes::Hash;
 use keryx_mining::mempool::tx::{Orphan, Priority};
 use keryx_mining::{manager::MiningManagerProxy, mempool::tx::RbfPolicy};
@@ -338,8 +338,8 @@ impl FlowContext {
             let depth = virtual_daa.saturating_sub(block.header.daa_score);
             if depth <= POM_PROOF_SERVE_DEPTH_DAA {
                 self.enqueue_pom_reproof(block.hash());
-                error!(
-                    "PoM guard-rail: about to serve RECENT block {} (daa {}, depth {}) WITHOUT its possession proof. Proof-enforcing peers will reject it — this is how a propagation hole becomes a network wedge. The proof should be re-synced from a proof-carrying node.",
+                debug!(
+                    "Serving recent block {} (daa {}, depth {}) without its possession proof; re-proof requested",
                     block.hash(),
                     block.header.daa_score,
                     depth
