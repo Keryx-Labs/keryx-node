@@ -51,6 +51,8 @@ pub enum KaspadMessagePayloadType {
     RequestServiceState,
     ServiceStateChunk,
     DoneServiceStateChunks,
+    ServiceLedgerSnapshotChunk,
+    DoneServiceLedgerSnapshotChunks,
 }
 
 impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
@@ -110,6 +112,8 @@ impl From<&KaspadMessagePayload> for KaspadMessagePayloadType {
             KaspadMessagePayload::RequestServiceState(_) => KaspadMessagePayloadType::RequestServiceState,
             KaspadMessagePayload::ServiceStateChunk(_) => KaspadMessagePayloadType::ServiceStateChunk,
             KaspadMessagePayload::DoneServiceStateChunks(_) => KaspadMessagePayloadType::DoneServiceStateChunks,
+            KaspadMessagePayload::ServiceLedgerSnapshotChunk(_) => KaspadMessagePayloadType::ServiceLedgerSnapshotChunk,
+            KaspadMessagePayload::DoneServiceLedgerSnapshotChunks(_) => KaspadMessagePayloadType::DoneServiceLedgerSnapshotChunks,
         }
     }
 }

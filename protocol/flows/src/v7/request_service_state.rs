@@ -5,13 +5,22 @@ use keryx_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
     dequeue, make_message,
-    pb::{DoneServiceStateChunksMessage, ServiceStateChunkMessage, kaspad_message::Payload},
+    pb::{
+        DoneServiceLedgerSnapshotChunksMessage, DoneServiceStateChunksMessage, ServiceLedgerSnapshotChunkMessage,
+        ServiceStateChunkMessage, kaspad_message::Payload,
+    },
 };
 use std::sync::Arc;
 
 /// Rows per chunk: canonical rows are at most 53 bytes, so a chunk stays well under the
 /// message size limit.
 const SERVICE_STATE_CHUNK_ROWS: usize = 10_000;
+
+/// Snapshot bytes per chunk.
+const SERVICE_LEDGER_SNAPSHOT_CHUNK_BYTES: usize = 512 * 1024;
+
+/// First protocol version that takes the ledger snapshot instead of the handoff band.
+pub const SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION: u32 = 12;
 
 pub struct RequestServiceStateFlow {
     ctx: FlowContext,
@@ -46,8 +55,14 @@ impl RequestServiceStateFlow {
     async fn handle_request(&mut self, pruning_point: Hash) -> Result<(), ProtocolError> {
         let consensus = self.ctx.consensus();
         let session = consensus.session().await;
-        // v11 peers take every flushed row; older peers only the handoff band they accept.
-        let handoff_daa = service_state_handoff_daa(self.protocol_version);
+        // A v12 peer holding the snapshot at this pruning point takes rows up to it only and
+        // re-derives everything above from the snapshot; other peers take the handoff band.
+        let snapshot = if self.protocol_version >= SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION {
+            session.async_get_service_ledger_snapshot(pruning_point).await?
+        } else {
+            None
+        };
+        let handoff_daa = if snapshot.is_some() { 0 } else { service_state_handoff_daa(self.protocol_version) };
         let rows = session.async_get_service_state_rows(pruning_point, handoff_daa).await?;
         drop(session);
         debug!("Serving {} service-state rows for pruning point {}", rows.len(), pruning_point);
@@ -57,6 +72,22 @@ impl RequestServiceStateFlow {
                 .await?;
         }
         self.router.enqueue(make_message!(Payload::DoneServiceStateChunks, DoneServiceStateChunksMessage {})).await?;
+        if self.protocol_version >= SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION {
+            if let Some(bytes) = snapshot {
+                debug!("Serving a {}-byte service-ledger snapshot for pruning point {}", bytes.len(), pruning_point);
+                for chunk in bytes.chunks(SERVICE_LEDGER_SNAPSHOT_CHUNK_BYTES) {
+                    self.router
+                        .enqueue(make_message!(
+                            Payload::ServiceLedgerSnapshotChunk,
+                            ServiceLedgerSnapshotChunkMessage { chunk: chunk.to_vec() }
+                        ))
+                        .await?;
+                }
+            }
+            self.router
+                .enqueue(make_message!(Payload::DoneServiceLedgerSnapshotChunks, DoneServiceLedgerSnapshotChunksMessage {}))
+                .await?;
+        }
         Ok(())
     }
 }

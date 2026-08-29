@@ -57,6 +57,8 @@ message KaspadMessage {
     RequestServiceStateMessage requestServiceState = 59;
     ServiceStateChunkMessage serviceStateChunk = 60;
     DoneServiceStateChunksMessage doneServiceStateChunks = 61;
+    ServiceLedgerSnapshotChunkMessage serviceLedgerSnapshotChunk = 62;
+    DoneServiceLedgerSnapshotChunksMessage doneServiceLedgerSnapshotChunks = 63;
   }
 }
 

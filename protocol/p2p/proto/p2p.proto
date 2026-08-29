@@ -364,3 +364,11 @@ message ServiceStateChunkMessage {
 
 message DoneServiceStateChunksMessage {
 }
+
+// Canonical service-ledger snapshot at the requested pruning point (protocol v12+), chunked.
+message ServiceLedgerSnapshotChunkMessage {
+  bytes chunk = 1;
+}
+
+message DoneServiceLedgerSnapshotChunksMessage {
+}

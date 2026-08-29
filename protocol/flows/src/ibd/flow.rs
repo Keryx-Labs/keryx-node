@@ -19,6 +19,11 @@ use keryx_consensusmanager::{ConsensusProxy, StagingConsensus, spawn_blocking};
 use keryx_core::{debug, info, time::unix_now, warn};
 use keryx_hashes::Hash;
 use keryx_muhash::MuHash;
+use keryx_consensus_core::collateral::{service_commitment_v2, ServiceLedgerSnapshot};
+use crate::v7::request_service_state::SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION;
+
+/// Upper bound on a transferred ledger snapshot.
+const MAX_SERVICE_LEDGER_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 use keryx_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
@@ -809,9 +814,43 @@ impl IbdFlow {
                 Err(_) => return Err(ProtocolError::Timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT)),
             }
         }
+        // A v12 peer follows the rows with the ledger snapshot at the pruning point.
+        let snapshot_bytes = if self.protocol_version >= SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION {
+            let mut bytes: Vec<u8> = Vec::new();
+            loop {
+                match tokio::time::timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+                    Ok(Some(msg)) => match msg.payload {
+                        Some(Payload::ServiceLedgerSnapshotChunk(chunk)) => {
+                            bytes.extend_from_slice(&chunk.chunk);
+                            if bytes.len() > MAX_SERVICE_LEDGER_SNAPSHOT_BYTES {
+                                return Err(ProtocolError::Other("service-ledger snapshot exceeds the size limit"));
+                            }
+                        }
+                        Some(Payload::DoneServiceLedgerSnapshotChunks(_)) => break,
+                        _ => {
+                            return Err(ProtocolError::UnexpectedMessage(
+                                stringify!(Payload::ServiceLedgerSnapshotChunk | Payload::DoneServiceLedgerSnapshotChunks),
+                                msg.payload.as_ref().map(|v| v.into()),
+                            ));
+                        }
+                    },
+                    Ok(None) => return Err(ProtocolError::ConnectionClosed),
+                    Err(_) => return Err(ProtocolError::Timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT)),
+                }
+            }
+            (!bytes.is_empty()).then_some(bytes)
+        } else {
+            None
+        };
         // Mirror `commitment_at` exactly: no rows seals nothing, and the expected value is then
         // the zero hash.
         let computed = if prefix_rows == 0 { Hash::default() } else { acc.finalize() };
+        // Headers past `service_ledger_activation` commit rows and snapshot together: such a
+        // vote only matches when the peer served the matching snapshot.
+        let snapshot_voted = snapshot_bytes
+            .as_ref()
+            .map(|bytes| service_commitment_v2(computed, ServiceLedgerSnapshot::hash_of_bytes(bytes)))
+            .is_some_and(|combined| votes.contains_key(&combined));
         // With a checkpoint, the rows up to it must reproduce it and the whole set must match a
         // commitment the chain carries (any of the voted ones, or the checkpoint itself when the
         // pruning point sits exactly on it); without one, the majority commitment decides.
@@ -824,9 +863,9 @@ impl IbdFlow {
                         cp_daa, at_checkpoint, cp_hash
                     )));
                 }
-                pp_daa == cp_daa || votes.contains_key(&computed)
+                pp_daa == cp_daa || votes.contains_key(&computed) || snapshot_voted
             }
-            None => computed == majority,
+            None => computed == majority || snapshot_voted,
         };
         if !accepted {
             return Err(ProtocolError::OtherOwned(format!(
@@ -837,6 +876,14 @@ impl IbdFlow {
         let handoff_rows = rows.len() - prefix_rows;
         consensus.clone().spawn_blocking(move |c| c.import_service_state(rows)).await?;
         info!("imported {} sealed service-state rows ({} verified, {} handoff)", prefix_rows + handoff_rows, prefix_rows, handoff_rows);
+        if let Some(bytes) = snapshot_bytes {
+            if !snapshot_voted {
+                warn!("service-ledger snapshot at {} is not covered by the chain's commitments yet, importing it unverified", pruning_point);
+            }
+            let len = bytes.len();
+            consensus.clone().spawn_blocking(move |c| c.import_service_ledger_snapshot(pruning_point, bytes)).await?;
+            info!("imported the service-ledger snapshot at {} ({} bytes{})", pruning_point, len, if snapshot_voted { ", verified" } else { "" });
+        }
         Ok(())
     }
 
