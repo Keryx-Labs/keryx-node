@@ -426,7 +426,19 @@ impl ConnectionManager {
         // entry and we kept re-dialing nodes we were already connected to. Those dials fail with
         // `PeerAlreadyExists` — correctly not counted as a failure, but they burned a dial slot on
         // every single round of a well-connected node.
-        let active_ips: HashSet<IpAddr> = peer_by_address.values().map(|peer| canonical_ip(peer.net_address().ip())).collect();
+        // Outbound peers by their dialed address; inbound peers by the address they advertised at
+        // handshake (their `net_address()` carries the remote ephemeral port).
+        let active_addresses: HashSet<(IpAddr, u16)> = peer_by_address
+            .values()
+            .filter_map(|peer| {
+                if peer.is_outbound() {
+                    Some(NetAddress::from(peer.net_address()))
+                } else {
+                    peer.properties().advertised_address
+                }
+            })
+            .map(|addr| (canonical_ip(addr.ip.into()), addr.port))
+            .collect();
         let active_outbound: HashSet<keryx_addressmanager::NetAddress> =
             peer_by_address.values().filter(|peer| peer.is_outbound()).map(|peer| peer.net_address().into()).collect();
         if active_outbound.len() >= self.outbound_target {
@@ -453,7 +465,7 @@ impl ConnectionManager {
                     exhausted = true;
                     break;
                 };
-                if active_ips.contains(&canonical_ip(net_addr.ip.into())) {
+                if active_addresses.contains(&(canonical_ip(net_addr.ip.into()), net_addr.port)) {
                     continue;
                 }
                 if self.is_cooling_down(net_addr) {

@@ -944,6 +944,7 @@ impl ConnectionInitializer for FlowContext {
             disable_relay_tx: peer_version.disable_relay_tx,
             subnetwork_id: peer_version.subnetwork_id.to_owned(),
             time_offset,
+            advertised_address: peer_version.address,
         });
         router.set_properties(peer_properties);
 

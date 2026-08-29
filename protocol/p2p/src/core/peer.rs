@@ -1,5 +1,5 @@
 use keryx_consensus_core::subnets::SubnetworkId;
-use keryx_utils::networking::{IpAddress, PeerId};
+use keryx_utils::networking::{IpAddress, NetAddress, PeerId};
 use std::{fmt::Display, net::SocketAddr, sync::Arc, time::Instant};
 
 #[derive(Debug, Clone, Default)]
@@ -11,6 +11,7 @@ pub struct PeerProperties {
     pub disable_relay_tx: bool,
     pub subnetwork_id: Option<SubnetworkId>,
     pub time_offset: i64,
+    pub advertised_address: Option<NetAddress>,
 }
 
 #[derive(Debug)]
