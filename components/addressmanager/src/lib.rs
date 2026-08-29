@@ -2,7 +2,13 @@ mod port_mapping_extender;
 mod stores;
 extern crate self as address_manager;
 
-use std::{collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    iter,
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use address_manager::port_mapping_extender::Extender;
 use igd_next::{
@@ -32,6 +38,15 @@ const UPNP_EXTEND_PERIOD: u64 = UPNP_DEADLINE_SEC / 2;
 
 /// The name used as description when registering the UPnP service
 pub(crate) const UPNP_REGISTRATION_NAME: &str = "keryx-labs";
+
+/// Normalizes an address to the v6-mapped form the address store keys on, so that a ban recorded
+/// against `1.2.3.4` also matches an entry stored as `::ffff:1.2.3.4`.
+fn mapped_v6(ip: IpAddress) -> Ipv6Addr {
+    match ip.0 {
+        IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+        IpAddr::V6(ip) => ip,
+    }
+}
 
 struct ExtendHelper {
     gateway: Gateway,
@@ -78,7 +93,10 @@ impl AddressManager {
         let extender = if self.local_net_addresses.is_empty() && !self.config.disable_upnp {
             let (net_address, ExtendHelper { gateway, local_addr, external_port }) = match self.upnp() {
                 Err(err) => {
-                    info!("[UPnP] Port mapping unavailable ({}). Use --disable-upnp to silence or --externalip to set your public IP manually.", err);
+                    info!(
+                        "[UPnP] Port mapping unavailable ({}). Use --disable-upnp to silence or --externalip to set your public IP manually.",
+                        err
+                    );
                     return None;
                 }
                 Ok(None) => return None,
@@ -106,6 +124,19 @@ impl AddressManager {
             None
         };
 
+        if self.local_net_addresses.is_empty() {
+            // Without a local address there is nothing to put in our handshake `Version` message,
+            // so no peer ever learns how to reach us and this node can only make outbound
+            // connections. That is a silent, permanent halving of its connectivity, so say it out
+            // loud rather than leaving it to an `info!` line lost in the boot log.
+            warn!(
+                "This node has no publicly routable address{} — it will advertise NO address to peers, \
+                 no other node can learn how to reach it, and it will receive ZERO inbound connections. \
+                 Set --externalip=<public-ip>[:<port>] and forward TCP {} to fix this.",
+                if self.config.disable_upnp { " and UPnP is disabled" } else { " and UPnP port mapping did not succeed" },
+                self.config.default_p2p_port()
+            );
+        }
         self.local_net_addresses.iter().for_each(|net_addr| {
             info!("Publicly routable local address {} added to store", net_addr);
         });
@@ -258,36 +289,58 @@ impl AddressManager {
         }
     }
 
-    pub fn add_address(&mut self, address: NetAddress) {
+    /// Adds `address` to the store. Returns whether it was newly learned, which callers use to
+    /// decide whether a discovery round actually made progress.
+    pub fn add_address(&mut self, address: NetAddress) -> bool {
         if address.ip.is_loopback() || address.ip.is_unspecified() {
             debug!("[Address manager] skipping local address {}", address.ip);
-            return;
+            return false;
         }
 
         // Do not re-add banned IPs — they would be re-selected for outbound connections
         if self.is_banned(address.ip) {
-            return;
+            return false;
         }
 
         if self.address_store.has(address) {
-            return;
+            return false;
         }
 
         // We mark `connection_failed_count` as 0 only after first success
         self.address_store.set(address, 1);
+        true
     }
 
+    /// Records a failed dial for `address`.
+    ///
+    /// The failure count *saturates* at [`MAX_CONNECTION_FAILED_COUNT`] instead of evicting the
+    /// entry. Deleting on the 4th failure used to make the store starve itself: a fresh gossiped
+    /// address enters with count 1, so three unlucky dials (a single lost SYN is enough at the p2p
+    /// connect timeout) erased an honest peer permanently, and the only way back in was a new
+    /// gossip or DNS result — which on a two-seeder network means never. A saturated entry keeps a
+    /// weight 64^3 below a proven peer (see `iterate_prioritized_random_addresses`), so it
+    /// is almost never selected, and one success resets it to 0. Capacity pressure is handled by
+    /// `keep_limit`, which already evicts the highest-failure entries first.
     pub fn mark_connection_failure(&mut self, address: NetAddress) {
         if !self.address_store.has(address) {
             return;
         }
 
-        let new_count = self.address_store.get(address).connection_failed_count + 1;
-        if new_count > MAX_CONNECTION_FAILED_COUNT {
-            self.address_store.remove(address);
-        } else {
-            self.address_store.set(address, new_count);
-        }
+        let new_count = (self.address_store.get(address).connection_failed_count + 1).min(MAX_CONNECTION_FAILED_COUNT);
+        self.address_store.set(address, new_count);
+    }
+
+    /// Decrements every non-zero failure count by one. Called when the selection iterator is
+    /// exhausted while the store is non-empty, i.e. when every known address has been written off:
+    /// without this, a node that was offline long enough to saturate all of its entries would keep
+    /// treating them as hopeless forever.
+    pub fn decay_connection_failures(&mut self) {
+        self.address_store.decay_connection_failures();
+    }
+
+    /// Number of addresses currently known (banned entries included).
+    pub fn address_count(&self) -> usize {
+        self.address_store.len()
     }
 
     pub fn mark_connection_success(&mut self, address: NetAddress) {
@@ -302,16 +355,33 @@ impl AddressManager {
         self.address_store.iterate_addresses()
     }
 
+    /// Outbound selection iterator, excluding `exceptions` and every address whose IP is currently
+    /// banned. The ban filter lives here (rather than in `ban`, which used to delete the entries)
+    /// and honors the ban expiry: an expired ban is lifted in passing and its addresses become
+    /// selectable again.
     pub fn iterate_prioritized_random_addresses(
-        &self,
-        exceptions: HashSet<NetAddress>,
+        &mut self,
+        mut exceptions: HashSet<NetAddress>,
     ) -> impl ExactSizeIterator<Item = NetAddress> + 'static {
+        let banned: HashSet<Ipv6Addr> =
+            self.get_all_banned_addresses().into_iter().filter(|&ip| self.is_banned(ip)).map(mapped_v6).collect();
+        if !banned.is_empty() {
+            exceptions
+                .extend(self.address_store.iterate_addresses().filter(|addr| banned.contains(&mapped_v6(addr.ip))).collect_vec());
+        }
         self.address_store.iterate_prioritized_random_addresses(exceptions)
     }
 
+    /// Bans `ip` for `MAX_BANNED_TIME` (24h).
+    ///
+    /// The addresses of that IP are deliberately *kept* in the store: a ban is local policy that
+    /// expires after 24h, and dropping the entries turned every ban into a permanent forget — after
+    /// the ban lifted, the peer could only come back through a seeder or fresh gossip. They are
+    /// filtered out of outbound selection while the ban holds (see
+    /// [`AddressManager::iterate_prioritized_random_addresses`]) and re-admitted automatically once
+    /// it expires.
     pub fn ban(&mut self, ip: IpAddress) {
         self.banned_address_store.set(ip.into(), ConnectionBanTimestamp(unix_now())).unwrap();
-        self.address_store.remove_by_ip(ip.into());
     }
 
     pub fn unban(&mut self, ip: IpAddress) {
@@ -347,7 +417,6 @@ mod address_store_with_cache {
     // We don't expect it to be expensive since we limit the number of saved addresses.
     use std::{
         collections::{HashMap, HashSet},
-        net::IpAddr,
         sync::Arc,
     };
 
@@ -410,10 +479,6 @@ mod address_store_with_cache {
             *self.addresses.get(&address.into()).unwrap()
         }
 
-        pub fn remove(&mut self, address: NetAddress) {
-            self.remove_by_key(address.into())
-        }
-
         fn remove_by_key(&mut self, key: AddressKey) {
             self.addresses.remove(&key);
             self.db_store.remove(key).unwrap()
@@ -421,6 +486,27 @@ mod address_store_with_cache {
 
         pub fn iterate_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
             self.addresses.values().map(|entry| entry.address)
+        }
+
+        pub fn len(&self) -> usize {
+            self.addresses.len()
+        }
+
+        /// Decrements every non-zero `connection_failed_count`. Counts only ever shrink here, so
+        /// there is no need to re-run `keep_limit`.
+        pub fn decay_connection_failures(&mut self) {
+            let decayed = self
+                .addresses
+                .iter()
+                .filter(|(_, entry)| entry.connection_failed_count > 0)
+                .map(|(key, entry)| {
+                    (*key, Entry { connection_failed_count: entry.connection_failed_count - 1, address: entry.address })
+                })
+                .collect_vec();
+            for (key, entry) in decayed {
+                self.db_store.set(key, entry).unwrap();
+                self.addresses.insert(key, entry);
+            }
         }
 
         /// This iterator functions as the node's ip routing selection algo.
@@ -463,12 +549,6 @@ mod address_store_with_cache {
             }
 
             RandomWeightedIterator::new(weights, filtered_addresses)
-        }
-
-        pub fn remove_by_ip(&mut self, ip: IpAddr) {
-            for key in self.addresses.keys().filter(|key| key.is_ip(ip)).copied().collect_vec() {
-                self.remove_by_key(key);
-            }
         }
     }
 
@@ -537,6 +617,76 @@ mod address_store_with_cache {
         use keryx_utils::networking::IpAddress;
         use rv::{dist::Uniform, misc::ks_test as one_way_ks_test, traits::Cdf};
         use std::net::{IpAddr, Ipv6Addr};
+
+        fn test_address_manager() -> Arc<parking_lot::Mutex<AddressManager>> {
+            let db = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+            // The temp db is dropped with its handle, so leak it for the lifetime of the test
+            std::mem::forget(db.0);
+            AddressManager::new(Arc::new(Config::new(SIMNET_PARAMS)), db.1, Arc::new(TickService::default())).0
+        }
+
+        fn addr(s: &str) -> NetAddress {
+            NetAddress::new(IpAddress::from_str(s).unwrap(), 22111)
+        }
+
+        #[test]
+        fn failed_dials_saturate_instead_of_evicting() {
+            let am = test_address_manager();
+            let mut am = am.lock();
+            let peer = addr("1.2.3.4");
+
+            assert!(am.add_address(peer), "a fresh address is newly learned");
+            assert!(!am.add_address(peer), "a known address is not learned again");
+
+            for _ in 0..(MAX_CONNECTION_FAILED_COUNT + 5) {
+                am.mark_connection_failure(peer);
+            }
+            assert_eq!(am.address_count(), 1, "a written-off address must stay in the store");
+            assert_eq!(am.iterate_prioritized_random_addresses(HashSet::new()).count(), 1, "and stay selectable, at low weight");
+
+            am.mark_connection_success(peer);
+            assert_eq!(am.address_count(), 1);
+        }
+
+        #[test]
+        fn decay_lets_a_written_off_store_recover() {
+            let am = test_address_manager();
+            let mut am = am.lock();
+            let peer = addr("1.2.3.4");
+            am.add_address(peer);
+            for _ in 0..(MAX_CONNECTION_FAILED_COUNT + 5) {
+                am.mark_connection_failure(peer);
+            }
+            for _ in 0..MAX_CONNECTION_FAILED_COUNT {
+                am.decay_connection_failures();
+            }
+            assert_eq!(am.address_count(), 1);
+        }
+
+        #[test]
+        fn ban_hides_the_address_without_forgetting_it() {
+            let am = test_address_manager();
+            let mut am = am.lock();
+            let peer = addr("1.2.3.4");
+            am.add_address(peer);
+
+            am.ban(peer.ip);
+            assert_eq!(am.address_count(), 1, "a ban expires after 24h, so it must not delete the entry");
+            assert_eq!(am.iterate_prioritized_random_addresses(HashSet::new()).count(), 0, "but it must not be dialed meanwhile");
+
+            am.unban(peer.ip);
+            assert_eq!(am.iterate_prioritized_random_addresses(HashSet::new()).count(), 1, "and comes back once the ban lifts");
+        }
+
+        #[test]
+        fn ban_matches_v4_mapped_entries() {
+            let am = test_address_manager();
+            let mut am = am.lock();
+            am.add_address(addr("::ffff:1.2.3.4"));
+
+            am.ban(IpAddress::from_str("1.2.3.4").unwrap());
+            assert_eq!(am.iterate_prioritized_random_addresses(HashSet::new()).count(), 0);
+        }
 
         #[test]
         fn test_weighted_iterator() {

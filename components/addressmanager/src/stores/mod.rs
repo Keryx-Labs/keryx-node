@@ -12,13 +12,6 @@ impl AddressKey {
     pub fn new(ip: Ipv6Addr, port: u16) -> Self {
         Self(ip, port)
     }
-
-    pub fn is_ip(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(ip) => ip.to_ipv6_mapped() == self.0,
-            IpAddr::V6(ip) => ip == self.0,
-        }
-    }
 }
 
 impl From<NetAddress> for AddressKey {
