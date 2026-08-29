@@ -313,7 +313,7 @@ impl VirtualStateProcessor {
         // distance from the committed virtual — computing it per block turns a long re-validation
         // walk quadratic, so a trusted transition must not pay for a comparison it discards.
         let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase();
-        if enforce || (std::env::var("KERYX_RATIO_DEBUG").is_ok() && !self.trust_coinbase()) {
+        if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
             self.verify_coinbase_transaction(
                 &txs[0],
                 header.daa_score,
@@ -1105,6 +1105,9 @@ impl VirtualStateProcessor {
         daa_bound: u64,
     ) -> u64 {
         self.window_floor_in_retention(sc, header_pp, own_pp, daa_bound).unwrap_or_else(|| {
+            if self.trust_coinbase() {
+                return sc.get_by_hash(own_pp).unwrap_or(0);
+            }
             panic!("the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir")
         })
     }
