@@ -1805,7 +1805,7 @@ pub const TESTNET_PARAMS: Params = Params {
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
     // PoM possession: active from genesis (mainnet-state baseline).
-    pom_activation: ForkActivation::new(0),
+    pom_activation: ForkActivation::new(1),
     very_light_activation: ForkActivation::new(0), // H2 5-tier lineup from genesis
     // H3 block levels: active from the first mined block (mainnet-state baseline; the H3
     // transition was rehearsed on the previous testnet). `new(1)` and NOT `new(0)`/`always()`:
@@ -1854,7 +1854,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // model lineup, so below this gate it has no model to walk and cannot mine at all. Genesis
     // itself is committed without body validation, so the mandatory escrow delegation never
     // applies to it. MUST mirror the miner's gate.
-    pom_v3_activation: ForkActivation::new(0),
+    pom_v3_activation: ForkActivation::new(1),
     // H7 service-bond v2 — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
     service_bond_v2_activation: ForkActivation::new(0),

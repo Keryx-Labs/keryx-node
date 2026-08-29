@@ -354,6 +354,17 @@ mod tests {
             let median_time_window_span = params.past_median_time_window_size as u64 * params.past_median_time_sample_rate();
             assert!(daa_window_span < finality_depth, "{net}: DAA window span {daa_window_span} >= finality depth {finality_depth}");
             assert!(median_time_window_span < finality_depth);
+
+            // Genesis is hashed and levelled by the pre-PoM rules on every network: its hash is a
+            // pinned constant and the pruning proof anchors it at the top level.
+            let genesis_daa = params.genesis.daa_score;
+            for (name, activation) in [
+                ("pom_activation", params.pom_activation),
+                ("pom_level_activation", params.pom_level_activation),
+                ("pom_v3_activation", params.pom_v3_activation),
+            ] {
+                assert!(!activation.is_active(genesis_daa), "{net}: {name} is active at the genesis daa score");
+            }
         }
     }
 }
