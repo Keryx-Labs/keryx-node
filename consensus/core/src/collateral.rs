@@ -481,6 +481,8 @@ pub struct ServiceLedger {
     /// Activation daa of the v2 service windows; `None` = not armed. Configuration, not folded
     /// state — installed on every fold entry, untouched by snapshots.
     window_v2_activation_daa: Option<u64>,
+    /// Burnable window override (test networks); `None` = `SERVICE_BURNABLE_WINDOW_DAA`.
+    burnable_window_daa: Option<u64>,
     /// Activation daa of vault reward routing (requests accepted at or after it mint their
     /// reward to the first accepted responder); `None` = not armed. Configuration, like above.
     reward_routing_daa: Option<u64>,
@@ -595,8 +597,9 @@ impl ServiceLedger {
             }
             self.vault.entry(*miner).or_default().push_back(*claim);
         }
+        let burnable = self.burnable_window_daa.unwrap_or(SERVICE_BURNABLE_WINDOW_DAA);
         for (miner, claims) in self.vault.iter_mut() {
-            while claims.front().is_some_and(|c| c.daa + SERVICE_BURNABLE_WINDOW_DAA <= daa) {
+            while claims.front().is_some_and(|c| c.daa + burnable <= daa) {
                 expired.push((*miner, claims.pop_front().unwrap()));
             }
         }
@@ -839,6 +842,11 @@ impl ServiceLedger {
     /// Installs the `service_bond_v2_activation` daa the arming path reads.
     pub fn set_window_v2_activation(&mut self, daa: u64) {
         self.window_v2_activation_daa = Some(daa);
+    }
+
+    /// Installs the network's burnable window.
+    pub fn set_burnable_window(&mut self, daa: u64) {
+        self.burnable_window_daa = Some(daa);
     }
 
     /// Installs the reward-routing activation daa.

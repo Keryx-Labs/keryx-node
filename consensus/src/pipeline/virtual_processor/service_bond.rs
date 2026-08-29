@@ -8,7 +8,7 @@ use crate::model::stores::{
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
     ServiceLedgerSnapshot,
-    ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry, SERVICE_BURNABLE_WINDOW_DAA,
+    ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
@@ -441,6 +441,7 @@ impl VirtualStateProcessor {
         }
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
+        ledger.set_burnable_window(self.service_burnable_window_daa);
         let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa));
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
@@ -564,7 +565,7 @@ impl VirtualStateProcessor {
         // claim readable at the frontier warm. A frontier of zero (nothing persisted yet) falls
         // back to the finality anchor: everything above it is re-derived.
         let start = if cursor_daa > 0 { cursor_daa } else { to_daa.saturating_sub(self.finality_depth) };
-        let daa_bound = start.saturating_sub(SERVICE_BURNABLE_WINDOW_DAA);
+        let daa_bound = start.saturating_sub(self.service_burnable_window_daa);
         let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
         let mut bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
         // A persisted sample snapshot at or below `to` is the exact state there: restore it and
@@ -734,7 +735,7 @@ impl VirtualStateProcessor {
         sync.tip = Some(tip_idx);
         // Bound the logged set by the deepest span a refold can revisit (the finality anchor
         // plus the warmup horizon).
-        let logged_span = self.finality_depth + SERVICE_BURNABLE_WINDOW_DAA;
+        let logged_span = self.finality_depth + self.service_burnable_window_daa;
         sync.logged.retain(|_, daa| *daa + logged_span > tip_daa);
         // Events now deeper than finality are reorg-immune on every acceptable POV: persist the
         // burned outpoints, the strike records and the suspensions, in chain order, and advance

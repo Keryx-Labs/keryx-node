@@ -158,6 +158,7 @@ pub struct VirtualStateProcessor {
     /// Producers below the pruning point, from the snapshot imported (or persisted) at it.
     pub(super) service_imported_producers: RwLock<Vec<(u64, Hash, u8, Hash)>>,
     pub(super) service_ledger_activation: ForkActivation,
+    pub(super) service_burnable_window_daa: u64,
     /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
     #[allow(clippy::type_complexity)]
     pub(super) service_reward_recent: parking_lot::RwLock<
@@ -382,6 +383,7 @@ impl VirtualStateProcessor {
             service_ledger_hashes: Default::default(),
             service_imported_producers: Default::default(),
             service_ledger_activation: params.service_ledger_activation,
+            service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
             finality_depth: params.finality_depth(),

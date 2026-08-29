@@ -910,6 +910,14 @@ impl BlockrateParams {
         }
         self
     }
+
+    /// Test networks only: shrinks the depths so pruning points and finality come within hours.
+    pub const fn with_depths(mut self, finality_depth: u64, pruning_depth: u64, merge_depth: u64) -> Self {
+        self.finality_depth = finality_depth;
+        self.pruning_depth = pruning_depth;
+        self.merge_depth = merge_depth;
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1247,6 +1255,9 @@ pub struct Params {
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
+    /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
+    /// on mainnet; shrunk on test networks together with the depths).
+    pub service_burnable_window_daa: u64,
 
     /// Chain-anchor checkpoint `(hash, daa_score)` — local peering policy, see `CHAIN_ANCHOR_HASH`.
     /// `None` disables enforcement (all nets but mainnet).
@@ -1507,6 +1518,7 @@ impl Params {
             service_bond_v2_activation: self.service_bond_v2_activation,
             reward_routing_activation: self.reward_routing_activation,
             service_ledger_activation: self.service_ledger_activation,
+            service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
             service_state_checkpoint: self.service_state_checkpoint,
@@ -1714,6 +1726,7 @@ pub const MAINNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
     service_ledger_activation: ForkActivation::never(),
+    service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
     ratio_reward_window: RATIO_REWARD_WINDOW,
@@ -1765,7 +1778,7 @@ pub const TESTNET_PARAMS: Params = Params {
     max_block_level: 250,
     pruning_proof_m: 1000,
 
-    blockrate: BlockrateParams::new::<10>(),
+    blockrate: BlockrateParams::new::<10>().with_depths(2_000, 7_000, 2_000),
 
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
@@ -1839,6 +1852,7 @@ pub const TESTNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(500),
     service_ledger_activation: ForkActivation::new(500),
+    service_burnable_window_daa: 2_000,
     chain_anchor: None,
     service_state_checkpoint: None,
     // Testnet override: shrink the production window to ~100 s (1_000 blocks @ 10 BPS) instead of
@@ -1928,6 +1942,7 @@ pub const SIMNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
+    service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,
@@ -2011,6 +2026,7 @@ pub const DEVNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
+    service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
     ratio_reward_window: RATIO_REWARD_WINDOW,

@@ -347,13 +347,11 @@ impl Consensus {
         // anchor plus the burnable-window warmup) must stay above the pruning floor, or a fresh
         // node would silently rebuild a truncated vault → divergent burns.
         assert!(
-            this.config.params.finality_depth()
-                + keryx_consensus_core::collateral::SERVICE_BURNABLE_WINDOW_DAA
-                <= this.config.pruning_depth(),
-            "finality_depth ({}) + SERVICE_BURNABLE_WINDOW_DAA ({}) must not exceed pruning_depth ({}) — the \
+            this.config.params.finality_depth() + this.config.params.service_burnable_window_daa <= this.config.pruning_depth(),
+            "finality_depth ({}) + service_burnable_window_daa ({}) must not exceed pruning_depth ({}) — the \
              service-bond cold refold requires its whole window to stay above the pruning floor",
             this.config.params.finality_depth(),
-            keryx_consensus_core::collateral::SERVICE_BURNABLE_WINDOW_DAA,
+            this.config.params.service_burnable_window_daa,
             this.config.pruning_depth()
         );
 
