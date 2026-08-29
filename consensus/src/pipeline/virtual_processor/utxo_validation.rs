@@ -331,18 +331,10 @@ impl VirtualStateProcessor {
         // as the coinbase check — a node that cannot yet reproduce the fold trusts the
         // utxo-commitment-pinned chain instead.
         if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase() {
-            let pp_daa = self.headers_store.get_daa_score(header.pruning_point).unwrap();
-            let rows = self.service_commit_index.commitment_at(pp_daa);
-            let expected = if self.service_ledger_activation.is_active(header.daa_score) {
-                let Some(ledger) = self.service_ledger_hash_at(header.pruning_point) else {
-                    return Err(MissingServiceLedgerSnapshot(header.pruning_point));
-                };
-                keryx_consensus_core::collateral::service_commitment_v2(rows, ledger)
-            } else {
-                rows
-            };
-            if header.service_state_hash != expected {
-                return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
+            if let Some(expected) = self.expected_service_state_hash(header)? {
+                if header.service_state_hash != expected {
+                    return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
+                }
             }
         }
 
@@ -685,6 +677,22 @@ impl VirtualStateProcessor {
             }
         }
         set
+    }
+
+    /// The service-state commitment `header` must carry. `None` when it commits to a pruning
+    /// point older than every ledger snapshot this node holds: the snapshot cannot be re-derived
+    /// locally, so the check is skipped for that header.
+    pub(super) fn expected_service_state_hash(&self, header: &Header) -> BlockProcessResult<Option<Hash>> {
+        let pp_daa = self.headers_store.get_daa_score(header.pruning_point).unwrap();
+        let rows = self.service_commit_index.commitment_at(pp_daa);
+        if !self.service_ledger_activation.is_active(header.daa_score) {
+            return Ok(Some(rows));
+        }
+        match self.service_ledger_hash_at(header.pruning_point) {
+            Some(ledger) => Ok(Some(keryx_consensus_core::collateral::service_commitment_v2(rows, ledger))),
+            None if pp_daa < self.service_ledger_floor_daa() => Ok(None),
+            None => Err(MissingServiceLedgerSnapshot(header.pruning_point)),
+        }
     }
 
     pub(super) fn tier_bps_by_block(

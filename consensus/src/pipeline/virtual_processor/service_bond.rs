@@ -934,6 +934,11 @@ impl VirtualStateProcessor {
         self.service_ledger_hashes.read().get(&sample).copied()
     }
 
+    /// DAA score of the oldest sample whose ledger hash this node holds.
+    pub(super) fn service_ledger_floor_daa(&self) -> u64 {
+        self.service_ledger_hashes.read().keys().filter_map(|s| self.headers_store.get_daa_score(*s).ok()).min().unwrap_or(0)
+    }
+
     /// Boot-time load of the persisted burned outpoints into the RAM set consulted by transaction
     /// validation, of the suspensions (re-derived from the strike log) into the RAM map consulted
     /// by block validation, and of the deep cursor — the persisted event frontier bounding the

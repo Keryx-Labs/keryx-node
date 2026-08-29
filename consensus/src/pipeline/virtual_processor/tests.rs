@@ -508,6 +508,54 @@ async fn ibd_body_without_proof_is_paid_by_its_header_tier() {
     }
 }
 
+/// A header committing to a pruning point older than every ledger snapshot the node holds is
+/// not checked; one committing to a newer sample the node lacks is an error; a held sample is
+/// checked.
+#[tokio::test]
+async fn service_state_check_skips_pruning_points_below_the_snapshot_floor() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::errors::block::RuleError;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_level_activation = ForkActivation::always();
+            p.service_ledger_activation = ForkActivation::always();
+        })
+        .build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let mut parent = config.genesis.hash;
+    for n in 1..=30u64 {
+        let hash: Hash = n.into();
+        tc.add_utxo_valid_block_with_parents(hash, vec![parent], vec![]).await.unwrap();
+        parent = hash;
+    }
+    let vp = tc.virtual_processor().clone();
+    let held: Hash = 20u64.into();
+    {
+        let mut hashes = vp.service_ledger_hashes.write();
+        hashes.clear();
+        hashes.insert(held, Hash::from_u64_word(7));
+    }
+    assert_eq!(vp.service_ledger_floor_daa(), vp.headers_store.get_daa_score(held).unwrap());
+
+    let header_committing_to = |pp: u64| {
+        let mut header = (*vp.headers_store.get_header(30u64.into()).unwrap()).clone();
+        header.pruning_point = pp.into();
+        header
+    };
+    assert!(vp.expected_service_state_hash(&header_committing_to(10)).unwrap().is_none());
+    assert!(vp.expected_service_state_hash(&header_committing_to(20)).unwrap().is_some());
+    assert!(matches!(
+        vp.expected_service_state_hash(&header_committing_to(25)),
+        Err(RuleError::MissingServiceLedgerSnapshot(pp)) if pp == Hash::from(25u64)
+    ));
+    drop(vp);
+    tc.shutdown(handles);
+}
+
 /// A transaction spending a burned escrow outpoint is rejected in the UTXO context, before any
 /// entry lookup — the spend-level enforcement of a finality-deep service miss.
 #[tokio::test]
