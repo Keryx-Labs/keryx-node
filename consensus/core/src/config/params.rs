@@ -202,7 +202,7 @@ pub const H5_4_ACTIVATION_DAA: u64 = 63_280_622;
 pub const H9_ACTIVATION_DAA: u64 = 80_932_000;
 
 /// H10: re-walk seed switch. Node+miner lockstep.
-pub const H10_ACTIVATION_DAA: u64 = 87_440_000;
+pub const H10_ACTIVATION_DAA: u64 = 87_360_000;
 /// Testnet mirror of `H10_ACTIVATION_DAA`.
 pub const TESTNET_H10_ACTIVATION_DAA: u64 = 500;
 
