@@ -93,6 +93,7 @@ pub struct BlockBodyProcessor {
     /// the v2 path; `header.pom_final_state` carries `pom_v3::fold64(roots[K])`.
     pub(super) pom_v3_activation: ForkActivation,
     pub(super) pom_v4_activation: ForkActivation,
+    pub(super) h10_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -249,6 +250,7 @@ impl BlockBodyProcessor {
             h5_2_activation: params.h5_2_activation,
             pom_v3_activation: params.pom_v3_activation,
             pom_v4_activation: params.pom_v4_activation,
+            h10_activation: params.h10_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),

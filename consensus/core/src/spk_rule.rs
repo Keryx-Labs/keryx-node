@@ -56,11 +56,40 @@ pub const SPK_RULE_SCRIPTS_H5: &[&[u8]] = &[
     ],
 ];
 
-/// Whether ANY freeze window is active for a block at `daa_score` (H4 OR H5). Used as an early-out
+/// H10 freeze list, frozen from `SPK_RULE_ACTIVATION_DAA_H10` on. Payout scripts are P2PK
+/// (`0x20 <pubkey> 0xac`); escrow scripts are `<n> <sequence LE> OP_CSV <32> <pubkey> OP_CHECKSIG`.
+pub const SPK_RULE_ACTIVATION_DAA_H10: u64 = crate::config::params::H10_ACTIVATION_DAA;
+
+pub const SPK_RULE_SCRIPTS_H10: &[&[u8]] = &[
+    // keryx:qqzeejmz4p6u9zuaq8jh2rcrnhz0wd5htfqvvehr9ah9nk64u42z53dyw598w
+    &[
+        0x20, 0x05, 0x9c, 0xcb, 0x62, 0xa8, 0x75, 0xc2, 0x8b, 0x9d, 0x01, 0xe5, 0x75, 0x0f, 0x03, 0x9d, 0xc4, 0xf7,
+        0x36, 0x97, 0x5a, 0x40, 0xc6, 0x66, 0xe3, 0x2f, 0x6e, 0x59, 0xdb, 0x55, 0xe5, 0x54, 0x2a, 0xac
+    ],
+    // escrow script, CSV 792 000
+    &[
+        0x03, 0xc0, 0x15, 0x0c, 0xb1, 0x20, 0x6a, 0xea, 0x17, 0x62, 0x52, 0x85, 0xc5, 0x83, 0x13, 0xd9, 0xcf, 0xa5,
+        0x90, 0x19, 0xb1, 0x63, 0x4a, 0x2d, 0xbc, 0x9a, 0x05, 0x29, 0xe1, 0x6b, 0x90, 0x12, 0x48, 0xfc, 0x51, 0x10,
+        0xd0, 0xe6, 0xac
+    ],
+    // escrow script, CSV 36 000
+    &[
+        0x02, 0xa0, 0x8c, 0xb1, 0x20, 0x6a, 0xea, 0x17, 0x62, 0x52, 0x85, 0xc5, 0x83, 0x13, 0xd9, 0xcf, 0xa5, 0x90,
+        0x19, 0xb1, 0x63, 0x4a, 0x2d, 0xbc, 0x9a, 0x05, 0x29, 0xe1, 0x6b, 0x90, 0x12, 0x48, 0xfc, 0x51, 0x10, 0xd0,
+        0xe6, 0xac
+    ],
+    // keryx:qzefx56v0q4ec7q9afazvw8n9hxqp428fh7zj73sdmy9aflc834l66ns8fw54
+    &[
+        0x20, 0xb2, 0x93, 0x53, 0x4c, 0x78, 0x2b, 0x9c, 0x78, 0x05, 0xea, 0x7a, 0x26, 0x38, 0xf3, 0x2d, 0xcc, 0x00,
+        0xd5, 0x47, 0x4d, 0xfc, 0x29, 0x7a, 0x30, 0x6e, 0xc8, 0x5e, 0xa7, 0xf8, 0x3c, 0x6b, 0xfd, 0xac
+    ],
+];
+
+/// Whether ANY freeze window is active for a block at `daa_score` (H4 OR H5 OR H10). Used as an early-out
 /// before the per-script, per-gate `spk_rule_matches` check.
 #[inline]
 pub fn spk_rule_active(daa_score: u64) -> bool {
-    daa_score >= SPK_RULE_ACTIVATION_DAA || daa_score >= SPK_RULE_ACTIVATION_DAA_H5
+    daa_score >= SPK_RULE_ACTIVATION_DAA || daa_score >= SPK_RULE_ACTIVATION_DAA_H5 || daa_score >= SPK_RULE_ACTIVATION_DAA_H10
 }
 
 /// Whether `script` (an output's `script_public_key.script()` bytes) is frozen for a spend at
@@ -70,6 +99,7 @@ pub fn spk_rule_active(daa_score: u64) -> bool {
 pub fn spk_rule_matches(script: &[u8], daa_score: u64) -> bool {
     (daa_score >= SPK_RULE_ACTIVATION_DAA && SPK_RULE_SCRIPTS.iter().any(|s| *s == script))
         || (daa_score >= SPK_RULE_ACTIVATION_DAA_H5 && SPK_RULE_SCRIPTS_H5.iter().any(|s| *s == script))
+        || (daa_score >= SPK_RULE_ACTIVATION_DAA_H10 && SPK_RULE_SCRIPTS_H10.iter().any(|s| *s == script))
 }
 
 #[cfg(test)]
@@ -106,6 +136,24 @@ mod tests {
             assert!(spk_rule_matches(spk, SPK_RULE_ACTIVATION_DAA_H5));
             assert!(!spk_rule_matches(spk, SPK_RULE_ACTIVATION_DAA_H5.saturating_sub(1)));
         }
+    }
+
+    #[test]
+    fn h10_scripts_frozen_only_at_h10_gate() {
+        let (pay, bond, inference) = (SPK_RULE_SCRIPTS_H10[0], SPK_RULE_SCRIPTS_H10[1], SPK_RULE_SCRIPTS_H10[2]);
+        assert_eq!(pay.len(), 34);
+        assert_eq!((pay[0], pay[33]), (0x20, 0xac));
+        assert_eq!(&bond[..6], &[0x03, 0xc0, 0x15, 0x0c, 0xb1, 0x20]);
+        assert_eq!(&inference[..5], &[0x02, 0xa0, 0x8c, 0xb1, 0x20]);
+        assert_eq!(&bond[6..38], &inference[5..37]);
+        assert_eq!((bond[38], inference[37]), (0xac, 0xac));
+        assert_eq!(SPK_RULE_SCRIPTS_H10[3].len(), 34);
+        assert_eq!((SPK_RULE_SCRIPTS_H10[3][0], SPK_RULE_SCRIPTS_H10[3][33]), (0x20, 0xac));
+        for spk in SPK_RULE_SCRIPTS_H10 {
+            assert!(spk_rule_matches(spk, SPK_RULE_ACTIVATION_DAA_H10));
+            assert!(!spk_rule_matches(spk, SPK_RULE_ACTIVATION_DAA_H10.saturating_sub(1)));
+        }
+        assert!(spk_rule_active(SPK_RULE_ACTIVATION_DAA_H10));
     }
 
     #[test]

@@ -185,6 +185,7 @@ impl Consensus {
         // Same pattern for the sealed service-state commitment (H6): header hashing commits
         // to `service_state_hash` from the H6 gate on.
         keryx_consensus_core::pom::init_service_commit_activation(params.pom_v3_activation.daa_score());
+        keryx_consensus_core::pom::init_pom_seed_h10_activation(params.h10_activation.daa_score());
 
         //
         // Storage layer

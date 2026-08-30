@@ -78,6 +78,8 @@ static COIN_AGE_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_3_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H5_4_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H6_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H10_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -443,6 +445,28 @@ impl VirtualStateProcessor {
             info!("  Difficulty    — reset window open: blocks build at genesis bits until the DAA re-converges");
             info!("  Separation    — un-upgraded nodes expect the inherited (decayed) bits and are cut off from here on");
             info!("  Miners        — unchanged: no walk-seed rotation, existing rigs keep mining");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // H10 banner. Same latching shape as the others.
+        if banner_should_fire(self.h10_activation, header)
+            && H10_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H10 · DAA {} ════════════════", self.h10_activation.daa_score());
+            info!("  PoM seed      — new walk-seed derivation from this block on; proof format unchanged");
+            info!("  Miners        — MANDATORY update: blocks mined with the v4 seed are rejected from here on");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        // H11 banner. Same latching shape as the others.
+        if banner_should_fire(self.service_ledger_activation, header)
+            && H11_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H11 · DAA {} ════════════════", self.service_ledger_activation.daa_score());
+            info!("  Service ledger — canonical snapshot at each pruning sample, committed in `serviceStateHash`");
+            info!("  Sync          — a fresh node imports the snapshot with the pruning point (protocol v12), no handoff band");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }

@@ -26,7 +26,7 @@
 
 use crate::hashing::header::hash_override_nonce_time;
 use crate::header::Header;
-use crate::pom::{PomProof, hash_pair, pom_block_seed_v4};
+use crate::pom::{PomProof, hash_pair, pom_block_seed_rewalk_era};
 use crate::pom_v4::{
     POM_V4_K, POM_V4_TILE_BYTES, PomProofV4, PomV4RangeProof, v4_n_tiles, v4_offset_chain, v4_tile_level_len, v4_tile_path_len,
     v4_tile_subtree_root,
@@ -68,7 +68,7 @@ pub fn v4_wire_context(header: &Header, tier: u8) -> Result<(u64, u64), PomWireE
     let tiers = crate::config::params::POM_TIERS_H6;
     let t = tiers.get(tier as usize).ok_or(PomWireError::UnknownTier(tier))?;
     let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
-    Ok((pom_block_seed_v4(&pre_pow_hash, header.timestamp, header.nonce), t.chunks))
+    Ok((pom_block_seed_rewalk_era(&pre_pow_hash, header.timestamp, header.nonce, header.daa_score), t.chunks))
 }
 
 /// Tier byte of a compact encoding, read without decoding it.

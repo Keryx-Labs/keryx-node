@@ -201,6 +201,14 @@ pub const H5_4_ACTIVATION_DAA: u64 = 63_280_622;
 /// re-mined block. Update before building the relaunch binary.
 pub const H9_ACTIVATION_DAA: u64 = 80_932_000;
 
+/// H10: re-walk seed switch. Node+miner lockstep.
+pub const H10_ACTIVATION_DAA: u64 = 87_440_000;
+/// Testnet mirror of `H10_ACTIVATION_DAA`.
+pub const TESTNET_H10_ACTIVATION_DAA: u64 = 500;
+
+/// H11: service-ledger snapshot commitment (`service_ledger_activation`). Node-only.
+pub const H11_ACTIVATION_DAA: u64 = 89_120_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -1155,6 +1163,10 @@ pub struct Params {
     /// the v3 spot-check. Node+miner lockstep. `never()` to disable.
     pub pom_v4_activation: ForkActivation,
 
+    /// H10 activation DAA score. At/after this score the re-walk seed is `pom_block_seed_h10`.
+    /// Strictly later than `pom_v4_activation`. Node+miner lockstep. `never()` to disable.
+    pub h10_activation: ForkActivation,
+
     /// Ratio-reward (holder-weighted miner-cut bonus) activation DAA score. At/after this score
     /// the coinbase miner cut is scaled by the producer's holder ratio bracket (`RATIO_REWARD_BPS`,
     /// computed by the node from the balance + windowed-production indexes). DAA-gated so IBD
@@ -1506,6 +1518,7 @@ impl Params {
 
             pom_maxlevel_v4_activation: self.pom_maxlevel_v4_activation,
             pom_v4_activation: self.pom_v4_activation,
+            h10_activation: self.h10_activation,
 
             ratio_reward_activation: self.ratio_reward_activation,
             ratio_verification_activation: self.ratio_verification_activation,
@@ -1673,6 +1686,7 @@ pub const MAINNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
     pom_maxlevel_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
     pom_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
+    h10_activation: ForkActivation::new(H10_ACTIVATION_DAA),
 
     // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
     // 2026-06-26 18:00 UTC at 10 BPS (measured: DAA 34_950_043 at 2026-06-23 11:24 UTC; +282_960 s
@@ -1733,7 +1747,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
-    service_ledger_activation: ForkActivation::never(),
+    service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -1825,6 +1839,7 @@ pub const TESTNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(0),
     pom_maxlevel_v4_activation: ForkActivation::new(500),
     pom_v4_activation: ForkActivation::new(500),
+    h10_activation: ForkActivation::new(TESTNET_H10_ACTIVATION_DAA),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
     ratio_reward_activation: ForkActivation::new(0),
@@ -1858,7 +1873,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // H7 service-bond v2 — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
     service_bond_v2_activation: ForkActivation::new(0),
-    reward_routing_activation: ForkActivation::new(500),
+    reward_routing_activation: ForkActivation::new(0),
     service_ledger_activation: ForkActivation::new(500),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
@@ -1931,6 +1946,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
     pom_v4_activation: ForkActivation::never(),
+    h10_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
@@ -2015,6 +2031,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
     pom_v4_activation: ForkActivation::never(),
+    h10_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),

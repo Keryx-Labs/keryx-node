@@ -52,6 +52,21 @@ pub fn service_commit_active(daa_score: u64) -> bool {
     daa_score >= SERVICE_COMMIT_ACTIVATION_DAA.load(Ordering::Relaxed)
 }
 
+/// DAA score at which the re-walk seed switches to `pom_block_seed_h10`. u64::MAX means "never" —
+/// initialised at startup from `Params::h10_activation`, same pattern as the PoM level activation.
+static POM_SEED_H10_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::h10_activation`.
+pub fn init_pom_seed_h10_activation(daa_score: u64) {
+    POM_SEED_H10_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Whether the H10 seed derivation is active for a block at `daa_score`.
+#[inline(always)]
+pub fn pom_seed_h10_active(daa_score: u64) -> bool {
+    daa_score >= POM_SEED_H10_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
+
 /// A PoM tier binding: the model whose possession this tier proves, plus its canonical
 /// 32 B-chunk Merkle root `R_T` and chunk count `N` (from the offline `pom-rt-builder`).
 /// Pinned per network in `config::params` (`POM_TIERS`); the tier index is the slice
@@ -537,6 +552,22 @@ fn pph_words_v4(pre_pow_hash: &[u8; 32]) -> [u64; 4] {
 /// v4-era block seed: fold over the v4-salted pre_pow_hash words (nonce already folded in).
 pub fn pom_block_seed_v4(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
     pom_block_seed_from_words(&pph_words_v4(pre_pow_hash), timestamp, nonce)
+}
+
+/// H10 block seed: the leading 64 bits of `cSHAKE256("ProofOfWorkHash")` over
+/// (pre_pow_hash, timestamp, nonce). BYTE-IDENTICAL to the miner's `pom_block_seed_h10`.
+pub fn pom_block_seed_h10(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    let hash = keryx_hashes::PowHash::new(keryx_hashes::Hash::from_bytes(*pre_pow_hash), timestamp).finalize_with_nonce(nonce);
+    hash.iter_le_u64().next().unwrap()
+}
+
+/// Re-walk-era (v4 proof format) block seed for a block at `daa_score`.
+pub fn pom_block_seed_rewalk_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, daa_score: u64) -> u64 {
+    if pom_seed_h10_active(daa_score) {
+        pom_block_seed_h10(pre_pow_hash, timestamp, nonce)
+    } else {
+        pom_block_seed_v4(pre_pow_hash, timestamp, nonce)
+    }
 }
 
 
@@ -1113,5 +1144,38 @@ mod verify_tests {
         let v2_bytes = bincode::serialize(&v2).unwrap();
         let back = bincode::deserialize::<PomProof>(&v2_bytes).unwrap();
         assert_eq!(back.steps_v2.as_ref().unwrap().len(), k as usize);
+    }
+}
+
+#[cfg(test)]
+mod seed_h10_tests {
+    use super::*;
+
+    // Cross-implementation vector: pinned in the miner's `pom::seed_h10_tests` and produced by
+    // its GPU keccak (`cuda/tests/seed_h10_check.cu`).
+    const SEED_H10_VECTOR_ZERO: u64 = 0x1fadaf72b089e024;
+
+    #[test]
+    fn seed_h10_is_the_pow_hash_prefix_and_differs_from_v4() {
+        assert_eq!(pom_block_seed_h10(&[0u8; 32], 0, 0), SEED_H10_VECTOR_ZERO);
+        let pph = [0x5au8; 32];
+        let (ts, nonce) = (1_788_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+        let h10 = pom_block_seed_h10(&pph, ts, nonce);
+        assert_eq!(h10, 0xcec7e2d9fce5bda6);
+        let expected = keryx_hashes::PowHash::new(keryx_hashes::Hash::from_bytes(pph), ts).finalize_with_nonce(nonce).as_bytes();
+        assert_eq!(h10, u64::from_le_bytes(expected[..8].try_into().unwrap()));
+        assert_ne!(h10, pom_block_seed_v4(&pph, ts, nonce));
+        assert_ne!(h10, pom_block_seed_h10(&pph, ts, nonce ^ 1));
+        assert_ne!(h10, pom_block_seed_h10(&pph, ts + 1, nonce));
+        assert_eq!(pom_block_seed_h10(&[0xa5u8; 32], ts, u64::MAX), 0x60977326f8e922ab);
+    }
+
+    #[test]
+    fn rewalk_era_seed_follows_the_global_gate() {
+        let pph = [7u8; 32];
+        init_pom_seed_h10_activation(1_000);
+        assert_eq!(pom_block_seed_rewalk_era(&pph, 1, 2, 999), pom_block_seed_v4(&pph, 1, 2));
+        assert_eq!(pom_block_seed_rewalk_era(&pph, 1, 2, 1_000), pom_block_seed_h10(&pph, 1, 2));
+        init_pom_seed_h10_activation(u64::MAX);
     }
 }

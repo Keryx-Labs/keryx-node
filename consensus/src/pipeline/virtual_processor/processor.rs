@@ -282,6 +282,7 @@ pub struct VirtualStateProcessor {
     pub(super) service_bond_v2_activation: ForkActivation,
     pub(super) difficulty_reset_activation_h5_3: ForkActivation,
     pub(super) difficulty_reset_activation_h5_4: ForkActivation,
+    pub(super) h10_activation: ForkActivation,
     // Coin-age maturity period (DAA score): the mature/immature bucket boundary (see `apply_age_diff`).
     pub(super) coin_age_maturity_w: u64,
     // Retention horizon (DAA score) for PROMOTED maturation-queue entries, enabling read-path
@@ -450,6 +451,7 @@ impl VirtualStateProcessor {
             service_bond_v2_activation: params.service_bond_v2_activation,
             difficulty_reset_activation_h5_3: params.difficulty_reset_activation_h5_3,
             difficulty_reset_activation_h5_4: params.difficulty_reset_activation_h5_4,
+            h10_activation: params.h10_activation,
             coin_age_maturity_w: params.coin_age_maturity_w,
             coin_age_retention: params.finality_depth(),
             is_archival,
