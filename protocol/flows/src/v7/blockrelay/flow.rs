@@ -156,7 +156,13 @@ impl HandleRelayInvsFlow {
             let is_ibd_in_transitional_state = session.async_is_consensus_in_transitional_ibd_state().await;
 
             match session.async_get_block_status(inv.hash).await {
-                None | Some(BlockStatus::StatusHeaderOnly) => {} // Continue processing this missing inv
+                None => {} // Continue processing this missing inv
+                Some(BlockStatus::StatusHeaderOnly) => {
+                    if self.header_only_below_pruning_point(&session, inv.hash).await {
+                        debug!("Relay block {} is header-only below the pruning point, continuing...", inv.hash);
+                        continue;
+                    }
+                }
                 Some(BlockStatus::StatusInvalid) => {
                     // The peer advertises as part of its chain a block we have proven invalid —
                     // that is a validation verdict, not an ambiguous ending, hence ban-worthy.
@@ -603,6 +609,14 @@ impl HandleRelayInvsFlow {
 
     /// Whether any root is a header-only block more than a pruning depth below `relay_daa`:
     /// no peer still serves such bodies, only a pruning catch-up gets past them.
+    /// A header-only block at or below the pruning point can never acquire a body.
+    async fn header_only_below_pruning_point(&self, consensus: &ConsensusProxy, hash: Hash) -> bool {
+        let Ok(header) = consensus.async_get_header(hash).await else { return false };
+        let pruning_point = consensus.async_pruning_point().await;
+        let Ok(pruning_point_header) = consensus.async_get_header(pruning_point).await else { return false };
+        header.daa_score <= pruning_point_header.daa_score
+    }
+
     async fn roots_beyond_pruning_depth(&self, consensus: &ConsensusProxy, roots: &[Hash], relay_daa: u64) -> bool {
         let depth = self.ctx.config.pruning_depth();
         for root in roots {
