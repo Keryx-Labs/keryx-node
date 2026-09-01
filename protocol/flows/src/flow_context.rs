@@ -69,7 +69,7 @@ use uuid::Uuid;
 /// (`BlockMessage.pom_proof_deduped`) and the requester-declared proof horizon
 /// (`RequestIBDBlocksMessage.pom_proof_min_daa`). Both are negotiated per peer, so a v11 node
 /// still serves the full-path encoding to everything older.
-const PROTOCOL_VERSION: u32 = 12;
+const PROTOCOL_VERSION: u32 = 13;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -933,6 +933,7 @@ impl ConnectionInitializer for FlowContext {
         // Register all flows according to version
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
             v if v >= PROTOCOL_VERSION => (v8::register(self.clone(), router.clone(), PROTOCOL_VERSION), PROTOCOL_VERSION),
+            12 => (v8::register(self.clone(), router.clone(), 12), 12),
             11 => (v8::register(self.clone(), router.clone(), 11), 11),
             10 => (v8::register(self.clone(), router.clone(), 10), 10),
             9 => (v8::register(self.clone(), router.clone(), 9), 9),

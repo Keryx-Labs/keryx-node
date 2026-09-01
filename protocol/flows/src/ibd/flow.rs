@@ -19,11 +19,12 @@ use keryx_consensusmanager::{ConsensusProxy, StagingConsensus, spawn_blocking};
 use keryx_core::{debug, info, time::unix_now, warn};
 use keryx_hashes::Hash;
 use keryx_muhash::MuHash;
-use keryx_consensus_core::collateral::{service_commitment_v2, ServiceLedgerSnapshot};
-use crate::v7::request_service_state::SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION;
+use keryx_consensus_core::collateral::{service_commitment_v2, service_commitment_v3, ProductionIndexSnapshot, ServiceLedgerSnapshot};
+use crate::v7::request_service_state::{PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION, SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION};
 
 /// Upper bound on a transferred ledger snapshot.
 const MAX_SERVICE_LEDGER_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PRODUCTION_INDEX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 use keryx_p2p_lib::{
     IncomingRoute, Router,
     common::ProtocolError,
@@ -842,15 +843,49 @@ impl IbdFlow {
         } else {
             None
         };
+        // A v13 peer follows the ledger snapshot with the production-index snapshot.
+        let production_bytes = if self.protocol_version >= PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION {
+            let mut bytes: Vec<u8> = Vec::new();
+            loop {
+                match tokio::time::timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT, self.incoming_route.recv()).await {
+                    Ok(Some(msg)) => match msg.payload {
+                        Some(Payload::ProductionIndexSnapshotChunk(chunk)) => {
+                            bytes.extend_from_slice(&chunk.chunk);
+                            if bytes.len() > MAX_PRODUCTION_INDEX_SNAPSHOT_BYTES {
+                                return Err(ProtocolError::Other("production-index snapshot exceeds the size limit"));
+                            }
+                        }
+                        Some(Payload::DoneProductionIndexSnapshotChunks(_)) => break,
+                        _ => {
+                            return Err(ProtocolError::UnexpectedMessage(
+                                stringify!(Payload::ProductionIndexSnapshotChunk | Payload::DoneProductionIndexSnapshotChunks),
+                                msg.payload.as_ref().map(|v| v.into()),
+                            ));
+                        }
+                    },
+                    Ok(None) => return Err(ProtocolError::ConnectionClosed),
+                    Err(_) => return Err(ProtocolError::Timeout(keryx_p2p_lib::common::DEFAULT_TIMEOUT)),
+                }
+            }
+            (!bytes.is_empty()).then_some(bytes)
+        } else {
+            None
+        };
         // Mirror `commitment_at` exactly: no rows seals nothing, and the expected value is then
         // the zero hash.
         let computed = if prefix_rows == 0 { Hash::default() } else { acc.finalize() };
         // Headers past `service_ledger_activation` commit rows and snapshot together: such a
         // vote only matches when the peer served the matching snapshot.
-        let snapshot_voted = snapshot_bytes
-            .as_ref()
-            .map(|bytes| service_commitment_v2(computed, ServiceLedgerSnapshot::hash_of_bytes(bytes)))
-            .is_some_and(|combined| votes.contains_key(&combined));
+        let ledger_hash = snapshot_bytes.as_ref().map(|bytes| ServiceLedgerSnapshot::hash_of_bytes(bytes));
+        let production_hash = production_bytes.as_ref().map(|bytes| ProductionIndexSnapshot::hash_of_bytes(bytes));
+        // A v3 vote (past `production_index_activation`) binds rows, ledger and production
+        // together; a v2 vote binds rows and ledger only.
+        let production_voted = match (ledger_hash, production_hash) {
+            (Some(l), Some(p)) => votes.contains_key(&service_commitment_v3(computed, l, p)),
+            _ => false,
+        };
+        let snapshot_voted =
+            production_voted || ledger_hash.is_some_and(|l| votes.contains_key(&service_commitment_v2(computed, l)));
         // With a checkpoint, the rows up to it must reproduce it and the whole set must match a
         // commitment the chain carries (any of the voted ones, or the checkpoint itself when the
         // pruning point sits exactly on it); without one, the majority commitment decides.
@@ -883,6 +918,22 @@ impl IbdFlow {
             let len = bytes.len();
             consensus.clone().spawn_blocking(move |c| c.import_service_ledger_snapshot(pruning_point, bytes)).await?;
             info!("imported the service-ledger snapshot at {} ({} bytes{})", pruning_point, len, if snapshot_voted { ", verified" } else { "" });
+        }
+        if let Some(bytes) = production_bytes {
+            if !production_voted {
+                warn!(
+                    "production-index snapshot at {} is not covered by the chain's commitments yet, importing it unverified",
+                    pruning_point
+                );
+            }
+            let len = bytes.len();
+            consensus.clone().spawn_blocking(move |c| c.import_production_index_snapshot(pruning_point, bytes)).await?;
+            info!(
+                "imported the production-index snapshot at {} ({} bytes{})",
+                pruning_point,
+                len,
+                if production_voted { ", verified" } else { "" }
+            );
         }
         Ok(())
     }

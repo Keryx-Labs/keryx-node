@@ -6,7 +6,8 @@ use keryx_p2p_lib::{
     common::ProtocolError,
     dequeue, make_message,
     pb::{
-        DoneServiceLedgerSnapshotChunksMessage, DoneServiceStateChunksMessage, ServiceLedgerSnapshotChunkMessage,
+        DoneProductionIndexSnapshotChunksMessage, DoneServiceLedgerSnapshotChunksMessage, DoneServiceStateChunksMessage,
+        ProductionIndexSnapshotChunkMessage, ServiceLedgerSnapshotChunkMessage,
         ServiceStateChunkMessage, kaspad_message::Payload,
     },
 };
@@ -21,6 +22,9 @@ const SERVICE_LEDGER_SNAPSHOT_CHUNK_BYTES: usize = 512 * 1024;
 
 /// First protocol version that takes the ledger snapshot instead of the handoff band.
 pub const SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION: u32 = 12;
+
+/// First protocol version that also takes the production-index snapshot.
+pub const PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION: u32 = 13;
 
 pub struct RequestServiceStateFlow {
     ctx: FlowContext,
@@ -62,6 +66,11 @@ impl RequestServiceStateFlow {
         } else {
             None
         };
+        let production = if self.protocol_version >= PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION {
+            session.async_get_production_index_snapshot(pruning_point).await?
+        } else {
+            None
+        };
         let handoff_daa = if snapshot.is_some() { 0 } else { service_state_handoff_daa(self.protocol_version) };
         let rows = session.async_get_service_state_rows(pruning_point, handoff_daa).await?;
         drop(session);
@@ -86,6 +95,22 @@ impl RequestServiceStateFlow {
             }
             self.router
                 .enqueue(make_message!(Payload::DoneServiceLedgerSnapshotChunks, DoneServiceLedgerSnapshotChunksMessage {}))
+                .await?;
+        }
+        if self.protocol_version >= PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION {
+            if let Some(bytes) = production {
+                debug!("Serving a {}-byte production-index snapshot for pruning point {}", bytes.len(), pruning_point);
+                for chunk in bytes.chunks(SERVICE_LEDGER_SNAPSHOT_CHUNK_BYTES) {
+                    self.router
+                        .enqueue(make_message!(
+                            Payload::ProductionIndexSnapshotChunk,
+                            ProductionIndexSnapshotChunkMessage { chunk: chunk.to_vec() }
+                        ))
+                        .await?;
+                }
+            }
+            self.router
+                .enqueue(make_message!(Payload::DoneProductionIndexSnapshotChunks, DoneProductionIndexSnapshotChunksMessage {}))
                 .await?;
         }
         Ok(())

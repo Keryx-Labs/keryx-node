@@ -59,6 +59,8 @@ message KaspadMessage {
     DoneServiceStateChunksMessage doneServiceStateChunks = 61;
     ServiceLedgerSnapshotChunkMessage serviceLedgerSnapshotChunk = 62;
     DoneServiceLedgerSnapshotChunksMessage doneServiceLedgerSnapshotChunks = 63;
+    ProductionIndexSnapshotChunkMessage productionIndexSnapshotChunk = 64;
+    DoneProductionIndexSnapshotChunksMessage doneProductionIndexSnapshotChunks = 65;
   }
 }
 

@@ -372,3 +372,11 @@ message ServiceLedgerSnapshotChunkMessage {
 
 message DoneServiceLedgerSnapshotChunksMessage {
 }
+
+// Canonical production-index snapshot at the requested pruning point (protocol v13+), chunked.
+message ProductionIndexSnapshotChunkMessage {
+  bytes chunk = 1;
+}
+
+message DoneProductionIndexSnapshotChunksMessage {
+}
