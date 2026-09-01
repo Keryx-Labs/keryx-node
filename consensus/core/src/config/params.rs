@@ -204,7 +204,7 @@ pub const H9_ACTIVATION_DAA: u64 = 80_932_000;
 /// H10: re-walk seed switch. Node+miner lockstep.
 pub const H10_ACTIVATION_DAA: u64 = 87_360_000;
 /// Testnet mirror of `H10_ACTIVATION_DAA`.
-pub const TESTNET_H10_ACTIVATION_DAA: u64 = 500;
+pub const TESTNET_H10_ACTIVATION_DAA: u64 = 1;
 
 /// H11: service-ledger snapshot commitment (`service_ledger_activation`). Node-only.
 pub const H11_ACTIVATION_DAA: u64 = 89_120_000;
@@ -1841,8 +1841,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // PoW SALT v4: active from genesis on testnet to mirror the live mainnet PoW (salt v4)
     // during the pre-PoM era, so the kHeavyHash→PoM transition test is a faithful H rehearsal.
     pow_salt_v4_activation: ForkActivation::new(0),
-    pom_maxlevel_v4_activation: ForkActivation::new(500),
-    pom_v4_activation: ForkActivation::new(500),
+    pom_maxlevel_v4_activation: ForkActivation::new(1),
+    pom_v4_activation: ForkActivation::new(1),
     h10_activation: ForkActivation::new(TESTNET_H10_ACTIVATION_DAA),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
@@ -1861,7 +1861,7 @@ pub const TESTNET_PARAMS: Params = Params {
     // exponent step, i.e. 256x harder than the reset target, which starves a single-GPU testnet.
     // At 1 the window covers [1, 26_441), far past the H7 gate.
     difficulty_reset_activation_h6: ForkActivation::new(1),
-    difficulty_reset_activation_v4: ForkActivation::new(500),
+    difficulty_reset_activation_v4: ForkActivation::new(1),
     h6_reset_bits: Some(0x1f7fffff),
     difficulty_reset_activation_h9: ForkActivation::never(),
     h9_reset_bits: None,
@@ -1878,8 +1878,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // flipping it below already-folded history splits the testnet.
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(0),
-    service_ledger_activation: ForkActivation::new(500),
-    production_index_activation: ForkActivation::new(700),
+    service_ledger_activation: ForkActivation::new(1),
+    production_index_activation: ForkActivation::new(500),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
