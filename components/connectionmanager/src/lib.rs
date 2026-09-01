@@ -334,27 +334,18 @@ impl ConnectionManager {
             (amgr.address_count(), banned, advertised)
         };
         let cooling = self.dial_cooldown.lock().len();
-        let (v11_out, v10_out, other_out) = {
-            let mut v11 = 0usize;
-            let mut v10 = 0usize;
-            let mut other = 0usize;
+        let versions_out = {
+            let mut versions = std::collections::BTreeMap::<u32, usize>::new();
             for peer in peer_by_address.values().filter(|p| p.is_outbound()) {
-                let props = peer.properties();
-                match props.protocol_version {
-                    v if v >= 11 => v11 += 1,
-                    10 => v10 += 1,
-                    _ => other += 1,
-                }
+                *versions.entry(peer.properties().protocol_version).or_default() += 1;
             }
-            (v11, v10, other)
+            versions.iter().rev().map(|(v, n)| format!("v{}={}", v, n)).collect::<Vec<_>>().join(" ")
         };
         info!(
-            "P2P health: outbound={}/{} (v11={} v10={} other={}) inbound={}/{} | addresses={} cooling_down={} banned={} | advertised={}",
+            "P2P health: outbound={}/{} ({}) inbound={}/{} | addresses={} cooling_down={} banned={} | advertised={}",
             outbound,
             self.outbound_target,
-            v11_out,
-            v10_out,
-            other_out,
+            versions_out,
             inbound,
             self.inbound_limit,
             known,
