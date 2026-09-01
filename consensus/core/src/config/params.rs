@@ -209,6 +209,10 @@ pub const TESTNET_H10_ACTIVATION_DAA: u64 = 1;
 /// H11: service-ledger snapshot commitment (`service_ledger_activation`). Node-only.
 pub const H11_ACTIVATION_DAA: u64 = 89_120_000;
 
+/// H12: production-index snapshot commitment (`production_index_activation`). Node-only.
+/// Targets 2026-09-04 ~16:00 UTC (from daa 89_060_852 at 2026-09-01 17:01 UTC, ~10.1 daa/s).
+pub const H12_ACTIVATION_DAA: u64 = 91_650_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -1751,7 +1755,7 @@ pub const MAINNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
-    production_index_activation: ForkActivation::never(),
+    production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
