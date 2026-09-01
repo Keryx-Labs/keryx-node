@@ -7,7 +7,7 @@ use crate::{
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
             AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
-            BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingServiceLedgerSnapshot,
+            BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot, MissingServiceLedgerSnapshot,
             WrongHeaderPruningPoint,
         },
     },
@@ -80,6 +80,7 @@ static H5_4_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H6_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H10_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -470,6 +471,13 @@ impl VirtualStateProcessor {
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
+        if banner_should_fire(self.production_index_activation, header)
+            && H12_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H12 · DAA {} ════════════════", self.production_index_activation.daa_score());
+            info!("  Ratio index   — production prefix snapshot at each pruning sample, committed in `serviceStateHash`");
+            info!("  Sync          — a fresh node imports the index with the pruning point (protocol v13); ratio verification exact from the first block");
+        }
 
         // H6 banner. Same latching shape as the others — fires once, on the first block at or
         // after the gate, only for a live crossing (see `banner_should_fire`).
@@ -712,10 +720,18 @@ impl VirtualStateProcessor {
         if !self.service_ledger_activation.is_active(header.daa_score) {
             return Ok(Some(rows));
         }
-        match self.service_ledger_hash_at(header.pruning_point) {
-            Some(ledger) => Ok(Some(keryx_consensus_core::collateral::service_commitment_v2(rows, ledger))),
-            None if pp_daa < self.service_ledger_floor_daa() => Ok(None),
-            None => Err(MissingServiceLedgerSnapshot(header.pruning_point)),
+        let ledger = match self.service_ledger_hash_at(header.pruning_point) {
+            Some(ledger) => ledger,
+            None if pp_daa < self.service_ledger_floor_daa() => return Ok(None),
+            None => return Err(MissingServiceLedgerSnapshot(header.pruning_point)),
+        };
+        if !self.production_index_activation.is_active(header.daa_score) {
+            return Ok(Some(keryx_consensus_core::collateral::service_commitment_v2(rows, ledger)));
+        }
+        match self.production_index_hash_at(header.pruning_point) {
+            Some(production) => Ok(Some(keryx_consensus_core::collateral::service_commitment_v3(rows, ledger, production))),
+            None if pp_daa < self.production_index_floor_daa() => Ok(None),
+            None => Err(MissingProductionIndexSnapshot(header.pruning_point)),
         }
     }
 

@@ -153,11 +153,14 @@ pub struct VirtualStateProcessor {
     pub(super) service_rewarded: parking_lot::RwLock<std::collections::HashSet<[u8; 32]>>,
     pub(super) service_reward_store: Arc<crate::model::stores::service_reward::DbServiceRewardStore>,
     pub(super) service_ledger_snapshot_store: Arc<crate::model::stores::service_ledger_snapshot::DbServiceLedgerSnapshotStore>,
+    pub(super) production_index_snapshot_store: Arc<crate::model::stores::production_index_snapshot::DbProductionIndexSnapshotStore>,
     /// Canonical hash of each persisted sample snapshot (see `service_ledger_hash_at`).
     pub(super) service_ledger_hashes: RwLock<HashMap<Hash, Hash>>,
+    pub(super) production_index_hashes: RwLock<HashMap<Hash, Hash>>,
     /// Producers below the pruning point, from the snapshot imported (or persisted) at it.
     pub(super) service_imported_producers: RwLock<Vec<(u64, Hash, u8, Hash)>>,
     pub(super) service_ledger_activation: ForkActivation,
+    pub(super) production_index_activation: ForkActivation,
     pub(super) service_burnable_window_daa: u64,
     /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
     #[allow(clippy::type_complexity)]
@@ -381,9 +384,12 @@ impl VirtualStateProcessor {
             service_rewarded: Default::default(),
             service_reward_store: storage.service_reward_store.clone(),
             service_ledger_snapshot_store: storage.service_ledger_snapshot_store.clone(),
+            production_index_snapshot_store: storage.production_index_snapshot_store.clone(),
             service_ledger_hashes: Default::default(),
+            production_index_hashes: Default::default(),
             service_imported_producers: Default::default(),
             service_ledger_activation: params.service_ledger_activation,
+            production_index_activation: params.production_index_activation,
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
@@ -1703,7 +1709,15 @@ impl VirtualStateProcessor {
         let service_state_hash = if keryx_consensus_core::pom::service_commit_active(virtual_state.daa_score) {
             let pp_daa = self.headers_store.get_daa_score(header_pruning_point).unwrap();
             let rows = self.service_commit_index.commitment_at(pp_daa);
-            if self.service_ledger_activation.is_active(virtual_state.daa_score) {
+            if self.production_index_activation.is_active(virtual_state.daa_score) {
+                let ledger = self
+                    .service_ledger_hash_at(header_pruning_point)
+                    .ok_or(RuleError::MissingServiceLedgerSnapshot(header_pruning_point))?;
+                let production = self
+                    .production_index_hash_at(header_pruning_point)
+                    .ok_or(RuleError::MissingProductionIndexSnapshot(header_pruning_point))?;
+                keryx_consensus_core::collateral::service_commitment_v3(rows, ledger, production)
+            } else if self.service_ledger_activation.is_active(virtual_state.daa_score) {
                 let ledger = self
                     .service_ledger_hash_at(header_pruning_point)
                     .ok_or(RuleError::MissingServiceLedgerSnapshot(header_pruning_point))?;

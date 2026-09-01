@@ -144,6 +144,17 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The canonical production-index snapshot persisted at pruning sample `sample`, if held.
+    fn get_production_index_snapshot(&self, sample: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        unimplemented!()
+    }
+
+    /// Installs an imported production-index snapshot for `sample` (the imported pruning point):
+    /// persists it and restores the ratio prefix index from it.
+    fn import_production_index_snapshot(&self, sample: Hash, bytes: Vec<u8>) -> ConsensusResult<()> {
+        unimplemented!()
+    }
+
     fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
         unimplemented!()
     }

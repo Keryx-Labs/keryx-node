@@ -168,6 +168,9 @@ pub enum RuleError {
     #[error("service-state commitment cannot be checked: no service-ledger snapshot at pruning point {0}")]
     MissingServiceLedgerSnapshot(Hash),
 
+    #[error("service-state commitment cannot be checked: no production-index snapshot at pruning point {0}")]
+    MissingProductionIndexSnapshot(Hash),
+
     #[error("coinbase announces no escrow delegation (`/escrow:` + `/esig:`), mandatory at/after the H6 gate")]
     MissingEscrowDelegation,
 

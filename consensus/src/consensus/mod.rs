@@ -855,6 +855,19 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.install_service_ledger_snapshot(sample, bytes, snapshot)
     }
 
+    fn get_production_index_snapshot(&self, sample: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        if sample == self.config.genesis.hash {
+            return Ok(Some(keryx_consensus_core::collateral::ProductionIndexSnapshot::default().to_bytes()));
+        }
+        Ok(self.storage.production_index_snapshot_store.get(sample).unwrap())
+    }
+
+    fn import_production_index_snapshot(&self, sample: Hash, bytes: Vec<u8>) -> ConsensusResult<()> {
+        let snapshot = keryx_consensus_core::collateral::ProductionIndexSnapshot::from_bytes(&bytes)
+            .map_err(|_| ConsensusError::General("malformed production-index snapshot"))?;
+        self.virtual_processor.install_production_index_snapshot(sample, bytes, snapshot)
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         self.lkg_virtual_state.load().bits
     }

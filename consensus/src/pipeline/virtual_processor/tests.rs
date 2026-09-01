@@ -1468,6 +1468,62 @@ async fn ledger_snapshots_are_persisted_at_pruning_samples() {
     tc.shutdown(handles);
 }
 
+/// Every pruning sample also persists its production-index snapshot, and restoring it onto a
+/// wiped index reproduces the exact windowed values (and clears the catch-up marker).
+#[tokio::test]
+async fn production_snapshots_are_persisted_and_restore_exactly() {
+    use keryx_consensus_core::collateral::ProductionIndexSnapshot;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+
+    let mut params = MAINNET_PARAMS;
+    params.pom_v3_activation = ForkActivation::always();
+    params.blockrate.finality_depth = 10;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let mut parent = config.genesis.hash;
+    for n in 1..=45u64 {
+        let hash: Hash = n.into();
+        tc.add_utxo_valid_block_with_parents(hash, vec![parent], vec![]).await.unwrap();
+        parent = hash;
+    }
+
+    let vp = tc.virtual_processor().clone();
+    let expected: Vec<Hash> = (1..=45u64).map(Hash::from).filter(|h| vp.is_pruning_sample_block(*h)).collect();
+    for h in expected.iter() {
+        let bytes = vp.production_index_snapshot_store.get(*h).unwrap().expect("a sample must carry its snapshot");
+        let snap = ProductionIndexSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(snap.to_bytes(), bytes);
+        assert_eq!(vp.production_index_hash_at(*h), Some(ProductionIndexSnapshot::hash_of_bytes(&bytes)));
+    }
+    assert_eq!(vp.production_index_hash_at(config.genesis.hash), Some(ProductionIndexSnapshot::default().hash()));
+    assert_eq!(vp.production_index_hash_at(Hash::from(11u64)), None);
+
+    // Restore-exactness: wipe-and-import the snapshot of the last sample, then every windowed
+    // value the consensus could read at that sample must be byte-identical to the live index.
+    let sample = *expected.last().unwrap();
+    let sample_idx = vp.selected_chain_store.read().get_by_hash(sample).unwrap();
+    let bytes = vp.production_index_snapshot_store.get(sample).unwrap().unwrap();
+    let snap = ProductionIndexSnapshot::from_bytes(&bytes).unwrap();
+    let w = sample_idx - snap.bottom_index;
+    use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
+    let probes: Vec<_> = snap
+        .entries
+        .iter()
+        .map(|(spk, _)| (spk.clone(), vp.windowed_production_prefix_store.windowed(spk, sample_idx, w).unwrap()))
+        .collect();
+    assert!(!probes.is_empty(), "the fixture must produce at least one indexed SPK");
+    vp.install_production_index_snapshot(sample, bytes, snap).unwrap();
+    for (spk, before) in probes {
+        assert_eq!(vp.windowed_production_prefix_store.windowed(&spk, sample_idx, w).unwrap(), before);
+    }
+    assert!(vp.production_index_seed_store.read().get_optional().is_none(), "the catch-up marker must be cleared");
+
+    tc.shutdown(handles);
+}
+
 /// Below the pruning point, a cohort walk past the ledger gate reads the producers carried by the
 /// imported snapshot instead of arming empty.
 #[tokio::test]

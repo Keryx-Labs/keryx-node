@@ -229,6 +229,70 @@ impl DbWindowedProductionPrefixStore {
         Ok(deleted)
     }
 
+    /// Dump, per SPK holding entries in `(bottom, top]`, the cumulative at `bottom` and those
+    /// entries, in on-disk bucket order. What a pruning-sample snapshot serializes.
+    pub fn dump_window(&self, bottom: u64, top: u64) -> Result<Vec<(ScriptPublicKey, u64, Vec<(u64, u64)>)>, StoreError> {
+        let mut opts = ReadOptions::default();
+        opts.set_iterate_range(rocksdb::PrefixRange([self.entries_prefix].as_slice()));
+        let it = self.db.iterator_opt(IteratorMode::Start, opts);
+        let mut groups: Vec<(Vec<u8>, Option<u64>, Vec<(u64, u64)>)> = Vec::new();
+        let mut cur: Option<(Vec<u8>, Option<u64>, Vec<(u64, u64)>)> = None;
+        for item in it {
+            let (key, value) = item?;
+            let index = u64::from_be_bytes(key[key.len() - 8..].try_into().expect("index is 8 bytes"));
+            let bucket = &key[1..key.len() - 8];
+            if cur.as_ref().is_none_or(|(b, ..)| b.as_slice() != bucket) {
+                if let Some(done) = cur.take()
+                    && !done.2.is_empty()
+                {
+                    groups.push(done);
+                }
+                cur = Some((bucket.to_vec(), None, Vec::new()));
+            }
+            let c = cur.as_mut().unwrap();
+            let v = decode_u64(value.to_vec());
+            if index <= bottom {
+                c.1 = Some(c.1.unwrap_or(0).max(v));
+            } else if index <= top {
+                c.2.push((index, v));
+            }
+        }
+        if let Some(done) = cur.take()
+            && !done.2.is_empty()
+        {
+            groups.push(done);
+        }
+        let mut result = Vec::with_capacity(groups.len());
+        for (bucket, base, entries) in groups {
+            let spk: ScriptPublicKey = ScriptPublicKeyBucket::from_bytes(bucket).into();
+            let base = match base {
+                Some(b) => b,
+                None => self.read_floor(&spk)?,
+            };
+            result.push((spk, base, entries));
+        }
+        Ok(result)
+    }
+
+    /// Replace the whole index with an imported window, atomically: per SPK, the cumulative
+    /// baseline at the window bottom (written as the floor) and the sparse entries inside it.
+    pub fn replace_with_window(
+        &self,
+        groups: &[(ScriptPublicKey, u64, Vec<(u64, u64)>)],
+        also: impl FnOnce(&mut WriteBatch),
+    ) -> Result<(), StoreError> {
+        let mut batch = WriteBatch::default();
+        self.clear(&mut batch);
+        for (spk, base, entries) in groups {
+            self.put_floor(&mut batch, spk, *base);
+            for (index, cumulative) in entries {
+                self.put_cumulative(&mut batch, spk, *index, *cumulative);
+            }
+        }
+        also(&mut batch);
+        Ok(self.db.write(batch)?)
+    }
+
     /// True if the index holds no entries at all (fresh prefix, or a datadir created before this
     /// store existed) — the trigger for the one-time from-chain build/migration at startup.
     pub fn is_empty(&self) -> bool {

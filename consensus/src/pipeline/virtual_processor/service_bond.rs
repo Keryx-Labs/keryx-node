@@ -7,7 +7,7 @@ use crate::model::stores::{
 };
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
-    ServiceLedgerSnapshot,
+    ProductionIndexSnapshot, ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
@@ -686,6 +686,9 @@ impl VirtualStateProcessor {
             if self.service_ledger_hashes.write().remove(removed).is_some() {
                 self.service_ledger_snapshot_store.delete(*removed).unwrap();
             }
+            if self.production_index_hashes.write().remove(removed).is_some() {
+                self.production_index_snapshot_store.delete(*removed).unwrap();
+            }
         }
         let mut sampled = false;
         for (k, h) in chain_path.added.iter().enumerate() {
@@ -720,6 +723,10 @@ impl VirtualStateProcessor {
                 let bytes = snapshot.to_bytes();
                 self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
+                let production = self.build_production_snapshot(&*sc, idx, daa);
+                let pbytes = production.to_bytes();
+                self.production_index_hashes.write().insert(*h, ProductionIndexSnapshot::hash_of_bytes(&pbytes));
+                self.production_index_snapshot_store.set(*h, pbytes).unwrap();
                 sampled = true;
             }
         }
@@ -891,6 +898,90 @@ impl VirtualStateProcessor {
                 self.service_ledger_snapshot_store.delete(sample).unwrap();
             }
         }
+        let samples: Vec<Hash> = self.production_index_hashes.read().keys().copied().collect();
+        for sample in samples {
+            let stale = match self.headers_store.get_blue_score(sample) {
+                Ok(blue) => blue < floor,
+                Err(_) => true,
+            };
+            if stale {
+                self.production_index_hashes.write().remove(&sample);
+                self.production_index_snapshot_store.delete(sample).unwrap();
+            }
+        }
+    }
+
+    /// Canonical production-index snapshot at chain block `sample_idx` (daa `sample_daa`): the
+    /// per-SPK cumulative baselines at the daa-window bottom plus the sparse entries above it.
+    pub(super) fn build_production_snapshot(
+        &self,
+        sc: &impl crate::model::stores::selected_chain::SelectedChainStoreReader,
+        sample_idx: u64,
+        sample_daa: u64,
+    ) -> ProductionIndexSnapshot {
+        let daa_bound = sample_daa.saturating_sub(self.ratio_reward_window_daa);
+        let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, sample_idx, 0);
+        let mut groups = self.windowed_production_prefix_store.dump_window(bottom, sample_idx).unwrap();
+        groups.sort_by(|a, b| (a.0.version(), a.0.script()).cmp(&(b.0.version(), b.0.script())));
+        let mut snap = ProductionIndexSnapshot {
+            bottom_index: bottom,
+            sample_index: sample_idx,
+            floors: Vec::with_capacity(groups.len()),
+            entries: Vec::with_capacity(groups.len()),
+        };
+        for (spk, base, points) in groups {
+            snap.floors.push((spk.clone(), base));
+            snap.entries.push((spk, points));
+        }
+        snap
+    }
+
+    /// Canonical hash of the persisted production-index snapshot at `sample`, if this node holds
+    /// it. Genesis carries the empty index.
+    pub(super) fn production_index_hash_at(&self, sample: Hash) -> Option<Hash> {
+        if sample == self.genesis.hash {
+            return Some(ProductionIndexSnapshot::default().hash());
+        }
+        self.production_index_hashes.read().get(&sample).copied()
+    }
+
+    /// DAA score of the oldest sample whose production-index hash this node holds.
+    pub(super) fn production_index_floor_daa(&self) -> u64 {
+        self.production_index_hashes.read().keys().filter_map(|s| self.headers_store.get_daa_score(*s).ok()).min().unwrap_or(0)
+    }
+
+    /// Installs an imported production-index snapshot taken at chain block `sample` (the new
+    /// pruning point): persists it and restores the prefix store from it, replacing any partial
+    /// content, so ratio verification is exact from the first validated block.
+    pub(crate) fn install_production_index_snapshot(
+        &self,
+        sample: Hash,
+        bytes: Vec<u8>,
+        snapshot: ProductionIndexSnapshot,
+    ) -> keryx_consensus_core::errors::consensus::ConsensusResult<()> {
+        self.selected_chain_store
+            .read()
+            .get_by_hash(sample)
+            .map_err(|_| keryx_consensus_core::errors::consensus::ConsensusError::General("snapshot sample is not a chain block"))?;
+        self.production_index_hashes.write().insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+        self.production_index_snapshot_store.set(sample, bytes).unwrap();
+        let groups: Vec<_> = snapshot
+            .floors
+            .iter()
+            .zip(snapshot.entries.iter())
+            .map(|((spk, base), (_, points))| (spk.clone(), *base, points.clone()))
+            .collect();
+        self.windowed_production_prefix_store
+            .replace_with_window(&groups, |batch| {
+                self.production_index_seed_store.write().remove_batch(batch).unwrap();
+            })
+            .unwrap();
+        info!(
+            "ratio: production index restored from the snapshot at {} ({} producers); coinbase verification is exact from here",
+            sample,
+            snapshot.entries.len()
+        );
+        Ok(())
     }
 
     /// Installs an imported ledger snapshot taken at chain block `sample` (the new pruning
@@ -1001,6 +1092,12 @@ impl VirtualStateProcessor {
         self.service_commit_index.rebuild(rows);
         self.service_ledger.lock().deep_cursor_daa = cursor;
         let own_pp = self.pruning_point_store.read().pruning_point().ok();
+        let mut phashes = self.production_index_hashes.write();
+        phashes.clear();
+        for (sample, bytes) in self.production_index_snapshot_store.entries() {
+            phashes.insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+        }
+        drop(phashes);
         let mut hashes = self.service_ledger_hashes.write();
         hashes.clear();
         for (sample, bytes) in self.service_ledger_snapshot_store.entries() {

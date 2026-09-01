@@ -61,3 +61,11 @@ impl ProductionIndexSeedStore for DbProductionIndexSeedStore {
         self.access.write(BatchDbWriter::new(batch), &seeded_at_index)
     }
 }
+
+impl DbProductionIndexSeedStore {
+    /// Clears the catch-up marker: the index is exact again (an imported production snapshot
+    /// restored it), so coinbase verification needs no relaxation.
+    pub fn remove_batch(&mut self, batch: &mut WriteBatch) -> StoreResult<()> {
+        self.access.remove(BatchDbWriter::new(batch))
+    }
+}

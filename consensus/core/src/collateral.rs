@@ -1237,6 +1237,131 @@ pub fn service_commitment_v2(rows: Hash, ledger: Hash) -> Hash {
     Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
 }
 
+/// Header service-state commitment past `production_index_activation`: sealed rows, ledger
+/// snapshot and production-index snapshot, all at the header's pruning point.
+pub fn service_commitment_v3(rows: Hash, ledger: Hash, production: Hash) -> Hash {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).personal(b"KeryxSvcCommit3").to_state();
+    hasher.update(&rows.as_bytes());
+    hasher.update(&ledger.as_bytes());
+    hasher.update(&production.as_bytes());
+    Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
+}
+
+const PRODUCTION_SNAPSHOT_ENCODING_VERSION: u8 = 1;
+
+/// Canonical snapshot of the ratio-reward production index at a pruning sample: per-SPK cumulative
+/// production at the window bottom (`floors`) plus the sparse prefix entries inside the window,
+/// both sorted by canonical SPK bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProductionIndexSnapshot {
+    /// Chain index of the window bottom the floors are cumulative at.
+    pub bottom_index: u64,
+    /// Chain index of the sample block the snapshot is taken at.
+    pub sample_index: u64,
+    /// `(spk, cumulative_at(spk, bottom_index))`, sorted by (version, script).
+    pub floors: Vec<(ScriptPublicKey, u64)>,
+    /// `(spk, entries)` with entries `(chain_index, cumulative)` strictly increasing in
+    /// `(bottom_index, sample_index]`; groups sorted by (version, script).
+    pub entries: Vec<(ScriptPublicKey, Vec<(u64, u64)>)>,
+}
+
+impl ProductionIndexSnapshot {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(PRODUCTION_SNAPSHOT_ENCODING_VERSION);
+        out.extend_from_slice(&self.bottom_index.to_le_bytes());
+        out.extend_from_slice(&self.sample_index.to_le_bytes());
+        out.extend_from_slice(&(self.floors.len() as u32).to_le_bytes());
+        for (spk, cum) in self.floors.iter() {
+            put_spk(&mut out, spk);
+            out.extend_from_slice(&cum.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for (spk, points) in self.entries.iter() {
+            put_spk(&mut out, spk);
+            out.extend_from_slice(&(points.len() as u32).to_le_bytes());
+            for (index, cum) in points.iter() {
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(&cum.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let mut r = Reader { bytes, pos: 0 };
+        if r.u8()? != PRODUCTION_SNAPSHOT_ENCODING_VERSION {
+            return Err("unknown production snapshot version".into());
+        }
+        let mut snap = Self { bottom_index: r.u64()?, sample_index: r.u64()?, ..Default::default() };
+        let n = r.u32()?;
+        for _ in 0..n {
+            let spk = read_spk(&mut r)?;
+            let cum = r.u64()?;
+            if snap.floors.last().is_some_and(|(prev, _)| spk_key(prev) >= spk_key(&spk)) {
+                return Err("unsorted floors".into());
+            }
+            snap.floors.push((spk, cum));
+        }
+        let m = r.u32()?;
+        for _ in 0..m {
+            let spk = read_spk(&mut r)?;
+            if snap.entries.last().is_some_and(|(prev, _)| spk_key(prev) >= spk_key(&spk)) {
+                return Err("unsorted entries".into());
+            }
+            let k = r.u32()?;
+            let mut points = Vec::with_capacity(k as usize);
+            let mut prev = None;
+            for _ in 0..k {
+                let index = r.u64()?;
+                let cum = r.u64()?;
+                if index <= snap.bottom_index || index > snap.sample_index || prev.is_some_and(|p| index <= p) {
+                    return Err("malformed production entries".into());
+                }
+                prev = Some(index);
+                points.push((index, cum));
+            }
+            snap.entries.push((spk, points));
+        }
+        if r.pos != bytes.len() {
+            return Err("trailing bytes".into());
+        }
+        if snap.to_bytes() != bytes {
+            return Err("non-canonical production snapshot".into());
+        }
+        Ok(snap)
+    }
+
+    /// Domain-separated digest of the canonical bytes.
+    pub fn hash(&self) -> Hash {
+        Self::hash_of_bytes(&self.to_bytes())
+    }
+
+    /// [`Self::hash`] over bytes already encoded.
+    pub fn hash_of_bytes(bytes: &[u8]) -> Hash {
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).personal(b"KeryxProdSnap").to_state();
+        hasher.update(bytes);
+        Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
+    }
+}
+
+fn spk_key(spk: &ScriptPublicKey) -> (u16, &[u8]) {
+    (spk.version(), spk.script())
+}
+
+fn put_spk(out: &mut Vec<u8>, spk: &ScriptPublicKey) {
+    out.extend_from_slice(&spk.version().to_le_bytes());
+    out.extend_from_slice(&(spk.script().len() as u16).to_le_bytes());
+    out.extend_from_slice(spk.script());
+}
+
+fn read_spk(r: &mut Reader<'_>) -> Result<ScriptPublicKey, String> {
+    let version = r.u16()?;
+    let len = r.u16()? as usize;
+    let script = r.take(len)?;
+    Ok(ScriptPublicKey::from_vec(version, script.to_vec()))
+}
+
 impl ServiceLedger {
     /// The effective state as a canonical snapshot: strike and sighting baselines folded into
     /// their deltas, vault claims in chain order.
@@ -1277,6 +1402,51 @@ impl ServiceLedger {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn production_snapshot_roundtrip_is_canonical() {
+        use crate::collateral::ProductionIndexSnapshot;
+        use crate::tx::ScriptPublicKey;
+        let spk_a = ScriptPublicKey::from_vec(0, vec![0x20; 34]);
+        let spk_b = ScriptPublicKey::from_vec(0, vec![0x21; 34]);
+        let snap = ProductionIndexSnapshot {
+            bottom_index: 100,
+            sample_index: 250,
+            floors: vec![(spk_a.clone(), 7), (spk_b.clone(), 0)],
+            entries: vec![(spk_a.clone(), vec![(101, 9), (240, 12)]), (spk_b.clone(), vec![(250, 3)])],
+        };
+        let bytes = snap.to_bytes();
+        let decoded = ProductionIndexSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, snap);
+        assert_eq!(ProductionIndexSnapshot::hash_of_bytes(&bytes), snap.hash());
+
+        // An empty snapshot is valid and hashes deterministically (the genesis commitment).
+        let empty = ProductionIndexSnapshot::default();
+        assert_eq!(ProductionIndexSnapshot::from_bytes(&empty.to_bytes()).unwrap(), empty);
+
+        // Unsorted groups are rejected (order malleability would fork the commitment).
+        let unsorted = ProductionIndexSnapshot {
+            bottom_index: 100,
+            sample_index: 250,
+            floors: vec![(spk_b.clone(), 0), (spk_a.clone(), 7)],
+            entries: vec![],
+        };
+        assert!(ProductionIndexSnapshot::from_bytes(&unsorted.to_bytes()).is_err());
+
+        // An entry outside (bottom, sample] is rejected.
+        let out_of_window = ProductionIndexSnapshot {
+            bottom_index: 100,
+            sample_index: 250,
+            floors: vec![],
+            entries: vec![(spk_a, vec![(100, 5)])],
+        };
+        assert!(ProductionIndexSnapshot::from_bytes(&out_of_window.to_bytes()).is_err());
+
+        // Trailing garbage is rejected.
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(ProductionIndexSnapshot::from_bytes(&padded).is_err());
+    }
     use super::{
         eligible_pairs, service_window_daa, service_window_daa_at, strike_penalty, strike_penalty_at, update_strikes,
         FoldOutcome, ServiceLedger, ServicePenalty, ServiceReward,

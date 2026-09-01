@@ -149,6 +149,8 @@ pub enum DatabaseStorePrefixes {
     ServiceReward = 200,
     /// Canonical service-ledger snapshot at each pruning sample: block hash → encoded state.
     ServiceLedgerSnapshot = 201,
+    /// Canonical production-index snapshot at each pruning sample: block hash → encoded state.
+    ProductionIndexSnapshot = 202,
 
     // ---- Separator ----
     /// Reserved as a separator
