@@ -723,10 +723,11 @@ impl VirtualStateProcessor {
                 let bytes = snapshot.to_bytes();
                 self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
-                let production = self.build_production_snapshot(&*sc, idx, daa);
-                let pbytes = production.to_bytes();
-                self.production_index_hashes.write().insert(*h, ProductionIndexSnapshot::hash_of_bytes(&pbytes));
-                self.production_index_snapshot_store.set(*h, pbytes).unwrap();
+                if let Some(production) = self.build_production_snapshot(&*sc, *h, idx, daa, pruning_point) {
+                    let pbytes = production.to_bytes();
+                    self.production_index_hashes.write().insert(*h, ProductionIndexSnapshot::hash_of_bytes(&pbytes));
+                    self.production_index_snapshot_store.set(*h, pbytes).unwrap();
+                }
                 sampled = true;
             }
         }
@@ -911,16 +912,21 @@ impl VirtualStateProcessor {
         }
     }
 
-    /// Canonical production-index snapshot at chain block `sample_idx` (daa `sample_daa`): the
-    /// per-SPK cumulative baselines at the daa-window bottom plus the sparse entries above it.
+    /// Canonical production-index snapshot at chain block `sample` (index `sample_idx`, daa
+    /// `sample_daa`): the per-SPK cumulative baselines at the daa-window bottom plus the sparse
+    /// entries above it. `None` when the window bottom sits below retained history.
     pub(super) fn build_production_snapshot(
         &self,
         sc: &impl crate::model::stores::selected_chain::SelectedChainStoreReader,
+        sample: Hash,
         sample_idx: u64,
         sample_daa: u64,
-    ) -> ProductionIndexSnapshot {
+        own_pp: Hash,
+    ) -> Option<ProductionIndexSnapshot> {
         let daa_bound = sample_daa.saturating_sub(self.ratio_reward_window_daa);
-        let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, sample_idx, 0);
+        let header_pp = self.headers_store.get_header(sample).unwrap().pruning_point;
+        let pruning_idx = self.window_floor_in_retention(sc, header_pp, own_pp, daa_bound)?;
+        let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, sample_idx, pruning_idx);
         let mut groups = self.windowed_production_prefix_store.dump_window(bottom, sample_idx).unwrap();
         groups.sort_by(|a, b| (a.0.version(), a.0.script()).cmp(&(b.0.version(), b.0.script())));
         let mut snap = ProductionIndexSnapshot {
@@ -933,7 +939,7 @@ impl VirtualStateProcessor {
             snap.floors.push((spk.clone(), base));
             snap.entries.push((spk, points));
         }
-        snap
+        Some(snap)
     }
 
     /// Canonical hash of the persisted production-index snapshot at `sample`, if this node holds

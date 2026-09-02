@@ -1319,6 +1319,41 @@ async fn reward_window_below_the_pruned_horizon_fails_loud() {
     let _ = vp.production_window_ctx(early, 0);
 }
 
+/// A pruning sample on a node whose selected-chain index is pruned below the daa window still
+/// builds its production snapshot from the retained floor; a sample whose whole window sits
+/// below retention yields no snapshot instead of probing pruned indices.
+#[tokio::test]
+async fn production_snapshot_survives_a_pruned_chain_index_floor() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::pruning::PruningStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+    let own_pp = vp.pruning_point_store.read().pruning_point().unwrap();
+
+    let sc = vp.selected_chain_store.read();
+    let (tip_idx, tip) = sc.get_tip().unwrap();
+    let tip_daa = vp.headers_store.get_daa_score(tip).unwrap();
+    let daa_bound = tip_daa - 200;
+    let mut expected = 5;
+    for i in 5..=tip_idx {
+        if vp.headers_store.get_daa_score(sc.get_by_index(i).unwrap()).unwrap() <= daa_bound {
+            expected = i;
+        } else {
+            break;
+        }
+    }
+
+    let snap = vp.build_production_snapshot(&*sc, tip, tip_idx, tip_daa, own_pp).expect("the tip sample must build its snapshot");
+    assert_eq!(snap.sample_index, tip_idx);
+    assert_eq!(snap.bottom_index, expected);
+
+    let early = sc.get_by_index(6).unwrap();
+    let early_daa = vp.headers_store.get_daa_score(early).unwrap();
+    assert!(vp.build_production_snapshot(&*sc, early, 6, early_daa, own_pp).is_none());
+}
+
 #[tokio::test]
 async fn cohort_window_survives_a_pruned_header_pruning_point() {
     let (tc, _db, _handles) = pruned_floor_fixture().await;
