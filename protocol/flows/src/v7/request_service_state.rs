@@ -26,6 +26,10 @@ pub const SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION: u32 = 12;
 /// First protocol version that also takes the production-index snapshot.
 pub const PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION: u32 = 13;
 
+/// First protocol version whose production-index snapshot carries the window daa table; older
+/// peers are served none.
+pub const PRODUCTION_WINDOW_TABLE_PROTOCOL_VERSION: u32 = 14;
+
 pub struct RequestServiceStateFlow {
     ctx: FlowContext,
     router: Arc<Router>,
@@ -66,7 +70,7 @@ impl RequestServiceStateFlow {
         } else {
             None
         };
-        let production = if self.protocol_version >= PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION {
+        let production = if self.protocol_version >= PRODUCTION_WINDOW_TABLE_PROTOCOL_VERSION {
             session.async_get_production_index_snapshot(pruning_point).await?
         } else {
             None

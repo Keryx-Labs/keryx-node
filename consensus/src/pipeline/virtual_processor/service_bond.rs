@@ -934,6 +934,7 @@ impl VirtualStateProcessor {
             sample_index: sample_idx,
             floors: Vec::with_capacity(groups.len()),
             entries: Vec::with_capacity(groups.len()),
+            window_daa: (bottom..=sample_idx).map(|i| self.chain_index_daa(sc, i)).collect(),
         };
         for (spk, base, points) in groups {
             snap.floors.push((spk.clone(), base));
@@ -953,7 +954,45 @@ impl VirtualStateProcessor {
 
     /// DAA score of the oldest sample whose production-index hash this node holds.
     pub(super) fn production_index_floor_daa(&self) -> u64 {
-        self.production_index_hashes.read().keys().filter_map(|s| self.headers_store.get_daa_score(*s).ok()).min().unwrap_or(0)
+        self.production_index_hashes.read().keys().filter_map(|s| self.headers_store.get_daa_score(*s).ok()).min().unwrap_or(u64::MAX)
+    }
+
+    /// Rebuilds, in the current encoding, every persisted v1 snapshot whose window is still
+    /// retained; the others are dropped.
+    fn upgrade_legacy_production_snapshots(&self, own_pp: Option<Hash>, legacy: Vec<Hash>) {
+        if legacy.is_empty() {
+            return;
+        }
+        let sc = self.selected_chain_store.read();
+        let mut upgraded = 0usize;
+        let mut dropped = 0usize;
+        for sample in legacy {
+            let rebuilt = own_pp.filter(|_| !self.in_production_catchup_window()).and_then(|own_pp| {
+                let idx = sc.get_by_hash(sample).ok()?;
+                let daa = self.headers_store.get_daa_score(sample).unwrap();
+                let daa_bound = daa.saturating_sub(self.ratio_reward_window_daa);
+                let header_pp = self.headers_store.get_header(sample).unwrap().pruning_point;
+                let floor = self.window_floor_in_retention(&*sc, header_pp, own_pp, daa_bound)?;
+                let bottom = self.chain_index_at_or_below_daa(&*sc, daa_bound, idx, floor);
+                if sc.get_by_index(bottom).is_err() || self.chain_index_daa(&*sc, bottom) > daa_bound {
+                    return None;
+                }
+                self.build_production_snapshot(&*sc, sample, idx, daa, own_pp)
+            });
+            match rebuilt {
+                Some(snapshot) => {
+                    let bytes = snapshot.to_bytes();
+                    self.production_index_hashes.write().insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+                    self.production_index_snapshot_store.set(sample, bytes).unwrap();
+                    upgraded += 1;
+                }
+                None => {
+                    self.production_index_snapshot_store.delete(sample).unwrap();
+                    dropped += 1;
+                }
+            }
+        }
+        info!("ratio: {} production snapshot(s) rebuilt with the window daa table, {} dropped", upgraded, dropped);
     }
 
     /// Installs an imported production-index snapshot taken at chain block `sample` (the new
@@ -965,27 +1004,43 @@ impl VirtualStateProcessor {
         bytes: Vec<u8>,
         snapshot: ProductionIndexSnapshot,
     ) -> keryx_consensus_core::errors::consensus::ConsensusResult<()> {
-        self.selected_chain_store
-            .read()
-            .get_by_hash(sample)
-            .map_err(|_| keryx_consensus_core::errors::consensus::ConsensusError::General("snapshot sample is not a chain block"))?;
-        self.production_index_hashes.write().insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
-        self.production_index_snapshot_store.set(sample, bytes).unwrap();
+        use crate::model::stores::selected_chain::SelectedChainStore;
+        use keryx_consensus_core::errors::consensus::ConsensusError;
+        if !snapshot.has_window_table() {
+            return Err(ConsensusError::General("production snapshot carries no window table"));
+        }
+        let mut sc = self.selected_chain_store.write();
+        let local_idx = sc.get_by_hash(sample).map_err(|_| ConsensusError::General("snapshot sample is not a chain block"))?;
         let groups: Vec<_> = snapshot
             .floors
             .iter()
             .zip(snapshot.entries.iter())
             .map(|((spk, base), (_, points))| (spk.clone(), *base, points.clone()))
             .collect();
+        let mut rebase_error = None;
         self.windowed_production_prefix_store
             .replace_with_window(&groups, |batch| {
+                if local_idx != snapshot.sample_index
+                    && let Err(e) = sc.rebase_lone_pruning_point(batch, sample, snapshot.sample_index)
+                {
+                    rebase_error = Some(e);
+                    return;
+                }
+                self.production_window_store.install(batch, snapshot.bottom_index, snapshot.sample_index, &snapshot.window_daa).unwrap();
                 self.production_index_seed_store.write().remove_batch(batch).unwrap();
             })
             .unwrap();
+        if rebase_error.is_some() {
+            return Err(ConsensusError::General("production snapshot numbering does not match the local chain"));
+        }
+        drop(sc);
+        self.production_index_hashes.write().insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+        self.production_index_snapshot_store.set(sample, bytes).unwrap();
         info!(
-            "ratio: production index restored from the snapshot at {} ({} producers); coinbase verification is exact from here",
+            "ratio: production index restored from the snapshot at {} ({} producers, chain index {}); coinbase verification is exact from here",
             sample,
-            snapshot.entries.len()
+            snapshot.entries.len(),
+            snapshot.sample_index
         );
         Ok(())
     }
@@ -1100,10 +1155,17 @@ impl VirtualStateProcessor {
         let own_pp = self.pruning_point_store.read().pruning_point().ok();
         let mut phashes = self.production_index_hashes.write();
         phashes.clear();
+        let mut legacy = Vec::new();
         for (sample, bytes) in self.production_index_snapshot_store.entries() {
-            phashes.insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+            match ProductionIndexSnapshot::from_bytes(&bytes) {
+                Ok(snapshot) if snapshot.has_window_table() => {
+                    phashes.insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+                }
+                _ => legacy.push(sample),
+            }
         }
         drop(phashes);
+        self.upgrade_legacy_production_snapshots(own_pp, legacy);
         let mut hashes = self.service_ledger_hashes.write();
         hashes.clear();
         for (sample, bytes) in self.service_ledger_snapshot_store.entries() {
@@ -1114,6 +1176,17 @@ impl VirtualStateProcessor {
                 }
             }
         }
+    }
+
+    /// Highest daa (exclusive) a virtual resolution may reach without a queued service event
+    /// crossing finality inside it, from a sink at `sink_daa`. `None` before the ledger is live.
+    pub(super) fn virtual_batch_daa_cutoff(&self, sink_daa: u64) -> Option<u64> {
+        if !self.pom_v3_activation.is_active(sink_daa) {
+            return None;
+        }
+        let span_cap = sink_daa.saturating_add((self.finality_depth / 8).max(1));
+        let frontier = self.service_ledger.lock().queue.front().map(|(_, daa, _)| daa.saturating_add(self.finality_depth));
+        Some(frontier.map_or(span_cap, |f| f.min(span_cap)))
     }
 
     /// Coinbase mint expectation for a block whose selected parent is `sp`: the reward wins

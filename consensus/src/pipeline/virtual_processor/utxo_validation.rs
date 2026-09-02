@@ -1184,9 +1184,35 @@ impl VirtualStateProcessor {
         own_pp: Hash,
         daa_bound: u64,
     ) -> Option<u64> {
+        if let Some(imported) = self.imported_window_at(sc, own_pp)
+            && self.production_window_store.daa_at(imported.bottom_index).is_some_and(|daa| daa <= daa_bound)
+        {
+            return Some(imported.bottom_index);
+        }
         match sc.get_by_hash(header_pp) {
             Ok(idx) => Some(idx),
             Err(_) => (self.headers_store.get_daa_score(own_pp).unwrap() <= daa_bound).then(|| sc.get_by_hash(own_pp).unwrap()),
+        }
+    }
+
+    /// The imported production window while `own_pp` is still its sample.
+    pub(super) fn imported_window_at(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        own_pp: Hash,
+    ) -> Option<crate::model::stores::production_window::ImportedProductionWindow> {
+        let imported = self.production_window_store.imported()?;
+        (sc.get_by_hash(own_pp).ok() == Some(imported.sample_index)).then_some(imported)
+    }
+
+    /// daa score of selected-chain `index`: from the chain, else from the imported window table.
+    pub(super) fn chain_index_daa(&self, sc: &impl SelectedChainStoreReader, index: u64) -> u64 {
+        match sc.get_by_index(index) {
+            Ok(hash) => self.headers_store.get_daa_score(hash).unwrap(),
+            Err(_) => self
+                .production_window_store
+                .daa_at(index)
+                .unwrap_or_else(|| panic!("selected-chain index {index} is neither retained nor covered by the imported production window")),
         }
     }
 
@@ -1197,7 +1223,7 @@ impl VirtualStateProcessor {
         hi_idx: u64,
         floor_idx: u64,
     ) -> u64 {
-        let daa_at = |i: u64| self.headers_store.get_daa_score(sc.get_by_index(i).unwrap()).unwrap();
+        let daa_at = |i: u64| self.chain_index_daa(sc, i);
         let mut lo = hi_idx.saturating_sub(self.ratio_reward_window_daa).max(floor_idx);
         let mut hi = hi_idx;
         if lo >= hi || daa_at(lo) > bound_daa {

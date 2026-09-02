@@ -69,7 +69,7 @@ use uuid::Uuid;
 /// (`BlockMessage.pom_proof_deduped`) and the requester-declared proof horizon
 /// (`RequestIBDBlocksMessage.pom_proof_min_daa`). Both are negotiated per peer, so a v11 node
 /// still serves the full-path encoding to everything older.
-const PROTOCOL_VERSION: u32 = 13;
+const PROTOCOL_VERSION: u32 = 14;
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -849,7 +849,7 @@ const MINIMUM_KERYXD_PEER_VERSION: (u32, u32, u32) = (1, 5, 3);
 /// Minimum peer version once H10 is active on the local virtual chain.
 const MINIMUM_KERYXD_PEER_VERSION_H10: (u32, u32, u32) = (1, 5, 7);
 /// Minimum peer version once H12 is active on the local virtual chain.
-const MINIMUM_KERYXD_PEER_VERSION_H12: (u32, u32, u32) = (1, 5, 9);
+const MINIMUM_KERYXD_PEER_VERSION_H12: (u32, u32, u32) = (1, 6, 0);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
@@ -938,6 +938,7 @@ impl ConnectionInitializer for FlowContext {
         // Register all flows according to version
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
             v if v >= PROTOCOL_VERSION => (v8::register(self.clone(), router.clone(), PROTOCOL_VERSION), PROTOCOL_VERSION),
+            13 => (v8::register(self.clone(), router.clone(), 13), 13),
             12 => (v8::register(self.clone(), router.clone(), 12), 12),
             11 => (v8::register(self.clone(), router.clone(), 11), 11),
             10 => (v8::register(self.clone(), router.clone(), 10), 10),

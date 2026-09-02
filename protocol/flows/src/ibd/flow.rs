@@ -877,6 +877,18 @@ impl IbdFlow {
         // Headers past `service_ledger_activation` commit rows and snapshot together: such a
         // vote only matches when the peer served the matching snapshot.
         let ledger_hash = snapshot_bytes.as_ref().map(|bytes| ServiceLedgerSnapshot::hash_of_bytes(bytes));
+        // Without the window table the snapshot is not imported; the catch-up window stays in force.
+        let production_bytes = production_bytes.filter(|bytes| match ProductionIndexSnapshot::from_bytes(bytes) {
+            Ok(snapshot) if snapshot.has_window_table() => true,
+            Ok(_) => {
+                warn!("production-index snapshot at {} carries no window table, syncing without it", pruning_point);
+                false
+            }
+            Err(e) => {
+                warn!("production-index snapshot at {} is malformed ({}), syncing without it", pruning_point, e);
+                false
+            }
+        });
         let production_hash = production_bytes.as_ref().map(|bytes| ProductionIndexSnapshot::hash_of_bytes(bytes));
         // A v3 vote (past `production_index_activation`) binds rows, ledger and production
         // together; a v2 vote binds rows and ledger only.
@@ -911,14 +923,6 @@ impl IbdFlow {
         let handoff_rows = rows.len() - prefix_rows;
         consensus.clone().spawn_blocking(move |c| c.import_service_state(rows)).await?;
         info!("imported {} sealed service-state rows ({} verified, {} handoff)", prefix_rows + handoff_rows, prefix_rows, handoff_rows);
-        if let Some(bytes) = snapshot_bytes {
-            if !snapshot_voted {
-                warn!("service-ledger snapshot at {} is not covered by the chain's commitments yet, importing it unverified", pruning_point);
-            }
-            let len = bytes.len();
-            consensus.clone().spawn_blocking(move |c| c.import_service_ledger_snapshot(pruning_point, bytes)).await?;
-            info!("imported the service-ledger snapshot at {} ({} bytes{})", pruning_point, len, if snapshot_voted { ", verified" } else { "" });
-        }
         if let Some(bytes) = production_bytes {
             if !production_voted {
                 warn!(
@@ -934,6 +938,14 @@ impl IbdFlow {
                 len,
                 if production_voted { ", verified" } else { "" }
             );
+        }
+        if let Some(bytes) = snapshot_bytes {
+            if !snapshot_voted {
+                warn!("service-ledger snapshot at {} is not covered by the chain's commitments yet, importing it unverified", pruning_point);
+            }
+            let len = bytes.len();
+            consensus.clone().spawn_blocking(move |c| c.import_service_ledger_snapshot(pruning_point, bytes)).await?;
+            info!("imported the service-ledger snapshot at {} ({} bytes{})", pruning_point, len, if snapshot_voted { ", verified" } else { "" });
         }
         Ok(())
     }

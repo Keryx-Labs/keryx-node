@@ -54,6 +54,7 @@ use crate::{
         window::WindowManager,
     },
 };
+use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath,
     acceptance_data::AcceptanceData,
@@ -154,6 +155,7 @@ pub struct VirtualStateProcessor {
     pub(super) service_reward_store: Arc<crate::model::stores::service_reward::DbServiceRewardStore>,
     pub(super) service_ledger_snapshot_store: Arc<crate::model::stores::service_ledger_snapshot::DbServiceLedgerSnapshotStore>,
     pub(super) production_index_snapshot_store: Arc<crate::model::stores::production_index_snapshot::DbProductionIndexSnapshotStore>,
+    pub(super) production_window_store: Arc<crate::model::stores::production_window::DbProductionWindowStore>,
     /// Canonical hash of each persisted sample snapshot (see `service_ledger_hash_at`).
     pub(super) service_ledger_hashes: RwLock<HashMap<Hash, Hash>>,
     pub(super) production_index_hashes: RwLock<HashMap<Hash, Hash>>,
@@ -385,6 +387,7 @@ impl VirtualStateProcessor {
             service_reward_store: storage.service_reward_store.clone(),
             service_ledger_snapshot_store: storage.service_ledger_snapshot_store.clone(),
             production_index_snapshot_store: storage.production_index_snapshot_store.clone(),
+            production_window_store: storage.production_window_store.clone(),
             service_ledger_hashes: Default::default(),
             production_index_hashes: Default::default(),
             service_imported_producers: Default::default(),
@@ -478,7 +481,7 @@ impl VirtualStateProcessor {
     /// `ratio_reward_window` selected-chain blocks have been committed since the last
     /// pruning-point UTXO import cleared the windowed-production prefix index. `false` if the node
     /// has never imported a snapshot (built from genesis — no gap to begin with).
-    fn in_production_catchup_window(&self) -> bool {
+    pub(super) fn in_production_catchup_window(&self) -> bool {
         let seeded_at = match self.production_index_seed_store.read().get_optional() {
             Some(idx) => idx,
             None => return false,
@@ -503,7 +506,7 @@ impl VirtualStateProcessor {
             let messages: Vec<VirtualStateProcessingMessage> = std::iter::once(msg).chain(self.receiver.try_iter()).collect();
             trace!("virtual processor received {} tasks", messages.len());
 
-            self.resolve_virtual();
+            while self.resolve_virtual() {}
 
             let statuses_read = self.statuses_store.read();
             for msg in messages {
@@ -521,7 +524,9 @@ impl VirtualStateProcessor {
         self.pruning_sender.send(PruningProcessingMessage::Exit).unwrap();
     }
 
-    fn resolve_virtual(self: &Arc<Self>) {
+    /// Resolves virtual over the current tips. Returns true when the resolution was cut short
+    /// of the tips so the service ledger can flush before the rest is validated: call again.
+    fn resolve_virtual(self: &Arc<Self>) -> bool {
         let pruning_point = self.pruning_point_store.read().pruning_point().unwrap();
         let virtual_read = self.virtual_stores.upgradable_read();
         let prev_state = virtual_read.state.get().unwrap();
@@ -548,6 +553,7 @@ impl VirtualStateProcessor {
             .collect_vec();
         drop(prune_guard);
         let prev_sink = prev_state.ghostdag_data.selected_parent;
+        let (tips, cut) = self.cut_tips_at_ledger_frontier(tips, prev_sink);
         let mut accumulated_diff = prev_state.utxo_diff.clone().to_reversed();
 
         let (new_sink, virtual_parent_candidates) =
@@ -615,6 +621,7 @@ impl VirtualStateProcessor {
                 )))
                 .expect("expecting an open unbounded channel");
         }
+        cut
     }
 
     pub(crate) fn virtual_finality_point(&self, virtual_ghostdag_data: &GhostdagData, pruning_point: Hash) -> Hash {
@@ -1198,6 +1205,28 @@ impl VirtualStateProcessor {
     /// The function returns with `diff` being the diff of the new sink from previous virtual.
     /// In addition to the found sink the function also returns a queue of additional virtual
     /// parent candidates ordered in descending blue work order.
+    /// Keeps the resolution below the service-ledger flush frontier: when a tip lies at or past
+    /// it, the tips collapse to the last chain block of the heaviest such tip below the frontier
+    /// (at least the block above `prev_sink`). Returns the tips and whether they were cut.
+    fn cut_tips_at_ledger_frontier(&self, tips: Vec<Hash>, prev_sink: Hash) -> (Vec<Hash>, bool) {
+        let sink_daa = self.headers_store.get_daa_score(prev_sink).unwrap();
+        let Some(cutoff) = self.virtual_batch_daa_cutoff(sink_daa) else { return (tips, false) };
+        let daa = |h: Hash| self.headers_store.get_daa_score(h).unwrap();
+        let Some(best) = tips.iter().copied().filter(|h| daa(*h) >= cutoff).max_by_key(|h| self.ghostdag_store.get_blue_work(*h).unwrap())
+        else {
+            return (tips, false);
+        };
+        let mut cut = best;
+        while daa(cut) >= cutoff {
+            let parent = self.ghostdag_store.get_selected_parent(cut).unwrap();
+            if parent.is_origin() || parent == prev_sink {
+                break;
+            }
+            cut = parent;
+        }
+        (vec![cut], true)
+    }
+
     pub(super) fn sink_search_algorithm(
         &self,
         stores: &VirtualStores,
@@ -1877,6 +1906,7 @@ impl VirtualStateProcessor {
             // import point (baseline immaterial — `windowed` is a difference), and the fast-sync
             // catch-up window trusts the coinbase until it has refilled past the import point.
             self.windowed_production_prefix_store.clear(&mut batch);
+            self.production_window_store.clear(&mut batch);
             self.production_index_seed_store.write().set_batch(&mut batch, production_seed_index).unwrap();
             for (spk, amount) in balances {
                 self.address_balance_store.set_batch(&mut batch, &spk, amount).unwrap();

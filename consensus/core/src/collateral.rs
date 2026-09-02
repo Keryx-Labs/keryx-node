@@ -1004,6 +1004,29 @@ impl<'a> Reader<'a> {
     }
 }
 
+fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn read_uvarint(r: &mut Reader<'_>) -> Result<u64, String> {
+    let mut v: u64 = 0;
+    for shift in (0..64).step_by(7) {
+        let b = r.u8()?;
+        v |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            if b == 0 && shift > 0 {
+                return Err("non-canonical varint".into());
+            }
+            return Ok(v);
+        }
+    }
+    Err("varint overflow".into())
+}
+
 fn put_hashes(out: &mut Vec<u8>, hashes: &[Hash]) {
     out.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
     for h in hashes {
@@ -1247,11 +1270,12 @@ pub fn service_commitment_v3(rows: Hash, ledger: Hash, production: Hash) -> Hash
     Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
 }
 
-const PRODUCTION_SNAPSHOT_ENCODING_VERSION: u8 = 1;
+const PRODUCTION_SNAPSHOT_ENCODING_V1: u8 = 1;
+const PRODUCTION_SNAPSHOT_ENCODING_V2: u8 = 2;
 
 /// Canonical snapshot of the ratio-reward production index at a pruning sample: per-SPK cumulative
-/// production at the window bottom (`floors`) plus the sparse prefix entries inside the window,
-/// both sorted by canonical SPK bytes.
+/// production at the window bottom (`floors`), the sparse prefix entries inside the window, both
+/// sorted by canonical SPK bytes, and the daa score of every chain index in the window.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProductionIndexSnapshot {
     /// Chain index of the window bottom the floors are cumulative at.
@@ -1263,12 +1287,20 @@ pub struct ProductionIndexSnapshot {
     /// `(spk, entries)` with entries `(chain_index, cumulative)` strictly increasing in
     /// `(bottom_index, sample_index]`; groups sorted by (version, script).
     pub entries: Vec<(ScriptPublicKey, Vec<(u64, u64)>)>,
+    /// daa score of chain indices `bottom_index..=sample_index`, strictly increasing; empty on a
+    /// v1 snapshot.
+    pub window_daa: Vec<u64>,
 }
 
 impl ProductionIndexSnapshot {
+    /// Whether the snapshot carries the window daa table.
+    pub fn has_window_table(&self) -> bool {
+        !self.window_daa.is_empty()
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(PRODUCTION_SNAPSHOT_ENCODING_VERSION);
+        out.push(if self.window_daa.is_empty() { PRODUCTION_SNAPSHOT_ENCODING_V1 } else { PRODUCTION_SNAPSHOT_ENCODING_V2 });
         out.extend_from_slice(&self.bottom_index.to_le_bytes());
         out.extend_from_slice(&self.sample_index.to_le_bytes());
         out.extend_from_slice(&(self.floors.len() as u32).to_le_bytes());
@@ -1285,15 +1317,28 @@ impl ProductionIndexSnapshot {
                 out.extend_from_slice(&cum.to_le_bytes());
             }
         }
+        if let Some((first, rest)) = self.window_daa.split_first() {
+            out.extend_from_slice(&(self.window_daa.len() as u32).to_le_bytes());
+            out.extend_from_slice(&first.to_le_bytes());
+            let mut prev = *first;
+            for daa in rest {
+                put_uvarint(&mut out, daa - prev);
+                prev = *daa;
+            }
+        }
         out
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { bytes, pos: 0 };
-        if r.u8()? != PRODUCTION_SNAPSHOT_ENCODING_VERSION {
+        let version = r.u8()?;
+        if version != PRODUCTION_SNAPSHOT_ENCODING_V1 && version != PRODUCTION_SNAPSHOT_ENCODING_V2 {
             return Err("unknown production snapshot version".into());
         }
         let mut snap = Self { bottom_index: r.u64()?, sample_index: r.u64()?, ..Default::default() };
+        if snap.sample_index < snap.bottom_index {
+            return Err("malformed production window".into());
+        }
         let n = r.u32()?;
         for _ in 0..n {
             let spk = read_spk(&mut r)?;
@@ -1323,6 +1368,23 @@ impl ProductionIndexSnapshot {
             }
             snap.entries.push((spk, points));
         }
+        if version == PRODUCTION_SNAPSHOT_ENCODING_V2 {
+            let n = r.u32()? as u64;
+            if n == 0 || n != snap.sample_index - snap.bottom_index + 1 {
+                return Err("malformed production window table".into());
+            }
+            let mut daa = r.u64()?;
+            snap.window_daa.reserve(n as usize);
+            snap.window_daa.push(daa);
+            for _ in 1..n {
+                let delta = read_uvarint(&mut r)?;
+                if delta == 0 {
+                    return Err("non-increasing production window table".into());
+                }
+                daa = daa.checked_add(delta).ok_or("production window table overflow")?;
+                snap.window_daa.push(daa);
+            }
+        }
         if r.pos != bytes.len() {
             return Err("trailing bytes".into());
         }
@@ -1330,6 +1392,14 @@ impl ProductionIndexSnapshot {
             return Err("non-canonical production snapshot".into());
         }
         Ok(snap)
+    }
+
+    /// daa score of chain index `index`, when the window table covers it.
+    pub fn window_daa_at(&self, index: u64) -> Option<u64> {
+        if index < self.bottom_index {
+            return None;
+        }
+        self.window_daa.get((index - self.bottom_index) as usize).copied()
     }
 
     /// Domain-separated digest of the canonical bytes.
@@ -1414,11 +1484,35 @@ mod tests {
             sample_index: 250,
             floors: vec![(spk_a.clone(), 7), (spk_b.clone(), 0)],
             entries: vec![(spk_a.clone(), vec![(101, 9), (240, 12)]), (spk_b.clone(), vec![(250, 3)])],
+            window_daa: vec![],
         };
         let bytes = snap.to_bytes();
+        assert_eq!(bytes[0], 1, "a snapshot without the table keeps the legacy encoding and hash");
         let decoded = ProductionIndexSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, snap);
         assert_eq!(ProductionIndexSnapshot::hash_of_bytes(&bytes), snap.hash());
+
+        // With the window daa table: v2 encoding, a different hash, exact round trip.
+        let tabled = ProductionIndexSnapshot { window_daa: (0..=150u64).map(|i| 1_000 + i * 5).collect(), ..snap.clone() };
+        let tbytes = tabled.to_bytes();
+        assert_eq!(tbytes[0], 2);
+        assert_ne!(ProductionIndexSnapshot::hash_of_bytes(&tbytes), snap.hash());
+        assert_eq!(ProductionIndexSnapshot::from_bytes(&tbytes).unwrap(), tabled);
+        assert_eq!(tabled.window_daa_at(100), Some(1_000));
+        assert_eq!(tabled.window_daa_at(250), Some(1_750));
+        assert_eq!(tabled.window_daa_at(99), None);
+        assert_eq!(tabled.window_daa_at(251), None);
+        // Large deltas exercise multi-byte varints.
+        let wide = ProductionIndexSnapshot { window_daa: (0..=150u64).map(|i| 1 << 40 | i * 300).collect(), ..snap.clone() };
+        assert_eq!(ProductionIndexSnapshot::from_bytes(&wide.to_bytes()).unwrap(), wide);
+
+        // A table that does not cover exactly [bottom, sample] is rejected.
+        let short = ProductionIndexSnapshot { window_daa: vec![1, 2, 3], ..snap.clone() };
+        assert!(ProductionIndexSnapshot::from_bytes(&short.to_bytes()).is_err());
+        // A non-increasing table is rejected.
+        let mut flat = tabled.clone();
+        flat.window_daa[10] = flat.window_daa[9];
+        assert!(ProductionIndexSnapshot::from_bytes(&flat.to_bytes()).is_err());
 
         // An empty snapshot is valid and hashes deterministically (the genesis commitment).
         let empty = ProductionIndexSnapshot::default();
@@ -1430,6 +1524,7 @@ mod tests {
             sample_index: 250,
             floors: vec![(spk_b.clone(), 0), (spk_a.clone(), 7)],
             entries: vec![],
+            window_daa: vec![],
         };
         assert!(ProductionIndexSnapshot::from_bytes(&unsorted.to_bytes()).is_err());
 
@@ -1439,6 +1534,7 @@ mod tests {
             sample_index: 250,
             floors: vec![],
             entries: vec![(spk_a, vec![(100, 5)])],
+            window_daa: vec![],
         };
         assert!(ProductionIndexSnapshot::from_bytes(&out_of_window.to_bytes()).is_err());
 

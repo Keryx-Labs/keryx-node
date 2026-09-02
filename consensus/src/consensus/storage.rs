@@ -94,6 +94,7 @@ pub struct ConsensusStorage {
     pub service_reward_store: Arc<crate::model::stores::service_reward::DbServiceRewardStore>,
     pub service_ledger_snapshot_store: Arc<crate::model::stores::service_ledger_snapshot::DbServiceLedgerSnapshotStore>,
     pub production_index_snapshot_store: Arc<crate::model::stores::production_index_snapshot::DbProductionIndexSnapshotStore>,
+    pub production_window_store: Arc<crate::model::stores::production_window::DbProductionWindowStore>,
     /// RAM-only sealed service-state commitment index; rebuilt from the two stores at boot,
     /// advanced at every finality flush, read by template build and body validation.
     pub service_commit_index: Arc<crate::processes::service_commit::ServiceCommitIndex>,
@@ -294,6 +295,7 @@ impl ConsensusStorage {
             Arc::new(crate::model::stores::service_ledger_snapshot::DbServiceLedgerSnapshotStore::new(db.clone()));
         let production_index_snapshot_store =
             Arc::new(crate::model::stores::production_index_snapshot::DbProductionIndexSnapshotStore::new(db.clone()));
+        let production_window_store = Arc::new(crate::model::stores::production_window::DbProductionWindowStore::new(db.clone()));
 
         // Tips
         let headers_selected_tip_store = Arc::new(RwLock::new(DbHeadersSelectedTipStore::new(db.clone())));
@@ -342,6 +344,7 @@ impl ConsensusStorage {
             service_reward_store,
             service_ledger_snapshot_store,
             production_index_snapshot_store,
+            production_window_store,
             service_commit_index,
             past_pruning_points_store,
             daa_excluded_store,

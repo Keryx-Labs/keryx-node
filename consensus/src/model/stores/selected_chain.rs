@@ -26,6 +26,8 @@ pub trait SelectedChainStore: SelectedChainStoreReader {
     fn apply_changes(&mut self, batch: &mut WriteBatch, changes: &ChainPath) -> StoreResult<()>;
     fn prune_below_point(&mut self, writer: impl DbWriter, block: Hash) -> StoreResult<()>;
     fn init_with_pruning_point(&mut self, batch: &mut WriteBatch, block: Hash) -> StoreResult<()>;
+    /// Moves a chain holding only `block` at index 0 to `index`. Errors if any other block is indexed.
+    fn rebase_lone_pruning_point(&mut self, batch: &mut WriteBatch, block: Hash, index: u64) -> StoreResult<()>;
 }
 
 /// A DB + cache implementation of `SelectedChainStore` trait, with concurrent readers support.
@@ -123,6 +125,21 @@ impl SelectedChainStore for DbSelectedChainStore {
         self.access_index_by_hash.write(BatchDbWriter::new(batch), block, 0)?;
         self.access_hash_by_index.write(BatchDbWriter::new(batch), 0.into(), block)?;
         self.access_highest_index.write(BatchDbWriter::new(batch), &0).unwrap();
+        Ok(())
+    }
+
+    fn rebase_lone_pruning_point(&mut self, batch: &mut WriteBatch, block: Hash, index: u64) -> StoreResult<()> {
+        let (tip_index, tip) = self.get_tip()?;
+        if tip_index != 0 || tip != block || self.get_by_hash(block)? != 0 {
+            return Err(StoreError::DataInconsistency("cannot rebase a populated selected chain".into()));
+        }
+        if index == 0 {
+            return Ok(());
+        }
+        self.access_index_by_hash.write(BatchDbWriter::new(batch), block, index)?;
+        self.access_hash_by_index.delete(BatchDbWriter::new(batch), 0.into())?;
+        self.access_hash_by_index.write(BatchDbWriter::new(batch), index.into(), block)?;
+        self.access_highest_index.write(BatchDbWriter::new(batch), &index)?;
         Ok(())
     }
 }

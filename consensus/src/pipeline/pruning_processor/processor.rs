@@ -191,6 +191,12 @@ impl PruningProcessor {
         let Some(pruning_idx) = self.selected_chain_store.read().get_by_hash(pruning_point).optional().unwrap() else {
             return; // pruning point not yet indexed on the selected chain
         };
+        if self.production_window_store.imported().is_some_and(|imported| imported.sample_index != pruning_idx) {
+            let mut batch = WriteBatch::default();
+            self.production_window_store.clear(&mut batch);
+            self.db.write(batch).unwrap();
+            debug!("Imported production window table dropped: pruning point moved past its sample");
+        }
         let floor_index = pruning_idx.saturating_sub(w);
         if floor_index == 0 {
             return; // the whole chain is still within one ratio window of the pruning point

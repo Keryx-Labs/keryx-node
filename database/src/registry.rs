@@ -151,6 +151,11 @@ pub enum DatabaseStorePrefixes {
     ServiceLedgerSnapshot = 201,
     /// Canonical production-index snapshot at each pruning sample: block hash → encoded state.
     ProductionIndexSnapshot = 202,
+    /// Window daa table of the production-index snapshot imported at the pruning point:
+    /// be(chain index) → daa score.
+    ProductionWindowDaa = 203,
+    /// Bounds (bottom, sample chain indices) of that imported window.
+    ProductionImportedWindow = 204,
 
     // ---- Separator ----
     /// Reserved as a separator

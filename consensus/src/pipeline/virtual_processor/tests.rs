@@ -1581,3 +1581,137 @@ async fn cohort_below_the_pruned_horizon_reads_the_imported_producers() {
     assert_eq!(vp.service_eligible_miners_windowed(early, 1, 100), vec![(id, escrow)]);
     assert!(vp.service_eligible_miners_windowed(early, 2, 100).is_empty());
 }
+
+/// A node that imports the production snapshot at its pruning point with no history below it
+/// (chain store holding only the pruning point at index 0) rebases to the network numbering,
+/// resolves window bottoms below the pruning point from the imported daa table, verifies the
+/// first blocks after the pruning point without trust, and rebuilds the next sample's snapshot
+/// byte-identical to the node that never pruned.
+#[tokio::test]
+async fn fresh_node_import_rebases_and_verifies_exactly() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::production_seed::ProductionIndexSeedStore;
+    use crate::model::stores::pruning::PruningStore;
+    use crate::model::stores::selected_chain::{SelectedChainStore, SelectedChainStoreReader};
+    use crate::pipeline::virtual_processor::utxo_validation::ProductionWindowCtx;
+    use keryx_consensus_core::collateral::ProductionIndexSnapshot;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::ChainPath;
+    use keryx_database::prelude::ConnBuilder;
+    use rocksdb::WriteBatch;
+
+    const WINDOW: u64 = 20;
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_level_activation = ForkActivation::always();
+            p.pom_v3_activation = ForkActivation::always();
+            p.blockrate.finality_depth = 10;
+            p.ratio_reward_window_daa = WINDOW;
+        })
+        .build();
+    let (db_lifetime, db) = keryx_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+    let (dummy_sender, _receiver) = async_channel::unbounded();
+    let tc = TestConsensus::with_db(db.clone(), &config, dummy_sender);
+    std::mem::forget(db_lifetime);
+    let handles = tc.init();
+
+    // Block hashes in a range no other test uses.
+    const BASE: u64 = 7_000_000;
+    let block = |n: u64| Hash::from(BASE + n);
+    let mut parent = config.genesis.hash;
+    for n in 1..=60u64 {
+        tc.add_utxo_valid_block_with_parents(block(n), vec![parent], vec![]).await.unwrap();
+        parent = block(n);
+    }
+    let vp = tc.virtual_processor().clone();
+
+    // Two consecutive samples deep enough that both windows start above genesis.
+    let samples: Vec<Hash> = (1..=60u64).map(block).filter(|h| vp.is_pruning_sample_block(*h)).collect();
+    let pos = samples
+        .iter()
+        .position(|h| vp.selected_chain_store.read().get_by_hash(*h).unwrap() >= 2 * WINDOW)
+        .expect("a sample two windows in");
+    let (sample, next_sample) = (samples[pos], samples[pos + 1]);
+    let sample_idx = vp.selected_chain_store.read().get_by_hash(sample).unwrap();
+    let next_idx = vp.selected_chain_store.read().get_by_hash(next_sample).unwrap();
+    let (tip_idx, _) = vp.selected_chain_store.read().get_tip().unwrap();
+    assert!(tip_idx > next_idx, "the chain must extend past the next sample");
+
+    // Reference values from the node that built everything from genesis.
+    let bytes = vp.production_index_snapshot_store.get(sample).unwrap().expect("the sample carries its snapshot");
+    let snapshot = ProductionIndexSnapshot::from_bytes(&bytes).unwrap();
+    assert!(snapshot.has_window_table(), "snapshots must carry the window daa table");
+    assert_eq!(snapshot.sample_index, sample_idx);
+    assert_eq!(snapshot.window_daa.len() as u64, sample_idx - snapshot.bottom_index + 1);
+    let next_bytes = vp.production_index_snapshot_store.get(next_sample).unwrap().unwrap();
+    let spks: Vec<_> = snapshot.entries.iter().map(|(spk, _)| spk.clone()).collect();
+    assert!(!spks.is_empty());
+    let probes: Vec<Hash> = ((sample_idx + 1)..=next_idx).map(|i| vp.selected_chain_store.read().get_by_index(i).unwrap()).collect();
+    let mut reference = Vec::new();
+    for m_sp in probes.iter() {
+        let ctx = vp.production_window_ctx(*m_sp, 0);
+        let ProductionWindowCtx::OnChain { m_idx, bottom } = ctx else { panic!("committed chain block") };
+        let values: Vec<u64> = spks.iter().map(|spk| vp.windowed_production_with_ctx(spk, &ctx)).collect();
+        reference.push((m_idx, bottom, values));
+    }
+    // The first probe's window bottom lies below the sample: the imported table must serve it.
+    assert!(reference[0].1 < sample_idx);
+
+    // Simulate the fast-sync import: the chain store holds only the pruning point at index 0,
+    // the prefix index and window table are empty, the catch-up marker is set.
+    {
+        let mut batch = WriteBatch::default();
+        vp.selected_chain_store.write().init_with_pruning_point(&mut batch, sample).unwrap();
+        vp.windowed_production_prefix_store.clear(&mut batch);
+        vp.production_window_store.clear(&mut batch);
+        vp.production_index_seed_store.write().set_batch(&mut batch, 0).unwrap();
+        db.write(batch).unwrap();
+    }
+    vp.pruning_point_store.write().set(sample, 1).unwrap();
+    assert!(vp.in_production_catchup_window());
+    assert_eq!(vp.selected_chain_store.read().get_tip().unwrap(), (0, sample));
+
+    vp.install_production_index_snapshot(sample, bytes.clone(), snapshot.clone()).unwrap();
+    assert_eq!(vp.selected_chain_store.read().get_tip().unwrap(), (sample_idx, sample));
+    assert_eq!(vp.selected_chain_store.read().get_by_hash(sample).unwrap(), sample_idx);
+    assert!(!vp.in_production_catchup_window(), "an exact import lifts the catch-up trust");
+    assert_eq!(vp.production_window_store.daa_at(snapshot.bottom_index), Some(snapshot.window_daa[0]));
+    assert_eq!(vp.production_window_store.daa_at(sample_idx), Some(*snapshot.window_daa.last().unwrap()));
+
+    // Replay the chain above the pruning point the way virtual resolution does.
+    {
+        let path = ChainPath { added: ((sample_idx + 1)..=tip_idx).map(block).collect(), removed: vec![] };
+        let mut batch = WriteBatch::default();
+        let mut sc = vp.selected_chain_store.write();
+        vp.advance_production_prefix(&mut batch, &path, &*sc);
+        sc.apply_changes(&mut batch, &path).unwrap();
+        drop(sc);
+        db.write(batch).unwrap();
+    }
+    // Chain index == block number on this linear chain.
+    assert_eq!(vp.selected_chain_store.read().get_by_hash(next_sample).unwrap(), next_idx);
+
+    // Windows reaching below the pruning point resolve without trust, with the same bottoms and
+    // the same values as the never-pruned node.
+    for (m_sp, (m_idx, bottom, values)) in probes.iter().zip(reference.iter()) {
+        let ctx = vp.production_window_ctx(*m_sp, 0);
+        let ProductionWindowCtx::OnChain { m_idx: got_idx, bottom: got_bottom } = ctx else { panic!("committed chain block") };
+        assert_eq!((got_idx, got_bottom), (*m_idx, *bottom));
+        let got: Vec<u64> = spks.iter().map(|spk| vp.windowed_production_with_ctx(spk, &ctx)).collect();
+        assert_eq!(&got, values);
+    }
+
+    // The next sample's snapshot is byte-identical, table included.
+    let sc = vp.selected_chain_store.read();
+    let next_daa = vp.headers_store.get_daa_score(next_sample).unwrap();
+    let rebuilt = vp.build_production_snapshot(&*sc, next_sample, next_idx, next_daa, sample).expect("the window is covered");
+    assert_eq!(rebuilt.to_bytes(), next_bytes);
+    drop(sc);
+
+    // A legacy snapshot (no table) is refused: the flow keeps such a node in catch-up trust.
+    let legacy = ProductionIndexSnapshot { window_daa: vec![], ..snapshot.clone() };
+    assert!(vp.install_production_index_snapshot(sample, legacy.to_bytes(), legacy).is_err());
+
+    tc.shutdown(handles);
+}
