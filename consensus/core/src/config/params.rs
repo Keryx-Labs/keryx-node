@@ -210,8 +210,8 @@ pub const TESTNET_H10_ACTIVATION_DAA: u64 = 1;
 pub const H11_ACTIVATION_DAA: u64 = 89_120_000;
 
 /// H12: production-index snapshot commitment (`production_index_activation`). Node-only.
-/// Targets 2026-09-04 ~16:00 UTC (from daa 89_060_852 at 2026-09-01 17:01 UTC, ~10.1 daa/s).
-pub const H12_ACTIVATION_DAA: u64 = 91_650_000;
+/// Targets 2026-09-05 ~16:00 UTC (from daa 89_706_379 at 2026-09-02 09:42 UTC, ~10.1 daa/s).
+pub const H12_ACTIVATION_DAA: u64 = 92_550_000;
 
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
