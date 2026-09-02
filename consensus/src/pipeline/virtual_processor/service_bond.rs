@@ -1,25 +1,22 @@
 use super::VirtualStateProcessor;
-use crate::processes::service_commit;
 use crate::model::stores::{
     acceptance_data::AcceptanceDataStoreReader, block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader,
-    ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, pruning::PruningStoreReader,
-    selected_chain::SelectedChainStoreReader,
+    ghostdag::GhostdagStoreReader, headers::HeaderStoreReader, pruning::PruningStoreReader, selected_chain::SelectedChainStoreReader,
 };
+use crate::processes::service_commit;
+use keryx_consensus_core::ChainPath;
+use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
-    ProductionIndexSnapshot, ServiceLedgerSnapshot,
-    ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
-    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
+    EscrowClaim, FoldOutcome, ProductionIndexSnapshot, RewardEntry, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2,
+    SERVICE_SUSPENSION_DAA, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot,
+    StrikeEntry, eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
-use keryx_consensus_core::ChainPath;
-use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{info, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
 use keryx_txscript::script_class::ScriptClass;
-
 
 /// The escrow pubkey locked by a CSV escrow script, if the script is one.
 fn csv_escrow_pubkey(script: &[u8]) -> Option<[u8; 32]> {
@@ -159,11 +156,7 @@ pub(super) struct ServiceLedgerSync {
 }
 
 /// Logs the misses of one fold that have not been logged yet.
-fn log_new_service_misses(
-    logged: &mut std::collections::HashMap<(Hash, [u8; 32], u32), u64>,
-    daa: u64,
-    misses: &[ServiceMiss],
-) {
+fn log_new_service_misses(logged: &mut std::collections::HashMap<(Hash, [u8; 32], u32), u64>, daa: u64, misses: &[ServiceMiss]) {
     for miss in misses.iter() {
         if logged.insert((miss.miner, miss.request_hash, miss.consecutive_misses), daa).is_some() {
             continue;
@@ -214,10 +207,22 @@ impl VirtualStateProcessor {
     /// set. Empty if `seed` is not a committed chain block.
     #[allow(dead_code)] // consumed by the coming penalty/RPC layer; exercised by tests today
     pub(crate) fn service_eligible_miners_windowed(&self, seed: Hash, target_tier: u8, window_daa: u64) -> Vec<(Hash, Hash)> {
-        // Read before the chain lock so the two locks are never held in inverse order.
-        let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
-        let sc = self.selected_chain_store.read();
-        self.service_eligible_miners_in(&*sc, seed, target_tier, window_daa, own_pp)
+        // Keep pruning point and chain view atomic (pruning -> chain order) to
+        // avoid the stale-pp race that caused the utxo KeyNotFound panic. Use
+        // try_read for the second lock to avoid deadlock with any inverse-order
+        // reader.
+        let (pp_guard, sc, own_pp) = loop {
+            let pp_guard = self.pruning_point_store.read();
+            let own_pp = pp_guard.pruning_point().unwrap();
+            if let Some(sc) = self.selected_chain_store.try_read() {
+                break (pp_guard, sc, own_pp);
+            }
+            drop(pp_guard);
+            std::hint::spin_loop();
+        };
+        let res = self.service_eligible_miners_in(&*sc, seed, target_tier, window_daa, own_pp);
+        drop(pp_guard);
+        res
     }
 
     fn service_eligible_miners_in(
@@ -442,7 +447,8 @@ impl VirtualStateProcessor {
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa));
+        let (requests, request_rewards, responses) =
+            self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa));
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -454,13 +460,7 @@ impl VirtualStateProcessor {
         };
         if live && !requests.is_empty() {
             for (rh, tier, max_tokens) in requests.iter() {
-                info!(
-                    "service-bond: request {} accepted at daa {}, tier {}, max_tokens {}",
-                    hex::encode(rh),
-                    daa,
-                    tier,
-                    max_tokens
-                );
+                info!("service-bond: request {} accepted at daa {}, tier {}, max_tokens {}", hex::encode(rh), daa, tier, max_tokens);
             }
         }
         let eligibility_window = if self.service_bond_v2_activation.is_active(daa) {
@@ -521,17 +521,43 @@ impl VirtualStateProcessor {
         hi_idx: u64,
         floor_idx: u64,
     ) -> u64 {
-        let daa_at = |i: u64| self.headers_store.get_daa_score(sc.get_by_index(i).unwrap()).unwrap();
+        // Defensive mirror of the ratio variant: a missing index is below retention.
+        // Service windows below the horizon arm empty via the caller (see
+        // service_eligible_miners_in), so a missing probe here is a bug and must
+        // panic — but with the pruned-horizon message rather than a raw
+        // KeyNotFound(ChainHashByIndex/0). Never reached for a correct floor
+        // (W < pruning_depth), so consensus unchanged.
+        let daa_at = |i: u64| -> Option<u64> {
+            match sc.get_by_index(i) {
+                Ok(h) => Some(self.headers_store.get_daa_score(h).unwrap()),
+                Err(keryx_database::prelude::StoreError::KeyNotFound(_)) => None,
+                Err(e) => panic!("unexpected selected_chain error at index {i}: {e}"),
+            }
+        };
         let (mut lo, mut hi) = (floor_idx, hi_idx);
-        if lo >= hi || daa_at(lo) > bound_daa {
+        match daa_at(lo) {
+            Some(d) if d <= bound_daa => {}
+            Some(_) => return lo,
+            None => panic!(
+                "service window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir (missing chain index {lo}, floor {floor_idx}, hi {hi_idx})"
+            ),
+        }
+        if lo >= hi {
             return lo;
         }
         while lo < hi {
             let mid = lo + (hi - lo + 1) / 2;
-            if daa_at(mid) <= bound_daa {
-                lo = mid
-            } else {
-                hi = mid - 1
+            match daa_at(mid) {
+                Some(d) => {
+                    if d <= bound_daa {
+                        lo = mid
+                    } else {
+                        hi = mid - 1
+                    }
+                }
+                None => panic!(
+                    "service window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir (missing chain index {mid}, floor {floor_idx}, hi {hi_idx})"
+                ),
             }
         }
         lo
@@ -558,9 +584,8 @@ impl VirtualStateProcessor {
         };
         let to_daa = self.headers_store.get_daa_score(to_hash).unwrap();
         ledger.set_base(std::sync::Arc::new(self.load_strike_base()));
-        ledger.set_first_seen_base(std::sync::Arc::new(
-            self.service_standing.read().first_seen.iter().map(|(k, v)| (*k, *v)).collect(),
-        ));
+        ledger
+            .set_first_seen_base(std::sync::Arc::new(self.service_standing.read().first_seen.iter().map(|(k, v)| (*k, *v)).collect()));
         // One burnable window below the persisted frontier keeps every pending request and vault
         // claim readable at the frontier warm. A frontier of zero (nothing persisted yet) falls
         // back to the finality anchor: everything above it is re-derived.
@@ -586,7 +611,11 @@ impl VirtualStateProcessor {
             if let Some(snapshot) = restored {
                 ledger.restore_snapshot(&snapshot);
                 bottom = sample_idx;
-                info!("service-bond: refold from the snapshot at chain index {} (daa {})", sample_idx, self.headers_store.get_daa_score(sample_hash).unwrap());
+                info!(
+                    "service-bond: refold from the snapshot at chain index {} (daa {})",
+                    sample_idx,
+                    self.headers_store.get_daa_score(sample_hash).unwrap()
+                );
             }
         }
         if bottom == pruning_idx && pruning_idx > 0 {
@@ -784,12 +813,7 @@ impl VirtualStateProcessor {
                         ));
                     }
                     if !miss.burned.is_empty() {
-                        info!(
-                            "service-bond: burn FINAL for miner {} — {} claims, miss daa {}",
-                            miss.miner,
-                            miss.burned.len(),
-                            daa
-                        );
+                        info!("service-bond: burn FINAL for miner {} — {} claims, miss daa {}", miss.miner, miss.burned.len(), daa);
                     }
                     // Mirror the fold: an executed suspension logs as `{0, daa}` — the streak
                     // restarts, the daa keeps the rate-limit armed and re-derives the deadline.
@@ -800,7 +824,12 @@ impl VirtualStateProcessor {
                     };
                     if self.service_standing.write().record_strike(miss.miner, daa, record.count, record.last_daa) {
                         self.service_strike_store.set(daa, miss.miner, record).unwrap();
-                        self.service_commit_index.add_row(&service_commit::strike_row_bytes(daa, miss.miner, record.count, record.last_daa));
+                        self.service_commit_index.add_row(&service_commit::strike_row_bytes(
+                            daa,
+                            miss.miner,
+                            record.count,
+                            record.last_daa,
+                        ));
                     }
                     // A third strike, now reorg-immune, suspends the miner's production. The
                     // deadline is derived from the miss's own daa (deterministic), and the full
@@ -999,11 +1028,10 @@ impl VirtualStateProcessor {
         bytes: Vec<u8>,
         snapshot: ServiceLedgerSnapshot,
     ) -> keryx_consensus_core::errors::consensus::ConsensusResult<()> {
-        let sample_idx = self
-            .selected_chain_store
-            .read()
-            .get_by_hash(sample)
-            .map_err(|_| keryx_consensus_core::errors::consensus::ConsensusError::General("snapshot sample is not a chain block"))?;
+        let sample_idx =
+            self.selected_chain_store.read().get_by_hash(sample).map_err(|_| {
+                keryx_consensus_core::errors::consensus::ConsensusError::General("snapshot sample is not a chain block")
+            })?;
         let sample_daa = self.headers_store.get_daa_score(sample).unwrap();
         self.service_ledger_hashes.write().insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
         self.service_ledger_snapshot_store.set(sample, bytes).unwrap();

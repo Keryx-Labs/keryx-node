@@ -1,14 +1,21 @@
 use super::VirtualStateProcessor;
+use crate::model::stores::address_amount::AddressAmountStoreReader;
+use crate::model::stores::age_buckets::{AgeBuckets, AgeBucketsStoreReader};
+use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
+use crate::model::stores::maturation_queue::{DbMaturationQueueStore, MaturationEntry};
+use crate::model::stores::pom_tier::PomTierStoreReader;
+use crate::model::stores::pruning::PruningStoreReader;
+use crate::model::stores::selected_chain::SelectedChainStoreReader;
+use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use crate::{
     errors::{
         BlockProcessResult,
         RuleError::{
-            AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
-            AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
-            AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
-            BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot, MissingServiceLedgerSnapshot,
-            WrongHeaderPruningPoint,
+            AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward, AiRequestInferenceRewardBelowMinimum,
+            AiRequestInvalidEscrowScript, AiRequestMaxTokensExceeded, AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
+            AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot, BadCoinbaseTransaction,
+            BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot,
+            MissingServiceLedgerSnapshot, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -25,17 +32,12 @@ use crate::{
         },
     },
 };
-use crate::model::stores::address_amount::AddressAmountStoreReader;
-use crate::model::stores::age_buckets::{AgeBuckets, AgeBucketsStoreReader};
-use crate::model::stores::maturation_queue::{DbMaturationQueueStore, MaturationEntry};
-use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
-use crate::model::stores::pom_tier::PomTierStoreReader;
-use crate::model::stores::pruning::PruningStoreReader;
-use crate::model::stores::selected_chain::SelectedChainStoreReader;
-use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
-use keryx_database::prelude::StoreResultExt;
+use keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
+use keryx_consensus_core::config::params::{
+    INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2,
+    tier_reward_bps,
+};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
     acceptance_data::{AcceptedTxEntry, MergesetBlockAcceptanceData},
@@ -54,8 +56,8 @@ use keryx_consensus_core::{
     },
 };
 use keryx_core::{debug, info, trace, warn};
+use keryx_database::prelude::{StoreError, StoreResultExt};
 use keryx_hashes::Hash;
-use keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
@@ -243,8 +245,7 @@ impl VirtualStateProcessor {
             });
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
-            let escrow_spk =
-                self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data, pov_daa_score);
+            let escrow_spk = self.coinbase_manager.parse_escrow_from_extra_data(coinbase_data.miner_data.extra_data, pov_daa_score);
             ctx.mergeset_rewards.insert(
                 merged_block,
                 BlockRewardData::new_with_escrow(
@@ -379,7 +380,9 @@ impl VirtualStateProcessor {
         {
             let mut lines: Vec<&str> = Vec::new();
             if header.daa_score == self.pom_activation.daa_score() {
-                lines.push("  PoM           — Proof-of-Model mining live; kHeavyHash retired (1 GPU = 1 tier); non-PoM miners rejected");
+                lines.push(
+                    "  PoM           — Proof-of-Model mining live; kHeavyHash retired (1 GPU = 1 tier); non-PoM miners rejected",
+                );
             }
             if header.daa_score == self.opoi_v2_activation.daa_score() {
                 lines.push("  OPoI v2       — uncensored model lineup now enforced");
@@ -476,7 +479,9 @@ impl VirtualStateProcessor {
         {
             info!("════════════════ KERYX HARDFORK H12 · DAA {} ════════════════", self.production_index_activation.daa_score());
             info!("  Ratio index   — production prefix snapshot at each pruning sample, committed in `serviceStateHash`");
-            info!("  Sync          — a fresh node imports the index with the pruning point (protocol v13); ratio verification exact from the first block");
+            info!(
+                "  Sync          — a fresh node imports the index with the pruning point (protocol v13); ratio verification exact from the first block"
+            );
         }
 
         // H6 banner. Same latching shape as the others — fires once, on the first block at or
@@ -504,9 +509,18 @@ impl VirtualStateProcessor {
         {
             info!("════════════════ KERYX HARDFORK H7 · DAA {} ════════════════", self.service_bond_v2_activation.daa_score());
             info!("  Service bond  — v2: the audit stops striking miners for losing a race");
-            info!("  Window        — every cohort member gets a {} DAA base (~5 min) to see and serve a request", keryx_consensus_core::collateral::SERVICE_WINDOW_BASE_DAA_V2);
-            info!("  Cohort        — eligibility tightens to {} DAA past the last proven tier block", keryx_consensus_core::collateral::SERVICE_ELIGIBILITY_WINDOW_DAA_V2);
-            info!("  First miss    — uniform {}-claim burn; a young identity no longer loses its whole vault", keryx_consensus_core::collateral::STRIKE_1_BURN_CLAIMS);
+            info!(
+                "  Window        — every cohort member gets a {} DAA base (~5 min) to see and serve a request",
+                keryx_consensus_core::collateral::SERVICE_WINDOW_BASE_DAA_V2
+            );
+            info!(
+                "  Cohort        — eligibility tightens to {} DAA past the last proven tier block",
+                keryx_consensus_core::collateral::SERVICE_ELIGIBILITY_WINDOW_DAA_V2
+            );
+            info!(
+                "  First miss    — uniform {}-claim burn; a young identity no longer loses its whole vault",
+                keryx_consensus_core::collateral::STRIKE_1_BURN_CLAIMS
+            );
             info!("  Standing      — probation-only: a strike keeps its burn but no longer demotes the reward rate");
             info!("  Rate-limit    — a served response no longer disarms the one-strike-per-interval limit");
             info!("  Miners        — unchanged: no model or walk changes, existing rigs keep mining");
@@ -520,7 +534,10 @@ impl VirtualStateProcessor {
             info!("════════════════ KERYX HARDFORK H8 · DAA {} ════════════════", self.reward_routing_activation.daa_score());
             info!("  Inference     — the reward goes to the FIRST miner whose response is accepted, not a client-designated key");
             info!("  Requests      — lock their reward in a keyless vault output; no answer within the horizon = burned");
-            info!("  Coinbase      — mints finalized rewards to the winner's payout address (up to {} per block)", keryx_consensus_core::collateral::MAX_REWARD_MINTS_PER_BLOCK);
+            info!(
+                "  Coinbase      — mints finalized rewards to the winner's payout address (up to {} per block)",
+                keryx_consensus_core::collateral::MAX_REWARD_MINTS_PER_BLOCK
+            );
             info!("  Miners        — unchanged: no model or walk changes, existing rigs keep mining");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
@@ -550,10 +567,7 @@ impl VirtualStateProcessor {
         // OPoI Phase 3 hardfork: enforce model capability declarations after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
             if header.daa_score == self.model_cap_enforcement_activation.daa_score() {
-                info!(
-                    "=== OPoI HARDFORK ACTIVATED at DAA {} — UTXO escrow + model cap enforcement now live ===",
-                    header.daa_score
-                );
+                info!("=== OPoI HARDFORK ACTIVATED at DAA {} — UTXO escrow + model cap enforcement now live ===", header.daa_score);
             }
             self.check_ai_response_model_caps(&txs)?;
 
@@ -566,7 +580,11 @@ impl VirtualStateProcessor {
             // disqualification, are unchanged, so patched and unpatched nodes agree and no gate
             // is needed. (The complementary fix is upstream — keeping such a tx out of the
             // mempool so honest miners never include it and lose their block.)
-            check_ai_request_payload_rules_all(&txs, self.ai_reward_minimums(header.daa_score), self.reward_routing_activation.is_active(header.daa_score))?;
+            check_ai_request_payload_rules_all(
+                &txs,
+                self.ai_reward_minimums(header.daa_score),
+                self.reward_routing_activation.is_active(header.daa_score),
+            )?;
         }
 
         // Verify all transactions are valid in context
@@ -580,7 +598,12 @@ impl VirtualStateProcessor {
 
         // Enforce AiRequest inference_reward minimums and fee coverage after activation.
         if self.model_cap_enforcement_activation.is_active(header.daa_score) {
-            check_ai_request_inference_rewards(&txs, &validated_transactions, self.ai_reward_minimums(header.daa_score), self.reward_routing_activation.is_active(header.daa_score))?;
+            check_ai_request_inference_rewards(
+                &txs,
+                &validated_transactions,
+                self.ai_reward_minimums(header.daa_score),
+                self.reward_routing_activation.is_active(header.daa_score),
+            )?;
         }
 
         Ok(())
@@ -747,10 +770,8 @@ impl VirtualStateProcessor {
         }
         // Reward schedule gated per block by daa_score (5-tier H6 once pom_v3 is live, else 5-tier H2,
         // else legacy 4-tier), keyed on this block's own daa_score to match `pom_tiers` under IBD.
-        let schedule = tier_reward_bps(
-            self.very_light_activation.is_active(pov_daa_score),
-            self.pom_v3_activation.is_active(pov_daa_score),
-        );
+        let schedule =
+            tier_reward_bps(self.very_light_activation.is_active(pov_daa_score), self.pom_v3_activation.is_active(pov_daa_score));
         // H6: the tier bonus is gated on standing — an identity in probation earns the floor
         // rate whatever tier it proves, so rotating identities forfeits the bonus for the whole
         // probation. Before service_bond_v2 a strike as of the lagged anchor also demotes.
@@ -879,8 +900,15 @@ impl VirtualStateProcessor {
                         let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
                         debug!(
                             "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={} spk_ver={} spk={}",
-                            pov_daa_score, blue, sp_idx, balance, prefix, prod_floor,
-                            map.get(blue).copied().unwrap_or(0), spk.version(), spk_hex
+                            pov_daa_score,
+                            blue,
+                            sp_idx,
+                            balance,
+                            prefix,
+                            prod_floor,
+                            map.get(blue).copied().unwrap_or(0),
+                            spk.version(),
+                            spk_hex
                         );
                     }
                 }
@@ -932,7 +960,11 @@ impl VirtualStateProcessor {
                         if prefix != truth {
                             warn!(
                                 "RATIO-SELFCHECK MISMATCH (prefix) daa={} blue={} prefix_prod={} direct_prod={} drift={}",
-                                pov_daa_score, blue, prefix, truth, prefix as i128 - truth as i128
+                                pov_daa_score,
+                                blue,
+                                prefix,
+                                truth,
+                                prefix as i128 - truth as i128
                             );
                         }
                     }
@@ -972,12 +1004,7 @@ impl VirtualStateProcessor {
         if self.pom_level_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
             let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
             let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
-            ghostdag_data
-                .mergeset_blues
-                .iter()
-                .filter(|b| !non_daa.contains(b))
-                .filter_map(|b| self.block_production(*b))
-                .collect()
+            ghostdag_data.mergeset_blues.iter().filter(|b| !non_daa.contains(b)).filter_map(|b| self.block_production(*b)).collect()
         } else {
             self.block_production(hash).into_iter().collect()
         }
@@ -1098,22 +1125,32 @@ impl VirtualStateProcessor {
     ///
     /// Both eras keep the pruning-point clamp (option C, see `windowed_production_for_block`).
     pub(super) fn production_window_ctx(&self, m_sp: Hash, w: u64) -> ProductionWindowCtx {
-        // Read before the chain lock so the two locks are never held in inverse order.
-        let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
-        let sc = self.selected_chain_store.read();
+        // Acquire both locks in pruning -> chain order, using try_read for the
+        // second to avoid deadlock with any inverse-order (chain -> pruning)
+        // reader. The original code read pruning, dropped, then read chain,
+        // which allowed a stale pruning point to be paired with a newer chain
+        // view — the root cause of the KeyNotFound(ChainHashByIndex/0) panic
+        // (stale own_pp + unwrap_or(0) floor). Holding both keeps them atomic.
+        let (pp_guard, sc, own_pp) = loop {
+            let pp_guard = self.pruning_point_store.read();
+            let own_pp = pp_guard.pruning_point().unwrap();
+            if let Some(sc) = self.selected_chain_store.try_read() {
+                break (pp_guard, sc, own_pp);
+            }
+            drop(pp_guard);
+            std::hint::spin_loop();
+        };
         let m_sp_header = self.headers_store.get_header(m_sp).unwrap();
         let h3 = self.pom_level_activation.is_active(m_sp_header.daa_score);
         // H3 window bottom in daa units — entries strictly above this daa are inside the window.
         let daa_bound = m_sp_header.daa_score.saturating_sub(self.ratio_reward_window_daa);
         let pruning_idx = self.reward_window_floor(&*sc, m_sp_header.pruning_point, own_pp, daa_bound);
+        drop(pp_guard);
         if let Ok(m_idx) = sc.get_by_hash(m_sp) {
             // Case A: m_sp is a committed chain block.
-            let bottom = if h3 {
-                self.chain_index_at_or_below_daa(&*sc, daa_bound, m_idx, pruning_idx)
-            } else {
-                m_idx.saturating_sub(w)
-            }
-            .max(pruning_idx);
+            let bottom =
+                if h3 { self.chain_index_at_or_below_daa(&*sc, daa_bound, m_idx, pruning_idx) } else { m_idx.saturating_sub(w) }
+                    .max(pruning_idx);
             return ProductionWindowCtx::OnChain { m_idx, bottom };
         }
         // Case B: m_sp is on a side chain. Reconstruct its window = committed-prefix part + side delta.
@@ -1130,11 +1167,7 @@ impl VirtualStateProcessor {
         // (legacy: index > lo; H3: the block's own daa above the daa bound).
         let mut side_by_spk: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
         for (k, h) in chain_path.added.iter().enumerate() {
-            let in_window = if h3 {
-                self.headers_store.get_daa_score(*h).unwrap() > daa_bound
-            } else {
-                common + 1 + k as u64 > lo
-            };
+            let in_window = if h3 { self.headers_store.get_daa_score(*h).unwrap() > daa_bound } else { common + 1 + k as u64 > lo };
             if in_window {
                 for (s, cut) in self.block_productions_cached(*h).iter() {
                     *side_by_spk.entry(s.clone()).or_default() += cut;
@@ -1169,7 +1202,14 @@ impl VirtualStateProcessor {
     ) -> u64 {
         self.window_floor_in_retention(sc, header_pp, own_pp, daa_bound).unwrap_or_else(|| {
             if self.trust_coinbase() {
-                return sc.get_by_hash(own_pp).unwrap_or(0);
+                // own_pp is the node's pruning point; it must be on the selected chain.
+                // With the pp_guard held in production_window_ctx the stale-pp race is
+                // closed, so this unwrap must succeed. Keep the panic message distinct
+                // from the 0-fallback that previously masked the bug and caused a later
+                // ChainHashByIndex/0 panic.
+                return sc
+                    .get_by_hash(own_pp)
+                    .unwrap_or_else(|_| panic!("trusted window floor: pruning point {own_pp} not on selected chain — retry or resync"));
             }
             panic!("the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir")
         })
@@ -1186,7 +1226,13 @@ impl VirtualStateProcessor {
     ) -> Option<u64> {
         match sc.get_by_hash(header_pp) {
             Ok(idx) => Some(idx),
-            Err(_) => (self.headers_store.get_daa_score(own_pp).unwrap() <= daa_bound).then(|| sc.get_by_hash(own_pp).unwrap()),
+            Err(_) => {
+                if self.headers_store.get_daa_score(own_pp).unwrap() <= daa_bound {
+                    sc.get_by_hash(own_pp).ok()
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -1197,15 +1243,59 @@ impl VirtualStateProcessor {
         hi_idx: u64,
         floor_idx: u64,
     ) -> u64 {
-        let daa_at = |i: u64| self.headers_store.get_daa_score(sc.get_by_index(i).unwrap()).unwrap();
+        // Non-consensus-change defensive layer: the original unwrap on
+        // `sc.get_by_index(i)` panicked with KeyNotFound(ChainHashByIndex/0)
+        // when the floor was stale (0) after a pruning race. For a correct
+        // floor (pruning point, guaranteed retained because W < pruning_depth)
+        // every probe is present and this path is never hit, so the consensus
+        // result is unchanged. A missing index means the search stepped below
+        // retention: for a trusted node we clamp to the floor, for a
+        // non-trusted node we fail loud exactly like reward_window_floor.
+        let daa_at = |i: u64| -> Option<u64> {
+            match sc.get_by_index(i) {
+                Ok(h) => Some(self.headers_store.get_daa_score(h).unwrap()),
+                Err(StoreError::KeyNotFound(_)) => None,
+                Err(e) => panic!("unexpected selected_chain error at index {i}: {e}"),
+            }
+        };
         let mut lo = hi_idx.saturating_sub(self.ratio_reward_window_daa).max(floor_idx);
         let mut hi = hi_idx;
-        if lo >= hi || daa_at(lo) > bound_daa {
+        match daa_at(lo) {
+            Some(d) if d <= bound_daa => {}
+            Some(_) => return lo,
+            None => {
+                if self.trust_coinbase() {
+                    return floor_idx;
+                }
+                panic!(
+                    "the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir (missing chain index {lo}, floor {floor_idx}, hi {hi_idx})"
+                )
+            }
+        }
+        if lo >= hi {
             return lo;
         }
         while lo < hi {
             let mid = lo + (hi - lo + 1) / 2;
-            if daa_at(mid) <= bound_daa { lo = mid } else { hi = mid - 1 }
+            match daa_at(mid) {
+                Some(d) => {
+                    if d <= bound_daa {
+                        lo = mid
+                    } else {
+                        hi = mid - 1
+                    }
+                }
+                None => {
+                    if self.trust_coinbase() {
+                        // Missing mid is below retention — the whole upper half is
+                        // also below; clamp. Mirrors the lo-missing case.
+                        return floor_idx;
+                    }
+                    panic!(
+                        "the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir (missing chain index {mid}, floor {floor_idx}, hi {hi_idx})"
+                    )
+                }
+            }
         }
         lo
     }
@@ -1232,7 +1322,6 @@ impl VirtualStateProcessor {
             }
         }
     }
-
 
     /// Ratio-reward (Stage 2b) — advances the balance index by `diff`, keeping it in lockstep with
     /// the virtual UTXO set (called from `commit_virtual_state` with the same `accumulated_diff`, in
@@ -1316,7 +1405,9 @@ impl VirtualStateProcessor {
                     amount: entry.amount,
                     anchor: entry.effective_daa,
                 };
-                self.maturation_queue_store.insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued).unwrap();
+                self.maturation_queue_store
+                    .insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued)
+                    .unwrap();
             } else {
                 d.1 += entry.amount as i128;
                 d.2 += (entry.amount as i128) * (entry.effective_daa as i128);
@@ -1326,7 +1417,9 @@ impl VirtualStateProcessor {
                     amount: entry.amount,
                     anchor: entry.effective_daa,
                 };
-                self.maturation_queue_store.insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued).unwrap();
+                self.maturation_queue_store
+                    .insert_batch(batch, entry.effective_daa + self.coin_age_maturity_w, outpoint, queued)
+                    .unwrap();
             }
         }
         deltas.retain(|_, d| *d != (0, 0, 0));
@@ -1379,8 +1472,7 @@ impl VirtualStateProcessor {
             // Fold all demotions by SPK first. The old implementation performed one
             // age-bucket read/modify/write per queued coin; during IBD re-anchors this
             // can serialize a large maturation range on the virtual-processor thread.
-            let mut demotions: std::collections::HashMap<ScriptPublicKey, (u64, u128)> =
-                std::collections::HashMap::new();
+            let mut demotions: std::collections::HashMap<ScriptPublicKey, (u64, u128)> = std::collections::HashMap::new();
 
             for (raw, due) in self.maturation_queue_store.due_range(new_daa_score, watermark) {
                 // Pure re-add (spent-after-maturing restore) — skip, `apply_age_diff` re-adds the
@@ -1392,7 +1484,12 @@ impl VirtualStateProcessor {
                     continue;
                 }
 
-                debug!("coin-age sweep: demote {} anchor {} spk {}", due.amount, due.anchor, hex::encode(due.script_public_key.script()));
+                debug!(
+                    "coin-age sweep: demote {} anchor {} spk {}",
+                    due.amount,
+                    due.anchor,
+                    hex::encode(due.script_public_key.script())
+                );
                 let d = demotions.entry(due.script_public_key.clone()).or_default();
                 d.0 = d.0.saturating_add(due.amount);
                 d.1 = d.1.saturating_add((due.amount as u128).saturating_mul(due.anchor as u128));
@@ -1428,8 +1525,7 @@ impl VirtualStateProcessor {
         }
 
         // Fold all promotions by SPK, then read/modify/write each age bucket once.
-        let mut promotions: std::collections::HashMap<ScriptPublicKey, (u64, u128)> =
-            std::collections::HashMap::new();
+        let mut promotions: std::collections::HashMap<ScriptPublicKey, (u64, u128)> = std::collections::HashMap::new();
 
         for (_, due) in self.maturation_queue_store.due_range(watermark, new_daa_score) {
             debug!("coin-age sweep: promote {} anchor {} spk {}", due.amount, due.anchor, hex::encode(due.script_public_key.script()));
@@ -1454,10 +1550,7 @@ impl VirtualStateProcessor {
                 if b.b_imm < amount || b.a_imm < weighted_anchor {
                     warn!(
                         "coin-age sweep: promotion underflows the immature bucket (b_imm {} < {} or a_imm {} < {}) — clamping; queue entries with no backing coin (ghost)",
-                        b.b_imm,
-                        amount,
-                        b.a_imm,
-                        weighted_anchor
+                        b.b_imm, amount, b.a_imm, weighted_anchor
                     );
                 }
 
@@ -1751,20 +1844,15 @@ impl VirtualStateProcessor {
 
                 // Extract request_hash and claimed_commitment for Phase 3 C fraud verification.
                 // Commitment = sha2-256 digest embedded in the IPFS multihash (bytes [2..34]).
-                let (request_hash, claimed_commitment) =
-                    if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-                        let commitment: [u8; 32] = resp.response_ipfs_cid[2..34].try_into().unwrap();
-                        (resp.request_hash, commitment)
-                    } else {
-                        ([0u8; 32], [0u8; 32])
-                    };
-
-                let record = AiResponseRecord {
-                    inclusion_blue_score: pov_daa_score,
-                    coinbase_tx_id,
-                    request_hash,
-                    claimed_commitment,
+                let (request_hash, claimed_commitment) = if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
+                    let commitment: [u8; 32] = resp.response_ipfs_cid[2..34].try_into().unwrap();
+                    (resp.request_hash, commitment)
+                } else {
+                    ([0u8; 32], [0u8; 32])
                 };
+
+                let record =
+                    AiResponseRecord { inclusion_blue_score: pov_daa_score, coinbase_tx_id, request_hash, claimed_commitment };
                 // Log only the first registration of a given response_hash. The same
                 // AiResponse is re-included in many block bodies across the DAG, so an
                 // unconditional log spams INFO once per body. The .set() itself stays
@@ -1809,8 +1897,8 @@ const HISTORICAL_ANCHOR_OVERRIDES: &[(Hash, u32, u64)] = &[(
     // aeb4e536e444210419a3bf2fae8e582816ad36339be0f429c0eaac611e3bcab3:1 — spent at DAA 74807554
     // committing anchor 74780462; re-derivation yields 74780464.
     Hash::from_bytes([
-        0xae, 0xb4, 0xe5, 0x36, 0xe4, 0x44, 0x21, 0x04, 0x19, 0xa3, 0xbf, 0x2f, 0xae, 0x8e, 0x58, 0x28, 0x16, 0xad, 0x36, 0x33,
-        0x9b, 0xe0, 0xf4, 0x29, 0xc0, 0xea, 0xac, 0x61, 0x1e, 0x3b, 0xca, 0xb3,
+        0xae, 0xb4, 0xe5, 0x36, 0xe4, 0x44, 0x21, 0x04, 0x19, 0xa3, 0xbf, 0x2f, 0xae, 0x8e, 0x58, 0x28, 0x16, 0xad, 0x36, 0x33, 0x9b,
+        0xe0, 0xf4, 0x29, 0xc0, 0xea, 0xac, 0x61, 0x1e, 0x3b, 0xca, 0xb3,
     ]),
     1,
     74780462,
@@ -1887,7 +1975,11 @@ fn check_ai_request_payload_rules_all(txs: &[Transaction], minimums: &[([u8; 32]
 /// Same rules for a SINGLE transaction, with no block around it — the entry point used by mempool
 /// admission (`validate_mempool_transaction_impl`) so a transaction that would poison every block
 /// including it never reaches a template. A non-`AiRequest` transaction passes untouched.
-pub(super) fn check_ai_request_tx_payload_rules(tx: &Transaction, minimums: &[([u8; 32], u64)], routed: bool) -> BlockProcessResult<()> {
+pub(super) fn check_ai_request_tx_payload_rules(
+    tx: &Transaction,
+    minimums: &[([u8; 32], u64)],
+    routed: bool,
+) -> BlockProcessResult<()> {
     if !tx.is_ai_request() {
         return Ok(());
     }
@@ -1985,8 +2077,7 @@ fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     }
 
     // blake2b(AiRequest_payload)[0..32] → model_id
-    let mut request_model_map: std::collections::HashMap<[u8; 32], [u8; 32]> =
-        std::collections::HashMap::new();
+    let mut request_model_map: std::collections::HashMap<[u8; 32], [u8; 32]> = std::collections::HashMap::new();
     for tx in txs.iter().skip(1) {
         if tx.is_ai_request() {
             if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
@@ -2148,8 +2239,7 @@ mod tests {
     /// value — the two things the H8 routing branch decides on.
     fn ai_request_with_escrow(model_id: [u8; 32], inference_reward: u64, value: u64, script: ScriptPublicKey) -> Transaction {
         let req = AiRequestPayload::new(model_id, 100, inference_reward, 30_000_000, b"test prompt".to_vec());
-        let outputs =
-            vec![TransactionOutput::new(1, ScriptPublicKey::new(0, vec![].into())), TransactionOutput::new(value, script)];
+        let outputs = vec![TransactionOutput::new(1, ScriptPublicKey::new(0, vec![].into())), TransactionOutput::new(value, script)];
         Transaction::new(0, vec![], outputs, 0, subnets::SUBNETWORK_ID_AI_REQUEST, 0, req.serialize())
     }
 
@@ -2175,10 +2265,7 @@ mod tests {
         let base = 400_000_000u64;
         let reward = routed_reward(base);
         let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward, csv_p2pk_script())];
-        assert!(matches!(
-            check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true),
-            Err(AiRequestInvalidEscrowScript(_))
-        ));
+        assert!(matches!(check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true), Err(AiRequestInvalidEscrowScript(_))));
     }
 
     #[test]
@@ -2187,10 +2274,7 @@ mod tests {
         let base = 400_000_000u64;
         let reward = routed_reward(base);
         let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward, vault_script())];
-        assert!(matches!(
-            check_ai_request_payload_rules_all(&txs, &[(model_id, base)], false),
-            Err(AiRequestInvalidEscrowScript(_))
-        ));
+        assert!(matches!(check_ai_request_payload_rules_all(&txs, &[(model_id, base)], false), Err(AiRequestInvalidEscrowScript(_))));
     }
 
     /// The vault is matched on script *and* version: the coinbase mint reads the canonical form
@@ -2202,10 +2286,7 @@ mod tests {
         let reward = routed_reward(base);
         let odd_version = ScriptPublicKey::new(1, keryx_inference::INFERENCE_VAULT_SCRIPT.to_vec().into());
         let txs = vec![make_coinbase_no_caps(), ai_request_with_escrow(model_id, reward, reward, odd_version)];
-        assert!(matches!(
-            check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true),
-            Err(AiRequestInvalidEscrowScript(_))
-        ));
+        assert!(matches!(check_ai_request_payload_rules_all(&txs, &[(model_id, base)], true), Err(AiRequestInvalidEscrowScript(_))));
     }
 
     /// The mint pays `inference_reward`, so a vault holding less than that would mint coins the
@@ -2410,4 +2491,3 @@ mod tests {
         });
     }
 }
-
