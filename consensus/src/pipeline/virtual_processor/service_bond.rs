@@ -214,9 +214,7 @@ impl VirtualStateProcessor {
     /// set. Empty if `seed` is not a committed chain block.
     #[allow(dead_code)] // consumed by the coming penalty/RPC layer; exercised by tests today
     pub(crate) fn service_eligible_miners_windowed(&self, seed: Hash, target_tier: u8, window_daa: u64) -> Vec<(Hash, Hash)> {
-        // Read before the chain lock so the two locks are never held in inverse order.
-        let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
-        let sc = self.selected_chain_store.read();
+        let (own_pp, sc) = self.retained_pruning_point_and_chain();
         self.service_eligible_miners_in(&*sc, seed, target_tier, window_daa, own_pp)
     }
 
@@ -566,7 +564,7 @@ impl VirtualStateProcessor {
         // back to the finality anchor: everything above it is re-derived.
         let start = if cursor_daa > 0 { cursor_daa } else { to_daa.saturating_sub(self.finality_depth) };
         let daa_bound = start.saturating_sub(self.service_burnable_window_daa);
-        let pruning_idx = sc.get_by_hash(pruning_point).unwrap_or(0);
+        let pruning_idx = sc.get_by_hash(pruning_point).expect("the pruning point is on the retained selected chain");
         let mut bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
         // A persisted sample snapshot at or below `to` is the exact state there: restore it and
         // fold only what lies above.
@@ -643,8 +641,8 @@ impl VirtualStateProcessor {
     /// right after the virtual state is committed, so the selected-chain store reflects the new
     /// chain. Reorgs restore the snapshot at the common ancestor; a cold start or a reorg deeper
     /// than the retained snapshots refolds the horizon.
-    pub(super) fn advance_service_ledger(&self, chain_path: &ChainPath, pruning_point: Hash) {
-        let sc = self.selected_chain_store.read();
+    pub(super) fn advance_service_ledger(&self, chain_path: &ChainPath, _pruning_point: Hash) {
+        let (pruning_point, sc) = self.retained_pruning_point_and_chain();
         let (tip_idx, tip_hash) = sc.get_tip().unwrap();
         if !self.pom_v3_activation.is_active(self.headers_store.get_daa_score(tip_hash).unwrap()) {
             return;

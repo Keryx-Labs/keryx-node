@@ -31,7 +31,7 @@ use crate::model::stores::maturation_queue::{DbMaturationQueueStore, MaturationE
 use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiResponseStoreReader};
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::pruning::PruningStoreReader;
-use crate::model::stores::selected_chain::SelectedChainStoreReader;
+use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
 use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
@@ -902,8 +902,7 @@ impl VirtualStateProcessor {
                     prefix_vals.insert(*blue, v.max(prod_floor));
                 }
             }
-            let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
-            let sc = self.selected_chain_store.read();
+            let (own_pp, sc) = self.retained_pruning_point_and_chain();
             if let Ok(sp_idx) = sc.get_by_hash(ghostdag_data.selected_parent) {
                 // Era-aware window bottom (exclusive), mirroring `production_window_ctx`:
                 // legacy = last `w` chain blocks; H3 = daa-sized window found by binary search.
@@ -1098,9 +1097,7 @@ impl VirtualStateProcessor {
     ///
     /// Both eras keep the pruning-point clamp (option C, see `windowed_production_for_block`).
     pub(super) fn production_window_ctx(&self, m_sp: Hash, w: u64) -> ProductionWindowCtx {
-        // Read before the chain lock so the two locks are never held in inverse order.
-        let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
-        let sc = self.selected_chain_store.read();
+        let (own_pp, sc) = self.retained_pruning_point_and_chain();
         let m_sp_header = self.headers_store.get_header(m_sp).unwrap();
         let h3 = self.pom_level_activation.is_active(m_sp_header.daa_score);
         // H3 window bottom in daa units — entries strictly above this daa are inside the window.
@@ -1169,10 +1166,25 @@ impl VirtualStateProcessor {
     ) -> u64 {
         self.window_floor_in_retention(sc, header_pp, own_pp, daa_bound).unwrap_or_else(|| {
             if self.trust_coinbase() {
-                return sc.get_by_hash(own_pp).unwrap_or(0);
+                return sc.get_by_hash(own_pp).expect("the pruning point is on the retained selected chain");
             }
             panic!("the validation window reaches below the pruned horizon; local history cannot revalidate it — resync from a fresh datadir")
         })
+    }
+
+    /// The pruning point together with a selected-chain read guard that contains it. The two
+    /// stores are read in the pruner's lock order and re-read until they agree.
+    pub(super) fn retained_pruning_point_and_chain(&self) -> (Hash, parking_lot::RwLockReadGuard<'_, DbSelectedChainStore>) {
+        for _ in 0..10_000 {
+            let own_pp = self.pruning_point_store.read().pruning_point().unwrap();
+            let sc = self.selected_chain_store.read();
+            if sc.get_by_hash(own_pp).is_ok() {
+                return (own_pp, sc);
+            }
+            drop(sc);
+            std::thread::yield_now();
+        }
+        panic!("the pruning point never appeared on the retained selected chain");
     }
 
     /// Fallible form of [`Self::reward_window_floor`]: `None` when the window bottom itself sits
