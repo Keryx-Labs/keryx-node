@@ -1287,6 +1287,153 @@ impl Deserializer for GetHeadersResponse {
     }
 }
 
+/// Holder-reward bracket state of one payout address. `next_bracket_bps`/`next_bracket_balance`
+/// are both `None` exactly when the address already sits in the top bracket.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetHolderRewardRequest {
+    pub address: RpcAddress,
+}
+
+impl GetHolderRewardRequest {
+    pub fn new(address: RpcAddress) -> Self {
+        Self { address }
+    }
+}
+
+impl Serializer for GetHolderRewardRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcAddress, &self.address, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetHolderRewardRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let address = load!(RpcAddress, reader)?;
+
+        Ok(Self { address })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetHolderRewardResponse {
+    pub virtual_daa_score: u64,
+    /// Ratio numerator: the coin-age effective balance (the plain balance pre-H4). Reads below
+    /// the spendable balance while coins are still ripening.
+    pub eff_balance: u64,
+    /// Windowed production before the one-block floor; zero means "not a miner in this window".
+    pub production_raw: u64,
+    /// The denominator actually used (floored at one block's base miner cut).
+    pub production: u64,
+    pub bracket_bps: u64,
+    pub next_bracket_bps: Option<u64>,
+    /// Effective balance that reaches `next_bracket_bps`.
+    pub next_bracket_balance: Option<u64>,
+    pub full_bracket_balance: u64,
+    pub window_daa: u64,
+    /// False before `ratio_reward_activation`: the miner cut is unscaled and the bracket figures
+    /// are informational only.
+    pub active: bool,
+    /// Miner cut actually PAID over the window (post tier/ratio scaling) — mining income, as
+    /// opposed to `production_raw`, which is only the entitlement.
+    pub paid: u64,
+    /// `production_raw − paid`: the shortfall the brackets destroyed.
+    pub burned: u64,
+    /// Escrow slice that accrued over the window; 0 for a standard miner, whose escrow is burned
+    /// at emission. CSV-locked and still forfeitable to a service penalty until claimed.
+    pub escrow: u64,
+    /// Inference-reward mints routed to this address over the window — income won by serving an
+    /// inference, outside the base entitlement the brackets scale.
+    pub inference: u64,
+    /// Daa actually spanned by `paid`, `burned`, `escrow` and `inference` — NOT necessarily
+    /// `window_daa`. Those four come from display-only indexes maintained forward from the boot
+    /// that created them, so a node that has just built them covers only the daa since; it equals
+    /// `window_daa` once a full window has elapsed, and 0 means no coverage. Label the income
+    /// figures with this, never with `window_daa`.
+    pub income_window_daa: u64,
+    /// Base miner cut over `income_window_daa` split by the proven model tier that earned it —
+    /// the MIX, indexed by tier (5 buckets today). Reported as buckets, not a single tier: rigs
+    /// run different models, so a window is a blend and any one tier named for it would be false.
+    /// Take shares over the SUM of these, never over the entitlement — a pre-PoM block has no
+    /// resolvable tier and is left out.
+    pub tier_base: Vec<u64>,
+}
+
+impl Serializer for GetHolderRewardResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // v2 appended `income_window_daa`; v3 appended `tier_base`.
+        store!(u16, &3, writer)?;
+        store!(u64, &self.virtual_daa_score, writer)?;
+        store!(u64, &self.eff_balance, writer)?;
+        store!(u64, &self.production_raw, writer)?;
+        store!(u64, &self.production, writer)?;
+        store!(u64, &self.bracket_bps, writer)?;
+        store!(Option<u64>, &self.next_bracket_bps, writer)?;
+        store!(Option<u64>, &self.next_bracket_balance, writer)?;
+        store!(u64, &self.full_bracket_balance, writer)?;
+        store!(u64, &self.window_daa, writer)?;
+        store!(bool, &self.active, writer)?;
+        store!(u64, &self.paid, writer)?;
+        store!(u64, &self.burned, writer)?;
+        store!(u64, &self.escrow, writer)?;
+        store!(u64, &self.inference, writer)?;
+        store!(u64, &self.income_window_daa, writer)?;
+        store!(Vec<u64>, &self.tier_base, writer)?;
+
+        Ok(())
+    }
+}
+
+impl Deserializer for GetHolderRewardResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let virtual_daa_score = load!(u64, reader)?;
+        let eff_balance = load!(u64, reader)?;
+        let production_raw = load!(u64, reader)?;
+        let production = load!(u64, reader)?;
+        let bracket_bps = load!(u64, reader)?;
+        let next_bracket_bps = load!(Option<u64>, reader)?;
+        let next_bracket_balance = load!(Option<u64>, reader)?;
+        let full_bracket_balance = load!(u64, reader)?;
+        let window_daa = load!(u64, reader)?;
+        let active = load!(bool, reader)?;
+        let paid = load!(u64, reader)?;
+        let burned = load!(u64, reader)?;
+        let escrow = load!(u64, reader)?;
+        let inference = load!(u64, reader)?;
+        // A v1 node did not report the span; 0 reads as "no coverage", which is the safe default
+        // for a caller that must not mislabel these figures as a full window.
+        let income_window_daa = if version >= 2 { load!(u64, reader)? } else { 0 };
+        // v3 appended the tier mix; an older node reports none, and an empty mix reads as
+        // "unknown" rather than as "all production at tier 0".
+        let tier_base = if version >= 3 { load!(Vec<u64>, reader)? } else { Vec::new() };
+
+        Ok(Self {
+            virtual_daa_score,
+            eff_balance,
+            production_raw,
+            production,
+            bracket_bps,
+            next_bracket_bps,
+            next_bracket_balance,
+            full_bracket_balance,
+            window_daa,
+            active,
+            paid,
+            burned,
+            escrow,
+            inference,
+            income_window_daa,
+            tier_base,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetBalanceByAddressRequest {

@@ -408,6 +408,32 @@ from!(item: RpcResult<&keryx_rpc_core::GetCoinSupplyResponse>, protowire::GetCoi
 });
 
 from!(&keryx_rpc_core::GetServiceStrikesRequest, protowire::GetServiceStrikesRequestMessage);
+
+from!(item: &keryx_rpc_core::GetHolderRewardRequest, protowire::GetHolderRewardRequestMessage, {
+    Self { address: (&item.address).into() }
+});
+
+from!(item: RpcResult<&keryx_rpc_core::GetHolderRewardResponse>, protowire::GetHolderRewardResponseMessage, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        eff_balance: item.eff_balance,
+        production_raw: item.production_raw,
+        production: item.production,
+        bracket_bps: item.bracket_bps,
+        next_bracket_bps: item.next_bracket_bps,
+        next_bracket_balance: item.next_bracket_balance,
+        full_bracket_balance: item.full_bracket_balance,
+        window_daa: item.window_daa,
+        active: item.active,
+        paid: item.paid,
+        burned: item.burned,
+        escrow: item.escrow,
+        inference: item.inference,
+        income_window_daa: item.income_window_daa,
+        tier_base: item.tier_base.clone(),
+        error: None,
+    }
+});
 from!(item: RpcResult<&keryx_rpc_core::GetServiceStrikesResponse>, protowire::GetServiceStrikesResponseMessage, {
     Self {
         virtual_daa_score: item.virtual_daa_score,
@@ -988,6 +1014,31 @@ try_from!(item: &protowire::GetCoinSupplyResponseMessage, RpcResult<keryx_rpc_co
 });
 
 try_from!(&protowire::GetServiceStrikesRequestMessage, keryx_rpc_core::GetServiceStrikesRequest);
+
+try_from!(item: &protowire::GetHolderRewardRequestMessage, keryx_rpc_core::GetHolderRewardRequest, {
+    Self { address: item.address.as_str().try_into()? }
+});
+
+try_from!(item: &protowire::GetHolderRewardResponseMessage, RpcResult<keryx_rpc_core::GetHolderRewardResponse>, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        eff_balance: item.eff_balance,
+        production_raw: item.production_raw,
+        production: item.production,
+        bracket_bps: item.bracket_bps,
+        next_bracket_bps: item.next_bracket_bps,
+        next_bracket_balance: item.next_bracket_balance,
+        full_bracket_balance: item.full_bracket_balance,
+        window_daa: item.window_daa,
+        active: item.active,
+        paid: item.paid,
+        burned: item.burned,
+        escrow: item.escrow,
+        inference: item.inference,
+        income_window_daa: item.income_window_daa,
+        tier_base: item.tier_base.clone(),
+    }
+});
 try_from!(item: &protowire::GetServiceStrikesResponseMessage, RpcResult<keryx_rpc_core::GetServiceStrikesResponse>, {
     Self {
         virtual_daa_score: item.virtual_daa_score,

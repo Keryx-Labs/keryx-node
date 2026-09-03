@@ -1000,6 +1000,10 @@ build_wrpc_wasm_bindgen_interface!(
         /// Retrieves the balance of a specific address in the Kaspa BlockDAG.
         /// Returned information: Balance of the address.
         GetBalanceByAddress,
+        /// Retrieves the holder-reward (ratio-reward) bracket state of a payout
+        /// address: the effective balance and windowed production the node divides,
+        /// the resulting bracket, and what the next bracket up would cost.
+        GetHolderReward,
         /// Retrieves balances for multiple addresses in the Kaspa BlockDAG.
         /// Returned information: Balances of the addresses.
         GetBalancesByAddresses,

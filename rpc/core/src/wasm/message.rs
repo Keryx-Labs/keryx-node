@@ -242,6 +242,60 @@ try_from! ( args: GetServiceStrikesResponse, IGetServiceStrikesResponse, {
 });
 
 declare! {
+    IGetHolderRewardRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetHolderRewardRequest {
+        address: Address | string;
+    }
+    "#,
+}
+
+try_from! ( args: IGetHolderRewardRequest, GetHolderRewardRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetHolderRewardResponse,
+    r#"
+    /**
+     * Holder-reward (ratio-reward) bracket state of one payout address.
+     *
+     * `effBalance` is the coin-age effective balance the bracket divides — NOT the spendable
+     * balance: coins younger than the maturity window count at a prorata of their age.
+     * `nextBracketBps` and `nextBracketBalance` are both absent once the address is in the top
+     * bracket.
+     *
+     * @category Node RPC
+     */
+    export interface IGetHolderRewardResponse {
+        virtualDaaScore: bigint;
+        effBalance: bigint;
+        productionRaw: bigint;
+        production: bigint;
+        bracketBps: bigint;
+        nextBracketBps?: bigint;
+        nextBracketBalance?: bigint;
+        fullBracketBalance: bigint;
+        windowDaa: bigint;
+        active: boolean;
+        paid: bigint;
+        burned: bigint;
+        escrow: bigint;
+        inference: bigint;
+        incomeWindowDaa: bigint;
+        tierBase: bigint[];
+    }
+    "#,
+}
+
+try_from! ( args: GetHolderRewardResponse, IGetHolderRewardResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
     IGetCoinSupplyRequest,
     r#"
     /**
