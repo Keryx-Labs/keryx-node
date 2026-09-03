@@ -511,6 +511,12 @@ async fn sanity_test() {
                 })
             }
 
+            KaspadPayloadOps::GetHolderReward => {
+                // Asserting on a snapshot needs a mined payout history, which this harness does
+                // not build; the encoding is covered by the borsh round-trip in rpc-core.
+                tst!(op, "needs a mined payout history")
+            }
+
             KaspadPayloadOps::GetCoinSupply => {
                 let rpc_client = client.clone();
                 tst!(op, {
