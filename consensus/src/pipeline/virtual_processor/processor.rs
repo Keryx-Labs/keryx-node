@@ -55,6 +55,7 @@ use crate::{
     },
 };
 use keryx_consensus_core::blockhash::BlockHashExtensions;
+use keryx_consensus_core::coinbase::{CoinbasePayout, TIER_BUCKETS};
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath,
     acceptance_data::AcceptanceData,
@@ -83,6 +84,7 @@ use keryx_consensus_notify::{
 use keryx_consensusmanager::SessionLock;
 use keryx_core::{debug, info, time::unix_now, trace, warn};
 use keryx_database::prelude::{StoreError, StoreResultExt, StoreResultUnitExt};
+use keryx_database::registry::DatabaseStorePrefixes;
 use keryx_hashes::{Hash, ZERO_HASH};
 use keryx_muhash::MuHash;
 use keryx_notify::{events::EventType, notifier::Notify};
@@ -197,6 +199,12 @@ pub struct VirtualStateProcessor {
     /// denominator (windowed production at a block's selected-parent view) is the difference of two
     /// cumulatives; read by `ratio_bps_by_block`.
     pub(super) windowed_production_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    /// Display-only companions of the production index: what coinbases actually paid this SPK, and
+    /// the escrow slice that accrued to it. Advanced in the same batch (`advance_production_prefix`).
+    pub(super) miner_paid_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    pub(super) miner_escrow_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    pub(super) miner_inference_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    pub(super) miner_tier_prefix_stores: [Arc<DbWindowedProductionPrefixStore>; TIER_BUCKETS],
     /// Memo for `block_productions` (chain block → its era-aware production contribution list),
     /// i.e. a parsed-coinbase/mergeset cache. During catch-up, `resolve_virtual` validates the
     /// whole prev_sink→new_sink path in one batch while the committed selected chain still ends at
@@ -205,6 +213,11 @@ pub struct VirtualStateProcessor {
     /// quadratic RocksDB reads without this memo (measured: virtual thread pegged at ~4
     /// UTXO-validated blocks/s on an IBD catch-up). Bounded by periodic clear.
     pub(super) block_production_cache: parking_lot::RwLock<BlockHashMap<std::sync::Arc<Vec<(ScriptPublicKey, u64)>>>>,
+    /// Same memo for the paid/escrow side (`block_payouts`). Its inputs — a committed block's own
+    /// coinbase outputs and its blues' coinbase payloads — are immutable per hash, so entries stay
+    /// valid indefinitely; bounded by the same periodic clear. Without it the commit path would
+    /// re-read every blue coinbase a second time, on top of `block_productions`.
+    pub(super) block_payout_cache: parking_lot::RwLock<BlockHashMap<std::sync::Arc<Vec<(ScriptPublicKey, CoinbasePayout)>>>>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -412,7 +425,12 @@ impl VirtualStateProcessor {
             maturation_queue_store: storage.maturation_queue_store.clone(),
             age_selfcheck_last: parking_lot::Mutex::new(None),
             windowed_production_prefix_store: storage.windowed_production_prefix_store.clone(),
+            miner_paid_prefix_store: storage.miner_paid_prefix_store.clone(),
+            miner_escrow_prefix_store: storage.miner_escrow_prefix_store.clone(),
+            miner_inference_prefix_store: storage.miner_inference_prefix_store.clone(),
+            miner_tier_prefix_stores: storage.miner_tier_prefix_stores.clone(),
             block_production_cache: parking_lot::RwLock::new(BlockHashMap::default()),
+            block_payout_cache: parking_lot::RwLock::new(BlockHashMap::default()),
             virtual_stores: storage.virtual_stores.clone(),
             pruning_meta_stores: storage.pruning_meta_stores.clone(),
             lkg_virtual_state: storage.lkg_virtual_state.clone(),
@@ -1158,6 +1176,136 @@ impl VirtualStateProcessor {
         }
         self.db.write(batch).unwrap();
         info!("windowed-production prefix build: done — {} entries written (canonical baseline).", written);
+    }
+
+    /// Lowest selected-chain index from which the paid/escrow/inference indexes are complete.
+    /// Absent (0) means "no payout data at all" — reads then report a zero-length span rather
+    /// than mistaking an empty index for a genuinely all-burned window.
+    pub(crate) fn miner_payout_index_start(&self) -> u64 {
+        self.db
+            .get([DatabaseStorePrefixes::MinerPayoutIndexStart as u8])
+            .ok()
+            .flatten()
+            .and_then(|v| v.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes))
+            .unwrap_or(0)
+    }
+
+    fn put_miner_payout_index_start(&self, batch: &mut WriteBatch, index: u64) {
+        batch.put([DatabaseStorePrefixes::MinerPayoutIndexStart as u8], index.to_le_bytes());
+    }
+
+    /// From-chain build of the paid/escrow/inference indexes, the display-only companions of the
+    /// production index. Same shape as `rebuild_windowed_production_prefix_index` and deliberately
+    /// the same walk, so a rebuilt index and an incrementally-maintained one agree.
+    ///
+    /// OPT-IN, and never on the boot path — see `rebuild_miner_payout_prefix_indexes_on_start`.
+    /// Unlike the production build, this walk needs the coinbase BODY of every chain block and of
+    /// each of its mergeset blues (a blue's payout SPK is what separates a miner cut from an
+    /// inference mint), which is ~5 random reads per chain block: seconds on NVMe, but hours on a
+    /// spinning disk, all of it before the node opens its ports. Forward maintenance costs nothing
+    /// and converges to the same values within one window, so history is the only thing this buys.
+    pub(crate) fn rebuild_miner_payout_prefix_indexes(&self) {
+        let sc = self.selected_chain_store.read();
+        let tip_idx = match sc.get_tip() {
+            Ok((idx, _)) => idx,
+            Err(_) => {
+                warn!("miner-payout prefix build: no selected-chain tip; skipping");
+                return;
+            }
+        };
+        let lo = tip_idx.saturating_sub(2 * self.ratio_reward_window).max(1);
+        info!("miner-payout prefix build: deriving paid/escrow/inference index over selected-chain [{}, {}]...", lo, tip_idx);
+        // Flushed in slices: one batch over the whole retained chain would hold millions of puts
+        // (a chain block contributes one entry per paid blue, times three indexes) before a single
+        // write. The result is identical either way — each entry is an absolute cumulative, not a
+        // delta — so the only thing slicing changes is peak memory.
+        const FLUSH_EVERY: u64 = 20_000;
+        let mut batch = WriteBatch::default();
+        self.put_miner_payout_index_start(&mut batch, lo);
+        self.miner_paid_prefix_store.clear(&mut batch);
+        self.miner_escrow_prefix_store.clear(&mut batch);
+        self.miner_inference_prefix_store.clear(&mut batch);
+        for store in self.miner_tier_prefix_stores.iter() {
+            store.clear(&mut batch);
+        }
+        let mut paid_cum: HashMap<ScriptPublicKey, u64> = HashMap::new();
+        let mut escrow_cum: HashMap<ScriptPublicKey, u64> = HashMap::new();
+        let mut inference_cum: HashMap<ScriptPublicKey, u64> = HashMap::new();
+        let mut tier_cum: HashMap<(ScriptPublicKey, usize), u64> = HashMap::new();
+        let mut written = 0u64;
+        for i in lo..=tip_idx {
+            if let Ok(h) = sc.get_by_index(i) {
+                for (spk, payout) in self.block_payouts(h) {
+                    let p = paid_cum.entry(spk.clone()).or_insert(0);
+                    *p += payout.paid;
+                    self.miner_paid_prefix_store.put_cumulative(&mut batch, &spk, i, *p);
+                    let e = escrow_cum.entry(spk.clone()).or_insert(0);
+                    *e += payout.escrow;
+                    self.miner_escrow_prefix_store.put_cumulative(&mut batch, &spk, i, *e);
+                    let f = inference_cum.entry(spk.clone()).or_insert(0);
+                    *f += payout.inference;
+                    self.miner_inference_prefix_store.put_cumulative(&mut batch, &spk, i, *f);
+                    for (t, store) in self.miner_tier_prefix_stores.iter().enumerate() {
+                        if payout.tier_base[t] == 0 {
+                            continue; // sparse: a zero contribution never changes a cumulative
+                        }
+                        let c = tier_cum.entry((spk.clone(), t)).or_insert(0);
+                        *c += payout.tier_base[t];
+                        store.put_cumulative(&mut batch, &spk, i, *c);
+                    }
+                    written += 1;
+                }
+            }
+            // Progress is reported per BLOCK SCANNED, not per entry written: the walk spends its
+            // time on blocks that yield nothing (pruned bodies, pre-fork blocks), so an
+            // entry-driven log is silent exactly when the operator most needs to see movement.
+            if (i - lo) % FLUSH_EVERY == FLUSH_EVERY - 1 {
+                self.db.write(std::mem::take(&mut batch)).unwrap();
+                info!(
+                    "miner-payout prefix build: chain index {}/{} ({:.1}%), {} entries...",
+                    i,
+                    tip_idx,
+                    (i - lo) as f64 * 100.0 / (tip_idx - lo).max(1) as f64,
+                    written
+                );
+            }
+        }
+        self.db.write(batch).unwrap();
+        info!("miner-payout prefix build: done — {} entries written.", written);
+    }
+
+    /// Startup hook for the paid/escrow/inference indexes; a no-op once they have a start index.
+    ///
+    /// Default is FORWARD-ONLY: the indexes are declared to start at the current chain tip and
+    /// then maintained in lockstep with the selected chain, at no cost. Reads clamp to that start
+    /// and report the span they actually cover, so a fresh index reports "nothing yet over a
+    /// zero-length span" instead of the far worse "everything you mined was burned" — and it
+    /// converges to the full window on its own, in one window's time.
+    ///
+    /// `KERYX_BUILD_PAYOUT_INDEX=1` opts into the from-chain backfill instead, which populates the
+    /// history immediately at the cost of a body read per chain block and per blue — worth it on
+    /// NVMe, and hours of blocked boot on a spinning disk.
+    pub(crate) fn rebuild_miner_payout_prefix_indexes_on_start(&self) {
+        if self.miner_payout_index_start() != 0 {
+            return;
+        }
+        if std::env::var("KERYX_BUILD_PAYOUT_INDEX").is_ok_and(|v| v == "1" || v == "true") {
+            self.rebuild_miner_payout_prefix_indexes();
+            return;
+        }
+        let Ok((tip_idx, _)) = self.selected_chain_store.read().get_tip() else {
+            warn!("miner-payout index: no selected-chain tip; deferring start to the next boot");
+            return;
+        };
+        let mut batch = WriteBatch::default();
+        self.put_miner_payout_index_start(&mut batch, tip_idx.max(1));
+        self.db.write(batch).unwrap();
+        info!(
+            "miner-payout index: starting forward-only at chain index {} — mined/burned/escrow figures \
+             widen to the full reward window over the next {} daa. Set KERYX_BUILD_PAYOUT_INDEX=1 to \
+             backfill the history from the chain instead (slow on a spinning disk).",
+            tip_idx, self.ratio_reward_window_daa
+        );
     }
 
     /// Startup hook: build the prefix-sum index from the chain only when it is empty (a datadir

@@ -156,6 +156,46 @@ pub enum DatabaseStorePrefixes {
     ProductionWindowDaa = 203,
     /// Bounds (bottom, sample chain indices) of that imported window.
     ProductionImportedWindow = 204,
+    /// Per-SPK prefix sum of the miner cut actually PAID by coinbases (post tier/ratio scaling),
+    /// and its pruning floor. Display only: read by `getHolderReward` to separate income from the
+    /// burned shortfall. Deliberately a separate keyspace from `WindowedProductionPrefix`, which
+    /// is hashed into the service commitment — nothing here enters consensus.
+    MinerPaidPrefix = 205,
+    MinerPaidFloor = 206,
+    /// Per-SPK prefix sum of the escrow cut that ACCRUED to the producer (zero for a standard
+    /// miner, whose escrow is burned at emission), and its pruning floor. Display only.
+    MinerEscrowPrefix = 207,
+    MinerEscrowFloor = 208,
+    /// Per-SPK prefix sum of inference-reward mints routed to this SPK by coinbases, and its
+    /// pruning floor. Mining income of a different kind, tracked apart from the miner cut because
+    /// a mint is indistinguishable from one by script alone. Display only.
+    MinerInferencePrefix = 209,
+    MinerInferenceFloor = 210,
+    /// Single u64: the lowest selected-chain index from which the three payout indexes above are
+    /// complete. They are maintained FORWARD from the boot that created them, because a from-chain
+    /// backfill has to read the coinbase BODY of every chain block and of each of its mergeset
+    /// blues — hours of random reads on a spinning disk. A query whose window bottom predates this
+    /// index would silently under-report income and over-report the burn, so reads clamp to it and
+    /// report the span actually covered, letting the caller label a partial window honestly.
+    MinerPayoutIndexStart = 211,
+    /// Per-SPK prefix sums of the BASE miner cut split by the proven model tier of the block that
+    /// earned it — one (entries, floor) pair per tier bucket — plus their pruning floors. Display
+    /// only, same keyspace shape and same forward-only start marker as the payout indexes above.
+    ///
+    /// Five buckets rather than one weighted average because a miner is not on one tier: rigs run
+    /// different models, so the window holds a MIX, and any single tier reported for it would be
+    /// false. From the buckets the weighted tier is a division; from a weighted tier the mix is
+    /// unrecoverable.
+    MinerTier0Prefix = 212,
+    MinerTier0Floor = 213,
+    MinerTier1Prefix = 214,
+    MinerTier1Floor = 215,
+    MinerTier2Prefix = 216,
+    MinerTier2Floor = 217,
+    MinerTier3Prefix = 218,
+    MinerTier3Floor = 219,
+    MinerTier4Prefix = 220,
+    MinerTier4Floor = 221,
 
     // ---- Separator ----
     /// Reserved as a separator

@@ -1182,7 +1182,13 @@ impl VirtualStateProcessor {
         if !self.pom_v3_activation.is_active(sink_daa) {
             return None;
         }
-        let span_cap = sink_daa.saturating_add((self.finality_depth / 8).max(1));
+        // IBD hot path: `finality/8 = 54k DAA` sliced a 2.7M DAA catch-up into ~50
+        // `resolve_virtual` batches (each with GHOSTDAG + UTXO + DB commit). During
+        // IBD the service-ledger queue is deep but FLUSH only needs `front+finality`,
+        // so a larger cap is safe and collapses the same work into ~12 batches
+        // (4x). `/2 = 216k DAA (~6h)` still flushes well before the queue would
+        // cross finality, and preserves the original invariant `cut < frontier`.
+        let span_cap = sink_daa.saturating_add((self.finality_depth / 2).max(1));
         let frontier = self.service_ledger.lock().queue.front().map(|(_, daa, _)| daa.saturating_add(self.finality_depth));
         Some(frontier.map_or(span_cap, |f| f.min(span_cap)))
     }

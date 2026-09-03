@@ -80,6 +80,14 @@ impl DbWindowedProductionPrefixStore {
         }
     }
 
+    /// Same index over a different keyspace. Every method here is already driven by the two
+    /// prefixes, so the paid- and escrow-per-SPK indexes are this exact structure — same
+    /// cumulative invariant, same reorg truncation, same pruning collapse — over their own
+    /// registry prefixes, instead of a second hand-written copy of it.
+    pub fn with_prefixes(db: Arc<DB>, entries_prefix: DatabaseStorePrefixes, floor_prefix: DatabaseStorePrefixes) -> Self {
+        Self { db, entries_prefix: entries_prefix.into(), floor_prefix: floor_prefix.into() }
+    }
+
     /// On-disk entry key: `entries_prefix || SPK_bucket || be(index)`.
     fn entry_key(&self, spk: &ScriptPublicKey, index: u64) -> Vec<u8> {
         let bucket = ScriptPublicKeyBucket::from(spk);
