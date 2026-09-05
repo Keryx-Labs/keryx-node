@@ -213,6 +213,10 @@ pub const H11_ACTIVATION_DAA: u64 = 89_120_000;
 /// Targets 2026-09-05 ~16:00 UTC (from daa 89_706_379 at 2026-09-02 09:42 UTC, ~10.1 daa/s).
 pub const H12_ACTIVATION_DAA: u64 = 92_550_000;
 
+/// H13: coinbase and service-state verification enforced by every node (`exact_verification_activation`).
+/// Targets 2026-09-06 ~19:45 UTC (from daa 92_654_952 at 2026-09-05 18:59 UTC, ~10.0 daa/s).
+pub const H13_ACTIVATION_DAA: u64 = 93_550_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -1759,7 +1763,7 @@ pub const MAINNET_PARAMS: Params = Params {
     reward_routing_activation: ForkActivation::new(79_210_000),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
-    exact_verification_activation: ForkActivation::never(),
+    exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),

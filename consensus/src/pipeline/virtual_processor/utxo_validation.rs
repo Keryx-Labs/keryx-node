@@ -81,6 +81,7 @@ static H6_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H10_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -477,6 +478,14 @@ impl VirtualStateProcessor {
             info!("════════════════ KERYX HARDFORK H12 · DAA {} ════════════════", self.production_index_activation.daa_score());
             info!("  Ratio index   — production prefix snapshot at each pruning sample, committed in `serviceStateHash`");
             info!("  Sync          — a fresh node imports the index with the pruning point (protocol v13); ratio verification exact from the first block");
+        }
+        if banner_should_fire(self.exact_verification_activation, header)
+            && H13_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H13 · DAA {} ════════════════", self.exact_verification_activation.daa_score());
+            info!("  Verification  — coinbase and `serviceStateHash` enforced by every node; the chain was trusted before the gate");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
         }
 
         // H6 banner. Same latching shape as the others — fires once, on the first block at or
