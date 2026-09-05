@@ -166,6 +166,7 @@ pub struct VirtualStateProcessor {
     pub(super) service_imported_producers: RwLock<Vec<(u64, Hash, u8, Hash)>>,
     pub(super) service_ledger_activation: ForkActivation,
     pub(super) production_index_activation: ForkActivation,
+    pub(super) exact_verification_activation: ForkActivation,
     pub(super) service_burnable_window_daa: u64,
     /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
     #[allow(clippy::type_complexity)]
@@ -396,6 +397,7 @@ impl VirtualStateProcessor {
             service_imported_producers: Default::default(),
             service_ledger_activation: params.service_ledger_activation,
             production_index_activation: params.production_index_activation,
+            exact_verification_activation: params.exact_verification_activation,
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
@@ -478,6 +480,11 @@ impl VirtualStateProcessor {
     /// construction, so the fast-sync catch-up relaxation auto-expires once the window refills.
     pub(super) fn trust_coinbase(&self) -> bool {
         self.is_archival || self.trust_coinbase_env || self.in_production_catchup_window()
+    }
+
+    /// `trust_coinbase()` extended by the H13 gate: every node trusts the chain before it.
+    pub(super) fn trust_coinbase_at(&self, daa_score: u64) -> bool {
+        !self.exact_verification_activation.is_active(daa_score) || self.trust_coinbase()
     }
 
     /// True while we're still inside our own post-import catch-up window: fewer than

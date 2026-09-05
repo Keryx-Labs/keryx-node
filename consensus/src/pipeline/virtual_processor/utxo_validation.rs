@@ -315,7 +315,7 @@ impl VirtualStateProcessor {
         // (cross-node comparison logs). The ratio balances fold `sp_diff`, which grows with the
         // distance from the committed virtual — computing it per block turns a long re-validation
         // walk quadratic, so a trusted transition must not pay for a comparison it discards.
-        let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase();
+        let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase_at(header.daa_score);
         if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
             self.verify_coinbase_transaction(
                 &txs[0],
@@ -333,7 +333,7 @@ impl VirtualStateProcessor {
         // least finality-deep past the pruning point), and is skipped in the same trust windows
         // as the coinbase check — a node that cannot yet reproduce the fold trusts the
         // utxo-commitment-pinned chain instead.
-        if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase() {
+        if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase_at(header.daa_score) {
             if let Some(expected) = self.expected_service_state_hash(header)? {
                 if header.service_state_hash != expected {
                     return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));

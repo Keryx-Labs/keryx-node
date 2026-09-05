@@ -877,6 +877,25 @@ async fn fastsync_catchup_window_trusts_then_expires() {
     assert!(!vp.trust_coinbase(), "must self-expire once a full ratio_reward_window of blocks has passed since import");
 }
 
+/// H13 gate: before its activation every node trusts the chain, whatever its own trust windows.
+#[tokio::test]
+async fn exact_verification_gate_trusts_every_node_before_activation() {
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let mut params = MAINNET_PARAMS;
+    params.exact_verification_activation = ForkActivation::new(100);
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let vp = tc.virtual_processor().clone();
+
+    assert!(!vp.trust_coinbase(), "a from-genesis node has no trust window of its own");
+    assert!(vp.trust_coinbase_at(99), "before the gate the chain is trusted");
+    assert!(!vp.trust_coinbase_at(100), "from the gate the node verifies");
+
+    tc.shutdown(handles);
+}
+
 /// Ratio-reward (Stage 2b) reconstruction-equality: the balance index maintained incrementally from
 /// genesis (lockstep with the virtual UTXO set in `commit_virtual_state`) must equal, key-for-key,
 /// the index a fast-synced node rebuilds at `import_pruning_point_utxo_set` by grouping the imported
