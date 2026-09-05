@@ -19,7 +19,7 @@ use keryx_consensusmanager::{ConsensusProxy, StagingConsensus, spawn_blocking};
 use keryx_core::{debug, info, time::unix_now, warn};
 use keryx_hashes::Hash;
 use keryx_muhash::MuHash;
-use keryx_consensus_core::collateral::{service_commitment_v2, service_commitment_v3, ProductionIndexSnapshot, ServiceLedgerSnapshot};
+use keryx_consensus_core::collateral::{service_commitment_v2, service_commitment_v3, service_commitment_v4, ProductionIndexSnapshot, ServiceLedgerSnapshot};
 use crate::v7::request_service_state::{PRODUCTION_INDEX_SNAPSHOT_PROTOCOL_VERSION, SERVICE_LEDGER_SNAPSHOT_PROTOCOL_VERSION};
 
 /// Upper bound on a transferred ledger snapshot.
@@ -890,10 +890,14 @@ impl IbdFlow {
             }
         });
         let production_hash = production_bytes.as_ref().map(|bytes| ProductionIndexSnapshot::hash_of_bytes(bytes));
-        // A v3 vote (past `production_index_activation`) binds rows, ledger and production
+        let production_relative_hash =
+            production_bytes.as_ref().and_then(|bytes| ProductionIndexSnapshot::from_bytes(bytes).ok()).map(|s| s.relative_hash());
+        // A v3 or v4 vote (past `production_index_activation`) binds rows, ledger and production
         // together; a v2 vote binds rows and ledger only.
-        let production_voted = match (ledger_hash, production_hash) {
-            (Some(l), Some(p)) => votes.contains_key(&service_commitment_v3(computed, l, p)),
+        let production_voted = match (ledger_hash, production_hash, production_relative_hash) {
+            (Some(l), Some(p), Some(r)) => {
+                votes.contains_key(&service_commitment_v3(computed, l, p)) || votes.contains_key(&service_commitment_v4(computed, l, r))
+            }
             _ => false,
         };
         let snapshot_voted =

@@ -737,7 +737,14 @@ impl VirtualStateProcessor {
         if !self.production_index_activation.is_active(header.daa_score) {
             return Ok(Some(keryx_consensus_core::collateral::service_commitment_v2(rows, ledger)));
         }
-        match self.production_index_hash_at(header.pruning_point) {
+        let v4 = self.exact_verification_activation.is_active(header.daa_score);
+        let production = if v4 {
+            self.production_index_relative_hash_at(header.pruning_point)
+        } else {
+            self.production_index_hash_at(header.pruning_point)
+        };
+        match production {
+            Some(production) if v4 => Ok(Some(keryx_consensus_core::collateral::service_commitment_v4(rows, ledger, production))),
             Some(production) => Ok(Some(keryx_consensus_core::collateral::service_commitment_v3(rows, ledger, production))),
             None if pp_daa < self.production_index_floor_daa() => Ok(None),
             None => Err(MissingProductionIndexSnapshot(header.pruning_point)),

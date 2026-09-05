@@ -143,24 +143,6 @@ fn main() {
                 .collect(),
             window_daa: snap.window_daa.clone(),
         };
-        // Second normalization: cumulative values relative to each SPK's own floor.
-        let floor_of = |spk: &keryx_consensus_core::tx::ScriptPublicKey| {
-            snap.floors.iter().find(|(s, _)| s == spk).map(|(_, v)| *v).unwrap_or(0)
-        };
-        let relative = ProductionIndexSnapshot {
-            bottom_index: 0,
-            sample_index: snap.sample_index - snap.bottom_index,
-            floors: snap.floors.iter().map(|(spk, _)| (spk.clone(), 0)).collect(),
-            entries: snap
-                .entries
-                .iter()
-                .map(|(spk, e)| {
-                    let f = floor_of(spk);
-                    (spk.clone(), e.iter().map(|(i, c)| (i - snap.bottom_index, c - f)).collect())
-                })
-                .collect(),
-            window_daa: snap.window_daa.clone(),
-        };
         let n_entries: usize = snap.entries.iter().map(|(_, e)| e.len()).sum();
         println!(
             "PRODUCTION sample={sample} hash={} encoding=v{} bottom_index={} sample_index={} span={} floors={} floors_sum={} groups={} entries={} window_daa={} [{}..{}] normalized_hash={}",
@@ -178,7 +160,7 @@ fn main() {
             snap.window_daa.last().copied().unwrap_or(0),
             ProductionIndexSnapshot::hash_of_bytes(&normalized.to_bytes()),
         );
-        println!("  relative_hash={}", ProductionIndexSnapshot::hash_of_bytes(&relative.to_bytes()));
+        println!("  relative_hash={}", snap.relative_hash());
         if full {
             for (spk, v) in normalized.floors.iter() {
                 println!("  FLOOR {} {}", hex::encode(spk.script()), v);

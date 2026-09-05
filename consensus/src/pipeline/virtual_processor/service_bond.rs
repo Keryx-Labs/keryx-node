@@ -733,7 +733,7 @@ impl VirtualStateProcessor {
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
                 if let Some(production) = self.build_production_snapshot(&*sc, *h, idx, daa, pruning_point) {
                     let pbytes = production.to_bytes();
-                    self.production_index_hashes.write().insert(*h, ProductionIndexSnapshot::hash_of_bytes(&pbytes));
+                    self.production_index_hashes.write().insert(*h, (ProductionIndexSnapshot::hash_of_bytes(&pbytes), production.relative_hash()));
                     self.production_index_snapshot_store.set(*h, pbytes).unwrap();
                 }
                 sampled = true;
@@ -957,7 +957,12 @@ impl VirtualStateProcessor {
         if sample == self.genesis.hash {
             return Some(ProductionIndexSnapshot::default().hash());
         }
-        self.production_index_hashes.read().get(&sample).copied()
+        self.production_index_hashes.read().get(&sample).map(|(stored, _)| *stored)
+    }
+
+    /// Window-relative hash of the production-index snapshot at `sample` (`service_commitment_v4`).
+    pub(super) fn production_index_relative_hash_at(&self, sample: Hash) -> Option<Hash> {
+        self.production_index_hashes.read().get(&sample).map(|(_, relative)| *relative)
     }
 
     /// DAA score of the oldest sample whose production-index hash this node holds.
@@ -990,7 +995,7 @@ impl VirtualStateProcessor {
             match rebuilt {
                 Some(snapshot) => {
                     let bytes = snapshot.to_bytes();
-                    self.production_index_hashes.write().insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+                    self.production_index_hashes.write().insert(sample, (ProductionIndexSnapshot::hash_of_bytes(&bytes), snapshot.relative_hash()));
                     self.production_index_snapshot_store.set(sample, bytes).unwrap();
                     upgraded += 1;
                 }
@@ -1042,7 +1047,7 @@ impl VirtualStateProcessor {
             return Err(ConsensusError::General("production snapshot numbering does not match the local chain"));
         }
         drop(sc);
-        self.production_index_hashes.write().insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+        self.production_index_hashes.write().insert(sample, (ProductionIndexSnapshot::hash_of_bytes(&bytes), snapshot.relative_hash()));
         self.production_index_snapshot_store.set(sample, bytes).unwrap();
         info!(
             "ratio: production index restored from the snapshot at {} ({} producers, chain index {}); coinbase verification is exact from here",
@@ -1167,7 +1172,7 @@ impl VirtualStateProcessor {
         for (sample, bytes) in self.production_index_snapshot_store.entries() {
             match ProductionIndexSnapshot::from_bytes(&bytes) {
                 Ok(snapshot) if snapshot.has_window_table() => {
-                    phashes.insert(sample, ProductionIndexSnapshot::hash_of_bytes(&bytes));
+                    phashes.insert(sample, (ProductionIndexSnapshot::hash_of_bytes(&bytes), snapshot.relative_hash()));
                 }
                 _ => legacy.push(sample),
             }

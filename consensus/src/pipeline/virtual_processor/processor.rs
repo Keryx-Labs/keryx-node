@@ -161,7 +161,7 @@ pub struct VirtualStateProcessor {
     pub(super) production_window_store: Arc<crate::model::stores::production_window::DbProductionWindowStore>,
     /// Canonical hash of each persisted sample snapshot (see `service_ledger_hash_at`).
     pub(super) service_ledger_hashes: RwLock<HashMap<Hash, Hash>>,
-    pub(super) production_index_hashes: RwLock<HashMap<Hash, Hash>>,
+    pub(super) production_index_hashes: RwLock<HashMap<Hash, (Hash, Hash)>>,
     /// Producers below the pruning point, from the snapshot imported (or persisted) at it.
     pub(super) service_imported_producers: RwLock<Vec<(u64, Hash, u8, Hash)>>,
     pub(super) service_ledger_activation: ForkActivation,
@@ -571,7 +571,9 @@ impl VirtualStateProcessor {
             self.sink_search_algorithm(&virtual_read, &mut accumulated_diff, prev_sink, tips, finality_point, pruning_point);
         let (virtual_parents, virtual_ghostdag_data) = self.pick_virtual_parents(new_sink, virtual_parent_candidates, pruning_point);
         assert_eq!(virtual_ghostdag_data.selected_parent, new_sink);
-        self.check_divergence(heaviest_tip, new_sink);
+        if !cut || new_sink == prev_sink {
+            self.check_divergence(heaviest_tip, new_sink);
+        }
 
         let sink_multiset = self.utxo_multisets_store.get(new_sink).unwrap();
         let chain_path = self.dag_traversal_manager.calculate_chain_path(prev_sink, new_sink, None);
@@ -1784,10 +1786,17 @@ impl VirtualStateProcessor {
                 let ledger = self
                     .service_ledger_hash_at(header_pruning_point)
                     .ok_or(RuleError::MissingServiceLedgerSnapshot(header_pruning_point))?;
-                let production = self
-                    .production_index_hash_at(header_pruning_point)
-                    .ok_or(RuleError::MissingProductionIndexSnapshot(header_pruning_point))?;
-                keryx_consensus_core::collateral::service_commitment_v3(rows, ledger, production)
+                if self.exact_verification_activation.is_active(virtual_state.daa_score) {
+                    let production = self
+                        .production_index_relative_hash_at(header_pruning_point)
+                        .ok_or(RuleError::MissingProductionIndexSnapshot(header_pruning_point))?;
+                    keryx_consensus_core::collateral::service_commitment_v4(rows, ledger, production)
+                } else {
+                    let production = self
+                        .production_index_hash_at(header_pruning_point)
+                        .ok_or(RuleError::MissingProductionIndexSnapshot(header_pruning_point))?;
+                    keryx_consensus_core::collateral::service_commitment_v3(rows, ledger, production)
+                }
             } else if self.service_ledger_activation.is_active(virtual_state.daa_score) {
                 let ledger = self
                     .service_ledger_hash_at(header_pruning_point)

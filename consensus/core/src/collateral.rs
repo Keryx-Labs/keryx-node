@@ -1282,6 +1282,16 @@ pub fn service_commitment_v3(rows: Hash, ledger: Hash, production: Hash) -> Hash
     Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
 }
 
+/// Header service-state commitment past `exact_verification_activation`: v3 with the production
+/// snapshot hashed in its window-relative form (`ProductionIndexSnapshot::relative_hash`).
+pub fn service_commitment_v4(rows: Hash, ledger: Hash, production: Hash) -> Hash {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).personal(b"KeryxSvcCommit4").to_state();
+    hasher.update(&rows.as_bytes());
+    hasher.update(&ledger.as_bytes());
+    hasher.update(&production.as_bytes());
+    Hash::from_bytes(hasher.finalize().as_bytes().try_into().unwrap())
+}
+
 const PRODUCTION_SNAPSHOT_ENCODING_V1: u8 = 1;
 const PRODUCTION_SNAPSHOT_ENCODING_V2: u8 = 2;
 
@@ -1308,6 +1318,32 @@ impl ProductionIndexSnapshot {
     /// Whether the snapshot carries the window daa table.
     pub fn has_window_table(&self) -> bool {
         !self.window_daa.is_empty()
+    }
+
+    /// The snapshot re-based to its window: chain indices from `bottom_index`, cumulative values
+    /// from each SPK's floor. Identical on every node holding the same window production, whatever
+    /// its own chain numbering and index baseline.
+    pub fn relative(&self) -> Self {
+        let floor_of = |spk: &ScriptPublicKey| self.floors.iter().find(|(s, _)| s == spk).map(|(_, v)| *v).unwrap_or(0);
+        Self {
+            bottom_index: 0,
+            sample_index: self.sample_index.saturating_sub(self.bottom_index),
+            floors: self.floors.iter().map(|(spk, _)| (spk.clone(), 0)).collect(),
+            entries: self
+                .entries
+                .iter()
+                .map(|(spk, e)| {
+                    let floor = floor_of(spk);
+                    (spk.clone(), e.iter().map(|(i, c)| (i.saturating_sub(self.bottom_index), c.saturating_sub(floor))).collect())
+                })
+                .collect(),
+            window_daa: self.window_daa.clone(),
+        }
+    }
+
+    /// Hash of the re-based snapshot's canonical encoding.
+    pub fn relative_hash(&self) -> Hash {
+        Self::hash_of_bytes(&self.relative().to_bytes())
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -1501,6 +1537,35 @@ mod tests {
         ledger.set_persisted_baselines(std::sync::Arc::new(base), std::sync::Arc::new(Default::default()));
         assert_eq!(ledger.consecutive_misses(&m), 3, "the persisted record wins over the older snapshot delta");
         assert_eq!(ledger.consecutive_misses(&n), 1);
+    }
+
+    #[test]
+    fn relative_hash_is_independent_of_chain_numbering_and_floors() {
+        use crate::collateral::{service_commitment_v3, service_commitment_v4, ProductionIndexSnapshot};
+        use crate::tx::ScriptPublicKey;
+        use keryx_hashes::Hash;
+        let spk = ScriptPublicKey::from_vec(0, vec![0x20; 34]);
+        let window_daa: Vec<u64> = (0..=150u64).map(|i| 1_000 + i * 5).collect();
+        let a = ProductionIndexSnapshot {
+            bottom_index: 100,
+            sample_index: 250,
+            floors: vec![(spk.clone(), 7)],
+            entries: vec![(spk.clone(), vec![(101, 9), (240, 12)])],
+            window_daa: window_daa.clone(),
+        };
+        let b = ProductionIndexSnapshot {
+            bottom_index: 5_100,
+            sample_index: 5_250,
+            floors: vec![(spk.clone(), 1_007)],
+            entries: vec![(spk.clone(), vec![(5_101, 1_009), (5_240, 1_012)])],
+            window_daa,
+        };
+        assert_ne!(ProductionIndexSnapshot::hash_of_bytes(&a.to_bytes()), ProductionIndexSnapshot::hash_of_bytes(&b.to_bytes()));
+        assert_eq!(a.relative_hash(), b.relative_hash(), "same window production, same relative hash");
+        let c = ProductionIndexSnapshot { entries: vec![(spk.clone(), vec![(101, 9), (240, 13)])], ..a.clone() };
+        assert_ne!(a.relative_hash(), c.relative_hash(), "a different production changes the relative hash");
+        let (rows, ledger) = (Hash::from_u64_word(1), Hash::from_u64_word(2));
+        assert_ne!(service_commitment_v3(rows, ledger, a.relative_hash()), service_commitment_v4(rows, ledger, a.relative_hash()));
     }
 
     #[test]

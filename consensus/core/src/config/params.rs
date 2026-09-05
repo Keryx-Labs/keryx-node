@@ -1892,7 +1892,7 @@ pub const TESTNET_PARAMS: Params = Params {
     reward_routing_activation: ForkActivation::new(0),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
-    exact_verification_activation: ForkActivation::new(500),
+    exact_verification_activation: ForkActivation::new(118_000),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
