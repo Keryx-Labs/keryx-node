@@ -81,7 +81,7 @@ use keryx_consensus_notify::{
     root::ConsensusNotificationRoot,
 };
 use keryx_consensusmanager::SessionLock;
-use keryx_core::{debug, info, time::unix_now, trace, warn};
+use keryx_core::{debug, error, info, time::unix_now, trace, warn};
 use keryx_database::prelude::{StoreError, StoreResultExt, StoreResultUnitExt};
 use keryx_hashes::{Hash, ZERO_HASH};
 use keryx_muhash::MuHash;
@@ -107,6 +107,9 @@ use std::{
     ops::Deref,
     sync::{Arc, atomic::Ordering},
 };
+
+/// Blue-score lead of a UTXO-invalid heaviest branch over the sink past which the node stops.
+const DIVERGENCE_HALT_BLUE_DEPTH: u64 = 1_000;
 
 pub struct VirtualStateProcessor {
     // Channels
@@ -553,6 +556,7 @@ impl VirtualStateProcessor {
             .collect_vec();
         drop(prune_guard);
         let prev_sink = prev_state.ghostdag_data.selected_parent;
+        let heaviest_tip = tips.iter().copied().max_by_key(|h| self.ghostdag_store.get_blue_work(*h).unwrap());
         let (tips, cut) = self.cut_tips_at_ledger_frontier(tips, prev_sink);
         let mut accumulated_diff = prev_state.utxo_diff.clone().to_reversed();
 
@@ -560,6 +564,7 @@ impl VirtualStateProcessor {
             self.sink_search_algorithm(&virtual_read, &mut accumulated_diff, prev_sink, tips, finality_point, pruning_point);
         let (virtual_parents, virtual_ghostdag_data) = self.pick_virtual_parents(new_sink, virtual_parent_candidates, pruning_point);
         assert_eq!(virtual_ghostdag_data.selected_parent, new_sink);
+        self.check_divergence(heaviest_tip, new_sink);
 
         let sink_multiset = self.utxo_multisets_store.get(new_sink).unwrap();
         let chain_path = self.dag_traversal_manager.calculate_chain_path(prev_sink, new_sink, None);
@@ -621,7 +626,37 @@ impl VirtualStateProcessor {
                 )))
                 .expect("expecting an open unbounded channel");
         }
-        cut
+        cut && new_sink != prev_sink
+    }
+
+    /// Stops the node once the network has kept building, past `DIVERGENCE_HALT_BLUE_DEPTH`, on a
+    /// heavier branch the sink cannot follow (UTXO-invalid or finality violating).
+    fn check_divergence(&self, heaviest_tip: Option<Hash>, sink: Hash) {
+        let Some(tip) = heaviest_tip else { return };
+        let stalled = tip != sink
+            && self.ghostdag_store.get_blue_work(tip).unwrap() > self.ghostdag_store.get_blue_work(sink).unwrap()
+            && !self.reachability_service.is_chain_ancestor_of(sink, tip);
+        if !stalled || self.revalidate_disqualified_env {
+            return;
+        }
+        let gap = self.headers_store.get_blue_score(tip).unwrap().saturating_sub(self.headers_store.get_blue_score(sink).unwrap());
+        if gap <= DIVERGENCE_HALT_BLUE_DEPTH {
+            return;
+        }
+        let mut culprit = tip;
+        loop {
+            let parent = self.ghostdag_store.get_selected_parent(culprit).unwrap();
+            if parent.is_origin() || parent == sink || self.statuses_store.read().get(parent).unwrap() != StatusDisqualifiedFromChain {
+                break;
+            }
+            culprit = parent;
+        }
+        error!(
+            "chain divergence: the network keeps building on block {} which this node rejects (heaviest tip {}, {} blue scores past the sink {}); this node cannot follow the chain and stops — resync from a trusted datadir",
+            culprit, tip, gap, sink
+        );
+        log::logger().flush();
+        std::process::exit(3);
     }
 
     pub(crate) fn virtual_finality_point(&self, virtual_ghostdag_data: &GhostdagData, pruning_point: Hash) -> Hash {
