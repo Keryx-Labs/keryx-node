@@ -428,6 +428,24 @@ async fn sanity_test() {
                 })
             }
 
+            KaspadPayloadOps::GetUtxoEntriesByOutpoints => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response =
+                        rpc_client.get_utxo_entries_by_outpoints_call(None, GetUtxoEntriesByOutpointsRequest::new(vec![])).await.unwrap();
+                    assert!(response.entries.is_empty());
+                })
+            }
+
+            KaspadPayloadOps::GetUtxoCountByAddress => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let address = Address::new(Prefix::Simnet, Version::PubKey, &[0u8; 32]);
+                    let response = rpc_client.get_utxo_count_by_address_call(None, GetUtxoCountByAddressRequest::new(address)).await.unwrap();
+                    assert_eq!(response.count, 0);
+                })
+            }
+
             KaspadPayloadOps::GetBalanceByAddress => {
                 let rpc_client = client.clone();
                 tst!(op, {

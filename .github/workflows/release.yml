@@ -1,0 +1,102 @@
+name: release
+
+# Builds keryxd + keryx-cli for Linux (x86_64, glibc) and Windows (x86_64, MSVC) and attaches one
+# zip per OS to a single draft GitHub Release. Trigger by pushing a version tag
+# (`git tag v1.6.1-PoM && git push origin v1.6.1-PoM`), or run manually from the Actions tab
+# (a `v0.0.0-dev-<run>` draft is created for testing; delete it afterwards).
+# The release is left as a DRAFT for the notes and a manual publish.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.mk.outputs.release_tag }}
+    steps:
+      - name: Create the draft release (once)
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isTag = context.ref.startsWith('refs/tags/');
+            const tag = isTag ? context.ref.replace('refs/tags/', '') : `v0.0.0-dev-${context.runNumber}`;
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: `Keryx-node-${tag}`,
+              body: 'keryxd + keryx-cli. Release notes to come.',
+              draft: true,
+              prerelease: false,
+            });
+            core.setOutput('release_tag', tag);
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            suffix: linux-amd64
+          - os: windows-latest
+            suffix: win64-amd64
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.suffix }}
+    steps:
+      - name: Fix CRLF on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build keryxd and keryx-cli
+        run: cargo build --release --bin keryxd --bin keryx-cli
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/keryx-node
+          cp target/release/keryxd target/release/keryx-cli dist/keryx-node/
+          archive="dist/keryx-node-${{ needs.create-release.outputs.release_tag }}-${{ matrix.suffix }}.zip"
+          (cd dist && zip -r "$(basename "$archive")" keryx-node)
+          echo "archive=$archive" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          archive="dist/keryx-node-${{ needs.create-release.outputs.release_tag }}-${{ matrix.suffix }}.zip"
+          powershell "Compress-Archive -Path target/release/keryxd.exe, target/release/keryx-cli.exe -DestinationPath \"$archive\""
+          echo "archive=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload to the draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.release_tag }}
+          draft: true
+          files: ${{ env.archive }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

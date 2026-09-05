@@ -61,6 +61,29 @@ fn main() {
     let full = args.iter().any(|a| a == "--full");
     let only: Option<Hash> = args.iter().skip(2).find(|a| a.len() == 64).map(|a| Hash::from_str(a).expect("bad hash"));
     let db = open(&args[1]);
+    if let Some(pos) = args.iter().position(|a| a == "--status") {
+        for h in args[pos + 1..].iter().filter(|a| a.len() == 64) {
+            let hash = Hash::from_str(h).expect("bad hash");
+            let mut key = vec![23u8];
+            key.extend_from_slice(&hash.as_bytes());
+            match db.get(&key).expect("read error") {
+                Some(v) => {
+                    let code = v.get(..4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                    let name = match code {
+                        Some(0) => "Invalid",
+                        Some(1) => "UTXOValid",
+                        Some(2) => "UTXOPendingVerification",
+                        Some(3) => "DisqualifiedFromChain",
+                        Some(4) => "HeaderOnly",
+                        _ => "?",
+                    };
+                    println!("STATUS {h} = {name} (raw {})", hex::encode(&v));
+                }
+                None => println!("STATUS {h} = <absent>"),
+            }
+        }
+        return;
+    }
     if let Some(pos) = args.iter().position(|a| a == "--peek") {
         let start: u8 = args[pos + 1].parse().expect("prefix byte");
         let mut ro = rocksdb::ReadOptions::default();

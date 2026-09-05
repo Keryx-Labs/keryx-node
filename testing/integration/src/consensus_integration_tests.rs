@@ -20,7 +20,6 @@ use keryx_consensus::pipeline::ProcessingCounters;
 use keryx_consensus::pipeline::monitor::ConsensusMonitor;
 use keryx_consensus::processes::reachability::tests::{DagBlock, DagBuilder, StoreValidationExtensions};
 use keryx_consensus::processes::window::{WindowManager, WindowType};
-use keryx_consensus_core::config::params::ForkActivation;
 use keryx_consensus_core::api::args::TransactionValidationArgs;
 use keryx_consensus_core::api::{BlockValidationFutures, ConsensusApi};
 use keryx_consensus_core::block::Block;
@@ -1103,6 +1102,8 @@ async fn difficulty_test() {
             blue_score: 0,
             pruning_point: 0.into(),
             pom_final_state: 0,
+            service_state_hash: 0.into(),
+            pom_tier: 0,
         };
 
         // Stage 0
