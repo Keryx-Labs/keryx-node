@@ -371,6 +371,14 @@ impl RpcApi for RpcCoreMock {
         Err(RpcError::NotImplemented)
     }
 
+    async fn get_holder_reward_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetHolderRewardRequest,
+    ) -> RpcResult<GetHolderRewardResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
     async fn get_daa_score_timestamp_estimate_call(
         &self,
         _connection: Option<&DynRpcConnection>,

@@ -84,6 +84,18 @@ pub struct ConsensusStorage {
     /// pure function of the chain (no path-dependent running sum), so all nodes compute identical
     /// windowed values. Maintained in lockstep with the selected chain; read by `ratio_bps_by_block`.
     pub windowed_production_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    /// Same prefix-sum structure over its own keyspace: the miner cut coinbases actually PAID this
+    /// SPK (post tier/ratio scaling). `production − paid` over a window is the burned shortfall.
+    /// Display only — never read by consensus, never hashed into the service commitment.
+    pub miner_paid_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    /// Likewise for the escrow cut that ACCRUED to the producer: zero for a standard miner, whose
+    /// escrow output is burned at emission. Display only.
+    pub miner_escrow_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    /// Likewise for inference-reward mints routed to this SPK. Display only.
+    pub miner_inference_prefix_store: Arc<DbWindowedProductionPrefixStore>,
+    /// Base miner cut per payout SPK split by proven model tier, one index per bucket. Display
+    /// only, same shape and start marker as the payout indexes.
+    pub miner_tier_prefix_stores: [Arc<DbWindowedProductionPrefixStore>; keryx_consensus_core::coinbase::TIER_BUCKETS],
 
     // OPoI slash stores (Phase 3 A4)
     pub ai_response_store: Arc<DbAiResponseStore>,
@@ -278,6 +290,31 @@ impl ConsensusStorage {
         let age_buckets_store = Arc::new(DbAgeBucketsStore::new(db.clone(), address_index_builder.build()));
         let maturation_queue_store = Arc::new(DbMaturationQueueStore::new(db.clone()));
         let windowed_production_prefix_store = Arc::new(DbWindowedProductionPrefixStore::new(db.clone()));
+        let miner_paid_prefix_store = Arc::new(DbWindowedProductionPrefixStore::with_prefixes(
+            db.clone(),
+            DatabaseStorePrefixes::MinerPaidPrefix,
+            DatabaseStorePrefixes::MinerPaidFloor,
+        ));
+        let miner_escrow_prefix_store = Arc::new(DbWindowedProductionPrefixStore::with_prefixes(
+            db.clone(),
+            DatabaseStorePrefixes::MinerEscrowPrefix,
+            DatabaseStorePrefixes::MinerEscrowFloor,
+        ));
+        let miner_inference_prefix_store = Arc::new(DbWindowedProductionPrefixStore::with_prefixes(
+            db.clone(),
+            DatabaseStorePrefixes::MinerInferencePrefix,
+            DatabaseStorePrefixes::MinerInferenceFloor,
+        ));
+        // One index per tier bucket, so the window yields the MIX a miner actually ran and not a
+        // single tier that would be false for anyone running more than one model.
+        let miner_tier_prefix_stores = [
+            (DatabaseStorePrefixes::MinerTier0Prefix, DatabaseStorePrefixes::MinerTier0Floor),
+            (DatabaseStorePrefixes::MinerTier1Prefix, DatabaseStorePrefixes::MinerTier1Floor),
+            (DatabaseStorePrefixes::MinerTier2Prefix, DatabaseStorePrefixes::MinerTier2Floor),
+            (DatabaseStorePrefixes::MinerTier3Prefix, DatabaseStorePrefixes::MinerTier3Floor),
+            (DatabaseStorePrefixes::MinerTier4Prefix, DatabaseStorePrefixes::MinerTier4Floor),
+        ]
+        .map(|(entries, floor)| Arc::new(DbWindowedProductionPrefixStore::with_prefixes(db.clone(), entries, floor)));
 
         // OPoI slash stores
         let ai_response_store = Arc::new(DbAiResponseStore::new(db.clone(), header_data_builder.build()));
@@ -336,6 +373,10 @@ impl ConsensusStorage {
             age_buckets_store,
             maturation_queue_store,
             windowed_production_prefix_store,
+            miner_paid_prefix_store,
+            miner_escrow_prefix_store,
+            miner_inference_prefix_store,
+            miner_tier_prefix_stores,
             ai_response_store,
             ai_slashed_store,
             service_burn_store,

@@ -725,6 +725,44 @@ pub const RATIO_REWARD_WINDOW_DAA: u64 = 864_000;
 /// KERYX-KRX/coin_age_holder_reward_spec.md §2/§9. Used at/after `coin_age_activation`.
 pub const COIN_AGE_MATURITY_W: u64 = 864_000; // 24h at 10 BPS
 
+/// The bracket table in force for a given era: `(thresholds, bps)`. `coin_age_active` selects the
+/// recalibrated v2 table, mirroring the gate in `ratio_bps_by_block` — callers that need to
+/// explain a bracket (which rung, what the next one costs) read the table instead of
+/// re-hardcoding it. `thresholds` and the returned `bps` are index-aligned.
+pub fn ratio_reward_table(coin_age_active: bool) -> (&'static [u64], &'static [u64]) {
+    if coin_age_active {
+        (&RATIO_REWARD_THRESHOLDS_V2, &RATIO_REWARD_BPS_V2)
+    } else {
+        (&RATIO_REWARD_THRESHOLDS, &RATIO_REWARD_BPS)
+    }
+}
+
+/// Explains a bracket rather than just returning it: `(bracket_bps, next_bracket, full_bracket)`
+/// where `next_bracket` is `(bps, balance needed to reach it)` and is `None` at the top rung, and
+/// `full_bracket` is the balance that reaches 100 %.
+///
+/// Same ascending scan as `ratio_bracket_bps`, but it keeps the rung INDEX so the rung above can
+/// be priced. `balance` must be the value the bracket actually divides (the coin-age effective
+/// balance in the v2 era) and `production` must already be floored by the caller, exactly as on
+/// the coinbase path — otherwise the answer explains a bracket the chain never applied.
+///
+/// Thresholds are multiples of production, so a heavy producer's target can exceed `u64`; those
+/// saturate, since the figure is only ever a display target.
+pub fn ratio_bracket_explain(balance: u64, production: u64, coin_age_active: bool) -> (u64, Option<(u64, u64)>, u64) {
+    let (thresholds, bps_table) = ratio_reward_table(coin_age_active);
+    let mut idx = 0usize;
+    for i in 0..thresholds.len() {
+        if (balance as u128) >= (thresholds[i] as u128) * (production as u128) {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    let target_at = |i: usize| ((thresholds[i] as u128) * (production as u128)).min(u64::MAX as u128) as u64;
+    let next = (idx + 1 < thresholds.len()).then(|| (bps_table[idx + 1], target_at(idx + 1)));
+    (bps_table[idx], next, target_at(thresholds.len() - 1))
+}
+
 /// Returns the `RATIO_REWARD_BPS` multiplier for a payout address given its `balance` and its
 /// `production` over the trailing window. The caller MUST floor `production` at one block subsidy
 /// (a zero-history / freshly-rotated address would otherwise hit the top bracket for free).
@@ -2129,5 +2167,47 @@ mod ratio_reward_bps_tests {
         // Off-by-one just under each threshold must NOT round up to the next bracket.
         assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
         assert_eq!(ratio_reward_bps_v2(90 * P - 1, P), 9_000);
+    }
+
+    #[test]
+    fn bracket_explain_agrees_with_bps_and_prices_the_next_rung() {
+        // Live mainnet figures for a miner sitting mid-table (eff balance / production ~= 52.3x,
+        // which clears the 45x rung but not 60x). Pinned against what the chain explorer reports
+        // for the same address, so a change to either table is caught here rather than in the UI.
+        let eff_balance = 1_341_588_096_761_450u64;
+        let production = 25_659_176_302_130u64;
+        let (bps, next, full) = ratio_bracket_explain(eff_balance, production, true);
+        assert_eq!(bps, 7_500);
+        assert_eq!(next, Some((8_000, 60 * production)));
+        assert_eq!(full, 90 * production);
+        // The explainer must never disagree with the multiplier the coinbase path uses.
+        assert_eq!(bps, ratio_reward_bps_v2(eff_balance, production));
+
+        // Top rung: nothing above it to price, and `full` is the rung already occupied.
+        let (top_bps, top_next, top_full) = ratio_bracket_explain(90 * production, production, true);
+        assert_eq!(top_bps, 10_000);
+        assert_eq!(top_next, None);
+        assert_eq!(top_full, 90 * production);
+
+        // Bottom rung: a pure dumper keeps the floor and is quoted the first step up.
+        let (floor_bps, floor_next, _) = ratio_bracket_explain(0, production, true);
+        assert_eq!(floor_bps, 5_000);
+        assert_eq!(floor_next, Some((5_500, 3 * production)));
+
+        // Pre-H4 era uses the 6-rung table: floor 40 %, top at 30 windows held.
+        let (v1_bps, v1_next, v1_full) = ratio_bracket_explain(0, production, false);
+        assert_eq!(v1_bps, 4_000);
+        assert_eq!(v1_next, Some((5_200, production)));
+        assert_eq!(v1_full, 30 * production);
+    }
+
+    #[test]
+    fn bracket_explain_saturates_instead_of_wrapping() {
+        // A heavy producer's top-rung target (90x production) overflows u64; the display figure
+        // must saturate rather than wrap around to a small number that reads as "almost there".
+        let production = u64::MAX / 2;
+        let (_, next, full) = ratio_bracket_explain(0, production, true);
+        assert_eq!(full, u64::MAX);
+        assert_eq!(next, Some((5_500, u64::MAX)));
     }
 }

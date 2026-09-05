@@ -25,6 +25,9 @@ impl CoinbaseManagerMock {
             tx: Transaction::new(TX_VERSION, vec![], vec![output], 0, SUBNETWORK_ID_COINBASE, 0, payload),
             has_red_reward: false,
             red_reward_output_index: None,
+            // The mock pays one flat subsidy to one miner and no block here is ever validated
+            // against a payout index, so there is nothing to attribute.
+            payouts: vec![],
         }
     }
 

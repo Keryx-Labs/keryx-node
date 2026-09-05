@@ -985,6 +985,39 @@ mod mockery {
 
     test!(GetHeadersResponse);
 
+    impl Mock for GetHolderRewardRequest {
+        fn mock() -> Self {
+            GetHolderRewardRequest { address: mock() }
+        }
+    }
+
+    test!(GetHolderRewardRequest);
+
+    impl Mock for GetHolderRewardResponse {
+        fn mock() -> Self {
+            GetHolderRewardResponse {
+                virtual_daa_score: mock(),
+                eff_balance: mock(),
+                production_raw: mock(),
+                production: mock(),
+                bracket_bps: mock(),
+                next_bracket_bps: mock(),
+                next_bracket_balance: mock(),
+                full_bracket_balance: mock(),
+                window_daa: mock(),
+                active: mock(),
+                paid: mock(),
+                burned: mock(),
+                escrow: mock(),
+                inference: mock(),
+                income_window_daa: mock(),
+                tier_base: mock(),
+            }
+        }
+    }
+
+    test!(GetHolderRewardResponse);
+
     impl Mock for GetBalanceByAddressRequest {
         fn mock() -> Self {
             GetBalanceByAddressRequest { address: mock() }

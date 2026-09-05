@@ -9,7 +9,7 @@ use crate::{
     block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
     blockstatus::BlockStatus,
     coinbase::MinerData,
-    collateral::ServiceStrikesSnapshot,
+    collateral::{HolderRewardSnapshot, ServiceStrikesSnapshot},
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         block::{BlockProcessResult, RuleError},
@@ -156,6 +156,11 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
+        unimplemented!()
+    }
+
+    /// Holder-reward (ratio-reward) state of one payout address at the committed virtual view.
+    fn get_holder_reward(&self, _script_public_key: &crate::tx::ScriptPublicKey) -> HolderRewardSnapshot {
         unimplemented!()
     }
 

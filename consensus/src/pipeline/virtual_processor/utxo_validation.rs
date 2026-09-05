@@ -32,9 +32,9 @@ use crate::model::stores::ai_slash::{AiResponseRecord, AiResponseStore, AiRespon
 use crate::model::stores::pom_tier::PomTierStoreReader;
 use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
-use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
+use crate::model::stores::windowed_production_prefix::{DbWindowedProductionPrefixStore, WindowedProductionPrefixStoreReader};
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_bracket_explain, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -55,7 +55,7 @@ use keryx_consensus_core::{
 };
 use keryx_core::{debug, info, trace, warn};
 use keryx_hashes::Hash;
-use keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
+use keryx_consensus_core::collateral::{AI_REQUEST_MAX_TOKENS_CAP, HolderRewardSnapshot};
 use keryx_inference::{AiRequestPayload, AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, parse_ai_caps};
 use keryx_muhash::MuHash;
 use keryx_txscript::script_class::ScriptClass;
@@ -319,6 +319,7 @@ impl VirtualStateProcessor {
         let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase_at(header.daa_score);
         if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
             self.verify_coinbase_transaction(
+                header.hash,
                 &txs[0],
                 header.daa_score,
                 &ctx.ghostdag_data,
@@ -628,6 +629,8 @@ impl VirtualStateProcessor {
 
     fn verify_coinbase_transaction(
         &self,
+        // The block being validated: the key `record_block_payouts` files its payout split under.
+        block_hash: Hash,
         coinbase: &Transaction,
         daa_score: u64,
         ghostdag_data: &GhostdagData,
@@ -646,7 +649,7 @@ impl VirtualStateProcessor {
         let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
         let suspended_blues = self.suspended_blues(ghostdag_data, mergeset_non_daa, daa_score);
         let reward_mints = self.service_reward_mints_for(ghostdag_data.selected_parent);
-        let expected_coinbase = self
+        let expected_template = self
             .coinbase_manager
             .expected_coinbase_transaction(
                 daa_score,
@@ -659,8 +662,24 @@ impl VirtualStateProcessor {
                 &suspended_blues,
                 &reward_mints,
             )
-            .unwrap()
-            .tx;
+            .unwrap();
+        let expected_coinbase = expected_template.tx;
+        if hashing::tx::hash(coinbase) == hashing::tx::hash(&expected_coinbase) {
+            // Exact income split, straight from the builder. This is the only moment it is
+            // knowable: the tier/ratio maps and the mint list above do not survive validation,
+            // and neither is recoverable from the finished transaction.
+            let mut payouts = expected_template.payouts;
+            // The one part the builder cannot fill (see `tier_base_by_spk`). Merged here so the
+            // recorded split and the re-derived one agree — otherwise the tier buckets would be
+            // populated only for the blocks that happened to take the fallback path.
+            let tier_base = self.tier_base_by_spk(ghostdag_data, mergeset_non_daa, mergeset_rewards);
+            for (spk, payout) in payouts.iter_mut() {
+                if let Some(buckets) = tier_base.get(spk) {
+                    payout.tier_base = *buckets;
+                }
+            }
+            self.record_block_payouts(block_hash, payouts);
+        }
         if hashing::tx::hash(coinbase) != hashing::tx::hash(&expected_coinbase) {
             // Diagnostic: pinpoint why the coinbase differs (tier vs ratio vs amounts). Logged at WARN
             // only when it causes a real rejection (`enforce`); in observe-only it would fire for every
@@ -793,6 +812,125 @@ impl VirtualStateProcessor {
             map.insert(*blue, bps);
         }
         map
+    }
+
+    /// The `(top, bottom)` chain-index span the display-only payout indexes can honestly answer
+    /// for `ctx`: the reward window's own span, raised to the index's start.
+    ///
+    /// The indexes are maintained forward from the boot that created them, so below their start
+    /// `cumulative_at` reads 0 — which would make a real payout look like a full burn. Raising the
+    /// bottom instead reports less over a shorter span, and the span is reported alongside the
+    /// figures so a caller never mislabels a partial window as a full one. A start of 0 means the
+    /// index was never initialised at all: the span collapses to zero length, so every figure
+    /// derived from it is 0 and the caller sees "no coverage" rather than a fabricated burn.
+    ///
+    /// Only the on-chain shape is truly meaningful: the snapshot is always taken against the sink,
+    /// which is a committed chain block, so `production_window_ctx` returns Case A. A side-chain
+    /// ctx would additionally need the per-SPK side aggregation the production path pre-builds,
+    /// which these indexes do not carry — so it reports the committed part alone rather than
+    /// silently mixing in a half-window.
+    fn payout_span(&self, ctx: &ProductionWindowCtx) -> (u64, u64) {
+        let (top, bottom) = match ctx {
+            ProductionWindowCtx::OnChain { m_idx, bottom } => (*m_idx, *bottom),
+            ProductionWindowCtx::SideChain { common, lo, .. } => (*common, *lo),
+        };
+        match self.miner_payout_index_start() {
+            0 => (top, top),
+            start => (top, bottom.max(start).min(top)),
+        }
+    }
+
+    /// Windowed value of one of the display-only payout indexes over a [`Self::payout_span`].
+    fn windowed_payout(&self, store: &DbWindowedProductionPrefixStore, spk: &ScriptPublicKey, span: (u64, u64)) -> u64 {
+        // No panic on this path: it is reachable from an RPC query, so a transient store error must
+        // degrade to "nothing recorded" rather than take the node down on a remote request.
+        let hi = store.cumulative_at(spk, span.0).unwrap_or(0);
+        let lo = store.cumulative_at(spk, span.1).unwrap_or(0);
+        hi.saturating_sub(lo)
+    }
+
+    /// Holder-reward state of one payout address at the committed virtual view — the query-side
+    /// mirror of `ratio_bps_by_block`, which computes the same bracket per rewarded blue.
+    ///
+    /// Reuses the consensus helpers verbatim rather than re-deriving them, so an operator's
+    /// reading can never disagree with the bracket their coinbase was actually scaled by:
+    /// `eff_balance_for_spk` for the numerator (coin-age era) and the prefix-sum production index
+    /// for the denominator. `view_diffs` is deliberately empty — this describes the node's
+    /// committed view, not a candidate block's POV — and `sink` is the virtual's selected parent,
+    /// a committed chain block, so `production_window_ctx` takes its cheap Case A path.
+    ///
+    /// Safe for an arbitrary address: both stores answer an absent key with zero.
+    pub(crate) fn holder_reward_snapshot(
+        &self,
+        spk: &ScriptPublicKey,
+        virtual_daa_score: u64,
+        sink: Hash,
+    ) -> HolderRewardSnapshot {
+        let coin_age_active = self.coin_age_activation.is_active(virtual_daa_score);
+        let eff_balance = if coin_age_active {
+            self.eff_balance_for_spk(spk, virtual_daa_score, &[])
+        } else {
+            self.address_balance_store.get(spk).unwrap_or(0)
+        };
+        let ctx = self.production_window_ctx(sink, self.ratio_reward_window);
+        let production_raw = self.windowed_production_with_ctx(spk, &ctx);
+        // Same floor the coinbase path applies: without it a zero-production address divides by
+        // zero and lands in the top bracket for free.
+        let production = production_raw.max(self.coinbase_manager.base_miner_cut(virtual_daa_score).max(1));
+        let (bracket_bps, next_bracket, full_bracket_balance) =
+            ratio_bracket_explain(eff_balance, production, coin_age_active);
+        // Income is reported over the span the payout indexes actually cover, which is the reward
+        // window once they have been maintained for one, and shorter on a node that has just built
+        // them forward from its tip.
+        let span = self.payout_span(&ctx);
+        let paid = self.windowed_payout(&self.miner_paid_prefix_store, spk, span);
+        let escrow = self.windowed_payout(&self.miner_escrow_prefix_store, spk, span);
+        let inference = self.windowed_payout(&self.miner_inference_prefix_store, spk, span);
+        // The burn is the entitlement the brackets destroyed, so it MUST be measured over exactly
+        // the span `paid` covers — against the full-window `production_raw` it would count as
+        // burned every block whose payment the index does not yet know about. Against the RAW
+        // entitlement too, never the floored denominator: the floor exists only so the bracket
+        // does not divide by zero, and subtracting `paid` from it would invent a burn for an
+        // address that never mined.
+        let production_in_span = self.windowed_payout(&self.windowed_production_prefix_store, spk, span);
+        // The mix: base cut per proven tier over the same span. Reported as buckets rather than a
+        // weighted average because a miner runs rigs on different models, so the window is a
+        // blend — the average is recoverable from these, the blend is not recoverable from it.
+        let mut tier_base = [0u64; TIER_BUCKETS];
+        for (t, store) in self.miner_tier_prefix_stores.iter().enumerate() {
+            tier_base[t] = self.windowed_payout(store, spk, span);
+        }
+        let burned = production_in_span.saturating_sub(paid);
+        // Daa actually spanned, for the caller to label the income figures with. Zero on any
+        // lookup failure — conservative: it reads as "no coverage", not as a full window.
+        let income_window_daa = {
+            let sc = self.selected_chain_store.read();
+            let daa_at = |idx: u64| {
+                sc.get_by_index(idx).ok().and_then(|h| self.headers_store.get_daa_score(h).ok()).unwrap_or(0)
+            };
+            daa_at(span.0).saturating_sub(daa_at(span.1))
+        };
+        HolderRewardSnapshot {
+            virtual_daa_score,
+            eff_balance,
+            production_raw,
+            production,
+            bracket_bps,
+            next_bracket,
+            full_bracket_balance,
+            paid,
+            burned,
+            escrow,
+            inference,
+            income_window_daa,
+            tier_base,
+            window_daa: if self.pom_level_activation.is_active(virtual_daa_score) {
+                self.ratio_reward_window_daa
+            } else {
+                self.ratio_reward_window
+            },
+            active: self.ratio_reward_activation.is_active(virtual_daa_score),
+        }
     }
 
     /// Ratio-reward map consumed by `expected_coinbase_transaction`: for each rewarded blue, the
@@ -972,6 +1110,140 @@ impl VirtualStateProcessor {
         Some((spk, cut))
     }
 
+    /// Payout split of committed selected-chain block `hash`, per payout SPK.
+    ///
+    /// The exact split is produced by the coinbase BUILDER and carried here by
+    /// [`Self::record_block_payouts`] when the block is validated — the only moment it is knowable,
+    /// since a miner cut is the base cut scaled by that block's tier and ratio brackets and an
+    /// inference mint is indistinguishable from a miner cut by script alone.
+    ///
+    /// This function is the FALLBACK for the gaps in that carry: blocks validated inside a
+    /// coinbase trust window (archival / fast-sync catch-up, where verification is skipped), and
+    /// the historical blocks a first-boot backfill walks. It reconstructs the split from the
+    /// committed coinbase outputs, which is exact except for one case it cannot see: a mint routed
+    /// to an SPK that also produced one of this block's blues lands in `paid` rather than
+    /// `inference`. Income is right either way — only the split between the two lines, and hence
+    /// the burn, is off, and only for a miner who won an inference on a block they also mined.
+    ///
+    /// Returns nothing before `pom_level_activation`: in that era `block_productions` credited only
+    /// the chain block's own producer while the coinbase already paid the blues, so the two sides
+    /// attribute over different sets and their difference would not be a burn. Every window this is
+    /// ever read over (a trailing 24 h from the tip) sits far past that fork.
+    /// The proven model tier of one blue, resolved exactly as `tier_bps_by_block` resolves it:
+    /// from the header at/after `pom_v3_activation` (H6 commits it there, bound to the proof by
+    /// body validation, so a body synced without its proof still answers), from the per-block
+    /// store before that. `None` for a blue with no proven tier at all — pre-PoM history, which
+    /// must be left out of the buckets rather than folded into tier 0.
+    fn blue_tier(&self, blue: Hash, header: &keryx_consensus_core::header::Header) -> Option<u8> {
+        if self.pom_v3_activation.is_active(header.daa_score) {
+            Some(header.pom_tier)
+        } else {
+            self.pom_tier_store.get(blue).optional().ok().flatten()
+        }
+    }
+
+    pub(super) fn block_payouts(&self, hash: Hash) -> Vec<(ScriptPublicKey, CoinbasePayout)> {
+        // ALL-OR-NOTHING, and never a panic. A pruned node keeps the selected chain far below the
+        // pruning point but drops the block BODIES there, and the backfill walks the whole
+        // retained chain — so a missing body is the normal case, not corruption. It must also not
+        // yield a PARTIAL answer: the outputs would still classify, but without each blue's payout
+        // SPK a miner cut is indistinguishable from an inference mint, so the split would be
+        // silently wrong. Skipping the block outright is exactly what the production index does
+        // over the same range, and is sound because a window never reaches below the floor.
+        let Ok(daa) = self.headers_store.get_daa_score(hash) else { return Vec::new() };
+        if !self.pom_level_activation.is_active(daa) {
+            return Vec::new();
+        }
+        let (Ok(ghostdag_data), Ok(non_daa), Ok(txs)) = (
+            self.ghostdag_store.get_data(hash),
+            self.daa_excluded_store.get_mergeset_non_daa(hash),
+            self.block_transactions_store.get(hash),
+        ) else {
+            return Vec::new();
+        };
+
+        // Per-blue facts: the payout SPK, its base cut, and whether its escrow slice accrued.
+        let mut acc: std::collections::HashMap<ScriptPublicKey, CoinbasePayout> = std::collections::HashMap::new();
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|b| !non_daa.contains(b)) {
+            // The full header rather than just the daa score: it carries the proven tier too, so
+            // the bucket split costs no extra read here.
+            let (Ok(blue_header), Ok(blue_txs)) =
+                (self.headers_store.get_header(*blue), self.block_transactions_store.get(*blue))
+            else {
+                return Vec::new();
+            };
+            let blue_daa = blue_header.daa_score;
+            let Ok(coinbase) = self.coinbase_manager.deserialize_coinbase_payload(&blue_txs[0].payload) else {
+                return Vec::new();
+            };
+            let announced =
+                self.coinbase_manager.parse_escrow_from_extra_data(coinbase.miner_data.extra_data, blue_daa).is_some();
+            let tier = self.blue_tier(*blue, &blue_header);
+            let entry = acc.entry(coinbase.miner_data.script_public_key).or_default();
+            let cut = self.coinbase_manager.base_miner_cut(blue_daa);
+            entry.base += cut;
+            if let Some(t) = tier.filter(|t| (*t as usize) < TIER_BUCKETS) {
+                entry.tier_base[t as usize] += cut;
+            }
+            if announced {
+                entry.escrow += self.coinbase_manager.escrow_cut(blue_daa);
+            }
+        }
+
+        // Outputs that are neither a burn, the R&D allocation nor an escrow lock are income: a
+        // miner cut when the SPK produced one of this block's blues, an inference mint otherwise.
+        for out in txs[0].outputs.iter() {
+            let spk = &out.script_public_key;
+            if spk == self.coinbase_manager.burn_spk()
+                || spk == self.coinbase_manager.rd_allocation_spk()
+                || ScriptClass::is_csv_pay_to_pubkey(spk.script())
+            {
+                continue;
+            }
+            match acc.get_mut(spk) {
+                Some(entry) => entry.paid += out.value,
+                None => acc.entry(spk.clone()).or_default().inference += out.value,
+            }
+        }
+        acc.into_iter().collect()
+    }
+
+    /// Base miner cut per payout SPK, split by the proven tier of the blue that earned it, for the
+    /// blues this block pays. Header reads only — no bodies — because `mergeset_rewards` already
+    /// carries each blue's payout SPK, derived for the coinbase itself.
+    ///
+    /// Exists because the builder cannot supply this: it is handed the tier as a bracket in bps,
+    /// and bps maps back to a tier ambiguously — the standing gate pays a demoted top tier at the
+    /// entry tier's rate, so a reverse lookup would file a Kimi-48B block under Qwen3.5-9B and
+    /// report a mix the miner never ran.
+    fn tier_base_by_spk(
+        &self,
+        ghostdag_data: &GhostdagData,
+        mergeset_non_daa: &BlockHashSet,
+        mergeset_rewards: &BlockHashMap<BlockRewardData>,
+    ) -> std::collections::HashMap<ScriptPublicKey, [u64; TIER_BUCKETS]> {
+        let mut out: std::collections::HashMap<ScriptPublicKey, [u64; TIER_BUCKETS]> = std::collections::HashMap::new();
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            let Some(reward) = mergeset_rewards.get(blue) else { continue };
+            let Ok(header) = self.headers_store.get_header(*blue) else { continue };
+            let Some(tier) = self.blue_tier(*blue, &header).filter(|t| (*t as usize) < TIER_BUCKETS) else { continue };
+            let cut = self.coinbase_manager.base_miner_cut(header.daa_score);
+            out.entry(reward.script_public_key.clone()).or_default()[tier as usize] += cut;
+        }
+        out
+    }
+
+    /// Stores the coinbase builder's exact payout split for `hash`, so the commit path attributes
+    /// income without having to re-derive it from the finished transaction. Called from coinbase
+    /// verification, the one place the tier/ratio maps and the mint list are all in hand.
+    pub(super) fn record_block_payouts(&self, hash: Hash, payouts: Vec<(ScriptPublicKey, CoinbasePayout)>) {
+        let mut cache = self.block_payout_cache.write();
+        if cache.len() >= 200_000 {
+            cache.clear();
+        }
+        cache.insert(hash, std::sync::Arc::new(payouts));
+    }
+
     /// Production contributions attributed at chain block `hash`'s index in the prefix-sum index,
     /// era-aware. The era is gated by the CHAIN BLOCK's own daa_score — a pure per-block property,
     /// so the index remains a pure, IBD-re-derivable function of the chain across the fork:
@@ -1010,6 +1282,20 @@ impl VirtualStateProcessor {
         }
         let v = std::sync::Arc::new(self.block_productions(hash));
         let mut cache = self.block_production_cache.write();
+        if cache.len() >= 200_000 {
+            cache.clear();
+        }
+        cache.insert(hash, v.clone());
+        v
+    }
+
+    /// Memoized [`Self::block_payouts`]. Immutable per hash for the same reason productions are.
+    pub(super) fn block_payouts_cached(&self, hash: Hash) -> std::sync::Arc<Vec<(ScriptPublicKey, CoinbasePayout)>> {
+        if let Some(v) = self.block_payout_cache.read().get(&hash) {
+            return v.clone();
+        }
+        let v = std::sync::Arc::new(self.block_payouts(hash));
+        let mut cache = self.block_payout_cache.write();
         if cache.len() >= 200_000 {
             cache.clear();
         }
@@ -1064,6 +1350,46 @@ impl VirtualStateProcessor {
             })
             .collect();
         self.windowed_production_prefix_store.extend(batch, common, &removals, &additions).unwrap();
+
+        // The paid/escrow indexes ride the SAME index assignment and the same batch, so all three
+        // are always in lockstep with the selected chain: a window read can never pair a
+        // production cumulative with a paid cumulative from a different chain state.
+        let payout_removals: Vec<(ScriptPublicKey, u64)> = chain_path
+            .removed
+            .iter()
+            .enumerate()
+            .flat_map(|(j, h)| {
+                self.block_payouts_cached(*h).iter().map(|(spk, _)| (spk.clone(), from_tip - j as u64)).collect::<Vec<_>>()
+            })
+            .collect();
+        let mut paid_additions: Vec<(ScriptPublicKey, u64, u64)> = Vec::new();
+        let mut escrow_additions: Vec<(ScriptPublicKey, u64, u64)> = Vec::new();
+        let mut inference_additions: Vec<(ScriptPublicKey, u64, u64)> = Vec::new();
+        let mut tier_additions: [Vec<(ScriptPublicKey, u64, u64)>; TIER_BUCKETS] = Default::default();
+        for (k, h) in chain_path.added.iter().enumerate() {
+            let index = common + 1 + k as u64;
+            for (spk, p) in self.block_payouts_cached(*h).iter() {
+                paid_additions.push((spk.clone(), index, p.paid));
+                escrow_additions.push((spk.clone(), index, p.escrow));
+                inference_additions.push((spk.clone(), index, p.inference));
+                for (t, additions) in tier_additions.iter_mut().enumerate() {
+                    // Sparse on purpose: an SPK that ran no block at this tier gets no entry, and
+                    // `cumulative_at` reverse-seeks past the gap to its last real one.
+                    if p.tier_base[t] > 0 {
+                        additions.push((spk.clone(), index, p.tier_base[t]));
+                    }
+                }
+            }
+        }
+        self.miner_paid_prefix_store.extend(batch, common, &payout_removals, &paid_additions).unwrap();
+        self.miner_escrow_prefix_store.extend(batch, common, &payout_removals, &escrow_additions).unwrap();
+        self.miner_inference_prefix_store.extend(batch, common, &payout_removals, &inference_additions).unwrap();
+        // The tier buckets ride the same index assignment and batch as the three above. Removals
+        // are the shared payout list: deleting a key that was never written is a no-op, so passing
+        // every removed (spk, index) to each bucket is correct and needs no per-tier bookkeeping.
+        for (store, additions) in self.miner_tier_prefix_stores.iter().zip(tier_additions.iter()) {
+            store.extend(batch, common, &payout_removals, additions).unwrap();
+        }
     }
 
     /// Windowed production for `spk` as seen by the block whose selected parent is `m_sp`, read from

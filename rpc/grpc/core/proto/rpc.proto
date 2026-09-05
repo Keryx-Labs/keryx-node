@@ -1172,6 +1172,46 @@ message ServiceStrikeTotalMessage {
 message GetServiceStrikesRequestMessage {
 }
 
+// GetHolderRewardRequestMessage asks for the holder-reward (ratio-reward) bracket state of one
+// payout address: the effective balance and windowed production the node divides, the resulting
+// bracket, and what the next bracket up would cost.
+message GetHolderRewardRequestMessage {
+  string address = 1;
+}
+
+message GetHolderRewardResponseMessage {
+  uint64 virtualDaaScore = 1;
+  // Coin-age effective balance (the plain balance pre-H4) — NOT the spendable balance.
+  uint64 effBalance = 2;
+  // Windowed production before the one-block floor; 0 means "not a miner in this window".
+  uint64 productionRaw = 3;
+  uint64 production = 4;
+  uint64 bracketBps = 5;
+  // Both unset exactly when the address already sits in the top bracket.
+  optional uint64 nextBracketBps = 6;
+  optional uint64 nextBracketBalance = 7;
+  uint64 fullBracketBalance = 8;
+  uint64 windowDaa = 9;
+  bool active = 10;
+  // Miner cut actually paid over the window (post tier/ratio scaling) — income, not entitlement.
+  uint64 paid = 11;
+  // productionRaw - paid: the shortfall the brackets destroyed.
+  uint64 burned = 12;
+  // Escrow slice accrued over the window; 0 for a standard miner (burned at emission).
+  uint64 escrow = 13;
+  // Inference-reward mints routed to this address over the window.
+  uint64 inference = 14;
+  // Daa actually spanned by paid/burned/escrow/inference - NOT necessarily windowDaa. Those come
+  // from display-only indexes maintained forward from the boot that created them, so a fresh node
+  // covers only the daa since; 0 means no coverage. Label the income figures with this.
+  uint64 incomeWindowDaa = 15;
+  // Base miner cut over incomeWindowDaa split by proven model tier - the MIX, indexed by tier.
+  // Shares must be taken over the sum of these, never over the entitlement.
+  repeated uint64 tierBase = 16;
+
+  RPCError error = 1000;
+}
+
 message GetServiceStrikesResponseMessage {
   uint64 virtualDaaScore = 1;
   repeated ServiceStrikeMessage strikes = 2;

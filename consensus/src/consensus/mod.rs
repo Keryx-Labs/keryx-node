@@ -57,7 +57,7 @@ use keryx_consensus_core::{
     blockhash::BlockHashExtensions,
     blockstatus::BlockStatus,
     coinbase::MinerData,
-    collateral::ServiceStrikesSnapshot,
+    collateral::{HolderRewardSnapshot, ServiceStrikesSnapshot},
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         coinbase::CoinbaseResult,
@@ -360,6 +360,7 @@ impl Consensus {
         // (a datadir predating it, or a fresh prefix). Once populated it is kept current by lockstep
         // maintenance, so this is a no-op on subsequent boots. Pure function of the chain.
         this.virtual_processor.rebuild_windowed_production_prefix_index_on_start();
+        this.virtual_processor.rebuild_miner_payout_prefix_indexes_on_start();
 
         // Ratio-reward balance index (the ratio numerator): recompute from the current UTXO set so a
         // snapshot-restored datadir's stale balance index can't make the numerator differ across nodes.
@@ -718,6 +719,18 @@ impl ConsensusApi for Consensus {
 
     fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
         self.virtual_processor.service_strikes_snapshot(self.lkg_virtual_state.load().daa_score)
+    }
+
+    fn get_holder_reward(&self, script_public_key: &keryx_consensus_core::tx::ScriptPublicKey) -> HolderRewardSnapshot {
+        // One load of the last-known-good virtual state, so the daa score and the sink the
+        // snapshot is taken against are the same view (two loads could straddle a virtual change
+        // and pair a balance with a window that never coexisted).
+        let virtual_state = self.lkg_virtual_state.load();
+        self.virtual_processor.holder_reward_snapshot(
+            script_public_key,
+            virtual_state.daa_score,
+            virtual_state.ghostdag_data.selected_parent,
+        )
     }
 
     fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {

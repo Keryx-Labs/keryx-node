@@ -38,6 +38,14 @@ workflow-log.workspace = true
 workflow-core.workspace = true
 workflow-wasm.workspace = true
 
+# getrandom 0.3 arrives transitively (ahash) and refuses to build for
+# wasm32-unknown-unknown unless its `wasm_js` backend is BOTH feature-enabled and
+# cfg-selected. The feature is enabled here; the matching
+# `--cfg getrandom_backend="wasm_js"` is supplied by the build scripts / .cargo/config.toml.
+# Scoped to wasm32 so host builds (build scripts, proc macros) keep the default backend.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_wasm_js = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
 [features]
 wasm32-sdk = [
     "keryx-wallet-core/wasm32-sdk",
