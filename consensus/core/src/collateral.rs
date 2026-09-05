@@ -834,6 +834,18 @@ impl ServiceLedger {
         self.first_seen_base = base;
     }
 
+    /// Drops the folded strike and first-sighting deltas and installs the persisted baselines.
+    pub fn set_persisted_baselines(
+        &mut self,
+        base: std::sync::Arc<std::collections::BTreeMap<Hash, StrikeEntry>>,
+        first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>,
+    ) {
+        self.strikes.clear();
+        self.first_seen.clear();
+        self.base = base;
+        self.first_seen_base = first_seen_base;
+    }
+
     /// Whether `service_bond_v2_activation` is live at `daa`.
     fn v2_at(&self, daa: u64) -> bool {
         self.window_v2_activation_daa.is_some_and(|a| daa >= a)
@@ -1472,6 +1484,24 @@ impl ServiceLedger {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn persisted_baselines_replace_the_restored_strike_state() {
+        use crate::collateral::{ServiceLedger, ServiceLedgerSnapshot, StrikeEntry};
+        use keryx_hashes::Hash;
+        let m = Hash::from_u64_word(1);
+        let n = Hash::from_u64_word(2);
+        let mut snap = ServiceLedgerSnapshot::default();
+        snap.strikes.insert(m, StrikeEntry { count: 2, last_daa: 5 });
+        let mut ledger = ServiceLedger::default();
+        ledger.restore_snapshot(&snap);
+        assert_eq!(ledger.consecutive_misses(&m), 2);
+
+        let base = [(m, StrikeEntry { count: 3, last_daa: 9 }), (n, StrikeEntry { count: 1, last_daa: 2 })].into_iter().collect();
+        ledger.set_persisted_baselines(std::sync::Arc::new(base), std::sync::Arc::new(Default::default()));
+        assert_eq!(ledger.consecutive_misses(&m), 3, "the persisted record wins over the older snapshot delta");
+        assert_eq!(ledger.consecutive_misses(&n), 1);
+    }
 
     #[test]
     fn production_snapshot_roundtrip_is_canonical() {

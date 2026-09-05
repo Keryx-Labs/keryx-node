@@ -1503,6 +1503,44 @@ async fn ledger_snapshots_are_persisted_at_pruning_samples() {
     tc.shutdown(handles);
 }
 
+/// A cold refold restores the newest sample at or below the persisted event frontier, never one
+/// above it: the queued events between the frontier and a newer sample only exist in the fold.
+#[tokio::test]
+async fn cold_refold_picks_the_sample_at_or_below_the_persisted_frontier() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let mut params = MAINNET_PARAMS;
+    params.pom_v3_activation = ForkActivation::always();
+    params.blockrate.finality_depth = 10;
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let mut parent = config.genesis.hash;
+    for n in 1..=45u64 {
+        let hash: Hash = n.into();
+        tc.add_utxo_valid_block_with_parents(hash, vec![parent], vec![]).await.unwrap();
+        parent = hash;
+    }
+
+    let vp = tc.virtual_processor().clone();
+    let daa = |n: u64| vp.headers_store.get_daa_score(Hash::from(n)).unwrap();
+    let sc = vp.selected_chain_store.read();
+    let (tip_idx, _) = sc.get_tip().unwrap();
+    let idx = |n: u64| sc.get_by_hash(Hash::from(n)).unwrap();
+
+    assert_eq!(vp.refold_sample(&*sc, tip_idx, None), Some((idx(40), Hash::from(40u64))));
+    assert_eq!(vp.refold_sample(&*sc, tip_idx, Some(daa(35))), Some((idx(30), Hash::from(30u64))), "a sample above the frontier is skipped");
+    assert_eq!(vp.refold_sample(&*sc, tip_idx, Some(daa(40))), Some((idx(40), Hash::from(40u64))), "a sample at the frontier qualifies");
+    assert_eq!(vp.refold_sample(&*sc, tip_idx, Some(daa(9))), None);
+    assert_eq!(vp.refold_sample(&*sc, idx(25), None), Some((idx(20), Hash::from(20u64))));
+    drop(sc);
+
+    tc.shutdown(handles);
+}
+
 /// Every pruning sample also persists its production-index snapshot, and restoring it onto a
 /// wiped index reproduces the exact windowed values (and clears the catch-up marker).
 #[tokio::test]

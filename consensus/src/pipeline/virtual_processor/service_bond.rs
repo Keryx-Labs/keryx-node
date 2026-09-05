@@ -535,6 +535,17 @@ impl VirtualStateProcessor {
         lo
     }
 
+    /// The newest held sample snapshot at chain index `<= to` whose daa is at or below
+    /// `frontier` (any held sample when `None`).
+    pub(super) fn refold_sample(&self, sc: &impl SelectedChainStoreReader, to: u64, frontier: Option<u64>) -> Option<(u64, Hash)> {
+        self.service_ledger_hashes
+            .read()
+            .keys()
+            .filter_map(|h| sc.get_by_hash(*h).ok().filter(|idx| *idx <= to).map(|idx| (idx, *h)))
+            .filter(|(_, h)| frontier.is_none_or(|f| self.headers_store.get_daa_score(*h).is_ok_and(|d| d <= f)))
+            .max()
+    }
+
     /// Rebuilds the ledger up to chain index `to` by folding the committed chain from an empty
     /// state — the cold-start and deep-reorg path. The strike baseline is reloaded from the
     /// store (the exact state at the persisted frontier `cursor_daa`), blocks at or below the
@@ -555,10 +566,11 @@ impl VirtualStateProcessor {
             return ledger;
         };
         let to_daa = self.headers_store.get_daa_score(to_hash).unwrap();
-        ledger.set_base(std::sync::Arc::new(self.load_strike_base()));
-        ledger.set_first_seen_base(std::sync::Arc::new(
-            self.service_standing.read().first_seen.iter().map(|(k, v)| (*k, *v)).collect(),
-        ));
+        let strike_base = std::sync::Arc::new(self.load_strike_base());
+        let first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>> =
+            std::sync::Arc::new(self.service_standing.read().first_seen.iter().map(|(k, v)| (*k, *v)).collect());
+        ledger.set_base(strike_base.clone());
+        ledger.set_first_seen_base(first_seen_base.clone());
         // One burnable window below the persisted frontier keeps every pending request and vault
         // claim readable at the frontier warm. A frontier of zero (nothing persisted yet) falls
         // back to the finality anchor: everything above it is re-derived.
@@ -566,15 +578,10 @@ impl VirtualStateProcessor {
         let daa_bound = start.saturating_sub(self.service_burnable_window_daa);
         let pruning_idx = sc.get_by_hash(pruning_point).expect("the pruning point is on the retained selected chain");
         let mut bottom = self.service_chain_index_at_or_below_daa(sc, daa_bound, to, pruning_idx);
-        // A persisted sample snapshot at or below `to` is the exact state there: restore it and
-        // fold only what lies above.
-        let sample = self
-            .service_ledger_hashes
-            .read()
-            .keys()
-            .filter_map(|h| sc.get_by_hash(*h).ok().filter(|idx| *idx <= to).map(|idx| (idx, *h)))
-            .max();
-        if let Some((sample_idx, sample_hash)) = sample {
+        // The event queue is not persisted: the restored sample must not sit above the persisted
+        // frontier, and the persisted strike and sighting records supersede the snapshot's.
+        let frontier = (cursor_daa > 0).then_some(cursor_daa);
+        if let Some((sample_idx, sample_hash)) = self.refold_sample(sc, to, frontier) {
             let restored = self
                 .service_ledger_snapshot_store
                 .get(sample_hash)
@@ -583,6 +590,9 @@ impl VirtualStateProcessor {
                 .and_then(|bytes| ServiceLedgerSnapshot::from_bytes(&bytes).ok());
             if let Some(snapshot) = restored {
                 ledger.restore_snapshot(&snapshot);
+                if frontier.is_some() {
+                    ledger.set_persisted_baselines(strike_base.clone(), first_seen_base.clone());
+                }
                 bottom = sample_idx;
                 info!("service-bond: refold from the snapshot at chain index {} (daa {})", sample_idx, self.headers_store.get_daa_score(sample_hash).unwrap());
             }
