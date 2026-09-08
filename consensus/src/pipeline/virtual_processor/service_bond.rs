@@ -15,7 +15,7 @@ use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
-use keryx_core::{info, warn};
+use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload};
 use keryx_txscript::script_class::ScriptClass;
@@ -581,6 +581,7 @@ impl VirtualStateProcessor {
         // The event queue is not persisted: the restored sample must not sit above the persisted
         // frontier, and the persisted strike and sighting records supersede the snapshot's.
         let frontier = (cursor_daa > 0).then_some(cursor_daa);
+        let mut snapshot_restored = false;
         if let Some((sample_idx, sample_hash)) = self.refold_sample(sc, to, frontier) {
             let restored = self
                 .service_ledger_snapshot_store
@@ -594,14 +595,15 @@ impl VirtualStateProcessor {
                     ledger.set_persisted_baselines(strike_base.clone(), first_seen_base.clone());
                 }
                 bottom = sample_idx;
+                snapshot_restored = true;
                 info!("service-bond: refold from the snapshot at chain index {} (daa {})", sample_idx, self.headers_store.get_daa_score(sample_hash).unwrap());
             }
         }
-        if bottom == pruning_idx && pruning_idx > 0 {
+        if !snapshot_restored && bottom == pruning_idx && pruning_idx > 0 {
             let bottom_daa = self.headers_store.get_daa_score(sc.get_by_index(bottom).unwrap()).unwrap();
             if bottom_daa > daa_bound {
-                warn!(
-                    "service-bond: cold refold clamped at the pruning point (daa {} > bound {}) — events below it cannot be re-derived",
+                error!(
+                    "service-bond: no ledger snapshot at or below the frontier and the pruning point (daa {}) is above the warm-up bound ({}) — service state below it is lost, resync required",
                     bottom_daa, daa_bound
                 );
             }
