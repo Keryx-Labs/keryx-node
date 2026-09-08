@@ -247,7 +247,7 @@ pub struct FlowContextInner {
     // Blocks detected as stored without their PoM possession proof while still within the proof
     // service window (FIFO + dedup, bounded). Drained by the relay flow, which re-fetches each
     // block from a peer and adopts the proof — the self-healing counterpart of the guard-rail.
-    pom_reproof_queue: Mutex<(VecDeque<Hash>, HashSet<Hash>)>,
+    pom_reproof_queue: Mutex<ReproofQueue>,
     // Compact (multiproof) proof encodings, computed once per block and reused across peers.
     // Building one costs ~1.3 ms of hashing — affordable once a block, but not once per peer per
     // block, which at 10 BPS with 8 peers would be ~10% of a core. FIFO-bounded.
@@ -399,30 +399,19 @@ impl FlowContext {
     /// band the oldest entries are dropped first, and the guard-rail re-queues any block that is
     /// still naked the next time it is served.
     pub fn enqueue_pom_reproof(&self, hash: Hash) {
-        const POM_REPROOF_QUEUE_CAP: usize = 4096;
-        let mut guard = self.pom_reproof_queue.lock();
-        let (queue, dedup) = &mut *guard;
-        if !dedup.insert(hash) {
-            return;
-        }
-        if queue.len() >= POM_REPROOF_QUEUE_CAP {
-            if let Some(evicted) = queue.pop_front() {
-                dedup.remove(&evicted);
-            }
-        }
-        queue.push_back(hash);
+        self.pom_reproof_queue.lock().enqueue(hash);
     }
 
     /// Takes up to `max` blocks queued for proof re-fetching. Taken entries leave the dedup set,
-    /// so a block whose re-fetch fails can be re-queued by the next guard-rail hit.
+    /// so a block whose re-fetch fails can be re-queued by the next guard-rail hit, up to
+    /// `POM_REPROOF_MAX_ATTEMPTS` times in total.
     pub fn take_pom_reproof_candidates(&self, max: usize) -> Vec<Hash> {
-        let mut guard = self.pom_reproof_queue.lock();
-        let (queue, dedup) = &mut *guard;
-        let taken: Vec<Hash> = queue.drain(..max.min(queue.len())).collect();
-        for hash in &taken {
-            dedup.remove(hash);
-        }
-        taken
+        self.pom_reproof_queue.lock().take(max)
+    }
+
+    /// Gives up on a block for good: no proof will be fetched for it anymore.
+    pub fn abandon_pom_reproof(&self, hash: Hash) {
+        self.pom_reproof_queue.lock().abandon(hash);
     }
 
     pub fn new(
@@ -463,7 +452,7 @@ impl FlowContext {
                 max_orphans,
                 config,
                 mining_rule_engine,
-                pom_reproof_queue: Mutex::new((VecDeque::new(), HashSet::new())),
+                pom_reproof_queue: Mutex::new(ReproofQueue::default()),
                 pom_wire_cache: Mutex::new((HashMap::new(), VecDeque::new())),
             }),
         }
@@ -997,5 +986,95 @@ impl ConnectionInitializer for FlowContext {
         // it is considered a protocol error and the connection will disconnect
 
         Ok(())
+    }
+}
+
+/// A block is re-fetched at most this many times; a proof nobody serves is then left alone.
+pub const POM_REPROOF_MAX_ATTEMPTS: u32 = 3;
+const POM_REPROOF_QUEUE_CAP: usize = 4096;
+const POM_REPROOF_ATTEMPTS_CAP: usize = 16_384;
+
+/// FIFO of blocks awaiting a proof re-fetch, deduplicated, with a per-block attempt budget.
+#[derive(Default)]
+pub struct ReproofQueue {
+    queue: VecDeque<Hash>,
+    queued: HashSet<Hash>,
+    attempts: HashMap<Hash, u32>,
+}
+
+impl ReproofQueue {
+    pub fn enqueue(&mut self, hash: Hash) {
+        if self.attempts.get(&hash).is_some_and(|n| *n >= POM_REPROOF_MAX_ATTEMPTS) {
+            return;
+        }
+        if !self.queued.insert(hash) {
+            return;
+        }
+        if self.queue.len() >= POM_REPROOF_QUEUE_CAP {
+            if let Some(evicted) = self.queue.pop_front() {
+                self.queued.remove(&evicted);
+            }
+        }
+        self.queue.push_back(hash);
+    }
+
+    pub fn take(&mut self, max: usize) -> Vec<Hash> {
+        let taken: Vec<Hash> = self.queue.drain(..max.min(self.queue.len())).collect();
+        if self.attempts.len() >= POM_REPROOF_ATTEMPTS_CAP {
+            self.attempts.clear();
+        }
+        for hash in &taken {
+            self.queued.remove(hash);
+            *self.attempts.entry(*hash).or_insert(0) += 1;
+        }
+        taken
+    }
+
+    /// Drops a block for good: it is neither queued nor eligible for a further attempt.
+    pub fn abandon(&mut self, hash: Hash) {
+        self.queued.remove(&hash);
+        self.queue.retain(|h| *h != hash);
+        self.attempts.insert(hash, POM_REPROOF_MAX_ATTEMPTS);
+    }
+}
+
+#[cfg(test)]
+mod reproof_queue_tests {
+    use super::*;
+
+    fn h(i: u64) -> Hash {
+        Hash::from_u64_word(i)
+    }
+
+    #[test]
+    fn a_block_is_retried_at_most_max_attempts_times() {
+        let mut q = ReproofQueue::default();
+        for round in 0..POM_REPROOF_MAX_ATTEMPTS {
+            q.enqueue(h(1));
+            assert_eq!(q.take(1), vec![h(1)], "attempt {}", round + 1);
+        }
+        q.enqueue(h(1));
+        assert!(q.take(1).is_empty(), "budget exhausted, never queued again");
+    }
+
+    #[test]
+    fn dedup_holds_while_queued_and_clears_on_take() {
+        let mut q = ReproofQueue::default();
+        q.enqueue(h(2));
+        q.enqueue(h(2));
+        assert_eq!(q.take(8), vec![h(2)]);
+        q.enqueue(h(2));
+        assert_eq!(q.take(8), vec![h(2)]);
+    }
+
+    #[test]
+    fn abandon_removes_and_blocks_further_attempts() {
+        let mut q = ReproofQueue::default();
+        q.enqueue(h(3));
+        q.enqueue(h(4));
+        q.abandon(h(3));
+        assert_eq!(q.take(8), vec![h(4)]);
+        q.enqueue(h(3));
+        assert!(q.take(8).is_empty());
     }
 }

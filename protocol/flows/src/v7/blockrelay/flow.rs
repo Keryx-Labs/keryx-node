@@ -140,19 +140,25 @@ impl HandleRelayInvsFlow {
             // serving guard-rail or the IBD receive path). Piggybacks on the inv cadence so it
             // needs no timer, rate-limited by `POM_REPROOF_MIN_INTERVAL`. A candidate that cannot
             // be repaired here returns to the tail of the queue for another peer to try.
+            let session = self.ctx.consensus().unguarded_session();
+
             if self.last_reproof_attempt.elapsed() >= POM_REPROOF_MIN_INTERVAL {
                 self.last_reproof_attempt = Instant::now();
                 if let Some(naked_hash) = self.ctx.take_pom_reproof_candidates(1).into_iter().next() {
-                    if let Err(e) = self.try_readopt_pom_proof(naked_hash).await {
-                        // `take_pom_reproof_candidates` cleared the dedup entry: re-queue before
-                        // propagating, otherwise this flow's exit loses the candidate.
+                    // A re-proof grafts a proof onto a body we hold; a block we only have the
+                    // header of belongs to the relay and IBD paths, and asking peers for it in a
+                    // loop is how one bodyless header cut the whole network into pieces.
+                    if session.async_get_block_status(naked_hash).await == Some(BlockStatus::StatusHeaderOnly) {
+                        self.ctx.abandon_pom_reproof(naked_hash);
+                        debug!("PoM re-proof: {} is header-only here, dropped from the re-fetch queue", naked_hash);
+                    } else if let Err(e) = self.try_readopt_pom_proof(naked_hash).await {
+                        // Never the peer's fault: re-queue (within the attempt budget) and keep
+                        // the connection; a closed one surfaces on the next dequeue anyway.
                         self.ctx.enqueue_pom_reproof(naked_hash);
-                        return Err(e);
+                        debug!("PoM re-proof: re-fetch of {} via peer {} failed: {} — re-queued", naked_hash, self.router, e);
                     }
                 }
             }
-
-            let session = self.ctx.consensus().unguarded_session();
             let is_ibd_in_transitional_state = session.async_is_consensus_in_transitional_ibd_state().await;
 
             match session.async_get_block_status(inv.hash).await {

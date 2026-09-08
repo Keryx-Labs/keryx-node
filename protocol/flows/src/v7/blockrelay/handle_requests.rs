@@ -5,7 +5,7 @@ use keryx_p2p_lib::{
     common::ProtocolError,
     convert::{block::PomWireFormat, header::HeaderFormat},
     dequeue_with_request_id, make_message, make_response,
-    pb::{InvRelayBlockMessage, kaspad_message::Payload},
+    pb::{InvRelayBlockMessage, RejectMessage, kaspad_message::Payload},
 };
 use std::sync::Arc;
 
@@ -52,7 +52,16 @@ impl HandleRelayBlockRequests {
             let session = self.ctx.consensus().unguarded_session();
 
             for hash in hashes {
-                let block = session.async_get_block(hash).await?;
+                // A block we cannot serve in full gets an immediate reject but keeps the peer: a
+                // re-proof re-fetch asks any peer, so honest peers ask for bodies we never had.
+                let block = match session.async_get_block(hash).await {
+                    Ok(block) => block,
+                    Err(e) => {
+                        debug!("cannot serve block {} to peer {}: {}", hash, self.router, e);
+                        self.router.enqueue(make_message!(Payload::Reject, RejectMessage { reason: e.to_string() })).await?;
+                        continue;
+                    }
+                };
                 self.ctx.warn_if_serving_naked_pom_block(&block);
                 self.router
                     .enqueue(make_response!(
