@@ -15,7 +15,7 @@ use crate::{
         headers::{CompactHeaderData, DbHeadersStore},
         headers_selected_tip::DbHeadersSelectedTipStore,
         past_pruning_points::DbPastPruningPointsStore,
-        pom_proof::DbPomProofStore,
+        pom_proof::{DbPomProofStore, DEFAULT_FILE_RING_BYTES, DEFAULT_MEMORY_RING_BYTES, ring_capacity_from_env},
         pom_tier::DbPomTierStore,
         production_seed::DbProductionIndexSeedStore,
         pruning::DbPruningStore,
@@ -253,10 +253,12 @@ impl ConsensusStorage {
         ));
         let daa_excluded_store = Arc::new(DbDaaStore::new(db.clone(), daa_excluded_builder.build()));
         let pom_tier_store = Arc::new(DbPomTierStore::new(db.clone(), header_data_builder.build()));
-        let pom_proof_store = Arc::new(
-            DbPomProofStore::open(db.path(), crate::model::stores::pom_proof::ring_capacity_from_env())
-                .expect("open the PoM proof ring next to the consensus database"),
-        );
+        let pom_proof_store = Arc::new(if config.pom_proof_ring_file {
+            DbPomProofStore::open_file(db.path(), ring_capacity_from_env(DEFAULT_FILE_RING_BYTES))
+                .expect("open the PoM proof ring next to the consensus database")
+        } else {
+            DbPomProofStore::in_memory(db.path(), ring_capacity_from_env(DEFAULT_MEMORY_RING_BYTES))
+        });
         purge_legacy_pom_proofs(&db);
         let headers_store = Arc::new(DbHeadersStore::new(db.clone(), headers_builder.build(), headers_compact_builder.build()));
         let depth_store = Arc::new(DbDepthStore::new(db.clone(), header_data_builder.build()));

@@ -1,16 +1,18 @@
-//! PoM possession proofs in a fixed-size ring file.
+//! PoM possession proofs in a fixed-size ring, in memory by default or in a file next to the
+//! database (`--pom-proof-ring-file`).
 //!
 //! One ~440 KiB proof per block at 10 BPS lives a few minutes before the pruning GC drops it.
 //! Through RocksDB those writes dominate the node's I/O and their dead copies linger in blob
-//! files until compaction. Here proofs are appended to one file of fixed size, overwritten in
-//! place once it wraps; the index lives in memory and is rebuilt by a scan at open. Consensus
-//! never depends on a proof being present (the header pins the state), so a proof lost to a
-//! wrap or a crash only stops that block from being re-served with its proof.
+//! files until compaction. Here proofs are appended to one buffer of fixed size, overwritten in
+//! place once it wraps; the index lives in memory (rebuilt by a scan at open for the file
+//! backend). Consensus never depends on a proof being present (the header pins the state), so a
+//! proof lost to a wrap, a crash or a restart only stops that block from being re-served with
+//! its proof.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use keryx_consensus_core::pom::PomProof;
 use keryx_database::prelude::{DbKey, StoreError};
@@ -30,23 +32,26 @@ pub trait PomProofStoreReader {
 }
 
 pub const RING_FILE_NAME: &str = "pom-proofs.ring";
-/// Ring size unless `KERYX_POM_PROOF_RING_MB` says otherwise: ~4 600 proofs, about three times
-/// the `POM_PROOF_SERVE_DEPTH_DAA` window at 10 BPS.
-pub const DEFAULT_RING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Defaults unless `KERYX_POM_PROOF_RING_MB` says otherwise, sized against the
+/// `POM_PROOF_SERVE_DEPTH_DAA` window at 10 BPS: ~1.5x of it in memory, ~3x on disk.
+pub const DEFAULT_MEMORY_RING_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_FILE_RING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const RING_MB_ENV: &str = "KERYX_POM_PROOF_RING_MB";
 const MIN_RING_BYTES: u64 = 64 * 1024 * 1024;
+/// Only used to report the covered window at boot.
+const NOMINAL_PROOF_BYTES: u64 = 460 * 1024;
 
 const RECORD_MAGIC: u32 = 0x504F_4D52;
 /// magic u32 ‖ seq u64 ‖ block hash 32 ‖ payload len u32 ‖ payload check 8
 const HEADER_LEN: usize = 4 + 8 + 32 + 4 + 8;
 
 /// Ring capacity from the environment, floored so a few minutes of proofs always fit.
-pub fn ring_capacity_from_env() -> u64 {
+pub fn ring_capacity_from_env(default: u64) -> u64 {
     std::env::var(RING_MB_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|mb| mb.saturating_mul(1024 * 1024))
-        .unwrap_or(DEFAULT_RING_BYTES)
+        .unwrap_or(default)
         .max(MIN_RING_BYTES)
 }
 
@@ -56,19 +61,19 @@ fn payload_check(payload: &[u8]) -> [u8; 8] {
 }
 
 #[cfg(unix)]
-fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+fn file_read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
 }
 
 #[cfg(unix)]
-fn write_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
+fn file_write_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.write_all_at(buf, offset)
 }
 
 #[cfg(windows)]
-fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+fn file_read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     let mut done = 0usize;
     while done < buf.len() {
@@ -82,7 +87,7 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn write_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
+fn file_write_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     let mut done = 0usize;
     while done < buf.len() {
@@ -95,6 +100,37 @@ fn write_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+enum Backing {
+    Memory(Vec<u8>),
+    File(File),
+}
+
+impl Backing {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        match self {
+            Backing::Memory(mem) => {
+                let start = offset as usize;
+                let src = mem.get(start..start + buf.len()).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "read past the proof ring"))?;
+                buf.copy_from_slice(src);
+                Ok(())
+            }
+            Backing::File(file) => file_read_at(file, offset, buf),
+        }
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Backing::Memory(mem) => {
+                let start = offset as usize;
+                let dst = mem.get_mut(start..start + buf.len()).ok_or_else(|| io::Error::new(io::ErrorKind::WriteZero, "write past the proof ring"))?;
+                dst.copy_from_slice(buf);
+                Ok(())
+            }
+            Backing::File(file) => file_write_at(file, offset, buf),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Slot {
     offset: u64,
@@ -102,7 +138,7 @@ struct Slot {
 }
 
 struct Ring {
-    file: File,
+    backing: Backing,
     capacity: u64,
     write_pos: u64,
     next_seq: u64,
@@ -111,12 +147,21 @@ struct Ring {
 }
 
 impl Ring {
+    fn with_backing(backing: Backing, capacity: u64) -> Self {
+        Self { backing, capacity, write_pos: 0, next_seq: 1, by_hash: HashMap::new(), by_offset: BTreeMap::new() }
+    }
+
+    /// Zeroed pages are only materialized as proofs land, so RSS grows with use, not at open.
+    fn in_memory(capacity: u64) -> Self {
+        Self::with_backing(Backing::Memory(vec![0u8; capacity as usize]), capacity)
+    }
+
     fn open(path: &Path, capacity: u64) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
         if file.metadata()?.len() != capacity {
             file.set_len(capacity)?;
         }
-        let mut ring = Self { file, capacity, write_pos: 0, next_seq: 1, by_hash: HashMap::new(), by_offset: BTreeMap::new() };
+        let mut ring = Self::with_backing(Backing::File(file), capacity);
         ring.recover()?;
         Ok(ring)
     }
@@ -130,13 +175,13 @@ impl Ring {
         let mut last_seq = 0u64;
         let mut header = [0u8; HEADER_LEN];
         while pos + HEADER_LEN as u64 <= self.capacity {
-            read_at(&self.file, pos, &mut header)?;
+            self.backing.read_at(pos, &mut header)?;
             let Some((seq, hash, len, check)) = parse_header(&header) else { break };
             if seq <= last_seq || len == 0 || pos + HEADER_LEN as u64 + len as u64 > self.capacity {
                 break;
             }
             let mut payload = vec![0u8; len as usize];
-            read_at(&self.file, pos + HEADER_LEN as u64, &mut payload)?;
+            self.backing.read_at(pos + HEADER_LEN as u64, &mut payload)?;
             if payload_check(&payload) != check {
                 break;
             }
@@ -170,7 +215,7 @@ impl Ring {
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(&payload_check(payload));
         buf.extend_from_slice(payload);
-        write_at(&self.file, start, &buf)?;
+        self.backing.write_at(start, &buf)?;
 
         self.next_seq = seq + 1;
         self.write_pos = end;
@@ -209,7 +254,7 @@ impl Ring {
     fn read(&self, hash: Hash) -> io::Result<Option<Vec<u8>>> {
         let Some(slot) = self.by_hash.get(&hash) else { return Ok(None) };
         let mut payload = vec![0u8; slot.len as usize];
-        read_at(&self.file, slot.offset + HEADER_LEN as u64, &mut payload)?;
+        self.backing.read_at(slot.offset + HEADER_LEN as u64, &mut payload)?;
         Ok(Some(payload))
     }
 }
@@ -229,28 +274,35 @@ fn io_error(e: io::Error) -> StoreError {
     StoreError::DataInconsistency(format!("PoM proof ring: {e}"))
 }
 
-/// The ring-file implementation of `PomProofStoreReader`. `WriteBatch` parameters are accepted
-/// for call-site compatibility with the other stores; the ring is written directly.
+fn window_summary(capacity: u64) -> String {
+    let proofs = capacity / NOMINAL_PROOF_BYTES;
+    format!("{} MB, ~{} proofs, ~{:.1} min at 10 BPS", capacity / (1024 * 1024), proofs, proofs as f64 / 600.0)
+}
+
+/// The ring implementation of `PomProofStoreReader`. `WriteBatch` parameters are accepted for
+/// call-site compatibility with the other stores; the ring is written directly.
 pub struct DbPomProofStore {
-    path: PathBuf,
     ring: Mutex<Ring>,
 }
 
 impl DbPomProofStore {
-    pub fn open(dir: &Path, capacity: u64) -> io::Result<Self> {
-        let path = dir.join(RING_FILE_NAME);
-        let ring = Ring::open(&path, capacity)?;
-        log::info!(
-            "PoM proof ring {} — {} MB, {} proofs recovered",
-            path.display(),
-            capacity / (1024 * 1024),
-            ring.by_hash.len()
-        );
-        Ok(Self { path, ring: Mutex::new(ring) })
+    /// In-memory ring. A ring file left in `dir` by an earlier run is removed.
+    pub fn in_memory(dir: &Path, capacity: u64) -> Self {
+        let stale = dir.join(RING_FILE_NAME);
+        match std::fs::remove_file(&stale) {
+            Ok(()) => log::info!("removed the ring file {} left by an earlier run", stale.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!("could not remove the stale ring file {}: {e}", stale.display()),
+        }
+        log::info!("PoM proof ring in memory: {}", window_summary(capacity));
+        Self { ring: Mutex::new(Ring::in_memory(capacity)) }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn open_file(dir: &Path, capacity: u64) -> io::Result<Self> {
+        let path = dir.join(RING_FILE_NAME);
+        let ring = Ring::open(&path, capacity)?;
+        log::info!("PoM proof ring in {}: {}, {} proofs recovered", path.display(), window_summary(capacity), ring.by_hash.len());
+        Ok(Self { ring: Mutex::new(ring) })
     }
 
     pub fn insert_batch(&self, _batch: &mut WriteBatch, hash: Hash, proof: &PomProof) -> Result<(), StoreError> {
@@ -290,14 +342,25 @@ impl PomProofStoreReader for DbPomProofStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn temp_ring(name: &str, capacity: u64) -> (PathBuf, Ring) {
+    fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("keryx-pom-ring-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(RING_FILE_NAME);
+        dir
+    }
+
+    fn temp_ring(name: &str, capacity: u64) -> (PathBuf, Ring) {
+        let path = temp_dir(name).join(RING_FILE_NAME);
         let _ = std::fs::remove_file(&path);
         let ring = Ring::open(&path, capacity).unwrap();
         (path, ring)
+    }
+
+    /// Both backends, so every behaviour test runs on each.
+    fn both_rings(name: &str, capacity: u64) -> Vec<(Option<PathBuf>, Ring)> {
+        let (path, file_ring) = temp_ring(name, capacity);
+        vec![(None, Ring::in_memory(capacity)), (Some(path), file_ring)]
     }
 
     fn h(i: u8) -> Hash {
@@ -306,37 +369,43 @@ mod tests {
 
     #[test]
     fn round_trip_and_delete() {
-        let (path, mut ring) = temp_ring("rt", MIN_RING_BYTES);
-        ring.append(h(1), b"alpha").unwrap();
-        ring.append(h(2), b"beta").unwrap();
-        assert_eq!(ring.read(h(1)).unwrap().as_deref(), Some(&b"alpha"[..]));
-        assert_eq!(ring.read(h(2)).unwrap().as_deref(), Some(&b"beta"[..]));
-        ring.remove(h(1));
-        assert!(ring.read(h(1)).unwrap().is_none());
-        assert_eq!(ring.by_offset.len(), 1);
-        std::fs::remove_file(path).unwrap();
+        for (path, mut ring) in both_rings("rt", MIN_RING_BYTES) {
+            ring.append(h(1), b"alpha").unwrap();
+            ring.append(h(2), b"beta").unwrap();
+            assert_eq!(ring.read(h(1)).unwrap().as_deref(), Some(&b"alpha"[..]));
+            assert_eq!(ring.read(h(2)).unwrap().as_deref(), Some(&b"beta"[..]));
+            ring.remove(h(1));
+            assert!(ring.read(h(1)).unwrap().is_none());
+            assert_eq!(ring.by_offset.len(), 1);
+            if let Some(path) = path {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
     }
 
     #[test]
     fn wrap_evicts_the_overwritten_records_only() {
         // 4 records of 100 bytes fit; the 5th wraps to 0 and evicts the 1st (and only the 1st).
         let record = HEADER_LEN as u64 + 100;
-        let (path, mut ring) = temp_ring("wrap", MIN_RING_BYTES);
-        ring.capacity = record * 4 + 10;
-        for i in 1..=4u8 {
-            ring.append(h(i), &[i; 100]).unwrap();
+        for (path, mut ring) in both_rings("wrap", MIN_RING_BYTES) {
+            ring.capacity = record * 4 + 10;
+            for i in 1..=4u8 {
+                ring.append(h(i), &[i; 100]).unwrap();
+            }
+            ring.append(h(5), &[5; 100]).unwrap();
+            assert!(ring.read(h(1)).unwrap().is_none());
+            assert_eq!(ring.read(h(2)).unwrap().unwrap(), vec![2u8; 100]);
+            assert_eq!(ring.read(h(5)).unwrap().unwrap(), vec![5u8; 100]);
+            assert_eq!(ring.write_pos, record);
+            // A longer record spanning two old ones evicts both.
+            ring.append(h(6), &[6; 200]).unwrap();
+            assert!(ring.read(h(2)).unwrap().is_none());
+            assert!(ring.read(h(3)).unwrap().is_none());
+            assert_eq!(ring.read(h(4)).unwrap().unwrap(), vec![4u8; 100]);
+            if let Some(path) = path {
+                std::fs::remove_file(path).unwrap();
+            }
         }
-        ring.append(h(5), &[5; 100]).unwrap();
-        assert!(ring.read(h(1)).unwrap().is_none());
-        assert_eq!(ring.read(h(2)).unwrap().unwrap(), vec![2u8; 100]);
-        assert_eq!(ring.read(h(5)).unwrap().unwrap(), vec![5u8; 100]);
-        assert_eq!(ring.write_pos, record);
-        // A longer record spanning two old ones evicts both.
-        ring.append(h(6), &[6; 200]).unwrap();
-        assert!(ring.read(h(2)).unwrap().is_none());
-        assert!(ring.read(h(3)).unwrap().is_none());
-        assert_eq!(ring.read(h(4)).unwrap().unwrap(), vec![4u8; 100]);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -361,7 +430,7 @@ mod tests {
         ring.append(h(1), b"good").unwrap();
         ring.append(h(2), b"bad!").unwrap();
         let bad_payload_at = ring.by_hash[&h(2)].offset + HEADER_LEN as u64;
-        write_at(&ring.file, bad_payload_at, b"BAD!").unwrap();
+        ring.backing.write_at(bad_payload_at, b"BAD!").unwrap();
         drop(ring);
         let reopened = Ring::open(&path, MIN_RING_BYTES).unwrap();
         assert!(reopened.read(h(1)).unwrap().is_some());
@@ -371,7 +440,18 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_store_removes_a_stale_ring_file() {
+        let dir = temp_dir("stale");
+        let path = dir.join(RING_FILE_NAME);
+        std::fs::write(&path, b"leftover").unwrap();
+        let store = DbPomProofStore::in_memory(&dir, MIN_RING_BYTES);
+        assert!(!path.exists());
+        assert!(!store.has(h(1)).unwrap());
+    }
+
+    #[test]
     fn capacity_env_is_floored() {
-        assert!(ring_capacity_from_env() >= MIN_RING_BYTES);
+        assert!(ring_capacity_from_env(DEFAULT_MEMORY_RING_BYTES) >= MIN_RING_BYTES);
+        assert!(ring_capacity_from_env(1) >= MIN_RING_BYTES);
     }
 }

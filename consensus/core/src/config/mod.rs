@@ -35,6 +35,9 @@ pub struct Config {
     /// Indicates whether this node is an archival node
     pub is_archival: bool,
 
+    /// Keep PoM proofs in a ring file next to the database instead of memory
+    pub pom_proof_ring_file: bool,
+
     /// Enable various sanity checks which might be compute-intensive (mostly performed during pruning)
     pub enable_sanity_checks: bool,
 
@@ -84,6 +87,7 @@ impl Config {
             perf,
             process_genesis: true,
             is_archival: false,
+            pom_proof_ring_file: false,
             enable_sanity_checks: false,
             utxoindex: false,
             unsafe_rpc: false,

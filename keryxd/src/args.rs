@@ -69,6 +69,7 @@ pub struct Args {
     pub devnet: bool,
     pub simnet: bool,
     pub archival: bool,
+    pub pom_proof_ring_file: bool,
     pub sanity: bool,
     pub yes: bool,
     #[serde_as(as = "Option<DisplayFromStr>")]
@@ -123,6 +124,7 @@ impl Default for Args {
             devnet: false,
             simnet: false,
             archival: false,
+            pom_proof_ring_file: false,
             sanity: false,
             logdir: None,
             rpclisten: None,
@@ -168,6 +170,7 @@ impl Args {
         config.enable_unsynced_mining = self.enable_unsynced_mining;
         config.enable_mainnet_mining = self.enable_mainnet_mining;
         config.is_archival = self.archival;
+        config.pom_proof_ring_file = self.pom_proof_ring_file;
         // TODO: change to `config.enable_sanity_checks = self.sanity` when we reach stable versions
         config.enable_sanity_checks = true;
         config.user_agent_comments.clone_from(&self.user_agent_comments);
@@ -367,6 +370,7 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
         .arg(arg!(--devnet "Use the development test network").env("KERYXD_DEVNET"))
         .arg(arg!(--simnet "Use the simulation test network").env("KERYXD_SIMNET"))
         .arg(arg!(--archival "Run as an archival node: avoids deleting old block data when moving the pruning point (Warning: heavy disk usage)").env("KERYXD_ARCHIVAL"))
+        .arg(arg!(--"pom-proof-ring-file" "Keep PoM proofs in a ring file next to the database instead of memory (lower RAM, constant disk writes)").env("KERYXD_POM_PROOF_RING_FILE"))
         .arg(arg!(--sanity "Enable various sanity checks which might be compute-intensive (mostly performed during pruning)").env("KERYXD_SANITY"))
         .arg(arg!(--yes "Answer yes to all interactive console questions").env("KERYXD_NONINTERACTIVE"))
         .arg(
@@ -534,6 +538,7 @@ impl Args {
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
             simnet: arg_match_unwrap_or::<bool>(&m, "simnet", defaults.simnet),
             archival: arg_match_unwrap_or::<bool>(&m, "archival", defaults.archival),
+            pom_proof_ring_file: arg_match_unwrap_or::<bool>(&m, "pom-proof-ring-file", defaults.pom_proof_ring_file),
             sanity: arg_match_unwrap_or::<bool>(&m, "sanity", defaults.sanity),
             yes: arg_match_unwrap_or::<bool>(&m, "yes", defaults.yes),
             user_agent_comments: arg_match_many_unwrap_or::<String>(&m, "user_agent_comments", defaults.user_agent_comments),
