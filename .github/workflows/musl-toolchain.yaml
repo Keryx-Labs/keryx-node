@@ -1,12 +1,6 @@
 name: Build musl toolchain
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - 'musl-toolchain/preset.sh'
-    branches:
-      - master
+on: workflow_dispatch
 
 jobs:
   build-toolchain:
