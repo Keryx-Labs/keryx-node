@@ -1843,6 +1843,11 @@ impl VirtualStateProcessor {
     /// Make sure pruning point-related stores are initialized
     pub fn init(self: &Arc<Self>) {
         self.load_service_burned();
+        if super::service_bond::service_repair_daa().is_some()
+            && let Some(pruning_point) = self.pruning_point_store.read().pruning_point().optional().unwrap()
+        {
+            self.advance_service_ledger(&ChainPath::default(), pruning_point);
+        }
         let pruning_point_read = self.pruning_point_store.upgradable_read();
         if pruning_point_read.pruning_point().optional().unwrap().is_none() {
             let mut pruning_point_write = RwLockUpgradableReadGuard::upgrade(pruning_point_read);

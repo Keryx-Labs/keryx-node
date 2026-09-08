@@ -41,4 +41,17 @@ impl DbServiceRewardStore {
     pub fn iterator(&self) -> impl Iterator<Item = Result<(Box<[u8]>, RewardEntry), Box<dyn std::error::Error>>> + '_ {
         self.access.iterator()
     }
+
+    /// Deletes every reward with a daa above `daa`; returns how many.
+    pub fn delete_above(&self, daa: u64) -> Result<usize, StoreError> {
+        let keys: Vec<RewardKey> = self
+            .access
+            .iterator()
+            .filter_map(|r| r.ok())
+            .filter(|(_, entry)| entry.daa > daa)
+            .map(|(k, _)| RewardKey(k[..32].try_into().unwrap()))
+            .collect();
+        self.access.delete_many(DirectDbWriter::new(&self.db), &mut keys.iter().copied())?;
+        Ok(keys.len())
+    }
 }

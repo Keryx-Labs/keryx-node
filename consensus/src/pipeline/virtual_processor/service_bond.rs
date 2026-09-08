@@ -158,6 +158,11 @@ pub(super) struct ServiceLedgerSync {
     logged: std::collections::HashMap<(Hash, [u8; 32], u32), u64>,
 }
 
+/// `KERYX_SERVICE_REPAIR_DAA`, parsed once per call.
+pub(super) fn service_repair_daa() -> Option<u64> {
+    std::env::var("KERYX_SERVICE_REPAIR_DAA").ok().and_then(|v| v.trim().parse().ok())
+}
+
 /// Logs the misses of one fold that have not been logged yet.
 fn log_new_service_misses(
     logged: &mut std::collections::HashMap<(Hash, [u8; 32], u32), u64>,
@@ -617,6 +622,15 @@ impl VirtualStateProcessor {
             let warmup = daa < cursor_daa;
             let (outcome, _added) = self.fold_service_chain_block(&mut ledger, sc, hash, pruning_point, false, warmup);
             log_new_service_misses(logged, daa, &outcome.misses);
+            if !warmup && self.is_pruning_sample_block(hash) && !self.service_ledger_hashes.read().contains_key(&hash) {
+                let mut snapshot = ledger.snapshot();
+                snapshot.recent_producers = self.recent_producers_below(sc, i, daa);
+                let bytes = snapshot.to_bytes();
+                let snapshot_hash = ServiceLedgerSnapshot::hash_of_bytes(&bytes);
+                self.service_ledger_hashes.write().insert(hash, snapshot_hash);
+                self.service_ledger_snapshot_store.set(hash, bytes).unwrap();
+                info!("service-bond: sample snapshot rebuilt at {} (chain index {}, daa {}): {}", hash, i, daa, snapshot_hash);
+            }
             if daa >= cursor_daa {
                 // Sightings first: a partially flushed daa must never persist a claim's burn
                 // before its identity's sighting.
@@ -1106,11 +1120,36 @@ impl VirtualStateProcessor {
         self.service_ledger_hashes.read().keys().filter_map(|s| self.headers_store.get_daa_score(*s).ok()).min().unwrap_or(0)
     }
 
+    /// One-shot repair (`KERYX_SERVICE_REPAIR_DAA`): drops every persisted service record and
+    /// sample ledger snapshot above `daa`, so the boot refold restarts from the sample kept at
+    /// `daa` and re-derives the rest from the chain.
+    fn truncate_service_stores_above(&self, daa: u64) {
+        let burns = self.service_burn_store.delete_above(daa).unwrap();
+        let strikes = self.service_strike_store.delete_above(daa).unwrap();
+        let sightings = self.service_first_seen_store.delete_above(daa).unwrap();
+        let rewards = self.service_reward_store.delete_above(daa).unwrap();
+        let mut snapshots = 0;
+        for (sample, _) in self.service_ledger_snapshot_store.entries() {
+            if self.headers_store.get_daa_score(sample).is_ok_and(|d| d > daa) {
+                self.service_ledger_snapshot_store.delete(sample).unwrap();
+                snapshots += 1;
+            }
+        }
+        warn!(
+            "service-bond: REPAIR above daa {} — dropped {} burns, {} strikes, {} sightings, {} rewards, {} sample snapshots; remove KERYX_SERVICE_REPAIR_DAA after this run",
+            daa, burns, strikes, sightings, rewards, snapshots
+        );
+    }
+
     /// Boot-time load of the persisted burned outpoints into the RAM set consulted by transaction
     /// validation, of the suspensions (re-derived from the strike log) into the RAM map consulted
     /// by block validation, and of the deep cursor — the persisted event frontier bounding the
     /// cold-start refold.
     pub(crate) fn load_service_burned(&self) {
+        let repair_daa = service_repair_daa();
+        if let Some(daa) = repair_daa {
+            self.truncate_service_stores_above(daa);
+        }
         let mut rows: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut set = self.service_burned.write();
         let mut cursor = 0u64;
@@ -1166,7 +1205,9 @@ impl VirtualStateProcessor {
             }
         }
         self.service_commit_index.rebuild(rows);
-        self.service_ledger.lock().deep_cursor_daa = cursor;
+        // A repair restarts the fold at the sample kept at `repair_daa`: everything above it is
+        // re-derived and re-flushed.
+        self.service_ledger.lock().deep_cursor_daa = repair_daa.map_or(cursor, |daa| cursor.max(daa));
         let own_pp = self.pruning_point_store.read().pruning_point().ok();
         let mut phashes = self.production_index_hashes.write();
         phashes.clear();

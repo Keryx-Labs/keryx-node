@@ -26,4 +26,17 @@ impl DbServiceFirstSeenStore {
     pub fn iterator(&self) -> impl Iterator<Item = Result<(Box<[u8]>, u64), Box<dyn std::error::Error>>> + '_ {
         self.access.iterator()
     }
+
+    /// Deletes every sighting with a daa above `daa`; returns how many.
+    pub fn delete_above(&self, daa: u64) -> Result<usize, StoreError> {
+        let keys: Vec<Hash> = self
+            .access
+            .iterator()
+            .filter_map(|r| r.ok())
+            .filter(|(_, seen_daa)| *seen_daa > daa)
+            .map(|(k, _)| Hash::from_bytes(k[..32].try_into().unwrap()))
+            .collect();
+        self.access.delete_many(DirectDbWriter::new(&self.db), &mut keys.iter().copied())?;
+        Ok(keys.len())
+    }
 }
