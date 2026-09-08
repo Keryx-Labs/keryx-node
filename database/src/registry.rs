@@ -129,10 +129,9 @@ pub enum DatabaseStorePrefixes {
     CirculatingSupply = 194,
 
     // ---- PoM possession proof ----
-    /// Full PoM possession proof per block: block_hash → bincode(PomProof) — bincode, like every
-    /// other `CachedDbAccess` store; borsh is the WIRE encoding only (`PomProof::to_wire_bytes`).
-    /// Persisted so a block can be re-served (relay/IBD) with its proof; otherwise `get_block`
-    /// returns `pom_proof: None` and peers reject the served block (`PoM possession proof missing`).
+    /// Reserved: PoM possession proofs used to live here (block_hash → bincode(PomProof)); they
+    /// now live in the `pom-proofs.ring` file next to the database and this prefix is purged at
+    /// open. Kept so the prefix is never reused for another store.
     PomProof = 195,
     /// Service-bond burned escrow outpoints (finality-deep misses): outpoint → miss daa.
     ServiceBurn = 196,

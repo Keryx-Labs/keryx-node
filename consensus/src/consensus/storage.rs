@@ -37,6 +37,8 @@ use crate::{
 use super::cache_policy_builder::CachePolicyBuilder as PolicyBuilder;
 use keryx_consensus_core::{BlockHashSet, blockstatus::BlockStatus};
 use keryx_database::registry::DatabaseStorePrefixes;
+use keryx_consensus_core::pom::PomProof;
+use keryx_consensus_core::BlockHasher;
 use keryx_hashes::Hash;
 use parking_lot::RwLock;
 use std::{ops::DerefMut, sync::Arc};
@@ -144,7 +146,6 @@ impl ConsensusStorage {
         // policy of 10_000 items — what this store used to share with the header-data caches —
         // reaches ~4.4 GB and, since item counts are not scaled, ignores `--ram-scale` entirely.
         // 192 MB holds ~435 of the hottest proofs of the 1500-DAA / 2000-chain-block window.
-        let pom_proof_budget = scaled(192_000_000);
         // Ratio-reward / coin-age indexes are SPK-keyed over a UTXO-scale keyspace. The old
         // Count(10_000) shared with the UTXO set cache had near-zero hit rate; every virtual-commit
         // RMW then paid a random HDD read (~9 ms). Budget by bytes so `--ram-scale` actually grows
@@ -220,8 +221,6 @@ impl ConsensusStorage {
         let transactions_builder = PolicyBuilder::new().bytes_budget(transactions_budget).tracked_bytes();
         let acceptance_data_builder = PolicyBuilder::new().bytes_budget(acceptance_data_budget).tracked_bytes();
         let past_pruning_points_builder = PolicyBuilder::new().max_items(1024).untracked();
-        // Tracked by bytes (`PomProof::estimate_mem_bytes`), never by count — see `pom_proof_budget`.
-        let pom_proof_builder = PolicyBuilder::new().bytes_budget(pom_proof_budget).min_items(16).tracked_bytes();
 
         // TODO: consider tracking UtxoDiff byte sizes more accurately including the exact size of ScriptPublicKey
 
@@ -254,7 +253,11 @@ impl ConsensusStorage {
         ));
         let daa_excluded_store = Arc::new(DbDaaStore::new(db.clone(), daa_excluded_builder.build()));
         let pom_tier_store = Arc::new(DbPomTierStore::new(db.clone(), header_data_builder.build()));
-        let pom_proof_store = Arc::new(DbPomProofStore::new(db.clone(), pom_proof_builder.build()));
+        let pom_proof_store = Arc::new(
+            DbPomProofStore::open(db.path(), crate::model::stores::pom_proof::ring_capacity_from_env())
+                .expect("open the PoM proof ring next to the consensus database"),
+        );
+        purge_legacy_pom_proofs(&db);
         let headers_store = Arc::new(DbHeadersStore::new(db.clone(), headers_builder.build(), headers_compact_builder.build()));
         let depth_store = Arc::new(DbDepthStore::new(db.clone(), header_data_builder.build()));
         let selected_chain_store = Arc::new(RwLock::new(DbSelectedChainStore::new(db.clone(), header_data_builder.build())));
@@ -358,5 +361,16 @@ impl ConsensusStorage {
             block_window_cache_for_past_median_time,
             lkg_virtual_state,
         })
+    }
+}
+
+/// Proofs written by earlier versions live under the RocksDB `PomProof` prefix; drop them once
+/// so the ring is the only copy and the blob files they occupied can be reclaimed.
+fn purge_legacy_pom_proofs(db: &Arc<DB>) {
+    use keryx_database::prelude::{CachedDbAccess, CachePolicy, DirectDbWriter};
+    let legacy: CachedDbAccess<Hash, PomProof, BlockHasher> =
+        CachedDbAccess::new(db.clone(), CachePolicy::Empty, DatabaseStorePrefixes::PomProof.into());
+    if let Err(e) = legacy.delete_all(DirectDbWriter::new(db)) {
+        log::warn!("could not purge legacy RocksDB PoM proofs: {e}");
     }
 }
