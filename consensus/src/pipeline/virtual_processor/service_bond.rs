@@ -541,13 +541,23 @@ impl VirtualStateProcessor {
     }
 
     /// The newest held sample snapshot at chain index `<= to` whose daa is at or below
-    /// `frontier` (any held sample when `None`).
+    /// `frontier` (any held sample when `None`). A sample at or below the pruning point is
+    /// always sealed, so it qualifies whatever the frontier.
     pub(super) fn refold_sample(&self, sc: &impl SelectedChainStoreReader, to: u64, frontier: Option<u64>) -> Option<(u64, Hash)> {
+        let pp_daa = self
+            .pruning_point_store
+            .read()
+            .pruning_point()
+            .ok()
+            .and_then(|pp| self.headers_store.get_daa_score(pp).ok())
+            .unwrap_or(0);
         self.service_ledger_hashes
             .read()
             .keys()
             .filter_map(|h| sc.get_by_hash(*h).ok().filter(|idx| *idx <= to).map(|idx| (idx, *h)))
-            .filter(|(_, h)| frontier.is_none_or(|f| self.headers_store.get_daa_score(*h).is_ok_and(|d| d <= f)))
+            .filter(|(_, h)| {
+                frontier.is_none_or(|f| self.headers_store.get_daa_score(*h).is_ok_and(|d| d <= f.max(pp_daa)))
+            })
             .max()
     }
 
@@ -1205,10 +1215,15 @@ impl VirtualStateProcessor {
             }
         }
         self.service_commit_index.rebuild(rows);
-        // A repair restarts the fold at the sample kept at `repair_daa`: everything above it is
-        // re-derived and re-flushed.
-        self.service_ledger.lock().deep_cursor_daa = repair_daa.map_or(cursor, |daa| cursor.max(daa));
         let own_pp = self.pruning_point_store.read().pruning_point().ok();
+        let pp_daa = own_pp.and_then(|pp| self.headers_store.get_daa_score(pp).ok()).unwrap_or(0);
+        // Everything at or below the pruning point is sealed, so the frontier is never below it
+        // even when the last persisted event is older. A repair restarts the fold at the sample
+        // kept at `repair_daa` instead: everything above it was just dropped and is re-derived.
+        self.service_ledger.lock().deep_cursor_daa = match repair_daa {
+            Some(daa) => cursor.max(daa),
+            None => cursor.max(pp_daa),
+        };
         let mut phashes = self.production_index_hashes.write();
         phashes.clear();
         let mut legacy = Vec::new();
