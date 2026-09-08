@@ -174,6 +174,16 @@ impl Rpc {
                 let result = rpc.get_utxos_by_addresses_call(None, GetUtxosByAddressesRequest { addresses }).await?;
                 self.println(&ctx, result);
             }
+            RpcApiOps::GetHolderReward => {
+                if argv.is_empty() {
+                    return Err(Error::custom("Please specify at least one address"));
+                }
+                let addresses = argv.iter().map(|s| Address::try_from(s.as_str())).collect::<std::result::Result<Vec<_>, _>>()?;
+                for address in addresses {
+                    let result = rpc.get_holder_reward_call(None, GetHolderRewardRequest { address }).await?;
+                    self.println(&ctx, result);
+                }
+            }
             RpcApiOps::GetBalanceByAddress => {
                 if argv.is_empty() {
                     return Err(Error::custom("Please specify at least one address"));

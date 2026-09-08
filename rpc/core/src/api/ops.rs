@@ -146,6 +146,8 @@ pub enum RpcApiOps {
     GetUtxoEntriesByOutpoints = 153,
     /// Service-bond strike, suspension and pending-burn state
     GetServiceStrikes = 154,
+    /// Holder-reward (ratio-reward) bracket state of one payout address
+    GetHolderReward = 155,
 }
 
 impl RpcApiOps {

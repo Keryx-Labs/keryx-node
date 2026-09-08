@@ -209,11 +209,38 @@ impl PruningProcessor {
                 return;
             }
         };
-        if deleted == 0 {
+        // The display-only paid/escrow indexes share the production index's key layout and its
+        // floor, so they collapse on the same boundary and in the same batch. Their budgets are
+        // spent independently — they carry their own entry counts, and letting them lag the
+        // production floor would leave stale sub-floor entries growing without bound — so the
+        // early return below has to consider all three, or a batch holding only their writes
+        // would be dropped on the floor.
+        let mut payout_deleted = 0u64;
+        // Every display-only index, not a hand-listed subset: the inference index was missing from
+        // this list and so was never collapsed, which let its sub-floor entries grow without
+        // bound. Built from the stores themselves to keep a newly added bucket from being
+        // forgotten the same way.
+        let payout_stores = [
+            ("paid", &self.miner_paid_prefix_store),
+            ("escrow", &self.miner_escrow_prefix_store),
+            ("inference", &self.miner_inference_prefix_store),
+        ]
+        .into_iter()
+        .map(|(l, s)| (l.to_string(), s))
+        .chain(self.miner_tier_prefix_stores.iter().enumerate().map(|(t, s)| (format!("tier{t}"), s)));
+        for (label, store) in payout_stores {
+            match store.collapse_below(&mut batch, floor_index, COLLAPSE_BUDGET) {
+                Ok(n) => payout_deleted += n,
+                Err(e) => warn!("miner-{label} prefix collapse skipped: {e}"),
+            }
+        }
+        if deleted == 0 && payout_deleted == 0 {
             return; // caught up — nothing newly fell below the floor
         }
         self.db.write(batch).unwrap();
-        debug!("Ratio prefix collapse: folded {deleted} entries below chain index {floor_index} into per-SPK floors");
+        debug!(
+            "Ratio prefix collapse: folded {deleted} production and {payout_deleted} payout/tier entries below chain index {floor_index} into per-SPK floors"
+        );
     }
 
     /// Garbage-collect PoM possession proofs older than `POM_PROOF_GC_DEPTH_CHAIN_BLOCKS` chain blocks.

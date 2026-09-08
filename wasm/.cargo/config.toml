@@ -1,2 +1,7 @@
 [build]
 rustflags = ["-Ctarget-cpu=mvp"]
+
+# Scoped to wasm32: the `wasm_js` backend hard-errors if selected for a host target, and
+# `[build]` rustflags also reach build scripts and proc macros.
+[target.wasm32-unknown-unknown]
+rustflags = ["-Ctarget-cpu=mvp", "--cfg", 'getrandom_backend="wasm_js"']

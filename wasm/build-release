@@ -6,7 +6,11 @@ set -e
 
 # Workaround for Rust 1.87.0
 # https://github.com/rust-lang/rust/issues/141048
-export RUSTFLAGS=-Ctarget-cpu=mvp
+# `getrandom_backend` is required alongside the crate's `wasm_js` feature (enabled in
+# wasm/Cargo.toml) or getrandom 0.3 refuses to build for wasm32-unknown-unknown. It has to
+# travel in RUSTFLAGS: setting the env var overrides .cargo/config.toml's rustflags entirely,
+# so listing it there alone would be silently dropped by these scripts.
+export RUSTFLAGS='-Ctarget-cpu=mvp --cfg getrandom_backend="wasm_js"'
 
 rm -rf release/*
 rm -rf web/*

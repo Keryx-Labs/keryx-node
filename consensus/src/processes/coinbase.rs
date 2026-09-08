@@ -305,6 +305,9 @@ impl CoinbaseManager {
         // allocation, + 1 for the accumulated tier-reward burn
         let mut outputs = Vec::with_capacity(ghostdag_data.mergeset_blues.len() * 2 + 3);
         let mut rd_total = 0u64;
+        // Per-SPK split of what this coinbase pays, accumulated as the outputs are built so it is
+        // the SAME arithmetic and can never drift from the transaction it describes.
+        let mut payouts: std::collections::HashMap<ScriptPublicKey, CoinbasePayout> = std::collections::HashMap::new();
         // Sum of the per-blue miner-cut reductions (tier-reward and ratio-reward combined), burned
         // in a single output below. Keeps the total block reward equal to the schedule subsidy —
         // only the miner's share is penalised.
@@ -343,6 +346,16 @@ impl CoinbaseManager {
                     miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * ratio_bps / RATIO_REWARD_BPS_DIVISOR
                 };
                 reward_burn_total += miner_subsidy - miner_paid;
+                {
+                    let entry = payouts.entry(reward_data.script_public_key.clone()).or_default();
+                    entry.base += miner_subsidy;
+                    entry.paid += miner_paid;
+                    // Only an announced escrow key accrues: without one the slice below is paid to
+                    // the burn SPK and belongs to nobody.
+                    if reward_data.escrow_script_public_key.is_some() {
+                        entry.escrow += escrow_cut;
+                    }
+                }
                 // Zero-value outputs are rejected in isolation, so a fully-burned miner cut emits
                 // none: the amount is already in `reward_burn_total`.
                 if miner_paid > 0 {
@@ -412,6 +425,7 @@ impl CoinbaseManager {
         // Inference-reward mints, in the caller's canonical order, after every other output.
         for (spk, amount) in reward_mints {
             outputs.push(TransactionOutput::new(*amount, spk.clone()));
+            payouts.entry(spk.clone()).or_default().inference += *amount;
         }
 
         // Build the current block's payload
@@ -422,6 +436,7 @@ impl CoinbaseManager {
             tx: Transaction::new(constants::TX_VERSION, vec![], outputs, 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload),
             has_red_reward: red_subsidy > 0 || red_fees > 0,
             red_reward_output_index,
+            payouts: payouts.into_iter().collect(),
         })
     }
 
@@ -569,6 +584,24 @@ impl CoinbaseManager {
     /// index (see `ratio_bps_by_block`) — deliberately the base cut, not the paid (post-scaling)
     /// amount, so production stays independent of the reward policy it feeds. Mirrors the per-blue
     /// split in `expected_coinbase_transaction` (`miner_subsidy = subsidy − rd_cut − escrow_cut`).
+    /// The escrow slice of one block's subsidy at `daa_score`: CSV-locked to the producer's
+    /// announced escrow key, or paid to the burn SPK when the producer announced none. Exposed so
+    /// callers reporting mining income do not re-hardcode `ESCROW_RATE_BPS`.
+    pub fn escrow_cut(&self, daa_score: u64) -> u64 {
+        self.calc_block_subsidy(daa_score) * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR
+    }
+
+    /// The SPK every burn output in a coinbase is paid to (fees, the tier/ratio shortfall, red
+    /// subsidy, and a standard miner's escrow slice).
+    pub fn burn_spk(&self) -> &ScriptPublicKey {
+        &self.burn_script_public_key
+    }
+
+    /// The SPK the accumulated R&D allocation is paid to.
+    pub fn rd_allocation_spk(&self) -> &ScriptPublicKey {
+        &self.rd_allocation_script_public_key
+    }
+
     pub fn base_miner_cut(&self, daa_score: u64) -> u64 {
         let subsidy = self.calc_block_subsidy(daa_score);
         let rd_cut = subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR;

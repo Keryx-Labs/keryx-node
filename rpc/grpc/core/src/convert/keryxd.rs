@@ -48,6 +48,7 @@ pub mod kaspad_request_convert {
     impl_into_kaspad_request!(GetUtxoCountByAddress);
     impl_into_kaspad_request!(GetUtxoEntriesByOutpoints);
     impl_into_kaspad_request!(GetServiceStrikes);
+    impl_into_kaspad_request!(GetHolderReward);
     impl_into_kaspad_request!(GetBalanceByAddress);
     impl_into_kaspad_request!(GetBalancesByAddresses);
     impl_into_kaspad_request!(GetSinkBlueScore);
@@ -190,6 +191,7 @@ pub mod kaspad_response_convert {
     impl_into_kaspad_response!(GetUtxoCountByAddress);
     impl_into_kaspad_response!(GetUtxoEntriesByOutpoints);
     impl_into_kaspad_response!(GetServiceStrikes);
+    impl_into_kaspad_response!(GetHolderReward);
     impl_into_kaspad_response!(GetBalanceByAddress);
     impl_into_kaspad_response!(GetBalancesByAddresses);
     impl_into_kaspad_response!(GetSinkBlueScore);

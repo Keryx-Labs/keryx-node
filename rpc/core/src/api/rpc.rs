@@ -461,6 +461,17 @@ pub trait RpcApi: Sync + Send + AnySync {
         request: GetServiceStrikesRequest,
     ) -> RpcResult<GetServiceStrikesResponse>;
 
+    /// Holder-reward (ratio-reward) bracket state of one payout address: the inputs the node
+    /// scales that address's miner cut by, and what the next bracket up would cost.
+    async fn get_holder_reward(&self, address: RpcAddress) -> RpcResult<GetHolderRewardResponse> {
+        self.get_holder_reward_call(None, GetHolderRewardRequest { address }).await
+    }
+    async fn get_holder_reward_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetHolderRewardRequest,
+    ) -> RpcResult<GetHolderRewardResponse>;
+
     async fn get_daa_score_timestamp_estimate(&self, daa_scores: Vec<u64>) -> RpcResult<Vec<u64>> {
         Ok(self.get_daa_score_timestamp_estimate_call(None, GetDaaScoreTimestampEstimateRequest { daa_scores }).await?.timestamps)
     }

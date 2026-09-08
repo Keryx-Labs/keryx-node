@@ -899,6 +899,39 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetUtxoCountByAddressResponse::new(count))
     }
 
+    async fn get_holder_reward_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetHolderRewardRequest,
+    ) -> RpcResult<GetHolderRewardResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        // The bracket is read off the balance and production indexes, which are still being
+        // filled during IBD — answering then would hand back a bracket that has nothing to do
+        // with the chain's real state.
+        if session.async_is_consensus_in_transitional_ibd_state().await {
+            return Err(RpcError::ConsensusInTransitionalIbdState);
+        }
+        let snapshot = session.get_holder_reward(&pay_to_address_script(&request.address));
+        Ok(GetHolderRewardResponse {
+            virtual_daa_score: snapshot.virtual_daa_score,
+            eff_balance: snapshot.eff_balance,
+            production_raw: snapshot.production_raw,
+            production: snapshot.production,
+            bracket_bps: snapshot.bracket_bps,
+            next_bracket_bps: snapshot.next_bracket.map(|(bps, _)| bps),
+            next_bracket_balance: snapshot.next_bracket.map(|(_, balance)| balance),
+            full_bracket_balance: snapshot.full_bracket_balance,
+            window_daa: snapshot.window_daa,
+            active: snapshot.active,
+            paid: snapshot.paid,
+            burned: snapshot.burned,
+            escrow: snapshot.escrow,
+            inference: snapshot.inference,
+            income_window_daa: snapshot.income_window_daa,
+            tier_base: snapshot.tier_base.to_vec(),
+        })
+    }
+
     async fn get_balance_by_address_call(
         &self,
         _connection: Option<&DynRpcConnection>,

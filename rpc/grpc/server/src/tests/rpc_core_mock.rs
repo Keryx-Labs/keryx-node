@@ -354,6 +354,14 @@ impl RpcApi for RpcCoreMock {
         Err(RpcError::NotImplemented)
     }
 
+    async fn get_holder_reward_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetHolderRewardRequest,
+    ) -> RpcResult<GetHolderRewardResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
     async fn get_coin_supply_call(
         &self,
         _connection: Option<&DynRpcConnection>,

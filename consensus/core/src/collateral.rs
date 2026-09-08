@@ -330,7 +330,70 @@ pub struct ServiceStrikesSnapshot {
     pub lifetime_strikes: Vec<(Hash, u32)>,
 }
 
+/// Per-address holder-reward (ratio-reward) state at the node's committed virtual view: the exact
+/// inputs `ratio_bps_by_block` scales a miner cut by, for one payout address.
+///
+/// Display only — nothing in consensus reads this back. It answers "why is my miner cut being
+/// cut, and what would fix it" without an operator having to run `KERYX_RATIO_DEBUG` and tail a
+/// log. Unlike the bracket the coinbase uses, this is taken at the committed view with no
+/// `view_diffs`: it describes the chain as the node currently sees it, not some block's POV.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HolderRewardSnapshot {
+    pub virtual_daa_score: u64,
+    /// Ratio numerator: the coin-age effective balance at/after `coin_age_activation`, the
+    /// instantaneous balance before it. NOT the wallet's spendable balance — immature coins
+    /// count at a prorata of their age, so this reads below the UTXO total while coins ripen.
+    pub eff_balance: u64,
+    /// Windowed production BEFORE the one-block floor. Zero means this address has never been
+    /// paid a miner cut inside the window, which is what separates a plain holder from a miner.
+    pub production_raw: u64,
+    /// The denominator actually used: `production_raw` floored at one block's base miner cut, so
+    /// a newcomer with no recent production divides by one block instead of by zero.
+    pub production: u64,
+    /// Bracket multiplier in bps, out of `RATIO_REWARD_BPS_DIVISOR`.
+    pub bracket_bps: u64,
+    /// The rung above: `(bps, effective balance that reaches it)`. `None` at the top bracket.
+    pub next_bracket: Option<(u64, u64)>,
+    /// Effective balance that reaches the top (100 %) bracket.
+    pub full_bracket_balance: u64,
+    /// Length of the production window, in DAA score.
+    pub window_daa: u64,
+    /// Miner cut the coinbases actually PAID this address over the window, post tier/ratio
+    /// scaling. This is mining income, unlike `production_raw`, which is only the entitlement.
+    pub paid: u64,
+    /// The shortfall destroyed by the tier and ratio brackets: `production_raw − paid`.
+    pub burned: u64,
+    /// Escrow slice that ACCRUED to this address over the window — zero for a standard miner,
+    /// whose escrow output is paid to the burn SPK at emission. CSV-locked, and still forfeitable
+    /// to a service penalty before it is claimed, so it is income earned but not yet in hand.
+    pub escrow: u64,
+    /// Inference-reward mints routed to this address over the window. Mining income of a second
+    /// kind: won by serving an inference, not by producing a block, so it is counted apart from
+    /// the miner cut and is NOT part of the base entitlement the brackets scale.
+    pub inference: u64,
+    /// Daa actually spanned by `paid`, `burned`, `escrow` and `inference` — **not** necessarily
+    /// `window_daa`. The payout indexes those four read are display-only and maintained forward
+    /// from the boot that created them (a from-chain backfill needs a coinbase body read per chain
+    /// block and per blue), so a node that has just built them covers only the daa since. Equal to
+    /// `window_daa` once a full window has elapsed; below it means the four figures are real but
+    /// describe a shorter period, and 0 means no coverage at all. Label them with this, never with
+    /// `window_daa`, or a node that mined all night reads as a node that burned all night.
+    pub income_window_daa: u64,
+    /// Base miner cut over `income_window_daa`, split by the proven model tier that earned it —
+    /// the MIX, indexed by tier. A miner is not on one tier: rigs run different models, so any
+    /// single tier reported for a window would be false for anyone running more than one. The
+    /// production-weighted tier is a division over these; the mix is not recoverable from it.
+    ///
+    /// Sums to the span's entitlement for blues whose tier is resolvable, and falls short for
+    /// pre-PoM ones — so shares must be taken over the sum of these, never over the entitlement.
+    pub tier_base: [u64; crate::coinbase::TIER_BUCKETS],
+    /// Whether the ratio reward is in force at this view at all. When false the miner cut is
+    /// unscaled and every bracket figure above is informational only.
+    pub active: bool,
+}
+
 /// One escrow claim of a miner: a CSV-locked coinbase escrow output he can claim after the lock,
+
 /// unless burned by a service penalty first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EscrowClaim {

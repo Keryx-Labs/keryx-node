@@ -216,6 +216,13 @@ impl ConsensusSessionOwned {
         self.consensus.get_service_strikes()
     }
 
+    pub fn get_holder_reward(
+        &self,
+        script_public_key: &keryx_consensus_core::tx::ScriptPublicKey,
+    ) -> keryx_consensus_core::collateral::HolderRewardSnapshot {
+        self.consensus.get_holder_reward(script_public_key)
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()

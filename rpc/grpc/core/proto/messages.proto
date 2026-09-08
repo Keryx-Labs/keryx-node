@@ -70,6 +70,7 @@ message KaspadRequest {
     GetUtxoCountByAddressRequestMessage getUtxoCountByAddressRequest = 1116;
     GetUtxoEntriesByOutpointsRequestMessage getUtxoEntriesByOutpointsRequest = 1118;
     GetServiceStrikesRequestMessage getServiceStrikesRequest = 1120;
+    GetHolderRewardRequestMessage getHolderRewardRequest = 1122;
   }
 }
 
@@ -140,6 +141,7 @@ message KaspadResponse {
     GetUtxoCountByAddressResponseMessage getUtxoCountByAddressResponse = 1117;
     GetUtxoEntriesByOutpointsResponseMessage getUtxoEntriesByOutpointsResponse = 1119;
     GetServiceStrikesResponseMessage getServiceStrikesResponse = 1121;
+    GetHolderRewardResponseMessage getHolderRewardResponse = 1123;
   }
 }
 

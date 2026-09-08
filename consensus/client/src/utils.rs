@@ -23,6 +23,25 @@ pub fn pay_to_address_script(address: &AddressT) -> Result<ScriptPublicKey> {
     Ok(standard::pay_to_address_script(address.as_ref()))
 }
 
+/// The service-ledger identity of a payout address: the `miner` key that
+/// {@link RpcClient.getServiceStrikes} reports strikes, suspensions and pending burns under.
+///
+/// That call returns the whole network keyed by this hash and takes no address, so without this
+/// there is no way to tell which row is yours. Derived here rather than reimplemented by callers
+/// on purpose: it is `blake2b-256(key="TransactionHash", version_le ‖ script)`, and a copy that
+/// drifted from the node would match nothing and report a clean record forever — the failure mode
+/// that looks like good news.
+///
+/// Note this is the identity of the PAYOUT address. An announced escrow key is a different
+/// identity, bound to this one by a delegation cert.
+/// @category Wallet SDK
+#[wasm_bindgen(js_name = minerKeyForAddress)]
+pub fn miner_key_for_address(address: &AddressT) -> Result<HexString> {
+    let address = Address::try_cast_from(address)?;
+    let spk = standard::pay_to_address_script(address.as_ref());
+    Ok(keryx_consensus_core::collateral::miner_key(&spk).to_hex().into())
+}
+
 /// Takes a script and returns an equivalent pay-to-script-hash script.
 /// @param redeem_script - The redeem script ({@link HexString} or Uint8Array).
 /// @category Wallet SDK
