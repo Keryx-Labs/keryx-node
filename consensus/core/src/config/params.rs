@@ -582,6 +582,26 @@ pub const POM_TIERS_H6: &[crate::pom::PomTier] = &[
     POM_TIERS_H4[4], // Kimi-Linear-48B, unchanged
 ];
 
+/// Shard possession anchors for the network-shard PoC (see keryx-miner's
+/// `docs/superpowers/specs/2026-09-09-network-fatia-shard-poc-design.md`). Each row is one
+/// fixed-size, layer-aligned slice of Kimi-Linear-48B at the POC's 8 GiB target
+/// (`models::POC_SHARD_TARGET_BYTES` on the miner side — the two must be kept in lockstep by
+/// hand; there is no dynamic negotiation in this phase). Tier indices are 5, 6, ... immediately
+/// after POM_TIERS_H6's 5 rows (`pom_tiers()` below concatenates them). Roots/chunks are pasted
+/// verbatim from `keryx-miner --print-shards very-high:8` output — DO NOT hand-derive them.
+/// Gated by `shard_poc_activation`, which is `never()` on every real network (see below) — this
+/// table is dead code until a private testnet flips that gate, so the placeholder row is safe.
+pub const POM_SHARDS_POC: &[crate::pom::PomTier] = &[
+    // TODO(shard-poc): paste real output of `keryx-miner --print-shards very-high:8` here, one
+    // crate::pom::PomTier { model_id: KIMI_LINEAR_48B_MODEL_ID, root: [...], chunks: ... } per
+    // shard line printed. This is the ONLY acceptable source for these values — do not compute
+    // them by hand or guess. Placeholder below is a zeroed root/chunks=0 row: structurally valid
+    // Rust so the gated dead-code path still compiles, but semantically unusable — it MUST be
+    // replaced with real manifest data before `shard_poc_activation` is ever set to anything but
+    // `never()` on a live network.
+    crate::pom::PomTier { model_id: KIMI_LINEAR_48B_MODEL_ID, root: [0u8; 32], chunks: 0 },
+];
+
 /// Possession anchors for a block at `daa_score`: the H5 set once `h5_activation` is live (tier-0
 /// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
 /// else the legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
@@ -592,7 +612,11 @@ pub fn pom_tiers(
     h5_active: bool,
     coin_age_active: bool,
     very_light_active: bool,
+    shard_poc_active: bool,
 ) -> &'static [crate::pom::PomTier] {
+    if shard_poc_active && pom_v3_active {
+        return pom_tiers_with_shards();
+    }
     if pom_v3_active {
         POM_TIERS_H6
     } else if h5_active {
@@ -604,6 +628,13 @@ pub fn pom_tiers(
     } else {
         POM_TIERS
     }
+}
+
+/// H6 tiers plus the shard-PoC rows, concatenated once. `shard_poc_active` is `never()`
+/// everywhere except a private testnet, so this path is dead code on every real network.
+fn pom_tiers_with_shards() -> &'static [crate::pom::PomTier] {
+    static COMBINED: std::sync::OnceLock<Vec<crate::pom::PomTier>> = std::sync::OnceLock::new();
+    COMBINED.get_or_init(|| POM_TIERS_H6.iter().copied().chain(POM_SHARDS_POC.iter().copied()).collect())
 }
 
 /// Tier-reward — multiplier in basis points applied to the *immediate miner cut* (the 75 %
@@ -1270,6 +1301,13 @@ pub struct Params {
     /// per nonce than the v2 hash walk).
     pub pom_v3_activation: ForkActivation,
 
+    /// Shard-possession PoC gate (network-shard PoC). At/after this score AND `pom_v3_activation`,
+    /// `pom_tiers()` appends `POM_SHARDS_POC` after the H6 5-tier table, letting a block prove
+    /// possession of a shard instead of a whole model. `never()` on every real network (mainnet,
+    /// testnet, devnet, simnet) — this is dead code everywhere except a private testnet the
+    /// project owner sets up separately to exercise the PoC end to end.
+    pub shard_poc_activation: ForkActivation,
+
     /// Service-bond v2 window retune: halves the cohort-eligibility window (6 000 → 3 000 DAA)
     /// and raises the response-window base (300 → 3 000 DAA). Changes the audit fold, hence the
     /// sealed service state — must be armed above every live tip before the binary ships.
@@ -1548,6 +1586,7 @@ impl Params {
             h5_1_activation: self.h5_1_activation,
             h5_2_activation: self.h5_2_activation,
             pom_v3_activation: self.pom_v3_activation,
+            shard_poc_activation: self.shard_poc_activation,
             service_bond_v2_activation: self.service_bond_v2_activation,
             reward_routing_activation: self.reward_routing_activation,
             service_ledger_activation: self.service_ledger_activation,
@@ -1757,6 +1796,8 @@ pub const MAINNET_PARAMS: Params = Params {
     // H6 matrix walk, armed together with its difficulty-reset companion at the same score.
     // Gate = virtual daa of the relaunch base: active from the first post-relaunch block.
     pom_v3_activation: ForkActivation::new(76_316_623),
+    // Shard-possession PoC: dormant on mainnet. Only ever armed on a private testnet.
+    shard_poc_activation: ForkActivation::never(),
     // H7 service-bond v2. Scheduled for 2026-08-17 20:00 CEST: measured from daa 77_196_191 at
     // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
     service_bond_v2_activation: ForkActivation::new(77_525_000),
@@ -1886,6 +1927,10 @@ pub const TESTNET_PARAMS: Params = Params {
     // itself is committed without body validation, so the mandatory escrow delegation never
     // applies to it. MUST mirror the miner's gate.
     pom_v3_activation: ForkActivation::new(1),
+    // Shard-possession PoC: dormant here too — this is the shared public Testnet network, not
+    // the project owner's private testnet the PoC is meant for. When that private testnet's
+    // params are set up (separately, not in this file), it flips this to `ForkActivation::new(0)`.
+    shard_poc_activation: ForkActivation::never(),
     // H7 service-bond v2 — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
     service_bond_v2_activation: ForkActivation::new(0),
@@ -1981,6 +2026,7 @@ pub const SIMNET_PARAMS: Params = Params {
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
     pom_v3_activation: ForkActivation::never(),
+    shard_poc_activation: ForkActivation::never(),
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
@@ -2068,6 +2114,7 @@ pub const DEVNET_PARAMS: Params = Params {
     h5_1_activation: ForkActivation::never(),
     h5_2_activation: ForkActivation::never(),
     pom_v3_activation: ForkActivation::never(),
+    shard_poc_activation: ForkActivation::never(),
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
