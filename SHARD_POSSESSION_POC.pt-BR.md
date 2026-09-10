@@ -156,8 +156,8 @@ Isto é uma prova de conceito, não uma funcionalidade terminada. Em particular:
 
 ## 7. Onde olhar / como reproduzir
 
-- `keryx-node`, branch `shard-poc`: commit `76aa3c6f` (tabela de tiers de fatia + esqueleto do
-  gate, com uma linha placeholder), commit `ecb0f09e` (dados reais do manifest + o perfil de
+- `keryx-node`, branch `shard-poc`: commit `8107a66f` (tabela de tiers de fatia + esqueleto do
+  gate, com uma linha placeholder), commit `b7a7c2ed` (dados reais do manifest + o perfil de
   ativação do `SIMNET_PARAMS` do §3).
 - `keryx-miner`, branch `shard-poc`: commits `3cf1bd4` (registro de fatia + caminho de
   instalação), `15649ec` (CLI `--shard`/`--print-shards`), `ba2aa2f` (integração na atribuição de

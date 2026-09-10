@@ -139,8 +139,8 @@ This is a concept proof, not a finished feature. In particular:
 
 ## 7. Where to look / how to reproduce
 
-- `keryx-node`, branch `shard-poc`: commit `76aa3c6f` (shard tier table + gating scaffold, then
-  a placeholder row), commit `ecb0f09e` (real manifest data + the `SIMNET_PARAMS` activation
+- `keryx-node`, branch `shard-poc`: commit `8107a66f` (shard tier table + gating scaffold, then
+  a placeholder row), commit `b7a7c2ed` (real manifest data + the `SIMNET_PARAMS` activation
   profile from §3).
 - `keryx-miner`, branch `shard-poc`: commits `3cf1bd4` (shard registry + install path), `15649ec`
   (`--shard`/`--print-shards` CLI), `ba2aa2f` (wiring into tier assignment and the mining loop),
