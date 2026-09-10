@@ -92,6 +92,10 @@ pub struct BlockBodyProcessor {
     /// state commitments; the verifier never re-walks). Same seed/target/final_hash inputs as
     /// the v2 path; `header.pom_final_state` carries `pom_v3::fold64(roots[K])`.
     pub(super) pom_v3_activation: ForkActivation,
+    /// Shard-possession PoC gate — when active (with `pom_v3_activation`) at a block's daa_score,
+    /// `pom_tiers()` appends `POM_SHARDS_POC` after the H6 table. `never()` on every real network;
+    /// see `Params::shard_poc_activation`.
+    pub(super) shard_poc_activation: ForkActivation,
     pub(super) pom_v4_activation: ForkActivation,
     pub(super) h10_activation: ForkActivation,
 
@@ -249,6 +253,7 @@ impl BlockBodyProcessor {
             h5_1_activation: params.h5_1_activation,
             h5_2_activation: params.h5_2_activation,
             pom_v3_activation: params.pom_v3_activation,
+            shard_poc_activation: params.shard_poc_activation,
             pom_v4_activation: params.pom_v4_activation,
             h10_activation: params.h10_activation,
 
