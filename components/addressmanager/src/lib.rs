@@ -32,6 +32,8 @@ pub use stores::NetAddress;
 
 const MAX_ADDRESSES: usize = 4096;
 const MAX_CONNECTION_FAILED_COUNT: u64 = 3;
+/// Entries one IP may hold (distinct ports); the least-failed ones are kept.
+const MAX_ADDRESSES_PER_IP: usize = 2;
 
 const UPNP_DEADLINE_SEC: u64 = 2 * 60;
 const UPNP_EXTEND_PERIOD: u64 = UPNP_DEADLINE_SEC / 2;
@@ -306,6 +308,10 @@ impl AddressManager {
             return false;
         }
 
+        if self.address_store.ip_entries(address.ip) >= MAX_ADDRESSES_PER_IP {
+            return false;
+        }
+
         // We mark `connection_failed_count` as 0 only after first success
         self.address_store.set(address, 1);
         true
@@ -422,14 +428,14 @@ mod address_store_with_cache {
 
     use itertools::Itertools;
     use keryx_database::prelude::{CachePolicy, DB};
-    use keryx_utils::networking::PrefixBucket;
+    use keryx_utils::networking::{IpAddress, PrefixBucket};
     use rand::{
         distributions::{WeightedError, WeightedIndex},
         prelude::Distribution,
     };
 
     use crate::{
-        MAX_ADDRESSES, MAX_CONNECTION_FAILED_COUNT, NetAddress,
+        MAX_ADDRESSES, MAX_ADDRESSES_PER_IP, MAX_CONNECTION_FAILED_COUNT, NetAddress,
         stores::{
             AddressKey,
             address_store::{AddressesStore, DbAddressesStore, Entry},
@@ -439,6 +445,7 @@ mod address_store_with_cache {
     pub struct Store {
         db_store: DbAddressesStore,
         addresses: HashMap<AddressKey, Entry>,
+        per_ip: HashMap<IpAddress, usize>,
     }
 
     impl Store {
@@ -446,11 +453,34 @@ mod address_store_with_cache {
             // We manage the cache ourselves on this level, so we disable the inner builtin cache
             let db_store = DbAddressesStore::new(db, CachePolicy::Empty);
             let mut addresses = HashMap::new();
+            let mut per_ip: HashMap<IpAddress, usize> = HashMap::new();
             for (key, entry) in db_store.iterator().map(|res| res.unwrap()) {
                 addresses.insert(key, entry);
+                *per_ip.entry(entry.address.ip).or_insert(0) += 1;
             }
 
-            Self { db_store, addresses }
+            let mut store = Self { db_store, addresses, per_ip };
+            store.prune_ip_floods();
+            store
+        }
+
+        /// Trims every IP holding more than `MAX_ADDRESSES_PER_IP` entries down to its
+        /// least-failed ones.
+        fn prune_ip_floods(&mut self) {
+            let flooded: Vec<IpAddress> =
+                self.per_ip.iter().filter(|(_, n)| **n > MAX_ADDRESSES_PER_IP).map(|(ip, _)| *ip).collect();
+            for ip in flooded {
+                let mut entries: Vec<(AddressKey, Entry)> =
+                    self.addresses.iter().filter(|(_, e)| e.address.ip == ip).map(|(k, e)| (*k, *e)).collect();
+                entries.sort_by_key(|(_, e)| (e.connection_failed_count, e.address.port));
+                for (key, _) in entries.into_iter().skip(MAX_ADDRESSES_PER_IP) {
+                    self.remove_by_key(key);
+                }
+            }
+        }
+
+        pub fn ip_entries(&self, ip: IpAddress) -> usize {
+            self.per_ip.get(&ip).copied().unwrap_or(0)
         }
 
         pub fn has(&mut self, address: NetAddress) -> bool {
@@ -460,7 +490,10 @@ mod address_store_with_cache {
         pub fn set(&mut self, address: NetAddress, connection_failed_count: u64) {
             let entry = match self.addresses.get(&address.into()) {
                 Some(entry) => Entry { connection_failed_count, address: entry.address },
-                None => Entry { connection_failed_count, address },
+                None => {
+                    *self.per_ip.entry(address.ip).or_insert(0) += 1;
+                    Entry { connection_failed_count, address }
+                }
             };
             self.db_store.set(address.into(), entry).unwrap();
             self.addresses.insert(address.into(), entry);
@@ -480,7 +513,14 @@ mod address_store_with_cache {
         }
 
         fn remove_by_key(&mut self, key: AddressKey) {
-            self.addresses.remove(&key);
+            if let Some(entry) = self.addresses.remove(&key) {
+                if let Some(n) = self.per_ip.get_mut(&entry.address.ip) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.per_ip.remove(&entry.address.ip);
+                    }
+                }
+            }
             self.db_store.remove(key).unwrap()
         }
 
@@ -627,6 +667,41 @@ mod address_store_with_cache {
 
         fn addr(s: &str) -> NetAddress {
             NetAddress::new(IpAddress::from_str(s).unwrap(), 22111)
+        }
+
+        #[test]
+        fn an_ip_keeps_a_bounded_number_of_ports() {
+            let am = test_address_manager();
+            let mut am = am.lock();
+            let ip = IpAddress::from_str("1.2.3.4").unwrap();
+            for port in 0..MAX_ADDRESSES_PER_IP as u16 {
+                assert!(am.add_address(NetAddress::new(ip, 40_000 + port)));
+            }
+            assert!(!am.add_address(NetAddress::new(ip, 50_000)), "one more port of the same ip is not learned");
+            assert!(am.add_address(addr("5.6.7.8")), "other ips are unaffected");
+            assert_eq!(am.address_count(), MAX_ADDRESSES_PER_IP + 1);
+        }
+
+        #[test]
+        fn loading_prunes_ports_beyond_the_per_ip_bound() {
+            let db = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+            std::mem::forget(db.0);
+            let ip = IpAddress::from_str("9.9.9.9").unwrap();
+            {
+                let mut raw = DbAddressesStore::new(db.1.clone(), CachePolicy::Empty);
+                for port in 1..=10u16 {
+                    let address = NetAddress::new(ip, port);
+                    raw.set(address.into(), Entry { connection_failed_count: (port % 3) as u64, address }).unwrap();
+                }
+                let other = addr("5.6.7.8");
+                raw.set(other.into(), Entry { connection_failed_count: 0, address: other }).unwrap();
+            }
+            let am = AddressManager::new(Arc::new(Config::new(SIMNET_PARAMS)), db.1, Arc::new(TickService::default())).0;
+            let am = am.lock();
+            assert_eq!(am.address_count(), MAX_ADDRESSES_PER_IP + 1);
+            let kept: Vec<u16> = am.iterate_addresses().filter(|a| a.ip == ip).map(|a| a.port).collect();
+            assert_eq!(kept.len(), MAX_ADDRESSES_PER_IP);
+            assert!(kept.iter().all(|p| p % 3 == 0), "the least-failed ports survive: {kept:?}");
         }
 
         #[test]
