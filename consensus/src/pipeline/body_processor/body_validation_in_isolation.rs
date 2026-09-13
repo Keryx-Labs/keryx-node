@@ -254,6 +254,7 @@ impl BlockBodyProcessor {
             self.h5_activation.is_active(header.daa_score),
             self.coin_age_verification_activation.is_active(header.daa_score),
             self.very_light_activation.is_active(header.daa_score),
+            self.shard_poc_activation.is_active(header.daa_score),
         );
         let tier = tiers.get(proof.tier as usize).ok_or(RuleError::PomUnknownTier(proof.tier))?;
 
