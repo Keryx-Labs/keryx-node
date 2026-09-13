@@ -231,6 +231,45 @@ mod tests {
         processes::transaction_validator::{TransactionValidator, errors::TxRuleError},
     };
 
+    /// Private inference: a signed AiResponse carrying an inline body is a valid payload in
+    /// isolation up to the extended maximum (the era gate lives in header/UTXO context), an
+    /// oversized or malformed one is not.
+    #[test]
+    fn ai_response_inline_body_lengths_in_isolation() {
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_RESPONSE;
+        use keryx_inference::{AiResponder, AiResponsePayload, AI_RESPONSE_PAYLOAD_V2_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN};
+
+        let params = MAINNET_PARAMS.clone();
+        let tv = TransactionValidator::new_for_tests(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity(),
+            params.ghostdag_k(),
+            Default::default(),
+        );
+        let response = |payload: Vec<u8>| Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload);
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let head = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder);
+
+        assert_eq!(head.serialize().len(), AI_RESPONSE_PAYLOAD_V2_LEN);
+        tv.validate_tx_in_isolation(&response(head.serialize())).unwrap();
+        let with_body = head.clone().with_private_body(vec![0xAB; 1_000]).serialize();
+        tv.validate_tx_in_isolation(&response(with_body)).unwrap();
+        let max_body = head.clone().with_private_body(vec![0xAB; MAX_AI_RESPONSE_PRIVATE_BODY_LEN]).serialize();
+        assert_eq!(max_body.len(), MAX_AI_RESPONSE_PAYLOAD_LEN);
+        tv.validate_tx_in_isolation(&response(max_body)).unwrap();
+
+        let oversized = head.clone().with_private_body(vec![0xAB; MAX_AI_RESPONSE_PRIVATE_BODY_LEN + 1]).serialize();
+        assert_match!(tv.validate_tx_in_isolation(&response(oversized)), Err(TxRuleError::AiPayloadTooLong(_, _)));
+        // A truncated extension header is not a layout at all.
+        let mut truncated = head.serialize();
+        truncated.extend_from_slice(&[0x01, 0x02]);
+        assert_match!(tv.validate_tx_in_isolation(&response(truncated)), Err(TxRuleError::AiPayloadTooShort(_, _)));
+    }
+
     #[test]
     fn validate_tx_in_isolation_test() {
         let mut params = MAINNET_PARAMS.clone();

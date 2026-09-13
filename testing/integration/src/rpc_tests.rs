@@ -529,6 +529,14 @@ async fn sanity_test() {
                 })
             }
 
+            KaspadPayloadOps::GetServiceProviders => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response = rpc_client.get_service_providers_call(None, GetServiceProvidersRequest {}).await.unwrap();
+                    assert!(response.providers.is_empty());
+                })
+            }
+
             KaspadPayloadOps::GetCoinSupply => {
                 let rpc_client = client.clone();
                 tst!(op, {

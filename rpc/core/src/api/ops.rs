@@ -146,6 +146,8 @@ pub enum RpcApiOps {
     GetUtxoEntriesByOutpoints = 153,
     /// Service-bond strike, suspension and pending-burn state
     GetServiceStrikes = 154,
+    /// Service-eligible responders per tier (identity, escrow key) — private-inference targets
+    GetServiceProviders = 155,
 }
 
 impl RpcApiOps {

@@ -2028,6 +2028,64 @@ impl Deserializer for GetServiceStrikesResponse {
     }
 }
 
+/// One service-eligible responder of a tier at the current sink (see `getServiceProviders`).
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceProvider {
+    /// Proven PoM tier (index into the current tier lineup).
+    pub tier: u32,
+    /// Model id of that tier — the `AiRequest.model_id` to use.
+    pub model_id: RpcHash,
+    /// Service identity (payout-SPK key): what strikes and rewards are booked to.
+    pub identity: RpcHash,
+    /// The x-only escrow pubkey the miner announces: what a private request is sealed to and
+    /// what signs its V2 responses.
+    pub escrow_pubkey: RpcHash,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceProvidersRequest {}
+
+impl Serializer for GetServiceProvidersRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceProvidersRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceProvidersResponse {
+    pub virtual_daa_score: u64,
+    pub providers: Vec<RpcServiceProvider>,
+}
+
+impl Serializer for GetServiceProvidersResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.virtual_daa_score, writer)?;
+        store!(Vec<RpcServiceProvider>, &self.providers, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceProvidersResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let virtual_daa_score = load!(u64, reader)?;
+        let providers = load!(Vec<RpcServiceProvider>, reader)?;
+        Ok(Self { virtual_daa_score, providers })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PingRequest {}

@@ -9,7 +9,7 @@ use crate::{
     block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
     blockstatus::BlockStatus,
     coinbase::MinerData,
-    collateral::ServiceStrikesSnapshot,
+    collateral::{ServiceProvidersSnapshot, ServiceStrikesSnapshot},
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         block::{BlockProcessResult, RuleError},
@@ -157,6 +157,19 @@ pub trait ConsensusApi: Send + Sync {
 
     fn get_service_strikes(&self) -> ServiceStrikesSnapshot {
         unimplemented!()
+    }
+
+    /// The service-eligible responders per tier at the current sink: identity and escrow key —
+    /// the keys a private-inference request can be sealed to.
+    fn get_service_providers(&self) -> ServiceProvidersSnapshot {
+        unimplemented!()
+    }
+
+    /// The named responders (escrow keys) of a pending private AiRequest; `None` when the
+    /// request is unknown, expired or public.
+    fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        let _ = request_hash;
+        None
     }
 
     fn get_virtual_bits(&self) -> u32 {

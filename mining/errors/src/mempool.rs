@@ -81,6 +81,9 @@ pub enum RuleError {
     #[error("request {0} already has the maximum number of pending AiResponses")]
     RejectAiResponsesSaturated(String),
 
+    #[error("the AiResponse for request {0} carries an inline body, but that is not a pending private request naming this responder")]
+    RejectAiResponseBody(String),
+
     #[error("an AiChallenge for response {0} is already in the mempool")]
     RejectDuplicateAiChallenge(String),
 

@@ -461,6 +461,17 @@ pub trait RpcApi: Sync + Send + AnySync {
         request: GetServiceStrikesRequest,
     ) -> RpcResult<GetServiceStrikesResponse>;
 
+    /// Service-eligible responders per tier at the current sink: identity and escrow key — the
+    /// keys a private-inference request can be sealed to.
+    async fn get_service_providers(&self) -> RpcResult<GetServiceProvidersResponse> {
+        self.get_service_providers_call(None, GetServiceProvidersRequest {}).await
+    }
+    async fn get_service_providers_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetServiceProvidersRequest,
+    ) -> RpcResult<GetServiceProvidersResponse>;
+
     async fn get_daa_score_timestamp_estimate(&self, daa_scores: Vec<u64>) -> RpcResult<Vec<u64>> {
         Ok(self.get_daa_score_timestamp_estimate_call(None, GetDaaScoreTimestampEstimateRequest { daa_scores }).await?.timestamps)
     }
