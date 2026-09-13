@@ -30,6 +30,39 @@ What changes for the chain, past the gate:
 Everything else — vault output, reward floors, `max_tokens` cap, model caps, mempool dedup,
 service windows, strike escalation, reward minting — is untouched.
 
+### Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as Requester (keryx-cli wallet)
+    participant N as Node (mempool + consensus + service ledger)
+    participant M as Named responder (miner holding the escrow key)
+    participant O as Other miners of the tier
+
+    R->>N: getServiceProviders
+    N-->>R: eligible responders per tier with their escrow keys
+    Note over R: seal_request: draw root_key, wrap it to each named escrow key (ECDH + HKDF),<br/>encrypt the prompt under k_prompt with the request header as associated data
+    R->>N: AiRequest tx: public header, keyless reward vault, prompt = sealed envelope
+    Note over N: mempool: the envelope must parse, its recipients are indexed
+    N-->>M: block template / block carrying the AiRequest
+    N-->>O: the same bytes - ciphertext only, nothing to run
+    Note over M: open_request with the escrow secret: unwrap root_key, decrypt the prompt
+    Note over M: run the inference (llama.cpp)
+    Note over M: seal_response(root_key, request_hash, own escrow key) -> body,<br/>sign v1 head + extension with the escrow key
+    M->>N: AiResponse V2 + inline sealed body
+    Note over N: mempool: an inline body is admitted only from a named responder<br/>of a pending private request
+    Note over N: ledger fold: cohort = eligible tier set restricted to the named keys,<br/>first credited named responder wins the vault, the rest of the tier is never audited
+    N-->>O: not obligated, not struck
+    R->>N: inference fetch: scan the mempool and the blocks since the request
+    N-->>R: the AiResponse with the sealed body
+    Note over R: open_response(root_key, request_hash, responder key) -> plaintext answer
+    N->>M: coinbase mints the vault reward once the win is finality-deep
+```
+
+The three responder notes and step 6 are the miner-side changes specified in §7; every other step
+is implemented in this repository.
+
 ## 2. Request envelope (`inference/src/private.rs`)
 
 The whole `prompt` field of a private `AiRequestPayload` is:
@@ -72,6 +105,19 @@ one recipient, 2 697 for sixteen (`max_private_prompt_len`).
 Using the escrow (signing) key for ECDH is a deliberate trade-off: it is the only key a miner
 already announces on-chain and the one bound to its service identity. Domain-separated HKDF info
 keeps the ECDH output independent of the Schnorr signatures made with the same key.
+
+Key material at a glance (one recipient shown, the wrap repeats per named key):
+
+```mermaid
+flowchart LR
+    e["ephemeral secret e<br/>(E = e*G goes on the wire)"] -->|"ECDH with lift_x(R_i)"| ss["ss_i"]
+    ss -->|"HKDF, info = kek + E + R_i"| kek["kek_i"]
+    root["root_key<br/>(random 32 B, kept by the requester)"] -->|"ChaCha20-Poly1305 under kek_i,<br/>aad = request header"| wrapped["wrapped_root_key_i<br/>(on the wire)"]
+    root -->|"HKDF, info = prompt"| kp["k_prompt"]
+    kp -->|"encrypt prompt,<br/>aad = request + envelope headers"| ct["prompt ciphertext<br/>(on the wire)"]
+    root -->|"HKDF, info = response + R_responder"| kr["k_response"]
+    kr -->|"encrypt answer,<br/>aad = request_hash + R_responder"| body["sealed body<br/>(in the AiResponse)"]
+```
 
 ## 3. Response payload extension (`inference/src/ai_payload.rs`)
 
