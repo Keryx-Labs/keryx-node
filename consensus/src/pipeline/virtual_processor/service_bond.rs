@@ -8,7 +8,7 @@ use crate::model::stores::{
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
     ProductionIndexSnapshot, ServiceLedgerSnapshot,
-    ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
+    ServiceMiss, ServicePenalty, ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
@@ -17,7 +17,7 @@ use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiRequestPayload, AiResponsePayload};
+use keryx_inference::{AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 use keryx_txscript::script_class::ScriptClass;
 
 
@@ -274,14 +274,18 @@ impl VirtualStateProcessor {
     /// Accepted AiRequests `(request_hash, tier)` and AiResponses `(request_hash, verified
     /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
     /// Requests for models outside the tier lineup are skipped; a v1 response or an invalid
-    /// responder signature yields `None` (a volunteer — never serves the assignment).
+    /// responder signature yields `None` (a volunteer — never serves the assignment). With
+    /// `private` set, a request sealed to named responders also yields its recipient set.
+    #[allow(clippy::type_complexity)]
     fn service_events_of_chain_block(
         &self,
         hash: Hash,
         txid_identity: bool,
-    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Option<Hash>)>) {
+        private: bool,
+    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Vec<Hash>)>, Vec<([u8; 32], Option<Hash>)>) {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
+        let mut request_recipients = Vec::new();
         let mut responses = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
         for mbad in acceptance.iter() {
@@ -304,6 +308,18 @@ impl VirtualStateProcessor {
                             }
                             requests.push((request_hash, tier as u8, req.max_tokens));
                             request_rewards.push((request_hash, req.inference_reward));
+                            // Past the private-inference gate a well-formed envelope names the
+                            // only responders obligated for (and paid by) this request; a
+                            // malformed one folds as a public request over opaque bytes.
+                            if private
+                                && req.is_private()
+                                && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
+                            {
+                                let mut recipients: Vec<Hash> = envelope.recipient_keys().map(escrow_miner_key).collect();
+                                recipients.sort_unstable();
+                                recipients.dedup();
+                                request_recipients.push((request_hash, recipients));
+                            }
                         }
                     }
                 } else if tx.is_ai_response() {
@@ -313,7 +329,7 @@ impl VirtualStateProcessor {
                 }
             }
         }
-        (requests, request_rewards, responses)
+        (requests, request_rewards, request_recipients, responses)
     }
 
     /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
@@ -377,6 +393,32 @@ impl VirtualStateProcessor {
             .collect();
         snapshot.suspended.sort_unstable();
         snapshot
+    }
+
+    /// The private-inference recipients of a pending request (see
+    /// [`ServiceLedger::private_recipients`]), as raw escrow pubkeys.
+    pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        let sync = self.service_ledger.lock();
+        sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
+    }
+
+    /// The service-eligible responders of every tier at `sink`: the identities that proved a
+    /// block of the tier inside the eligibility window, each with the escrow key it announces —
+    /// the keys a private request can be sealed to. Sorted by (tier, identity, escrow key).
+    pub(crate) fn service_providers_snapshot(&self, sink: Hash, virtual_daa_score: u64) -> ServiceProvidersSnapshot {
+        let window = if self.service_bond_v2_activation.is_active(virtual_daa_score) {
+            SERVICE_ELIGIBILITY_WINDOW_DAA_V2
+        } else {
+            SERVICE_ELIGIBILITY_WINDOW_DAA
+        };
+        let mut providers = Vec::new();
+        for (tier, model) in POM_TIERS_H6.iter().enumerate() {
+            for (identity, escrow) in self.service_eligible_miners_windowed(sink, tier as u8, window) {
+                providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
+            }
+        }
+        providers.sort_by(|x, y| (x.tier, x.identity, x.escrow_pubkey).cmp(&(y.tier, y.identity, y.escrow_pubkey)));
+        ServiceProvidersSnapshot { virtual_daa_score, providers }
     }
 
     /// Escrow claims created by committed chain block `hash`'s coinbase, keyed by producing miner:
@@ -445,7 +487,11 @@ impl VirtualStateProcessor {
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa));
+        let (requests, request_rewards, request_recipients, responses) = self.service_events_of_chain_block(
+            hash,
+            self.reward_routing_activation.is_active(daa),
+            self.private_inference_activation.is_active(daa),
+        );
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -481,10 +527,11 @@ impl VirtualStateProcessor {
         };
         if warmup {
             let burned = self.service_burned.read();
-            ledger.on_chain_block_warmup_with_rewards(
+            ledger.on_chain_block_warmup_with_recipients(
                 daa,
                 &requests,
                 &request_rewards,
+                &request_recipients,
                 &responses,
                 &escrows,
                 &producers,
@@ -493,10 +540,11 @@ impl VirtualStateProcessor {
             );
             (FoldOutcome::default(), escrows)
         } else {
-            let outcome = ledger.on_chain_block_with_rewards(
+            let outcome = ledger.on_chain_block_with_recipients(
                 daa,
                 &requests,
                 &request_rewards,
+                &request_recipients,
                 &responses,
                 &escrows,
                 &producers,

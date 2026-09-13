@@ -383,6 +383,49 @@ async fn opoi_response_registered_on_chain() {
     tc.shutdown(handles);
 }
 
+/// Private inference: a signed AiResponse carrying an inline (sealed) body is rejected at mempool
+/// admission before `private_inference_activation` — the same rule the block check enforces — and
+/// admitted at/after it.
+#[tokio::test]
+async fn private_response_body_is_gated_at_mempool_admission() {
+    use keryx_consensus_core::api::ConsensusApi;
+    use keryx_consensus_core::api::args::TransactionValidationArgs;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::errors::tx::TxRuleError;
+    use keryx_consensus_core::tx::MutableTransaction;
+    use keryx_inference::{AI_RESPONSE_PAYLOAD_V2_LEN, AiResponder};
+
+    fn body_response() -> Transaction {
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let payload = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder).with_private_body(vec![0xAB; 64]).serialize();
+        Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload)
+    }
+
+    for (gate, admitted) in [(ForkActivation::never(), false), (ForkActivation::always(), true)] {
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::always();
+        params.private_inference_activation = gate;
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let handles = tc.init();
+
+        let mut mtx = MutableTransaction::from_tx(body_response());
+        let result = tc.validate_mempool_transaction(&mut mtx, &TransactionValidationArgs::new(None));
+        if admitted {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(TxRuleError::AiPayloadTooLong(_, AI_RESPONSE_PAYLOAD_V2_LEN))), "{result:?}");
+        }
+        // A body-less V2 response is admitted on both sides of the gate.
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let plain = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder).serialize();
+        let mut mtx = MutableTransaction::from_tx(Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, plain));
+        tc.validate_mempool_transaction(&mut mtx, &TransactionValidationArgs::new(None)).unwrap();
+
+        tc.shutdown(handles);
+    }
+}
+
 // OPoI slashing removed (v1.2.3): the slash-behavior tests (fraud→slash, honest→no-slash,
 // unknown→no-slash, outside-window→no-slash) were dropped together with the slashing mechanism.
 // Escrows are now always spendable; there is no slash state to assert.

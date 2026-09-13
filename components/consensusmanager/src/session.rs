@@ -216,6 +216,10 @@ impl ConsensusSessionOwned {
         self.consensus.get_service_strikes()
     }
 
+    pub fn get_service_providers(&self) -> keryx_consensus_core::collateral::ServiceProvidersSnapshot {
+        self.consensus.get_service_providers()
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()
