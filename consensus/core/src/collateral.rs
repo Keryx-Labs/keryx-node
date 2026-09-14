@@ -194,6 +194,11 @@ pub const SERVICE_WINDOW_BASE_DAA_V2: u64 = 3_000;
 /// interface maximum. Bounds the service window any single request can demand and rejects
 /// nonsense values.
 pub const AI_REQUEST_MAX_TOKENS_CAP: u32 = 4_096;
+/// Window base for a request to the network model (~10 minutes at 10 BPS): pipeline assembly
+/// across several miners before the first token.
+pub const SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL: u64 = 6_000;
+/// Per-token allowance for the network model: one network round trip per shard and per token.
+pub const SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA: u64 = 10;
 
 /// DAA window an assigned miner has, from his assignment seed block, for the request to be served
 /// before it counts as a miss: a fixed base plus a per-requested-token allowance floored at the
@@ -205,12 +210,18 @@ pub fn service_window_daa(tier: u8, max_tokens: u32) -> u64 {
 /// [`service_window_daa`] with the base selected by whether `service_bond_v2_activation` is
 /// active at the daa the audit arms.
 pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
+    use crate::config::params::NETWORK_MODEL_TIER;
     let per_token_daa: u64 = match tier {
         0..=2 => 2, // 0.2 s/token — 5 tok/s floor
         3 => 3,     // 0.3 s/token
-        _ => 4,     // 0.4 s/token — 2.5 tok/s floor
+        4 => 4,     // 0.4 s/token — 2.5 tok/s floor
+        t if t >= NETWORK_MODEL_TIER => SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA,
+        _ => 4,
     };
-    let base = if v2 { SERVICE_WINDOW_BASE_DAA_V2 } else { SERVICE_WINDOW_BASE_DAA };
+    let mut base = if v2 { SERVICE_WINDOW_BASE_DAA_V2 } else { SERVICE_WINDOW_BASE_DAA };
+    if tier >= NETWORK_MODEL_TIER {
+        base = base.max(SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL);
+    }
     base + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
@@ -298,7 +309,9 @@ pub fn update_strikes(current: u32, missed: bool) -> u32 {
 /// the recent window. Sorted and deduped so every node derives the identical set. `recent` is
 /// `(identity, tier, escrow key)` for the recently-active window (order irrelevant).
 pub fn eligible_pairs(recent: &[(Hash, u8, Hash)], target_tier: u8) -> Vec<(Hash, Hash)> {
-    let mut set: Vec<(Hash, Hash)> = recent.iter().filter(|(_, t, _)| *t == target_tier).map(|(m, _, e)| (*m, *e)).collect();
+    use crate::config::params::tier_serves;
+    let mut set: Vec<(Hash, Hash)> =
+        recent.iter().filter(|(_, t, _)| tier_serves(*t, target_tier)).map(|(m, _, e)| (*m, *e)).collect();
     set.sort_unstable();
     set.dedup();
     set
@@ -2268,6 +2281,34 @@ mod tests {
         assert_eq!(eligible_pairs(&recent, 0), vec![(a, e), (b, b)]);
         assert_eq!(eligible_pairs(&recent, 1), vec![(c, e)]);
         assert!(eligible_pairs(&recent, 4).is_empty());
+    }
+
+    #[test]
+    fn network_model_requests_draw_from_every_shard() {
+        use crate::config::params::NETWORK_MODEL_TIER;
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let c = Hash::from_bytes([3u8; 32]);
+        let e = Hash::from_bytes([9u8; 32]);
+        let recent = [(a, NETWORK_MODEL_TIER + 1, e), (b, NETWORK_MODEL_TIER + 3, e), (c, 4u8, e)];
+        assert_eq!(eligible_pairs(&recent, NETWORK_MODEL_TIER), vec![(a, e), (b, e)]);
+        assert_eq!(eligible_pairs(&recent, NETWORK_MODEL_TIER + 1), vec![(a, e)]);
+        assert_eq!(eligible_pairs(&recent, 4), vec![(c, e)]);
+    }
+
+    #[test]
+    fn network_model_window_is_wider_and_slower() {
+        use super::{
+            service_window_daa_at, SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL, SERVICE_WINDOW_BASE_DAA_V2,
+            SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA,
+        };
+        use crate::config::params::NETWORK_MODEL_TIER;
+        assert_eq!(service_window_daa_at(4, 256, true), SERVICE_WINDOW_BASE_DAA_V2 + 256 * 4);
+        assert_eq!(
+            service_window_daa_at(NETWORK_MODEL_TIER, 256, true),
+            SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL + 256 * SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA
+        );
+        assert_eq!(service_window_daa_at(NETWORK_MODEL_TIER + 2, 0, false), SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL);
     }
 
     #[test]

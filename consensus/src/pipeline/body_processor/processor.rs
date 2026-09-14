@@ -92,6 +92,7 @@ pub struct BlockBodyProcessor {
     /// state commitments; the verifier never re-walks). Same seed/target/final_hash inputs as
     /// the v2 path; `header.pom_final_state` carries `pom_v3::fold64(roots[K])`.
     pub(super) pom_v3_activation: ForkActivation,
+    pub(super) model_split_activation: ForkActivation,
     pub(super) pom_v4_activation: ForkActivation,
     pub(super) h10_activation: ForkActivation,
 
@@ -249,6 +250,7 @@ impl BlockBodyProcessor {
             h5_1_activation: params.h5_1_activation,
             h5_2_activation: params.h5_2_activation,
             pom_v3_activation: params.pom_v3_activation,
+            model_split_activation: params.model_split_activation,
             pom_v4_activation: params.pom_v4_activation,
             h10_activation: params.h10_activation,
 

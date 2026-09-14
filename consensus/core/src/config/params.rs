@@ -582,18 +582,38 @@ pub const POM_TIERS_H6: &[crate::pom::PomTier] = &[
     POM_TIERS_H4[4], // Kimi-Linear-48B, unchanged
 ];
 
-/// Possession anchors for a block at `daa_score`: the H5 set once `h5_activation` is live (tier-0
+/// First tier index of the network model (H14). Tier `NETWORK_MODEL_TIER` is the whole model —
+/// the id AiRequests target and pipeline heads declare; nobody mines it. The tiers after it are
+/// its shards, in layer order, each a possession anchor of its own.
+pub const NETWORK_MODEL_TIER: u8 = 5;
+
+/// H14 tier set: the H6 lineup unchanged, then the network model and its shards. Gated by
+/// `model_split_activation`. The network-model entries are appended once their roots are pinned.
+pub const POM_TIERS_H14: &[crate::pom::PomTier] =
+    &[POM_TIERS_H6[0], POM_TIERS_H6[1], POM_TIERS_H6[2], POM_TIERS_H6[3], POM_TIERS_H6[4]];
+
+/// True for a tier that serves requests addressed to `target`: the tier itself, or any shard of
+/// the network model when the target is the network model.
+pub fn tier_serves(tier: u8, target: u8) -> bool {
+    tier == target || (target == NETWORK_MODEL_TIER && tier > NETWORK_MODEL_TIER)
+}
+
+/// Possession anchors for a block at `daa_score`: the H14 set once `model_split_activation` is
+/// live, else the H6 set once `pom_v3_activation`, else the H5 set once `h5_activation` (tier-0
 /// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
 /// else the legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
 /// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
 /// against the wrong anchors and reject the chain.
 pub fn pom_tiers(
+    model_split_active: bool,
     pom_v3_active: bool,
     h5_active: bool,
     coin_age_active: bool,
     very_light_active: bool,
 ) -> &'static [crate::pom::PomTier] {
-    if pom_v3_active {
+    if model_split_active {
+        POM_TIERS_H14
+    } else if pom_v3_active {
         POM_TIERS_H6
     } else if h5_active {
         POM_TIERS_H5
@@ -648,12 +668,19 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 ///   4  Kimi-48B        0%
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
-/// Tier-reward schedule for a block at `daa_score`: 5-tier H6 once `pom_v3_activation` is live,
-/// 5-tier H2 once `very_light_activation`, legacy 4-tier before. Chosen per block from that block's
-/// own DAA (never frozen) — same gating discipline as `pom_tiers`, so archival/IBD recomputation of
-/// older blocks stays canonical.
-pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool) -> &'static [u64] {
-    if pom_v3_active {
+/// H14 schedule: one entry per `POM_TIERS_H14` tier, H6 values first. Gated by
+/// `model_split_activation`. Extended together with the tier table — an entry per shard, set by
+/// the shard's card class.
+pub const TIER_REWARD_BPS_H14: [u64; 5] = TIER_REWARD_BPS_H6;
+
+/// Tier-reward schedule for a block at `daa_score`: H14 once `model_split_activation` is live,
+/// 5-tier H6 once `pom_v3_activation`, 5-tier H2 once `very_light_activation`, legacy 4-tier
+/// before. Chosen per block from that block's own DAA (never frozen) — same gating discipline as
+/// `pom_tiers`, so archival/IBD recomputation of older blocks stays canonical.
+pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool, model_split_active: bool) -> &'static [u64] {
+    if model_split_active {
+        &TIER_REWARD_BPS_H14
+    } else if pom_v3_active {
         &TIER_REWARD_BPS_H6
     } else if very_light_active {
         &TIER_REWARD_BPS_H2
@@ -1287,6 +1314,9 @@ pub struct Params {
     pub production_index_activation: ForkActivation,
     /// H13: coinbase and service-state verification enforced by every node; trusted before.
     pub exact_verification_activation: ForkActivation,
+    /// H14: model split — network-model and shard tiers (`POM_TIERS_H14`), shard-aware service
+    /// cohorts and windows. Scheduled once the shard roots are pinned.
+    pub model_split_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
     pub service_burnable_window_daa: u64,
@@ -1553,6 +1583,7 @@ impl Params {
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
+            model_split_activation: self.model_split_activation,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
@@ -1764,6 +1795,7 @@ pub const MAINNET_PARAMS: Params = Params {
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
+    model_split_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -1893,6 +1925,7 @@ pub const TESTNET_PARAMS: Params = Params {
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
+    model_split_activation: ForkActivation::never(),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -1986,6 +2019,7 @@ pub const SIMNET_PARAMS: Params = Params {
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
+    model_split_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2073,6 +2107,7 @@ pub const DEVNET_PARAMS: Params = Params {
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
+    model_split_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2085,6 +2120,38 @@ pub const DEVNET_PARAMS: Params = Params {
     coin_age_verification_activation: ForkActivation::never(),
     coin_age_maturity_w: COIN_AGE_MATURITY_W,
 };
+
+#[cfg(test)]
+mod model_split_tables_tests {
+    use super::*;
+
+    #[test]
+    fn h14_tier_tables_stay_aligned() {
+        assert_eq!(POM_TIERS_H14.len(), TIER_REWARD_BPS_H14.len());
+        assert!(POM_TIERS_H14.len() >= POM_TIERS_H6.len());
+        for (i, t) in POM_TIERS_H6.iter().enumerate() {
+            assert_eq!(POM_TIERS_H14[i].model_id, t.model_id);
+            assert_eq!(POM_TIERS_H14[i].root, t.root);
+            assert_eq!(POM_TIERS_H14[i].chunks, t.chunks);
+            assert_eq!(TIER_REWARD_BPS_H14[i], TIER_REWARD_BPS_H6[i]);
+        }
+        assert_eq!(NETWORK_MODEL_TIER as usize, POM_TIERS_H6.len());
+        assert_eq!(pom_tiers(true, true, true, true, true).len(), POM_TIERS_H14.len());
+        assert_eq!(pom_tiers(false, true, true, true, true).len(), POM_TIERS_H6.len());
+        assert_eq!(tier_reward_bps(true, true, true).len(), TIER_REWARD_BPS_H14.len());
+        assert_eq!(tier_reward_bps(true, true, false).len(), TIER_REWARD_BPS_H6.len());
+    }
+
+    #[test]
+    fn network_model_shards_serve_the_network_model() {
+        assert!(tier_serves(3, 3));
+        assert!(!tier_serves(4, 3));
+        assert!(tier_serves(NETWORK_MODEL_TIER + 1, NETWORK_MODEL_TIER));
+        assert!(tier_serves(NETWORK_MODEL_TIER + 7, NETWORK_MODEL_TIER));
+        assert!(!tier_serves(4, NETWORK_MODEL_TIER));
+        assert!(!tier_serves(NETWORK_MODEL_TIER + 1, NETWORK_MODEL_TIER + 2));
+    }
+}
 
 #[cfg(test)]
 mod ratio_reward_bps_tests {

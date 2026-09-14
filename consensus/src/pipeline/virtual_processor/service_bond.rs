@@ -11,7 +11,7 @@ use keryx_consensus_core::collateral::{
     ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
-use keryx_consensus_core::config::params::POM_TIERS_H6;
+use keryx_consensus_core::config::params::POM_TIERS_H14;
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
@@ -290,7 +290,7 @@ impl VirtualStateProcessor {
                 let tx = &txs[entry.index_within_block as usize];
                 if tx.is_ai_request() {
                     if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        if let Some(tier) = POM_TIERS_H6.iter().position(|t| t.model_id == req.model_id) {
+                        if let Some(tier) = POM_TIERS_H14.iter().position(|t| t.model_id == req.model_id) {
                             // Past the gate a request is identified by its transaction id, which is
                             // unique by construction. The payload digest is not: the same prompt with
                             // the same parameters is the same hash, so two senders — or one retry —

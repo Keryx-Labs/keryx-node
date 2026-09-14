@@ -61,11 +61,13 @@ pub enum PomWireError {
 /// Both are what [`encode_v4_deduped`]/[`decode_v4_deduped`] need, and both are derivable by any
 /// peer holding the header — which is why the compact form can omit them.
 ///
-/// The tier table is pinned to `POM_TIERS_H6`: `pom_v4_activation` is strictly later than
-/// `pom_v3_activation`, so every v4 block selects that table in `pom_tiers`. A tier outside it is
-/// rejected here rather than guessed, and the caller falls back to the legacy encoding.
+/// The tier table is pinned to `POM_TIERS_H14`, a superset of `POM_TIERS_H6` with the same
+/// indices: `pom_v4_activation` is strictly later than `pom_v3_activation`, so every v4 block
+/// selects one of those two tables in `pom_tiers`, and the superset resolves both. A tier outside
+/// it is rejected here rather than guessed, and the caller falls back to the legacy encoding;
+/// body validation still rejects a tier the block's own era does not know.
 pub fn v4_wire_context(header: &Header, tier: u8) -> Result<(u64, u64), PomWireError> {
-    let tiers = crate::config::params::POM_TIERS_H6;
+    let tiers = crate::config::params::POM_TIERS_H14;
     let t = tiers.get(tier as usize).ok_or(PomWireError::UnknownTier(tier))?;
     let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
     Ok((pom_block_seed_rewalk_era(&pre_pow_hash, header.timestamp, header.nonce, header.daa_score), t.chunks))

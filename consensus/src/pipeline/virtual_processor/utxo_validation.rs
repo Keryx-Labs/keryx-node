@@ -34,7 +34,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -82,6 +82,7 @@ static H10_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -488,6 +489,15 @@ impl VirtualStateProcessor {
             info!("═══════════════════════════════════════════════════════════════");
         }
 
+        if banner_should_fire(self.model_split_activation, header)
+            && H14_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H14 · DAA {} ════════════════", self.model_split_activation.daa_score());
+            info!("  Model split   — network-model and shard tiers; shard holders serve the network model");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════════════════════");
+        }
+
         // H6 banner. Same latching shape as the others — fires once, on the first block at or
         // after the gate, only for a live crossing (see `banner_should_fire`).
         if banner_should_fire(self.pom_v3_activation, header)
@@ -766,6 +776,7 @@ impl VirtualStateProcessor {
         let schedule = tier_reward_bps(
             self.very_light_activation.is_active(pov_daa_score),
             self.pom_v3_activation.is_active(pov_daa_score),
+            self.model_split_activation.is_active(pov_daa_score),
         );
         // H6: the tier bonus is gated on standing — an identity in probation earns the floor
         // rate whatever tier it proves, so rotating identities forfeits the bonus for the whole
@@ -781,7 +792,7 @@ impl VirtualStateProcessor {
                 self.pom_tier_store.get(*blue).optional().unwrap()
             };
             let Some(tier) = tier else { continue };
-            let mut bps = schedule.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
+            let mut bps = schedule.get(tier as usize).copied().unwrap_or(schedule[0]);
             if standing_gate {
                 let txs = self.block_transactions_store.get(*blue).unwrap();
                 let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
