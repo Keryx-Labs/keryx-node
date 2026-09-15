@@ -7,7 +7,7 @@ use crate::model::stores::pom_proof::PomProofStoreReader;
 use crate::processes::{coinbase::coinbase_outputs_limit, transaction_validator::errors::TxRuleError};
 use keryx_consensus_core::{
     block::Block,
-    config::params::{POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
+    config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
     errors::consensus::{ConsensusError, ConsensusResult},
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
@@ -40,6 +40,11 @@ impl BlockBodyProcessor {
         self.check_escrow_delegation(block)?;
         // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
+        // H14: the lineup tiers stay in the registry for older blocks but are no longer mineable.
+        // Keyed on the committed header tier, so the IBD proof skip does not bypass it.
+        if self.model_split_activation.is_active(block.header.daa_score) && block.header.pom_tier < NETWORK_MODEL_TIER {
+            return Err(RuleError::PomTierPaused(block.header.pom_tier));
+        }
         if !skip_pom_proof {
             self.check_pom_proof(block)?;
         }

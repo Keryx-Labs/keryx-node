@@ -11,7 +11,7 @@ use keryx_consensus_core::collateral::{
     ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
-use keryx_consensus_core::config::params::POM_TIERS_H14;
+use keryx_consensus_core::config::params::{NETWORK_MODEL_TIER, POM_TIERS_H14};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
@@ -273,12 +273,14 @@ impl VirtualStateProcessor {
 
     /// Accepted AiRequests `(request_hash, tier)` and AiResponses `(request_hash, verified
     /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
-    /// Requests for models outside the tier lineup are skipped; a v1 response or an invalid
+    /// Requests for models outside the mineable tier set are skipped: the lineup before
+    /// `model_split`, the network model and its shards after it. A v1 response or an invalid
     /// responder signature yields `None` (a volunteer — never serves the assignment).
     fn service_events_of_chain_block(
         &self,
         hash: Hash,
         txid_identity: bool,
+        model_split: bool,
     ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Option<Hash>)>) {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
@@ -290,7 +292,11 @@ impl VirtualStateProcessor {
                 let tx = &txs[entry.index_within_block as usize];
                 if tx.is_ai_request() {
                     if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        if let Some(tier) = POM_TIERS_H14.iter().position(|t| t.model_id == req.model_id) {
+                        if let Some(tier) = POM_TIERS_H14
+                            .iter()
+                            .position(|t| t.model_id == req.model_id)
+                            .filter(|&tier| model_split == (tier >= NETWORK_MODEL_TIER as usize))
+                        {
                             // Past the gate a request is identified by its transaction id, which is
                             // unique by construction. The payload digest is not: the same prompt with
                             // the same parameters is the same hash, so two senders — or one retry —
@@ -445,7 +451,7 @@ impl VirtualStateProcessor {
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa));
+        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa), self.model_split_activation.is_active(daa));
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
