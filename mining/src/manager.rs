@@ -57,16 +57,19 @@ impl MiningManager {
         Self::with_config(config, cache_lifetime, counters)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_extended_config(
         target_time_per_block: u64,
         relay_non_std_transactions: bool,
         max_block_mass: u64,
         ram_scale: f64,
+        model_split_activation_daa: u64,
         cache_lifetime: Option<u64>,
         counters: Arc<MiningCounters>,
     ) -> Self {
-        let config =
-            Config::build_default(target_time_per_block, relay_non_std_transactions, max_block_mass).apply_ram_scale(ram_scale);
+        let config = Config::build_default(target_time_per_block, relay_non_std_transactions, max_block_mass)
+            .apply_ram_scale(ram_scale)
+            .with_model_split_activation(model_split_activation_daa);
         Self::with_config(config, cache_lifetime, counters)
     }
 

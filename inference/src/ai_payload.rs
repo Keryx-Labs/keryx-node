@@ -25,8 +25,13 @@ pub const MAX_AI_REQUEST_PAYLOAD_LEN: usize = 4_096;
 /// the signature covering the 78 v1 bytes. Only the two exact lengths are valid.
 pub const AI_RESPONSE_PAYLOAD_LEN: usize = 78;
 pub const AI_RESPONSE_PAYLOAD_V2_LEN: usize = AI_RESPONSE_PAYLOAD_LEN + 32 + 64;
+/// V3 (model-split era) appends `[n_links: 1] n × [tier: 1] [link_escrow_pubkey: 32] [link_signature: 64]`
+/// to the V2 bytes: the pipeline links that served the response, each signing the 78 v1 bytes.
+/// `n` is 1..=MAX_AI_RESPONSE_LINKS; a V3 payload with no links is not a V3 payload.
+pub const AI_RESPONSE_LINK_LEN: usize = 1 + 32 + 64;
+pub const MAX_AI_RESPONSE_LINKS: usize = 15;
 pub const MIN_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_LEN;
-pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN;
+pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN + 1 + MAX_AI_RESPONSE_LINKS * AI_RESPONSE_LINK_LEN;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
 /// `[response_hash: 32] [challenger_deposit: 8 LE] [challenger_spk_version: 2 LE] [challenger_spk: 32] [proof_data…]`
@@ -103,6 +108,15 @@ pub struct AiResponder {
     pub signature: [u8; 64],
 }
 
+/// One pipeline link of a V3 AiResponse: the shard tier it served, its escrow pubkey and its
+/// schnorr signature over the 78 v1 payload bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiResponseLink {
+    pub tier: u8,
+    pub escrow_pubkey: [u8; 32],
+    pub signature: [u8; 64],
+}
+
 /// Payload of a `SUBNETWORK_ID_AI_RESPONSE` transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiResponsePayload {
@@ -117,11 +131,13 @@ pub struct AiResponsePayload {
     pub response_length: u32,
     /// V2 responder identity; `None` for a v1 payload.
     pub responder: Option<AiResponder>,
+    /// V3 pipeline links; empty for a v1 or v2 payload.
+    pub links: Vec<AiResponseLink>,
 }
 
 impl AiResponsePayload {
     pub fn new(request_hash: [u8; 32], challenge_window_end: u64, response_ipfs_cid: [u8; 34], response_length: u32) -> Self {
-        Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: None }
+        Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: None, links: Vec::new() }
     }
 
     pub fn new_v2(
@@ -131,7 +147,23 @@ impl AiResponsePayload {
         response_length: u32,
         responder: AiResponder,
     ) -> Self {
-        Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: Some(responder) }
+        Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: Some(responder), links: Vec::new() }
+    }
+
+    pub fn new_v3(
+        request_hash: [u8; 32],
+        challenge_window_end: u64,
+        response_ipfs_cid: [u8; 34],
+        response_length: u32,
+        responder: AiResponder,
+        links: Vec<AiResponseLink>,
+    ) -> Self {
+        Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder: Some(responder), links }
+    }
+
+    /// A V3 payload: signed responder plus at least one signed link.
+    pub fn is_v3(&self) -> bool {
+        self.responder.is_some() && !self.links.is_empty()
     }
 
     /// The 78 v1 bytes — also the message covered by the V2 responder signature.
@@ -147,22 +179,47 @@ impl AiResponsePayload {
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = self.signed_bytes();
         if let Some(r) = &self.responder {
-            out.reserve(32 + 64);
+            out.reserve(32 + 64 + 1 + self.links.len() * AI_RESPONSE_LINK_LEN);
             out.extend_from_slice(&r.escrow_pubkey);
             out.extend_from_slice(&r.signature);
+            if !self.links.is_empty() {
+                out.push(self.links.len() as u8);
+                for l in &self.links {
+                    out.push(l.tier);
+                    out.extend_from_slice(&l.escrow_pubkey);
+                    out.extend_from_slice(&l.signature);
+                }
+            }
         }
         out
     }
 
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() != AI_RESPONSE_PAYLOAD_LEN && data.len() != AI_RESPONSE_PAYLOAD_V2_LEN {
+        let len = data.len();
+        if len != AI_RESPONSE_PAYLOAD_LEN && len < AI_RESPONSE_PAYLOAD_V2_LEN {
             return None;
         }
         let request_hash: [u8; 32] = data[0..32].try_into().ok()?;
         let challenge_window_end = u64::from_le_bytes(data[32..40].try_into().ok()?);
         let response_ipfs_cid: [u8; 34] = data[40..74].try_into().ok()?;
         let response_length = u32::from_le_bytes(data[74..78].try_into().ok()?);
-        let responder = if data.len() == AI_RESPONSE_PAYLOAD_V2_LEN {
+        let mut links = Vec::new();
+        let responder = if len >= AI_RESPONSE_PAYLOAD_V2_LEN {
+            if len > AI_RESPONSE_PAYLOAD_V2_LEN {
+                let n = data[AI_RESPONSE_PAYLOAD_V2_LEN] as usize;
+                if n == 0 || n > MAX_AI_RESPONSE_LINKS || len != AI_RESPONSE_PAYLOAD_V2_LEN + 1 + n * AI_RESPONSE_LINK_LEN {
+                    return None;
+                }
+                let mut pos = AI_RESPONSE_PAYLOAD_V2_LEN + 1;
+                for _ in 0..n {
+                    links.push(AiResponseLink {
+                        tier: data[pos],
+                        escrow_pubkey: data[pos + 1..pos + 33].try_into().ok()?,
+                        signature: data[pos + 33..pos + 97].try_into().ok()?,
+                    });
+                    pos += AI_RESPONSE_LINK_LEN;
+                }
+            }
             Some(AiResponder {
                 escrow_pubkey: data[78..110].try_into().ok()?,
                 signature: data[110..174].try_into().ok()?,
@@ -170,7 +227,7 @@ impl AiResponsePayload {
         } else {
             None
         };
-        Some(Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder })
+        Some(Self { request_hash, challenge_window_end, response_ipfs_cid, response_length, responder, links })
     }
 
     /// Parse from a hex-encoded payload string (keryxd gRPC format).
@@ -322,6 +379,56 @@ mod tests {
         let parsed = AiResponsePayload::deserialize(&bytes).unwrap();
         assert_eq!(resp, parsed);
         assert_eq!(&bytes[..AI_RESPONSE_PAYLOAD_LEN], resp.signed_bytes().as_slice());
+    }
+
+    #[test]
+    fn ai_response_v3_roundtrip() {
+        let cid = [0x12u8; 34];
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let links = vec![
+            AiResponseLink { tier: 6, escrow_pubkey: [0x61u8; 32], signature: [0x62u8; 64] },
+            AiResponseLink { tier: 9, escrow_pubkey: [0x91u8; 32], signature: [0x92u8; 64] },
+        ];
+        let resp = AiResponsePayload::new_v3([7u8; 32], 900_000, cid, 128, responder, links);
+        assert!(resp.is_v3());
+        let bytes = resp.serialize();
+        assert_eq!(bytes.len(), AI_RESPONSE_PAYLOAD_V2_LEN + 1 + 2 * AI_RESPONSE_LINK_LEN);
+        assert!(bytes.len() <= MAX_AI_RESPONSE_PAYLOAD_LEN);
+        let parsed = AiResponsePayload::deserialize(&bytes).unwrap();
+        assert_eq!(resp, parsed);
+        assert_eq!(&bytes[..AI_RESPONSE_PAYLOAD_LEN], resp.signed_bytes().as_slice());
+        // v2 stays byte-identical to a v3 payload with no links
+        let v2 = AiResponsePayload::new_v2([7u8; 32], 900_000, cid, 128, responder);
+        assert!(!v2.is_v3());
+        assert_eq!(v2.serialize().len(), AI_RESPONSE_PAYLOAD_V2_LEN);
+    }
+
+    #[test]
+    fn ai_response_v3_rejects_malformed_link_sections() {
+        let cid = [0x12u8; 34];
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let link = AiResponseLink { tier: 6, escrow_pubkey: [0x61u8; 32], signature: [0x62u8; 64] };
+        let good = AiResponsePayload::new_v3([7u8; 32], 1, cid, 1, responder, vec![link]).serialize();
+        // a zero link count is not a v3 payload
+        let mut zero = good.clone();
+        zero[AI_RESPONSE_PAYLOAD_V2_LEN] = 0;
+        assert!(AiResponsePayload::deserialize(&zero).is_none());
+        // count and length must agree
+        let mut short = good.clone();
+        short.pop();
+        assert!(AiResponsePayload::deserialize(&short).is_none());
+        let mut long = good.clone();
+        long.push(0);
+        assert!(AiResponsePayload::deserialize(&long).is_none());
+        // a count above the cap is rejected even with a matching length
+        let mut many = good[..AI_RESPONSE_PAYLOAD_V2_LEN].to_vec();
+        many.push((MAX_AI_RESPONSE_LINKS + 1) as u8);
+        many.extend(std::iter::repeat(0u8).take((MAX_AI_RESPONSE_LINKS + 1) * AI_RESPONSE_LINK_LEN));
+        assert!(AiResponsePayload::deserialize(&many).is_none());
+        // a bare count byte after v2 is malformed
+        let mut bare = good[..AI_RESPONSE_PAYLOAD_V2_LEN].to_vec();
+        bare.push(1);
+        assert!(AiResponsePayload::deserialize(&bare).is_none());
     }
 
     #[test]

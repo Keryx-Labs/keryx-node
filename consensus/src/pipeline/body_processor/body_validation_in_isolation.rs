@@ -40,9 +40,10 @@ impl BlockBodyProcessor {
         self.check_escrow_delegation(block)?;
         // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
-        // H14: the lineup tiers stay in the registry for older blocks but are no longer mineable.
+        // H14: the lineup tiers stay in the registry for older blocks but are no longer mineable,
+        // and the network model itself is a request target, never a mined tier.
         // Keyed on the committed header tier, so the IBD proof skip does not bypass it.
-        if self.model_split_activation.is_active(block.header.daa_score) && block.header.pom_tier < NETWORK_MODEL_TIER {
+        if self.model_split_activation.is_active(block.header.daa_score) && block.header.pom_tier <= NETWORK_MODEL_TIER {
             return Err(RuleError::PomTierPaused(block.header.pom_tier));
         }
         if !skip_pom_proof {

@@ -51,6 +51,9 @@ pub struct Config {
     pub minimum_standard_transaction_version: u16,
     pub maximum_standard_transaction_version: u16,
     pub network_blocks_per_second: u64,
+    /// DAA score of the model-split activation: V3 (pipeline) AiResponses are admitted from it.
+    /// `u64::MAX` keeps them out.
+    pub model_split_activation_daa: u64,
 }
 
 impl Config {
@@ -96,7 +99,14 @@ impl Config {
             minimum_standard_transaction_version,
             maximum_standard_transaction_version,
             network_blocks_per_second,
+            model_split_activation_daa: u64::MAX,
         }
+    }
+
+    /// Installs the model-split activation score the V3 AiResponse admission reads.
+    pub fn with_model_split_activation(mut self, daa: u64) -> Self {
+        self.model_split_activation_daa = daa;
+        self
     }
 
     /// Build a default config.
@@ -125,6 +135,7 @@ impl Config {
             minimum_standard_transaction_version: DEFAULT_MINIMUM_STANDARD_TRANSACTION_VERSION,
             maximum_standard_transaction_version: DEFAULT_MAXIMUM_STANDARD_TRANSACTION_VERSION,
             network_blocks_per_second: 1000 / target_milliseconds_per_block,
+            model_split_activation_daa: u64::MAX,
         }
     }
 

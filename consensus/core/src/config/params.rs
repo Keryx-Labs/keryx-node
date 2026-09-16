@@ -333,6 +333,18 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H6: &[([u8; 32], u64)] = &[
     (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),   // 4.0 KRX  (--very-high)
 ];
 
+/// Per-model minimum inference_reward in sompi, H14 — enforced from `model_split_activation`.
+/// The H6 lineup floors are kept (its requests stay valid, they are just no longer assigned);
+/// the network model floor is the Kimi floor, shared by its six signers by VRAM weight.
+pub const INFERENCE_REWARD_MINIMUMS_V2_H14: &[([u8; 32], u64)] = &[
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  100_000_000),
+    (GLM_4_9B_0414_MODEL_ID,           150_000_000),
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 200_000_000),
+    (QWEN3_6_27B_MODEL_ID,             250_000_000),
+    (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),
+    (NETWORK_MODEL_V4_FLASH_MODEL_ID,    400_000_000), // 4.0 KRX, six signers
+];
+
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
 
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
@@ -728,6 +740,28 @@ pub fn tier_serves(tier: u8, target: u8) -> bool {
     tier == target || (target == NETWORK_MODEL_TIER && tier > NETWORK_MODEL_TIER)
 }
 
+/// Tier of the pipeline head: the last shard, which also carries the embeddings and the output
+/// head. Its miner signs the response as responder; every other shard tier signs as a link.
+pub const NETWORK_MODEL_HEAD_TIER: u8 = NETWORK_MODEL_TIER + NETWORK_MODEL_SHARDS.len() as u8;
+
+/// Card class of each shard tier (`NETWORK_MODEL_TIER + 1 + k`), in GB of VRAM: the weight of
+/// its signer's share of a served request's reward.
+pub const NETWORK_MODEL_SHARD_VRAM_GB: [u64; 6] = [8, 12, 12, 16, 24, 32];
+
+/// Reward-share weight of a network-model tier; 0 for any other tier.
+pub fn network_model_tier_weight(tier: u8) -> u64 {
+    if tier > NETWORK_MODEL_TIER {
+        NETWORK_MODEL_SHARD_VRAM_GB.get((tier - NETWORK_MODEL_TIER - 1) as usize).copied().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// The shard tiers a served network-model response must be signed by, head included.
+pub fn network_model_shard_tiers() -> impl Iterator<Item = u8> {
+    (NETWORK_MODEL_TIER + 1)..=NETWORK_MODEL_HEAD_TIER
+}
+
 /// Possession anchors for a block at `daa_score`: the H14 set once `model_split_activation` is
 /// live, else the H6 set once `pom_v3_activation`, else the H5 set once `h5_activation` (tier-0
 /// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
@@ -799,8 +833,8 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
 /// H14 schedule: H6 values, the network model itself (nobody mines it: floor), then one entry
-/// per shard, one notch under its card class until the pipeline economy hardfork.
-pub const TIER_REWARD_BPS_H14: [u64; 12] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 6_000, 6_000, 7_000, 8_000, 9_000];
+/// per shard at the rate of its card class (8 GB = tier 0 … 32 GB = tier 4).
+pub const TIER_REWARD_BPS_H14: [u64; 12] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 7_000, 7_000, 8_000, 9_000, 10_000];
 
 /// Tier-reward schedule for a block at `daa_score`: H14 once `model_split_activation` is live,
 /// 5-tier H6 once `pom_v3_activation`, 5-tier H2 once `very_light_activation`, legacy 4-tier
@@ -2279,6 +2313,27 @@ mod model_split_tables_tests {
         assert!(tier_serves(NETWORK_MODEL_TIER + 7, NETWORK_MODEL_TIER));
         assert!(!tier_serves(4, NETWORK_MODEL_TIER));
         assert!(!tier_serves(NETWORK_MODEL_TIER + 1, NETWORK_MODEL_TIER + 2));
+    }
+
+    #[test]
+    fn network_model_head_and_weights_follow_the_shard_table() {
+        assert_eq!(NETWORK_MODEL_HEAD_TIER as usize, POM_TIERS_H14.len() - 1);
+        assert_eq!(NETWORK_MODEL_SHARD_VRAM_GB.len(), NETWORK_MODEL_SHARDS.len());
+        assert_eq!(network_model_shard_tiers().count(), NETWORK_MODEL_SHARDS.len());
+        assert_eq!(network_model_tier_weight(NETWORK_MODEL_TIER + 1), 8);
+        assert_eq!(network_model_tier_weight(NETWORK_MODEL_HEAD_TIER), 32);
+        assert_eq!(network_model_tier_weight(NETWORK_MODEL_TIER), 0);
+        assert_eq!(network_model_tier_weight(4), 0);
+        assert_eq!(network_model_tier_weight(NETWORK_MODEL_HEAD_TIER + 1), 0);
+        // each shard is paid at the rate of its card class
+        for (k, gb) in NETWORK_MODEL_SHARD_VRAM_GB.iter().enumerate() {
+            let class = match gb { 8 => 0, 12 => 1, 16 => 2, 24 => 3, _ => 4 };
+            assert_eq!(TIER_REWARD_BPS_H14[NETWORK_MODEL_TIER as usize + 1 + k], TIER_REWARD_BPS_H6[class]);
+        }
+        // the network model has a floor and it is the H6 lineup plus one entry
+        assert_eq!(INFERENCE_REWARD_MINIMUMS_V2_H14.len(), INFERENCE_REWARD_MINIMUMS_V2_H6.len() + 1);
+        let min = INFERENCE_REWARD_MINIMUMS_V2_H14.iter().find(|(id, _)| *id == NETWORK_MODEL_V4_FLASH_MODEL_ID).unwrap().1;
+        assert_eq!(min, INFERENCE_REWARD_MINIMUMS_V2_H6[4].1);
     }
 }
 

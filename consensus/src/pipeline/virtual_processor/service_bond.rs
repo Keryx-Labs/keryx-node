@@ -7,7 +7,7 @@ use crate::model::stores::{
 };
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
-    ProductionIndexSnapshot, ServiceLedgerSnapshot,
+    ProductionIndexSnapshot, ResponseLinks, ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
@@ -35,6 +35,20 @@ fn csv_escrow_pubkey(script: &[u8]) -> Option<[u8; 32]> {
 fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
     let r = resp.responder.as_ref()?;
     verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()).then(|| escrow_miner_key(&r.escrow_pubkey))
+}
+
+/// The `(tier, escrow key)` of every link of a V3 response, iff every link signature verifies
+/// over the v1 payload bytes. `None` for a v1/v2 payload or any bad link signature — a
+/// pipeline response with one unverifiable link is credited to nobody.
+fn verified_links(resp: &AiResponsePayload) -> Option<Vec<(u8, Hash)>> {
+    if resp.links.is_empty() {
+        return None;
+    }
+    let signed = resp.signed_bytes();
+    resp.links
+        .iter()
+        .map(|l| verify_responder_signature(&l.escrow_pubkey, &l.signature, &signed).then(|| (l.tier, escrow_miner_key(&l.escrow_pubkey))))
+        .collect()
 }
 
 /// Retained per-chain-block ledger snapshots; reorgs deeper than this fall back to a horizon refold.
@@ -281,10 +295,11 @@ impl VirtualStateProcessor {
         hash: Hash,
         txid_identity: bool,
         model_split: bool,
-    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Option<Hash>)>) {
+    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Option<Hash>)>, Vec<ResponseLinks>) {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
         let mut responses = Vec::new();
+        let mut response_links = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
         for mbad in acceptance.iter() {
             let txs = self.block_transactions_store.get(mbad.block_hash).unwrap();
@@ -314,12 +329,16 @@ impl VirtualStateProcessor {
                     }
                 } else if tx.is_ai_response() {
                     if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-                        responses.push((resp.request_hash, verified_responder(&resp)));
+                        let head = verified_responder(&resp);
+                        if let (Some(head), Some(links)) = (head, verified_links(&resp)) {
+                            response_links.push((resp.request_hash, head, links));
+                        }
+                        responses.push((resp.request_hash, head));
                     }
                 }
             }
         }
-        (requests, request_rewards, responses)
+        (requests, request_rewards, responses, response_links)
     }
 
     /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
@@ -451,7 +470,7 @@ impl VirtualStateProcessor {
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, responses) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa), self.model_split_activation.is_active(daa));
+        let (requests, request_rewards, responses, response_links) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa), self.model_split_activation.is_active(daa));
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -494,6 +513,7 @@ impl VirtualStateProcessor {
                 &responses,
                 &escrows,
                 &producers,
+                &response_links,
                 &|op| burned.contains_key(op),
                 cohort,
             );
@@ -506,6 +526,7 @@ impl VirtualStateProcessor {
                 &responses,
                 &escrows,
                 &producers,
+                &response_links,
                 |id| self.service_standing_at(id, daa),
                 cohort,
             );

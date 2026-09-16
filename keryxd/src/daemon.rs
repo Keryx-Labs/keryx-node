@@ -671,6 +671,7 @@ Do you confirm? (y/n)";
         false,
         config.max_block_mass,
         config.ram_scale,
+        config.model_split_activation.daa_score(),
         config.block_template_cache_lifetime,
         mining_counters.clone(),
     )));

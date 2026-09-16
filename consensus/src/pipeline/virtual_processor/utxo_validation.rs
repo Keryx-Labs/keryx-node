@@ -6,7 +6,8 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
+            AiRequestMaxTokensExceeded, AiResponseLinksBeforeActivation, AiResponseModelCapMissing, AiResponseV2BeforeActivation,
+            BadAcceptedIDMerkleRoot,
             BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot, MissingServiceLedgerSnapshot,
             WrongHeaderPruningPoint,
         },
@@ -34,7 +35,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_V2_H14, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -548,6 +549,13 @@ impl VirtualStateProcessor {
         // Signed (v2) AiResponse payloads only become valid at the service-bond gate; before it
         // this keeps the fixed 78-byte rule every deployed node enforces. The gate also brings
         // the max_tokens cap on AiRequests.
+        if !self.model_split_activation.is_active(header.daa_score) {
+            for tx in txs.iter().skip(1) {
+                if tx.is_ai_response() && tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
+                    return Err(AiResponseLinksBeforeActivation(tx.id()));
+                }
+            }
+        }
         if !self.pom_v3_activation.is_active(header.daa_score) {
             for tx in txs.iter().skip(1) {
                 if tx.is_ai_response() && tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
@@ -611,7 +619,9 @@ impl VirtualStateProcessor {
     /// OPoI v2 introduced the uncensored lineup. Resolved in one place so the pre-UTXO fast path,
     /// the full block check and mempool admission cannot read different tables for the same score.
     pub(super) fn ai_reward_minimums(&self, daa_score: u64) -> &[([u8; 32], u64)] {
-        if self.pom_v3_activation.is_active(daa_score) {
+        if self.model_split_activation.is_active(daa_score) {
+            INFERENCE_REWARD_MINIMUMS_V2_H14
+        } else if self.pom_v3_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_V2_H6
         } else if self.coin_age_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_V2_H4

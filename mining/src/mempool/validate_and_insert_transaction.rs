@@ -28,7 +28,7 @@ impl Mempool {
         self.validate_transaction_unacceptance(&transaction)?;
         // Populate mass and estimated_size in the beginning, it will be used in multiple places throughout the validation and insertion.
         transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx));
-        self.validate_transaction_in_isolation(&transaction)?;
+        self.validate_transaction_in_isolation(&transaction, consensus.get_virtual_daa_score())?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
         self.populate_mempool_entries(&mut transaction);
         Ok(TransactionPreValidation { transaction, feerate_threshold })
@@ -155,7 +155,7 @@ impl Mempool {
         }
     }
 
-    fn validate_transaction_in_isolation(&self, transaction: &MutableTransaction) -> RuleResult<()> {
+    fn validate_transaction_in_isolation(&self, transaction: &MutableTransaction, virtual_daa: u64) -> RuleResult<()> {
         let transaction_id = transaction.id();
         if self.transaction_pool.has(&transaction_id) {
             return Err(RuleError::RejectDuplicate(transaction_id));
@@ -165,6 +165,17 @@ impl Mempool {
         // signature must verify so the dedup key cannot be forged by third parties.
         if transaction.tx.is_ai_response() {
             if let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) {
+                // A V3 payload is only block-valid past the model-split gate; admitting one
+                // earlier would put an invalid transaction into every honest template.
+                if resp.is_v3() {
+                    if virtual_daa < self.config.model_split_activation_daa {
+                        return Err(RuleError::RejectAiResponseLinksBeforeActivation(hex::encode(resp.request_hash)));
+                    }
+                    let signed = resp.signed_bytes();
+                    if resp.links.iter().any(|l| !verify_responder_signature(&l.escrow_pubkey, &l.signature, &signed)) {
+                        return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
+                    }
+                }
                 let responder = match resp.responder.as_ref() {
                     Some(r) => {
                         if !verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()) {

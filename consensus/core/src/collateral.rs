@@ -393,6 +393,62 @@ struct Audit {
     delegations: Vec<(Hash, Hash)>,
     responded: Vec<Hash>,
     window_end_daa: u64,
+    /// Network-model audits only: the identity drawn for each shard tier, tier order. The head
+    /// tier's draw is struck on silence; every other draw is struck when a credited response
+    /// was served without it. Empty for a lineup audit.
+    links: Vec<(u8, Hash)>,
+    /// Network-model audits only: `(identity, shard tier)` of every eligible producer, sorted —
+    /// a signer must hold the tier it signs for.
+    members: Vec<(Hash, u8)>,
+}
+
+/// A pipeline response's verified links, keyed to its `(request_hash, head escrow key)`
+/// response entry: `(shard tier, link escrow key)` per signing link.
+pub type ResponseLinks = ([u8; 32], Hash, Vec<(u8, Hash)>);
+
+/// Domain of the derived reward keys of a pipeline response's link shares.
+const REWARD_SHARE_DOMAIN: &[u8] = b"KeryxRewardShareV1";
+
+/// Reward-store key of the share paid to the link of `tier` for `request_hash`. The head's share
+/// keeps the request hash itself as its key.
+pub fn reward_share_key(request_hash: &[u8; 32], tier: u8) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(REWARD_SHARE_DOMAIN);
+    hasher.update(request_hash);
+    hasher.update(&[tier]);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hasher.finalize().as_bytes());
+    out
+}
+
+/// Per-shard draw seed: the request hash mixed with the shard tier, so the draws of one request
+/// are independent across tiers.
+fn shard_draw_seed(request_hash: &[u8; 32], tier: u8) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(request_hash);
+    hasher.update(&[tier]);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(hasher.finalize().as_bytes());
+    out
+}
+
+/// VRAM-weighted split of `reward` between the head and its links: `(identity, amount)` per
+/// signer, the head first and carrying the rounding remainder.
+pub fn split_pipeline_reward(reward: u64, head: (u8, Hash), links: &[(u8, Hash)]) -> Vec<(Hash, u64)> {
+    use crate::config::params::network_model_tier_weight;
+    let total: u128 = network_model_tier_weight(head.0) as u128 + links.iter().map(|(t, _)| network_model_tier_weight(*t) as u128).sum::<u128>();
+    if total == 0 {
+        return vec![(head.1, reward)];
+    }
+    let mut out = Vec::with_capacity(links.len() + 1);
+    let mut paid: u64 = 0;
+    for (tier, identity) in links {
+        let amount = (reward as u128 * network_model_tier_weight(*tier) as u128 / total) as u64;
+        paid += amount;
+        out.push((*identity, amount));
+    }
+    out.insert(0, (head.1, reward - paid));
+    out
 }
 
 /// One miner's strike state: consecutive-miss count and the daa of the last actual strike.
@@ -527,7 +583,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, &[], responses, escrows, &[], None, is_established, cohort)
+        self.fold_inner(daa, requests, &[], responses, escrows, &[], &[], None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block`] with the reward-routing inputs: per-request vaulted amounts and
@@ -541,10 +597,11 @@ impl ServiceLedger {
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        response_links: &[ResponseLinks],
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, response_links, None, is_established, cohort)
     }
 
     /// Folds a chain block whose strike events are already persisted (daa at or below the store
@@ -560,7 +617,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, &[], responses, escrows, &[], Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, &[], responses, escrows, &[], &[], Some(is_burned), |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup`] with the reward-routing inputs.
@@ -573,10 +630,11 @@ impl ServiceLedger {
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        response_links: &[ResponseLinks],
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, response_links, Some(is_burned), |_| true, cohort);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -588,10 +646,12 @@ impl ServiceLedger {
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        response_links: &[ResponseLinks],
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
         is_established: impl Fn(&Hash) -> bool,
         mut cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
+        use crate::config::params::{network_model_shard_tiers, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_TIER};
         let warmup = warmup_burned.is_some();
         for (identity, spk) in producers {
             self.producer_spk.insert(*identity, spk.clone());
@@ -672,6 +732,7 @@ impl ServiceLedger {
         for (rh, responder) in responses {
             let Some(r) = responder else { continue };
             let mut served: Vec<Hash> = Vec::new();
+            let mut pipeline: Option<(Hash, Vec<(u8, Hash)>)> = None;
             {
                 let Some(req) = self.pending.get_mut(rh) else {
                     let entry = self.early_responses.entry(*rh).or_insert((daa, Vec::new()));
@@ -687,14 +748,60 @@ impl ServiceLedger {
                     continue;
                 };
                 let matched: Vec<Hash> = audit.delegations.iter().filter(|(e, _)| e == r).map(|(_, id)| *id).collect();
-                for identity in matched {
-                    if audit.cohort.binary_search(&identity).is_ok() && !audit.responded.contains(&identity) {
-                        audit.responded.push(identity);
-                        served.push(identity);
+                if audit.links.is_empty() {
+                    for identity in matched {
+                        if audit.cohort.binary_search(&identity).is_ok() && !audit.responded.contains(&identity) {
+                            audit.responded.push(identity);
+                            served.push(identity);
+                        }
                     }
+                } else {
+                    // A pipeline response counts only complete: the head holds the head tier and
+                    // every other shard tier is signed by exactly one link holding it. Anything
+                    // else is no response at all — the drawn head answers for it at window close.
+                    let Some((_, _, links)) = response_links.iter().find(|(h, k, _)| h == rh && k == r) else { continue };
+                    let head_ids: Vec<Hash> =
+                        matched.iter().copied().filter(|id| audit.members.binary_search(&(*id, NETWORK_MODEL_HEAD_TIER)).is_ok()).collect();
+                    let Some(head) = head_ids.first().copied() else { continue };
+                    let mut expected: Vec<u8> = network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).collect();
+                    let mut signed: Vec<u8> = links.iter().map(|(t, _)| *t).collect();
+                    signed.sort_unstable();
+                    expected.sort_unstable();
+                    if signed != expected {
+                        continue;
+                    }
+                    let mut link_ids: Vec<(u8, Hash)> = Vec::with_capacity(links.len());
+                    let mut complete = true;
+                    for (tier, key) in links {
+                        let holder = audit
+                            .delegations
+                            .iter()
+                            .filter(|(e, _)| e == key)
+                            .map(|(_, id)| *id)
+                            .find(|id| audit.members.binary_search(&(*id, *tier)).is_ok());
+                        match holder {
+                            Some(id) => link_ids.push((*tier, id)),
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        continue;
+                    }
+                    for identity in head_ids.iter().chain(link_ids.iter().map(|(_, id)| id)) {
+                        if !audit.responded.contains(identity) {
+                            audit.responded.push(*identity);
+                            served.push(*identity);
+                        }
+                    }
+                    pipeline = Some((head, link_ids));
                 }
             }
-            if let Some(first) = served.first().copied() {
+            if let Some((head, link_ids)) = pipeline.take() {
+                self.maybe_award_pipeline(rh, head, &link_ids, warmup, &mut outcome);
+            } else if let Some(first) = served.first().copied() {
                 self.maybe_award(rh, first, warmup, &mut outcome);
             }
             for identity in served {
@@ -720,7 +827,20 @@ impl ServiceLedger {
             match &req.audit {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
-                    for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m)) {
+                    // Lineup: every silent cohort member. Pipeline: the drawn head alone when
+                    // nothing was served, else every drawn identity the served response did
+                    // without (a substituted head included).
+                    let silent: Vec<Hash> = if audit.links.is_empty() {
+                        audit.cohort.iter().filter(|m| !audit.responded.contains(m)).copied().collect()
+                    } else if audit.responded.is_empty() {
+                        audit.links.iter().filter(|(t, _)| *t == NETWORK_MODEL_HEAD_TIER).map(|(_, id)| *id).collect()
+                    } else {
+                        let mut v: Vec<Hash> = audit.links.iter().filter(|(_, id)| !audit.responded.contains(id)).map(|(_, id)| *id).collect();
+                        v.sort_unstable();
+                        v.dedup();
+                        v
+                    };
+                    for miner in silent.iter() {
                         if warmup {
                             // The miss is already persisted: its burns came in through `is_burned`
                             // and its strike lives in the baseline.
@@ -753,6 +873,52 @@ impl ServiceLedger {
                     self.pending.remove(&rh);
                 }
                 Some(_) => {}
+                None if daa > req.accepted_daa && req.tier == NETWORK_MODEL_TIER => {
+                    // One draw per shard tier; a tier nobody produces means the network cannot
+                    // assemble the model — the request is dropped, nobody is struck. Responses
+                    // that beat the arming are not creditable (they carry no links here).
+                    let mut ids: Vec<Hash> = Vec::new();
+                    let mut delegations: Vec<(Hash, Hash)> = Vec::new();
+                    let mut members: Vec<(Hash, u8)> = Vec::new();
+                    let mut links: Vec<(u8, Hash)> = Vec::new();
+                    let mut complete = true;
+                    for tier in network_model_shard_tiers() {
+                        let set = cohort(tier);
+                        if set.is_empty() {
+                            complete = false;
+                            break;
+                        }
+                        let mut tier_ids: Vec<Hash> = set.iter().map(|(id, _)| *id).collect();
+                        tier_ids.sort_unstable();
+                        tier_ids.dedup();
+                        let drawn = draw_assignment(&tier_ids, &[], &shard_draw_seed(&rh, tier)).unwrap();
+                        links.push((tier, drawn));
+                        members.extend(tier_ids.iter().map(|id| (*id, tier)));
+                        ids.extend(tier_ids);
+                        delegations.extend(set.iter().map(|(id, esc)| (*esc, *id)));
+                    }
+                    if !complete {
+                        self.pending.remove(&rh);
+                    } else {
+                        ids.sort_unstable();
+                        ids.dedup();
+                        delegations.sort_unstable();
+                        delegations.dedup();
+                        members.sort_unstable();
+                        members.dedup();
+                        let window = service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa));
+                        let req = self.pending.get_mut(&rh).unwrap();
+                        req.early_responders.clear();
+                        req.audit = Some(Audit {
+                            cohort: ids,
+                            delegations,
+                            responded: Vec::new(),
+                            window_end_daa: daa + window,
+                            links,
+                            members,
+                        });
+                    }
+                }
                 None if daa > req.accepted_daa => {
                     let set = cohort(req.tier);
                     if set.is_empty() {
@@ -779,8 +945,14 @@ impl ServiceLedger {
                             }
                         }
                         let first_credit = responded.first().copied();
-                        self.pending.get_mut(&rh).unwrap().audit =
-                            Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window });
+                        self.pending.get_mut(&rh).unwrap().audit = Some(Audit {
+                            cohort: ids,
+                            delegations,
+                            responded,
+                            window_end_daa: daa + window,
+                            links: Vec::new(),
+                            members: Vec::new(),
+                        });
                         if let Some(first) = first_credit {
                             self.maybe_award(&rh, first, warmup, &mut outcome);
                         }
@@ -894,6 +1066,32 @@ impl ServiceLedger {
         req.winner = Some(identity);
         if !warmup {
             outcome.rewards.push(ServiceReward { request_hash: *rh, winner: identity, amount: req.reward, spk });
+        }
+    }
+
+    /// Awards a served pipeline response: the vaulted reward split by shard VRAM between the
+    /// head (the recorded winner, keyed by the request hash) and its links (keyed by
+    /// [`reward_share_key`]). Same routing and once-only rules as [`Self::maybe_award`].
+    fn maybe_award_pipeline(&mut self, rh: &[u8; 32], head: Hash, links: &[(u8, Hash)], warmup: bool, outcome: &mut FoldOutcome) {
+        use crate::config::params::NETWORK_MODEL_HEAD_TIER;
+        if self.reward_routing_daa.is_none() {
+            return;
+        }
+        let routed_from = self.reward_routing_daa.unwrap();
+        let Some(req) = self.pending.get_mut(rh) else { return };
+        if req.accepted_daa < routed_from || req.winner.is_some() || req.reward == 0 {
+            return;
+        }
+        req.winner = Some(head);
+        let reward = req.reward;
+        if warmup {
+            return;
+        }
+        let shares = split_pipeline_reward(reward, (NETWORK_MODEL_HEAD_TIER, head), links);
+        for (i, (identity, amount)) in shares.into_iter().enumerate() {
+            let key = if i == 0 { *rh } else { reward_share_key(rh, links[i - 1].0) };
+            let spk = self.producer_spk.get(&identity).cloned();
+            outcome.rewards.push(ServiceReward { request_hash: key, winner: identity, amount, spk });
         }
     }
 
@@ -1091,7 +1289,9 @@ impl ServiceLedgerSnapshot {
             }
             match &r.audit {
                 Some(a) => {
-                    out.push(1);
+                    // Flag 2 carries the pipeline fields; a lineup audit keeps the flag-1 bytes
+                    // it always had, so every pre-H14 snapshot hash is unchanged.
+                    out.push(if a.links.is_empty() { 1 } else { 2 });
                     put_hashes(&mut out, &a.cohort);
                     out.extend_from_slice(&(a.delegations.len() as u32).to_le_bytes());
                     for (e, id) in a.delegations.iter() {
@@ -1100,6 +1300,18 @@ impl ServiceLedgerSnapshot {
                     }
                     put_hashes(&mut out, &a.responded);
                     out.extend_from_slice(&a.window_end_daa.to_le_bytes());
+                    if !a.links.is_empty() {
+                        out.extend_from_slice(&(a.links.len() as u32).to_le_bytes());
+                        for (t, id) in a.links.iter() {
+                            out.push(*t);
+                            out.extend_from_slice(&id.as_bytes());
+                        }
+                        out.extend_from_slice(&(a.members.len() as u32).to_le_bytes());
+                        for (id, t) in a.members.iter() {
+                            out.extend_from_slice(&id.as_bytes());
+                            out.push(*t);
+                        }
+                    }
                 }
                 None => out.push(0),
             }
@@ -1181,7 +1393,7 @@ impl ServiceLedgerSnapshot {
             };
             let audit = match r.u8()? {
                 0 => None,
-                1 => {
+                flag @ (1 | 2) => {
                     let cohort = r.hashes()?;
                     let k = r.u32()? as usize;
                     let mut delegations = Vec::with_capacity(k.min(1 << 16));
@@ -1192,7 +1404,26 @@ impl ServiceLedgerSnapshot {
                     }
                     let responded = r.hashes()?;
                     let window_end_daa = r.u64()?;
-                    Some(Audit { cohort, delegations, responded, window_end_daa })
+                    let mut links = Vec::new();
+                    let mut members = Vec::new();
+                    if flag == 2 {
+                        let n = r.u32()? as usize;
+                        if n == 0 {
+                            return Err("malformed audit links".into());
+                        }
+                        for _ in 0..n {
+                            let t = r.u8()?;
+                            let id = r.hash()?;
+                            links.push((t, id));
+                        }
+                        let m = r.u32()? as usize;
+                        for _ in 0..m {
+                            let id = r.hash()?;
+                            let t = r.u8()?;
+                            members.push((id, t));
+                        }
+                    }
+                    Some(Audit { cohort, delegations, responded, window_end_daa, links, members })
                 }
                 _ => return Err("malformed audit".into()),
             };
@@ -1659,6 +1890,11 @@ mod tests {
     };
     use keryx_hashes::Hash;
 
+    use crate::config::params::{
+        network_model_shard_tiers, network_model_tier_weight, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_SHARDS, NETWORK_MODEL_TIER,
+    };
+    use super::{reward_share_key, split_pipeline_reward, ServiceLedgerSnapshot};
+
     // Identity == escrow key in most tests; the delegation mapping itself is covered by
     // `response_credits_the_delegating_identity`.
     fn cohort_of(set: &[Hash]) -> impl FnMut(u8) -> Vec<(Hash, Hash)> + '_ {
@@ -1721,12 +1957,13 @@ mod tests {
             &[],
             &[],
             &[(a, spk_a.clone())],
+            &[],
             |_| true,
             cohort_of(&set),
         );
         assert!(out.rewards.is_empty());
         let out =
-            ledger.on_chain_block_with_rewards(101, &[], &[], &[(rh_old, Some(a))], &[], &[], |_| true, cohort_of(&set));
+            ledger.on_chain_block_with_rewards(101, &[], &[], &[(rh_old, Some(a))], &[], &[], &[], |_| true, cohort_of(&set));
         assert!(out.rewards.is_empty());
 
         // Post-gate request: the first credited responder wins, once, with a resolved script.
@@ -1738,16 +1975,17 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             |_| true,
             cohort_of(&set),
         );
         assert!(out.rewards.is_empty());
         // First accepted response after arming: `b` wins (no known script — stays burned).
-        let out = ledger.on_chain_block_with_rewards(302, &[], &[], &[(rh, Some(b))], &[], &[], |_| true, cohort_of(&set));
+        let out = ledger.on_chain_block_with_rewards(302, &[], &[], &[(rh, Some(b))], &[], &[], &[], |_| true, cohort_of(&set));
         assert_eq!(out.rewards.len(), 1);
         assert_eq!(out.rewards[0], ServiceReward { request_hash: rh, winner: b, amount: 9_000, spk: None });
         // A later responder wins nothing.
-        let out = ledger.on_chain_block_with_rewards(303, &[], &[], &[(rh, Some(a))], &[], &[], |_| true, cohort_of(&set));
+        let out = ledger.on_chain_block_with_rewards(303, &[], &[], &[(rh, Some(a))], &[], &[], &[], |_| true, cohort_of(&set));
         assert!(out.rewards.is_empty());
 
         // A winner with a folded producer script gets it resolved.
@@ -1759,10 +1997,11 @@ mod tests {
             &[],
             &[],
             &[(a, spk_a.clone())],
+            &[],
             |_| true,
             cohort_of(&set),
         );
-        let out = ledger.on_chain_block_with_rewards(312, &[], &[], &[(rh2, Some(a))], &[], &[], |_| true, cohort_of(&set));
+        let out = ledger.on_chain_block_with_rewards(312, &[], &[], &[(rh2, Some(a))], &[], &[], &[], |_| true, cohort_of(&set));
         assert_eq!(out.rewards.len(), 1);
         assert_eq!(out.rewards[0].spk, Some(spk_a));
     }
@@ -2294,6 +2533,247 @@ mod tests {
         assert_eq!(eligible_pairs(&recent, NETWORK_MODEL_TIER), vec![(a, e), (b, e)]);
         assert_eq!(eligible_pairs(&recent, NETWORK_MODEL_TIER + 1), vec![(a, e)]);
         assert_eq!(eligible_pairs(&recent, 4), vec![(c, e)]);
+    }
+
+    /// Per-tier cohorts of a pipeline test network: identity == escrow key, `t*16 + i`.
+    fn shard_id(tier: u8, i: u8) -> Hash {
+        Hash::from_bytes([tier * 16 + i; 32])
+    }
+
+    /// Two producers per shard tier, none for `missing_tier`.
+    fn shard_cohorts(missing_tier: Option<u8>) -> impl FnMut(u8) -> Vec<(Hash, Hash)> {
+        move |tier| {
+            if Some(tier) == missing_tier || tier <= NETWORK_MODEL_TIER {
+                return Vec::new();
+            }
+            (0..2u8).map(|i| (shard_id(tier, i), shard_id(tier, i))).collect()
+        }
+    }
+
+    fn drawn_links(ledger: &ServiceLedger, rh: &[u8; 32]) -> Vec<(u8, Hash)> {
+        ledger.pending.get(rh).unwrap().audit.as_ref().unwrap().links.clone()
+    }
+
+    /// A complete pipeline response by `head` with the drawn link of every other tier, unless
+    /// `substitute` replaces the drawn identity of that tier.
+    fn pipeline_links(links: &[(u8, Hash)], substitute: Option<(u8, Hash)>) -> Vec<(u8, Hash)> {
+        links
+            .iter()
+            .filter(|(t, _)| *t != NETWORK_MODEL_HEAD_TIER)
+            .map(|(t, id)| match substitute {
+                Some((st, sid)) if st == *t => (*t, sid),
+                _ => (*t, *id),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn network_model_audit_draws_one_identity_per_shard_tier() {
+        let mut ledger = ServiceLedger::default();
+        let rh = [7u8; 32];
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        let audit = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap();
+        let tiers: Vec<u8> = audit.links.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tiers, network_model_shard_tiers().collect::<Vec<_>>());
+        for (t, id) in audit.links.iter() {
+            assert!(audit.members.binary_search(&(*id, *t)).is_ok());
+        }
+        assert_eq!(audit.members.len(), 2 * NETWORK_MODEL_SHARDS.len());
+        assert_eq!(audit.cohort.len(), 2 * NETWORK_MODEL_SHARDS.len());
+        assert_eq!(audit.window_end_daa, 101 + service_window_daa(NETWORK_MODEL_TIER, 256));
+        // deterministic: a second ledger draws the same identities
+        let mut other = ServiceLedger::default();
+        other.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
+        other.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        assert_eq!(drawn_links(&other, &rh), audit.links);
+    }
+
+    #[test]
+    fn network_model_request_with_an_unproduced_shard_is_dropped_without_strikes() {
+        let mut ledger = ServiceLedger::default();
+        let rh = [7u8; 32];
+        let w = service_window_daa(NETWORK_MODEL_TIER, 256);
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(Some(NETWORK_MODEL_TIER + 3)));
+        let out = ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(Some(NETWORK_MODEL_TIER + 3)));
+        assert!(out.misses.is_empty());
+        assert_eq!(ledger.pending_len(), 0);
+        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(Some(NETWORK_MODEL_TIER + 3)));
+        assert!(out.misses.is_empty());
+    }
+
+    #[test]
+    fn network_model_silence_strikes_only_the_drawn_head() {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        let rh = [7u8; 32];
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        let links = drawn_links(&ledger, &rh);
+        let head = links.iter().find(|(t, _)| *t == NETWORK_MODEL_HEAD_TIER).unwrap().1;
+        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
+        assert_eq!(out.misses.len(), 1);
+        assert_eq!(out.misses[0].miner, head);
+        assert_eq!(out.misses[0].consecutive_misses, 1);
+        assert_eq!(ledger.pending_len(), 0);
+    }
+
+    #[test]
+    fn network_model_served_response_credits_every_signer_and_strikes_the_missing_link() {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let rh = [7u8; 32];
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        ledger.on_chain_block_with_rewards(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[(rh, 104_000)], &[], &[], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        let links = drawn_links(&ledger, &rh);
+        let head = links.iter().find(|(t, _)| *t == NETWORK_MODEL_HEAD_TIER).unwrap().1;
+        // the drawn link of tier 8 is replaced by the other producer of that tier
+        let sub_tier = NETWORK_MODEL_TIER + 3;
+        let drawn_sub = links.iter().find(|(t, _)| *t == sub_tier).unwrap().1;
+        let substitute = if drawn_sub == shard_id(sub_tier, 0) { shard_id(sub_tier, 1) } else { shard_id(sub_tier, 0) };
+        let signed = pipeline_links(&links, Some((sub_tier, substitute)));
+        // pre-arm strikes on the head so its reset is observable
+        ledger.strikes.insert(head, StrikeEntry { count: 1, last_daa: 50 });
+        let out = ledger.on_chain_block_with_rewards(
+            105,
+            &[],
+            &[],
+            &[(rh, Some(head))],
+            &[],
+            &[],
+            &[(rh, head, signed.clone())],
+            |_| true,
+            shard_cohorts(None),
+        );
+        // reward split by VRAM: weights 8/12/12/16/24/32 of 104 000
+        assert_eq!(out.rewards.len(), NETWORK_MODEL_SHARDS.len());
+        assert_eq!(out.rewards[0].request_hash, rh);
+        assert_eq!(out.rewards[0].winner, head);
+        assert_eq!(out.rewards[0].amount, 32_000);
+        let total: u64 = out.rewards.iter().map(|r| r.amount).sum();
+        assert_eq!(total, 104_000);
+        for (r, (tier, id)) in out.rewards[1..].iter().zip(signed.iter()) {
+            assert_eq!(r.winner, *id);
+            assert_eq!(r.request_hash, reward_share_key(&rh, *tier));
+            assert_eq!(r.amount, 104_000 * network_model_tier_weight(*tier) / 104);
+        }
+        assert!(out.resets.iter().any(|(id, _)| *id == head));
+        // window close: the substituted draw alone is struck, the substitute and the rest are clean
+        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
+        assert_eq!(out.misses.len(), 1);
+        assert_eq!(out.misses[0].miner, drawn_sub);
+        // a second identical response never pays twice
+        assert_eq!(ledger.pending_len(), 0);
+    }
+
+    #[test]
+    fn network_model_incomplete_or_foreign_responses_are_not_credited() {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let rh = [7u8; 32];
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        ledger.on_chain_block_with_rewards(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[(rh, 104_000)], &[], &[], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        let links = drawn_links(&ledger, &rh);
+        let head = links.iter().find(|(t, _)| *t == NETWORK_MODEL_HEAD_TIER).unwrap().1;
+        let full = pipeline_links(&links, None);
+        // no links at all (a v2-style answer to a pipeline request)
+        let out = ledger.on_chain_block_with_rewards(103, &[], &[], &[(rh, Some(head))], &[], &[], &[], |_| true, shard_cohorts(None));
+        assert!(out.rewards.is_empty());
+        // one tier missing
+        let mut short = full.clone();
+        short.pop();
+        let out = ledger.on_chain_block_with_rewards(104, &[], &[], &[(rh, Some(head))], &[], &[], &[(rh, head, short)], |_| true, shard_cohorts(None));
+        assert!(out.rewards.is_empty());
+        // a link signed by an identity that does not hold that tier
+        let mut wrong = full.clone();
+        wrong[0].1 = shard_id(NETWORK_MODEL_TIER + 5, 0);
+        let out = ledger.on_chain_block_with_rewards(105, &[], &[], &[(rh, Some(head))], &[], &[], &[(rh, head, wrong)], |_| true, shard_cohorts(None));
+        assert!(out.rewards.is_empty());
+        // a head that does not hold the head tier
+        let fake_head = shard_id(NETWORK_MODEL_TIER + 1, 0);
+        let out = ledger.on_chain_block_with_rewards(106, &[], &[], &[(rh, Some(fake_head))], &[], &[], &[(rh, fake_head, full.clone())], |_| true, shard_cohorts(None));
+        assert!(out.rewards.is_empty());
+        // nothing was credited: the drawn head is struck alone at window close
+        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
+        assert_eq!(out.misses.len(), 1);
+        assert_eq!(out.misses[0].miner, head);
+    }
+
+    #[test]
+    fn network_model_substitute_head_is_paid_and_the_drawn_head_struck() {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let rh = [7u8; 32];
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        ledger.on_chain_block_with_rewards(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[(rh, 1_040)], &[], &[], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        let links = drawn_links(&ledger, &rh);
+        let drawn_head = links.iter().find(|(t, _)| *t == NETWORK_MODEL_HEAD_TIER).unwrap().1;
+        let other_head = if drawn_head == shard_id(NETWORK_MODEL_HEAD_TIER, 0) { shard_id(NETWORK_MODEL_HEAD_TIER, 1) } else { shard_id(NETWORK_MODEL_HEAD_TIER, 0) };
+        let full = pipeline_links(&links, None);
+        let out = ledger.on_chain_block_with_rewards(105, &[], &[], &[(rh, Some(other_head))], &[], &[], &[(rh, other_head, full)], |_| true, shard_cohorts(None));
+        assert_eq!(out.rewards[0].winner, other_head);
+        assert_eq!(out.rewards[0].amount, 320);
+        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
+        assert_eq!(out.misses.len(), 1);
+        assert_eq!(out.misses[0].miner, drawn_head);
+    }
+
+    #[test]
+    fn pipeline_reward_split_keeps_the_remainder_on_the_head() {
+        let head = (NETWORK_MODEL_HEAD_TIER, shard_id(NETWORK_MODEL_HEAD_TIER, 0));
+        let links: Vec<(u8, Hash)> =
+            network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).map(|t| (t, shard_id(t, 0))).collect();
+        let shares = split_pipeline_reward(1_000_003, head, &links);
+        assert_eq!(shares.len(), NETWORK_MODEL_SHARDS.len());
+        assert_eq!(shares.iter().map(|(_, a)| *a).sum::<u64>(), 1_000_003);
+        assert_eq!(shares[0].0, head.1);
+        assert!(shares[0].1 > shares[1].1);
+        // no weights at all: everything to the head
+        assert_eq!(split_pipeline_reward(5, (4, head.1), &[]), vec![(head.1, 5)]);
+    }
+
+    #[test]
+    fn snapshot_roundtrips_a_pipeline_audit_and_keeps_lineup_bytes() {
+        let mut ledger = ServiceLedger::default();
+        let rh = [7u8; 32];
+        let lineup = [8u8; 32];
+        let a = Hash::from_bytes([1u8; 32]);
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256), (lineup, 0, 64)], &[], &[], |_| true, |tier| {
+            if tier == 0 { vec![(a, a)] } else { shard_cohorts(None)(tier) }
+        });
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, |tier| if tier == 0 { vec![(a, a)] } else { shard_cohorts(None)(tier) });
+        let snap = ledger.snapshot();
+        let bytes = snap.to_bytes();
+        let decoded = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, snap);
+        let mut restored = ServiceLedger::default();
+        restored.restore_snapshot(&decoded);
+        assert_eq!(drawn_links(&restored, &rh), drawn_links(&ledger, &rh));
+        assert!(restored.pending.get(&lineup).unwrap().audit.as_ref().unwrap().links.is_empty());
+        // a lineup-only ledger encodes exactly as before: flag 1, no link section
+        let mut old = ServiceLedger::default();
+        old.on_chain_block(100, &[(lineup, 0, 64)], &[], &[], |_| true, cohort_of(&[a]));
+        old.on_chain_block(101, &[], &[], &[], |_| true, cohort_of(&[a]));
+        let old_bytes = old.snapshot().to_bytes();
+        let mut expected = Vec::new();
+        expected.push(1u8);
+        expected.extend_from_slice(&0u32.to_le_bytes()); // vault
+        expected.extend_from_slice(&1u32.to_le_bytes()); // pending
+        expected.extend_from_slice(&lineup);
+        expected.push(0); // tier
+        expected.extend_from_slice(&64u32.to_le_bytes());
+        expected.extend_from_slice(&100u64.to_le_bytes());
+        expected.extend_from_slice(&0u64.to_le_bytes()); // reward
+        expected.push(0); // winner
+        expected.push(1); // audit flag: lineup
+        assert_eq!(&old_bytes[..expected.len()], expected.as_slice());
     }
 
     #[test]
