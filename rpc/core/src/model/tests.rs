@@ -658,7 +658,7 @@ mod mockery {
 
     impl Mock for GetBlockTemplateResponse {
         fn mock() -> Self {
-            GetBlockTemplateResponse { block: mock(), is_synced: true, inference_challenge: String::new() }
+            GetBlockTemplateResponse { block: mock(), is_synced: true, inference_challenge: String::new(), pipeline_assignments: String::new() }
         }
     }
 

@@ -161,7 +161,13 @@ from!(item: &keryx_rpc_core::GetBlockTemplateRequest, protowire::GetBlockTemplat
     }
 });
 from!(item: RpcResult<&keryx_rpc_core::GetBlockTemplateResponse>, protowire::GetBlockTemplateResponseMessage, {
-    Self { block: Some((&item.block).into()), is_synced: item.is_synced, inference_challenge: item.inference_challenge.clone(), error: None }
+    Self {
+        block: Some((&item.block).into()),
+        is_synced: item.is_synced,
+        inference_challenge: item.inference_challenge.clone(),
+        pipeline_assignments: item.pipeline_assignments.clone(),
+        error: None,
+    }
 });
 
 from!(item: &keryx_rpc_core::GetBlockRequest, protowire::GetBlockRequestMessage, {
@@ -693,6 +699,7 @@ try_from!(item: &protowire::GetBlockTemplateResponseMessage, RpcResult<keryx_rpc
             .try_into()?,
         is_synced: item.is_synced,
         inference_challenge: item.inference_challenge.clone(),
+        pipeline_assignments: item.pipeline_assignments.clone(),
     }
 });
 

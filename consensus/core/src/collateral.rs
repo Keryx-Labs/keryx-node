@@ -402,6 +402,54 @@ struct Audit {
     members: Vec<(Hash, u8)>,
 }
 
+/// An armed network-model audit as the pipeline head needs it: the escrow keys drawn for each
+/// shard tier (a substitute of the same tier is also credited, but the drawn one is struck).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineAssignment {
+    pub request_hash: [u8; 32],
+    pub accepted_daa: u64,
+    pub window_end_daa: u64,
+    /// `(shard tier, escrow pubkey)`, tier order; an identity delegating from several escrow
+    /// keys appears once per key.
+    pub links: Vec<(u8, [u8; 32])>,
+}
+
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn unhex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+impl PipelineAssignment {
+    /// Wire form for the block template: `hash:accepted:window_end:tier-escrowhex,...`.
+    pub fn encode(&self) -> String {
+        let links: Vec<String> = self.links.iter().map(|(t, k)| format!("{}-{}", t, hex32(k))).collect();
+        format!("{}:{}:{}:{}", hex32(&self.request_hash), self.accepted_daa, self.window_end_daa, links.join(","))
+    }
+
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.split(':');
+        let request_hash = unhex32(parts.next()?)?;
+        let accepted_daa: u64 = parts.next()?.parse().ok()?;
+        let window_end_daa: u64 = parts.next()?.parse().ok()?;
+        let mut links = Vec::new();
+        for item in parts.next()?.split(',').filter(|i| !i.is_empty()) {
+            let (t, k) = item.split_once('-')?;
+            links.push((t.parse().ok()?, unhex32(k)?));
+        }
+        Some(Self { request_hash, accepted_daa, window_end_daa, links })
+    }
+}
+
 /// A pipeline response's verified links, keyed to its `(request_hash, head escrow key)`
 /// response entry: `(shard tier, link escrow key)` per signing link.
 pub type ResponseLinks = ([u8; 32], Hash, Vec<(u8, Hash)>);
@@ -1001,6 +1049,31 @@ impl ServiceLedger {
             self.vault.remove(miner);
         }
         burned
+    }
+
+    /// The armed network-model audits, oldest first.
+    pub fn pipeline_assignments(&self) -> Vec<PipelineAssignment> {
+        let mut out: Vec<PipelineAssignment> = self
+            .pending
+            .iter()
+            .filter_map(|(rh, req)| {
+                let audit = req.audit.as_ref()?;
+                if audit.links.is_empty() {
+                    return None;
+                }
+                let mut links = Vec::new();
+                for (tier, identity) in audit.links.iter() {
+                    for (escrow, id) in audit.delegations.iter() {
+                        if id == identity {
+                            links.push((*tier, escrow.as_bytes()));
+                        }
+                    }
+                }
+                Some(PipelineAssignment { request_hash: *rh, accepted_daa: req.accepted_daa, window_end_daa: audit.window_end_daa, links })
+            })
+            .collect();
+        out.sort_by_key(|a| (a.accepted_daa, a.request_hash));
+        out
     }
 
     /// The miner's still-locked escrow claims, chain order (newest last).
@@ -1893,7 +1966,7 @@ mod tests {
     use crate::config::params::{
         network_model_shard_tiers, network_model_tier_weight, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_SHARDS, NETWORK_MODEL_TIER,
     };
-    use super::{reward_share_key, split_pipeline_reward, ServiceLedgerSnapshot};
+    use super::{reward_share_key, split_pipeline_reward, PipelineAssignment, ServiceLedgerSnapshot};
 
     // Identity == escrow key in most tests; the delegation mapping itself is covered by
     // `response_credits_the_delegating_identity`.
@@ -2723,6 +2796,29 @@ mod tests {
         let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
         assert_eq!(out.misses.len(), 1);
         assert_eq!(out.misses[0].miner, drawn_head);
+    }
+
+    #[test]
+    fn pipeline_assignments_list_the_drawn_escrow_keys_per_tier() {
+        let mut ledger = ServiceLedger::default();
+        let rh = [7u8; 32];
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256), ([8u8; 32], 0, 64)], &[], &[], |_| true, |tier| {
+            if tier == 0 { vec![(Hash::from_bytes([1u8; 32]), Hash::from_bytes([1u8; 32]))] } else { shard_cohorts(None)(tier) }
+        });
+        assert!(ledger.pipeline_assignments().is_empty());
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, |tier| {
+            if tier == 0 { vec![(Hash::from_bytes([1u8; 32]), Hash::from_bytes([1u8; 32]))] } else { shard_cohorts(None)(tier) }
+        });
+        let a = ledger.pipeline_assignments();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].request_hash, rh);
+        assert_eq!(a[0].accepted_daa, 100);
+        let drawn = drawn_links(&ledger, &rh);
+        let expected: Vec<(u8, [u8; 32])> = drawn.iter().map(|(t, id)| (*t, id.as_bytes())).collect();
+        assert_eq!(a[0].links, expected);
+        let wire = a[0].encode();
+        assert_eq!(PipelineAssignment::decode(&wire).unwrap(), a[0]);
+        assert!(PipelineAssignment::decode("zz:1:2:").is_none());
     }
 
     #[test]

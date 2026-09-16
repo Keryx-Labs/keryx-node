@@ -7,7 +7,7 @@ use crate::model::stores::{
 };
 use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
-    ProductionIndexSnapshot, ResponseLinks, ServiceLedgerSnapshot,
+    PipelineAssignment, ProductionIndexSnapshot, ResponseLinks, ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
@@ -363,6 +363,11 @@ impl VirtualStateProcessor {
     #[allow(dead_code)]
     pub(crate) fn service_vault_claims(&self, miner: &Hash) -> Vec<EscrowClaim> {
         self.service_ledger.lock().ledger.vault_claims(miner)
+    }
+
+    /// The armed network-model audits: what a pipeline head reads from the block template.
+    pub(crate) fn pipeline_assignments(&self) -> Vec<PipelineAssignment> {
+        self.service_ledger.lock().ledger.pipeline_assignments()
     }
 
     /// Point-in-time service-bond enforcement state: live strikes, suspensions and the misses

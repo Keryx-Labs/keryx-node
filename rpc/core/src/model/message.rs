@@ -167,14 +167,19 @@ pub struct GetBlockTemplateResponse {
     /// While non-empty, is_synced is forced false and mining is suspended until the miner
     /// responds with the inference result in the next GetBlockTemplateRequest.inference_result.
     pub inference_challenge: String,
+
+    /// H14: the armed network-model audits, `;`-separated `PipelineAssignment::encode` entries
+    /// (`hash:accepted:window_end:tier-escrowhex,...`). Empty when none.
+    pub pipeline_assignments: String,
 }
 
 impl Serializer for GetBlockTemplateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &2, writer)?;
+        store!(u16, &3, writer)?;
         serialize!(RpcRawBlock, &self.block, writer)?;
         store!(bool, &self.is_synced, writer)?;
         store!(String, &self.inference_challenge, writer)?;
+        store!(String, &self.pipeline_assignments, writer)?;
 
         Ok(())
     }
@@ -186,8 +191,9 @@ impl Deserializer for GetBlockTemplateResponse {
         let block = deserialize!(RpcRawBlock, reader)?;
         let is_synced = load!(bool, reader)?;
         let inference_challenge = if version >= 2 { load!(String, reader)? } else { String::new() };
+        let pipeline_assignments = if version >= 3 { load!(String, reader)? } else { String::new() };
 
-        Ok(Self { block, is_synced, inference_challenge })
+        Ok(Self { block, is_synced, inference_challenge, pipeline_assignments })
     }
 }
 

@@ -216,6 +216,10 @@ impl ConsensusSessionOwned {
         self.consensus.get_service_strikes()
     }
 
+    pub fn get_pipeline_assignments(&self) -> Vec<keryx_consensus_core::collateral::PipelineAssignment> {
+        self.consensus.get_pipeline_assignments()
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()

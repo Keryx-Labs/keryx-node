@@ -159,6 +159,11 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// The armed network-model audits (H14), for pipeline heads.
+    fn get_pipeline_assignments(&self) -> Vec<crate::collateral::PipelineAssignment> {
+        unimplemented!()
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         unimplemented!()
     }

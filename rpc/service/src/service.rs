@@ -533,10 +533,19 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             })
         };
 
+        // H14: pipeline heads read the drawn links of every armed network-model audit here.
+        let pipeline_assignments = if self.config.model_split_activation.is_active(current_daa) {
+            let session = self.consensus_manager.consensus().unguarded_session();
+            session.get_pipeline_assignments().iter().map(|a| a.encode()).collect::<Vec<_>>().join(";")
+        } else {
+            String::new()
+        };
+
         Ok(GetBlockTemplateResponse {
             block: block_template.block.into(),
             is_synced,
             inference_challenge,
+            pipeline_assignments,
         })
     }
 
