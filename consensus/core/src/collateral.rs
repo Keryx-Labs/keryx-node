@@ -2,6 +2,7 @@ use keryx_hashes::{Hash, Hasher, TransactionHash};
 use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
 
+use crate::config::params::{NetworkModelLayout, NETWORK_MODEL_MAINNET};
 use crate::tx::ScriptPublicKey;
 
 /// Fraction of each accepted block subsidy held in escrow as miner collateral (basis points).
@@ -482,16 +483,15 @@ fn shard_draw_seed(request_hash: &[u8; 32], tier: u8) -> [u8; 32] {
 
 /// VRAM-weighted split of `reward` between the head and its links: `(identity, amount)` per
 /// signer, the head first and carrying the rounding remainder.
-pub fn split_pipeline_reward(reward: u64, head: (u8, Hash), links: &[(u8, Hash)]) -> Vec<(Hash, u64)> {
-    use crate::config::params::network_model_tier_weight;
-    let total: u128 = network_model_tier_weight(head.0) as u128 + links.iter().map(|(t, _)| network_model_tier_weight(*t) as u128).sum::<u128>();
+pub fn split_pipeline_reward(layout: &NetworkModelLayout, reward: u64, head: (u8, Hash), links: &[(u8, Hash)]) -> Vec<(Hash, u64)> {
+    let total: u128 = layout.tier_weight(head.0) as u128 + links.iter().map(|(t, _)| layout.tier_weight(*t) as u128).sum::<u128>();
     if total == 0 {
         return vec![(head.1, reward)];
     }
     let mut out = Vec::with_capacity(links.len() + 1);
     let mut paid: u64 = 0;
     for (tier, identity) in links {
-        let amount = (reward as u128 * network_model_tier_weight(*tier) as u128 / total) as u64;
+        let amount = (reward as u128 * layout.tier_weight(*tier) as u128 / total) as u64;
         paid += amount;
         out.push((*identity, amount));
     }
@@ -610,9 +610,21 @@ pub struct ServiceLedger {
     /// Latest coinbase payout script seen per identity, folded from chain-block producers —
     /// resolves a reward winner to a mintable script.
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
+    /// The network model of this network; `None` = mainnet. Configuration, like the
+    /// activation daas — installed on every fold entry, never snapshotted.
+    network_model: Option<&'static NetworkModelLayout>,
 }
 
 impl ServiceLedger {
+    fn layout(&self) -> &'static NetworkModelLayout {
+        self.network_model.unwrap_or(&NETWORK_MODEL_MAINNET)
+    }
+
+    /// Installs the network model the pipeline audits follow.
+    pub fn set_network_model(&mut self, layout: &'static NetworkModelLayout) {
+        self.network_model = Some(layout);
+    }
+
     /// Folds one selected-chain block into the ledger and returns the misses it closes.
     ///
     /// `requests` are the block's accepted AiRequests as `(request_hash, tier, max_tokens)`;
@@ -699,7 +711,8 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         mut cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        use crate::config::params::{network_model_shard_tiers, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_TIER};
+        use crate::config::params::NETWORK_MODEL_TIER;
+        let layout = self.layout();
         let warmup = warmup_burned.is_some();
         for (identity, spk) in producers {
             self.producer_spk.insert(*identity, spk.clone());
@@ -809,9 +822,9 @@ impl ServiceLedger {
                     // else is no response at all — the drawn head answers for it at window close.
                     let Some((_, _, links)) = response_links.iter().find(|(h, k, _)| h == rh && k == r) else { continue };
                     let head_ids: Vec<Hash> =
-                        matched.iter().copied().filter(|id| audit.members.binary_search(&(*id, NETWORK_MODEL_HEAD_TIER)).is_ok()).collect();
+                        matched.iter().copied().filter(|id| audit.members.binary_search(&(*id, layout.head_tier())).is_ok()).collect();
                     let Some(head) = head_ids.first().copied() else { continue };
-                    let mut expected: Vec<u8> = network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).collect();
+                    let mut expected: Vec<u8> = layout.shard_tiers().filter(|t| *t != layout.head_tier()).collect();
                     let mut signed: Vec<u8> = links.iter().map(|(t, _)| *t).collect();
                     signed.sort_unstable();
                     expected.sort_unstable();
@@ -881,7 +894,7 @@ impl ServiceLedger {
                     let silent: Vec<Hash> = if audit.links.is_empty() {
                         audit.cohort.iter().filter(|m| !audit.responded.contains(m)).copied().collect()
                     } else if audit.responded.is_empty() {
-                        audit.links.iter().filter(|(t, _)| *t == NETWORK_MODEL_HEAD_TIER).map(|(_, id)| *id).collect()
+                        audit.links.iter().filter(|(t, _)| *t == layout.head_tier()).map(|(_, id)| *id).collect()
                     } else {
                         let mut v: Vec<Hash> = audit.links.iter().filter(|(_, id)| !audit.responded.contains(id)).map(|(_, id)| *id).collect();
                         v.sort_unstable();
@@ -930,7 +943,7 @@ impl ServiceLedger {
                     let mut members: Vec<(Hash, u8)> = Vec::new();
                     let mut links: Vec<(u8, Hash)> = Vec::new();
                     let mut complete = true;
-                    for tier in network_model_shard_tiers() {
+                    for tier in layout.shard_tiers() {
                         let set = cohort(tier);
                         if set.is_empty() {
                             complete = false;
@@ -1146,7 +1159,7 @@ impl ServiceLedger {
     /// head (the recorded winner, keyed by the request hash) and its links (keyed by
     /// [`reward_share_key`]). Same routing and once-only rules as [`Self::maybe_award`].
     fn maybe_award_pipeline(&mut self, rh: &[u8; 32], head: Hash, links: &[(u8, Hash)], warmup: bool, outcome: &mut FoldOutcome) {
-        use crate::config::params::NETWORK_MODEL_HEAD_TIER;
+        let layout = self.layout();
         if self.reward_routing_daa.is_none() {
             return;
         }
@@ -1160,7 +1173,7 @@ impl ServiceLedger {
         if warmup {
             return;
         }
-        let shares = split_pipeline_reward(reward, (NETWORK_MODEL_HEAD_TIER, head), links);
+        let shares = split_pipeline_reward(layout, reward, (layout.head_tier(), head), links);
         for (i, (identity, amount)) in shares.into_iter().enumerate() {
             let key = if i == 0 { *rh } else { reward_share_key(rh, links[i - 1].0) };
             let spk = self.producer_spk.get(&identity).cloned();
@@ -1964,7 +1977,8 @@ mod tests {
     use keryx_hashes::Hash;
 
     use crate::config::params::{
-        network_model_shard_tiers, network_model_tier_weight, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_SHARDS, NETWORK_MODEL_TIER,
+        network_model_shard_tiers, network_model_tier_weight, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_MAINNET, NETWORK_MODEL_SHARDS,
+        NETWORK_MODEL_TIER,
     };
     use super::{reward_share_key, split_pipeline_reward, PipelineAssignment, ServiceLedgerSnapshot};
 
@@ -2826,13 +2840,13 @@ mod tests {
         let head = (NETWORK_MODEL_HEAD_TIER, shard_id(NETWORK_MODEL_HEAD_TIER, 0));
         let links: Vec<(u8, Hash)> =
             network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).map(|t| (t, shard_id(t, 0))).collect();
-        let shares = split_pipeline_reward(1_000_003, head, &links);
+        let shares = split_pipeline_reward(&NETWORK_MODEL_MAINNET, 1_000_003, head, &links);
         assert_eq!(shares.len(), NETWORK_MODEL_SHARDS.len());
         assert_eq!(shares.iter().map(|(_, a)| *a).sum::<u64>(), 1_000_003);
         assert_eq!(shares[0].0, head.1);
         assert!(shares[0].1 > shares[1].1);
         // no weights at all: everything to the head
-        assert_eq!(split_pipeline_reward(5, (4, head.1), &[]), vec![(head.1, 5)]);
+        assert_eq!(split_pipeline_reward(&NETWORK_MODEL_MAINNET, 5, (4, head.1), &[]), vec![(head.1, 5)]);
     }
 
     #[test]

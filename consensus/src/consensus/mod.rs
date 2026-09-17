@@ -173,6 +173,7 @@ impl Consensus {
         mining_rules: Arc<MiningRules>,
     ) -> Self {
         let params = &config.params;
+        keryx_consensus_core::pom_v4_wire::set_active_tiers(params.network_model.tiers);
         let perf_params = &config.perf;
         let is_consensus_exiting: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 

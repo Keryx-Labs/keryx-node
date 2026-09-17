@@ -168,6 +168,7 @@ pub struct VirtualStateProcessor {
     pub(super) production_index_activation: ForkActivation,
     pub(super) exact_verification_activation: ForkActivation,
     pub(super) model_split_activation: ForkActivation,
+    pub(super) network_model: &'static keryx_consensus_core::config::params::NetworkModelLayout,
     pub(super) service_burnable_window_daa: u64,
     /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
     #[allow(clippy::type_complexity)]
@@ -400,6 +401,7 @@ impl VirtualStateProcessor {
             production_index_activation: params.production_index_activation,
             exact_verification_activation: params.exact_verification_activation,
             model_split_activation: params.model_split_activation,
+            network_model: params.network_model,
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,

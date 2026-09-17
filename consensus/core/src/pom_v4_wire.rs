@@ -66,8 +66,15 @@ pub enum PomWireError {
 /// selects one of those two tables in `pom_tiers`, and the superset resolves both. A tier outside
 /// it is rejected here rather than guessed, and the caller falls back to the legacy encoding;
 /// body validation still rejects a tier the block's own era does not know.
+static ACTIVE_TIERS: std::sync::OnceLock<&'static [crate::pom::PomTier]> = std::sync::OnceLock::new();
+
+/// Installs the tier table of the running network (its H14 layout); mainnet until set.
+pub fn set_active_tiers(tiers: &'static [crate::pom::PomTier]) {
+    let _ = ACTIVE_TIERS.set(tiers);
+}
+
 pub fn v4_wire_context(header: &Header, tier: u8) -> Result<(u64, u64), PomWireError> {
-    let tiers = crate::config::params::POM_TIERS_H14;
+    let tiers = ACTIVE_TIERS.get().copied().unwrap_or(crate::config::params::POM_TIERS_H14);
     let t = tiers.get(tier as usize).ok_or(PomWireError::UnknownTier(tier))?;
     let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
     Ok((pom_block_seed_rewalk_era(&pre_pow_hash, header.timestamp, header.nonce, header.daa_score), t.chunks))

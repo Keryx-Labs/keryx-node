@@ -256,7 +256,7 @@ impl BlockBodyProcessor {
         let pom_v3 = self.pom_v3_activation.is_active(header.daa_score);
         let pom_v4 = self.pom_v4_activation.is_active(header.daa_score);
         let tiers = pom_tiers(
-            self.model_split_activation.is_active(header.daa_score),
+            self.model_split_activation.is_active(header.daa_score).then_some(self.network_model.tiers),
             pom_v3,
             self.h5_activation.is_active(header.daa_score),
             self.coin_age_verification_activation.is_active(header.daa_score),

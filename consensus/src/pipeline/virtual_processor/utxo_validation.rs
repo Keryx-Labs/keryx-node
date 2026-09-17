@@ -35,7 +35,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_V2_H14, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -620,7 +620,7 @@ impl VirtualStateProcessor {
     /// the full block check and mempool admission cannot read different tables for the same score.
     pub(super) fn ai_reward_minimums(&self, daa_score: u64) -> &[([u8; 32], u64)] {
         if self.model_split_activation.is_active(daa_score) {
-            INFERENCE_REWARD_MINIMUMS_V2_H14
+            self.network_model.minimums
         } else if self.pom_v3_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_V2_H6
         } else if self.coin_age_activation.is_active(daa_score) {
@@ -786,7 +786,7 @@ impl VirtualStateProcessor {
         let schedule = tier_reward_bps(
             self.very_light_activation.is_active(pov_daa_score),
             self.pom_v3_activation.is_active(pov_daa_score),
-            self.model_split_activation.is_active(pov_daa_score),
+            self.model_split_activation.is_active(pov_daa_score).then_some(self.network_model.reward_bps),
         );
         // H6: the tier bonus is gated on standing — an identity in probation earns the floor
         // rate whatever tier it proves, so rotating identities forfeits the bonus for the whole

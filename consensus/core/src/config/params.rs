@@ -748,6 +748,106 @@ pub const NETWORK_MODEL_HEAD_TIER: u8 = NETWORK_MODEL_TIER + NETWORK_MODEL_SHARD
 /// its signer's share of a served request's reward.
 pub const NETWORK_MODEL_SHARD_VRAM_GB: [u64; 6] = [8, 12, 12, 16, 24, 32];
 
+/// Testnet network model: Qwen3.5-9B (the H6 tier-0 model) cut in two shards, so the whole
+/// pipeline (draw, links, V3 response, reward split) runs on one 24 GB card. `model_id` of each
+/// shard = CIDv0[2..34] of the shard GGUF.
+pub const SPLIT9B_SHARD_0_MODEL_ID: [u8; 32] = [
+    0x8d, 0xba, 0x34, 0xd0, 0x28, 0x5b, 0xe2, 0x87, 0xf0, 0x22, 0xda, 0xd0, 0xf3, 0x3e, 0xa5, 0x88,
+    0xc8, 0x36, 0x94, 0xd4, 0x83, 0x59, 0x60, 0x8c, 0xc8, 0xd4, 0x74, 0x24, 0x26, 0x76, 0xf2, 0x79,
+];
+pub const SPLIT9B_SHARD_1_MODEL_ID: [u8; 32] = [
+    0xa1, 0x98, 0xfe, 0x36, 0x9a, 0x63, 0xde, 0x8d, 0x75, 0xc5, 0xeb, 0x4a, 0x46, 0xa8, 0x24, 0xe0,
+    0x20, 0x55, 0x4a, 0xc2, 0x65, 0x48, 0xad, 0x68, 0x8c, 0x90, 0xa9, 0x60, 0xdb, 0x52, 0x49, 0x2e,
+];
+
+/// Testnet shards: layers 0-15 and 16-31 (the second is the head shard).
+pub const NETWORK_MODEL_SHARDS_TESTNET: &[([u8; 32], u32, u32)] =
+    &[(SPLIT9B_SHARD_0_MODEL_ID, 0, 15), (SPLIT9B_SHARD_1_MODEL_ID, 16, 31)];
+
+/// Testnet H14 tier set: the H6 lineup, the 9B as network model (its H6 anchor), two shards.
+pub const POM_TIERS_H14_TESTNET: &[crate::pom::PomTier] = &[
+    POM_TIERS_H6[0],
+    POM_TIERS_H6[1],
+    POM_TIERS_H6[2],
+    POM_TIERS_H6[3],
+    POM_TIERS_H6[4],
+    POM_TIERS_H6[0],
+    crate::pom::PomTier {
+        model_id: SPLIT9B_SHARD_0_MODEL_ID,
+        root: [
+            0x16, 0x48, 0x26, 0xf1, 0x91, 0xdf, 0x42, 0x79, 0xe4, 0xfe, 0x2d, 0x53, 0x62, 0x8b, 0xc3, 0xf6,
+            0x1b, 0xb5, 0xad, 0xf3, 0x1c, 0x09, 0xaa, 0xfb, 0xd2, 0x48, 0x7e, 0x17, 0x09, 0x6c, 0x57, 0xb5,
+        ],
+        chunks: 77_797_920,
+    },
+    crate::pom::PomTier {
+        model_id: SPLIT9B_SHARD_1_MODEL_ID,
+        root: [
+            0x68, 0x7c, 0xfd, 0xe0, 0x0e, 0xc1, 0xb5, 0xef, 0xf2, 0x8c, 0x33, 0x6b, 0x86, 0xbb, 0xaf, 0x1f,
+            0xea, 0x99, 0x0b, 0x45, 0x9a, 0xec, 0xe7, 0xff, 0xf0, 0xac, 0xf1, 0x7b, 0x60, 0xc8, 0x31, 0xa4,
+        ],
+        chunks: 77_745_696,
+    },
+];
+
+pub const TIER_REWARD_BPS_H14_TESTNET: [u64; 8] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 6_000];
+
+pub const NETWORK_MODEL_SHARD_VRAM_GB_TESTNET: [u64; 2] = [8, 8];
+
+/// The network model of one network: its H14 tier table (lineup, whole model, shards), the
+/// matching reward schedule and request minimums, and the card class of each shard.
+#[derive(Debug)]
+pub struct NetworkModelLayout {
+    pub tiers: &'static [crate::pom::PomTier],
+    pub reward_bps: &'static [u64],
+    pub minimums: &'static [([u8; 32], u64)],
+    pub shard_vram_gb: &'static [u64],
+}
+
+impl NetworkModelLayout {
+    pub fn n_shards(&self) -> usize {
+        self.tiers.len() - NETWORK_MODEL_TIER as usize - 1
+    }
+
+    /// Tier of the pipeline head: the last shard.
+    pub fn head_tier(&self) -> u8 {
+        NETWORK_MODEL_TIER + self.n_shards() as u8
+    }
+
+    /// Every shard tier, head included.
+    pub fn shard_tiers(&self) -> std::ops::RangeInclusive<u8> {
+        (NETWORK_MODEL_TIER + 1)..=self.head_tier()
+    }
+
+    /// Reward-share weight of a shard tier; 0 for any other tier.
+    pub fn tier_weight(&self, tier: u8) -> u64 {
+        if tier > NETWORK_MODEL_TIER {
+            self.shard_vram_gb.get((tier - NETWORK_MODEL_TIER - 1) as usize).copied().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    pub fn model_id(&self) -> [u8; 32] {
+        self.tiers[NETWORK_MODEL_TIER as usize].model_id
+    }
+}
+
+pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
+    tiers: POM_TIERS_H14,
+    reward_bps: &TIER_REWARD_BPS_H14,
+    minimums: INFERENCE_REWARD_MINIMUMS_V2_H14,
+    shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
+};
+
+/// The 9B already has its H6 floor (1 KRX), so the H6 minimums serve the testnet model too.
+pub static NETWORK_MODEL_TESTNET: NetworkModelLayout = NetworkModelLayout {
+    tiers: POM_TIERS_H14_TESTNET,
+    reward_bps: &TIER_REWARD_BPS_H14_TESTNET,
+    minimums: INFERENCE_REWARD_MINIMUMS_V2_H6,
+    shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_TESTNET,
+};
+
 /// Reward-share weight of a network-model tier; 0 for any other tier.
 pub fn network_model_tier_weight(tier: u8) -> u64 {
     if tier > NETWORK_MODEL_TIER {
@@ -769,14 +869,14 @@ pub fn network_model_shard_tiers() -> impl Iterator<Item = u8> {
 /// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
 /// against the wrong anchors and reject the chain.
 pub fn pom_tiers(
-    model_split_active: bool,
+    model_split_tiers: Option<&'static [crate::pom::PomTier]>,
     pom_v3_active: bool,
     h5_active: bool,
     coin_age_active: bool,
     very_light_active: bool,
 ) -> &'static [crate::pom::PomTier] {
-    if model_split_active {
-        POM_TIERS_H14
+    if let Some(tiers) = model_split_tiers {
+        tiers
     } else if pom_v3_active {
         POM_TIERS_H6
     } else if h5_active {
@@ -840,9 +940,9 @@ pub const TIER_REWARD_BPS_H14: [u64; 12] = [6_000, 7_000, 8_000, 9_000, 10_000, 
 /// 5-tier H6 once `pom_v3_activation`, 5-tier H2 once `very_light_activation`, legacy 4-tier
 /// before. Chosen per block from that block's own DAA (never frozen) — same gating discipline as
 /// `pom_tiers`, so archival/IBD recomputation of older blocks stays canonical.
-pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool, model_split_active: bool) -> &'static [u64] {
-    if model_split_active {
-        &TIER_REWARD_BPS_H14
+pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool, model_split_bps: Option<&'static [u64]>) -> &'static [u64] {
+    if let Some(bps) = model_split_bps {
+        bps
     } else if pom_v3_active {
         &TIER_REWARD_BPS_H6
     } else if very_light_active {
@@ -1480,6 +1580,8 @@ pub struct Params {
     /// H14: model split — network-model and shard tiers (`POM_TIERS_H14`), shard-aware service
     /// cohorts and windows. Scheduled once the shard roots are pinned.
     pub model_split_activation: ForkActivation,
+    /// H14: the network model of this network (tier table, schedule, minimums, shard classes).
+    pub network_model: &'static NetworkModelLayout,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
     pub service_burnable_window_daa: u64,
@@ -1747,6 +1849,7 @@ impl Params {
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
             model_split_activation: self.model_split_activation,
+            network_model: self.network_model,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
@@ -1959,6 +2062,7 @@ pub const MAINNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
     model_split_activation: ForkActivation::never(),
+    network_model: &NETWORK_MODEL_MAINNET,
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -2088,7 +2192,8 @@ pub const TESTNET_PARAMS: Params = Params {
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
-    model_split_activation: ForkActivation::never(),
+    model_split_activation: ForkActivation::new(133_000),
+    network_model: &NETWORK_MODEL_TESTNET,
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2183,6 +2288,7 @@ pub const SIMNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
     model_split_activation: ForkActivation::never(),
+    network_model: &NETWORK_MODEL_MAINNET,
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2271,6 +2377,7 @@ pub const DEVNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
     model_split_activation: ForkActivation::never(),
+    network_model: &NETWORK_MODEL_MAINNET,
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2299,10 +2406,10 @@ mod model_split_tables_tests {
             assert_eq!(TIER_REWARD_BPS_H14[i], TIER_REWARD_BPS_H6[i]);
         }
         assert_eq!(NETWORK_MODEL_TIER as usize, POM_TIERS_H6.len());
-        assert_eq!(pom_tiers(true, true, true, true, true).len(), POM_TIERS_H14.len());
-        assert_eq!(pom_tiers(false, true, true, true, true).len(), POM_TIERS_H6.len());
-        assert_eq!(tier_reward_bps(true, true, true).len(), TIER_REWARD_BPS_H14.len());
-        assert_eq!(tier_reward_bps(true, true, false).len(), TIER_REWARD_BPS_H6.len());
+        assert_eq!(pom_tiers(Some(POM_TIERS_H14), true, true, true, true).len(), POM_TIERS_H14.len());
+        assert_eq!(pom_tiers(None, true, true, true, true).len(), POM_TIERS_H6.len());
+        assert_eq!(tier_reward_bps(true, true, Some(&TIER_REWARD_BPS_H14)).len(), TIER_REWARD_BPS_H14.len());
+        assert_eq!(tier_reward_bps(true, true, None).len(), TIER_REWARD_BPS_H6.len());
     }
 
     #[test]
@@ -2313,6 +2420,26 @@ mod model_split_tables_tests {
         assert!(tier_serves(NETWORK_MODEL_TIER + 7, NETWORK_MODEL_TIER));
         assert!(!tier_serves(4, NETWORK_MODEL_TIER));
         assert!(!tier_serves(NETWORK_MODEL_TIER + 1, NETWORK_MODEL_TIER + 2));
+    }
+
+    #[test]
+    fn network_layouts_are_consistent() {
+        for (layout, shards) in [(&NETWORK_MODEL_MAINNET, NETWORK_MODEL_SHARDS.len()), (&NETWORK_MODEL_TESTNET, NETWORK_MODEL_SHARDS_TESTNET.len())] {
+            assert_eq!(layout.n_shards(), shards);
+            assert_eq!(layout.tiers.len(), layout.reward_bps.len());
+            assert_eq!(layout.shard_vram_gb.len(), shards);
+            assert_eq!(layout.shard_tiers().count(), shards);
+            assert_eq!(layout.head_tier() as usize, layout.tiers.len() - 1);
+            assert!(layout.minimums.iter().any(|(id, _)| *id == layout.model_id()));
+            assert_eq!(layout.tier_weight(NETWORK_MODEL_TIER), 0);
+            assert!(layout.tier_weight(layout.head_tier()) > 0);
+            for (i, t) in POM_TIERS_H6.iter().enumerate() {
+                assert_eq!(layout.tiers[i].model_id, t.model_id);
+            }
+        }
+        assert_eq!(NETWORK_MODEL_MAINNET.head_tier(), NETWORK_MODEL_HEAD_TIER);
+        assert_eq!(NETWORK_MODEL_TESTNET.head_tier(), 7);
+        assert_eq!(NETWORK_MODEL_TESTNET.model_id(), QWEN3_5_9B_ABLITERATED_MODEL_ID);
     }
 
     #[test]
