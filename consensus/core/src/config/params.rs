@@ -748,52 +748,6 @@ pub const NETWORK_MODEL_HEAD_TIER: u8 = NETWORK_MODEL_TIER + NETWORK_MODEL_SHARD
 /// its signer's share of a served request's reward.
 pub const NETWORK_MODEL_SHARD_VRAM_GB: [u64; 6] = [8, 12, 12, 16, 24, 32];
 
-/// Testnet network model: Qwen3.5-9B (the H6 tier-0 model) cut in two shards, so the whole
-/// pipeline (draw, links, V3 response, reward split) runs on one 24 GB card. `model_id` of each
-/// shard = CIDv0[2..34] of the shard GGUF.
-pub const SPLIT9B_SHARD_0_MODEL_ID: [u8; 32] = [
-    0x8d, 0xba, 0x34, 0xd0, 0x28, 0x5b, 0xe2, 0x87, 0xf0, 0x22, 0xda, 0xd0, 0xf3, 0x3e, 0xa5, 0x88,
-    0xc8, 0x36, 0x94, 0xd4, 0x83, 0x59, 0x60, 0x8c, 0xc8, 0xd4, 0x74, 0x24, 0x26, 0x76, 0xf2, 0x79,
-];
-pub const SPLIT9B_SHARD_1_MODEL_ID: [u8; 32] = [
-    0xa1, 0x98, 0xfe, 0x36, 0x9a, 0x63, 0xde, 0x8d, 0x75, 0xc5, 0xeb, 0x4a, 0x46, 0xa8, 0x24, 0xe0,
-    0x20, 0x55, 0x4a, 0xc2, 0x65, 0x48, 0xad, 0x68, 0x8c, 0x90, 0xa9, 0x60, 0xdb, 0x52, 0x49, 0x2e,
-];
-
-/// Testnet shards: layers 0-15 and 16-31 (the second is the head shard).
-pub const NETWORK_MODEL_SHARDS_TESTNET: &[([u8; 32], u32, u32)] =
-    &[(SPLIT9B_SHARD_0_MODEL_ID, 0, 15), (SPLIT9B_SHARD_1_MODEL_ID, 16, 31)];
-
-/// Testnet H14 tier set: the H6 lineup, the 9B as network model (its H6 anchor), two shards.
-pub const POM_TIERS_H14_TESTNET: &[crate::pom::PomTier] = &[
-    POM_TIERS_H6[0],
-    POM_TIERS_H6[1],
-    POM_TIERS_H6[2],
-    POM_TIERS_H6[3],
-    POM_TIERS_H6[4],
-    POM_TIERS_H6[0],
-    crate::pom::PomTier {
-        model_id: SPLIT9B_SHARD_0_MODEL_ID,
-        root: [
-            0x16, 0x48, 0x26, 0xf1, 0x91, 0xdf, 0x42, 0x79, 0xe4, 0xfe, 0x2d, 0x53, 0x62, 0x8b, 0xc3, 0xf6,
-            0x1b, 0xb5, 0xad, 0xf3, 0x1c, 0x09, 0xaa, 0xfb, 0xd2, 0x48, 0x7e, 0x17, 0x09, 0x6c, 0x57, 0xb5,
-        ],
-        chunks: 77_797_920,
-    },
-    crate::pom::PomTier {
-        model_id: SPLIT9B_SHARD_1_MODEL_ID,
-        root: [
-            0x68, 0x7c, 0xfd, 0xe0, 0x0e, 0xc1, 0xb5, 0xef, 0xf2, 0x8c, 0x33, 0x6b, 0x86, 0xbb, 0xaf, 0x1f,
-            0xea, 0x99, 0x0b, 0x45, 0x9a, 0xec, 0xe7, 0xff, 0xf0, 0xac, 0xf1, 0x7b, 0x60, 0xc8, 0x31, 0xa4,
-        ],
-        chunks: 77_745_696,
-    },
-];
-
-pub const TIER_REWARD_BPS_H14_TESTNET: [u64; 8] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 6_000];
-
-pub const NETWORK_MODEL_SHARD_VRAM_GB_TESTNET: [u64; 2] = [8, 8];
-
 /// The network model of one network: its H14 tier table (lineup, whole model, shards), the
 /// matching reward schedule and request minimums, and the card class of each shard.
 #[derive(Debug)]
@@ -838,14 +792,6 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     reward_bps: &TIER_REWARD_BPS_H14,
     minimums: INFERENCE_REWARD_MINIMUMS_V2_H14,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
-};
-
-/// The 9B already has its H6 floor (1 KRX), so the H6 minimums serve the testnet model too.
-pub static NETWORK_MODEL_TESTNET: NetworkModelLayout = NetworkModelLayout {
-    tiers: POM_TIERS_H14_TESTNET,
-    reward_bps: &TIER_REWARD_BPS_H14_TESTNET,
-    minimums: INFERENCE_REWARD_MINIMUMS_V2_H6,
-    shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_TESTNET,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -2193,7 +2139,7 @@ pub const TESTNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
     model_split_activation: ForkActivation::new(133_000),
-    network_model: &NETWORK_MODEL_TESTNET,
+    network_model: &NETWORK_MODEL_MAINNET,
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2424,7 +2370,7 @@ mod model_split_tables_tests {
 
     #[test]
     fn network_layouts_are_consistent() {
-        for (layout, shards) in [(&NETWORK_MODEL_MAINNET, NETWORK_MODEL_SHARDS.len()), (&NETWORK_MODEL_TESTNET, NETWORK_MODEL_SHARDS_TESTNET.len())] {
+        for (layout, shards) in [(&NETWORK_MODEL_MAINNET, NETWORK_MODEL_SHARDS.len())] {
             assert_eq!(layout.n_shards(), shards);
             assert_eq!(layout.tiers.len(), layout.reward_bps.len());
             assert_eq!(layout.shard_vram_gb.len(), shards);
@@ -2438,8 +2384,7 @@ mod model_split_tables_tests {
             }
         }
         assert_eq!(NETWORK_MODEL_MAINNET.head_tier(), NETWORK_MODEL_HEAD_TIER);
-        assert_eq!(NETWORK_MODEL_TESTNET.head_tier(), 7);
-        assert_eq!(NETWORK_MODEL_TESTNET.model_id(), QWEN3_5_9B_ABLITERATED_MODEL_ID);
+        assert_eq!(NETWORK_MODEL_MAINNET.model_id(), NETWORK_MODEL_V4_FLASH_MODEL_ID);
     }
 
     #[test]
