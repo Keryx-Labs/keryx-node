@@ -938,6 +938,7 @@ build_wrpc_wasm_bindgen_interface!(
         /// Returns the service-bond enforcement state: live strikes,
         /// production suspensions and misses awaiting finality.
         GetServiceStrikes,
+        GetNetworkModelAvailability,
         /// Retrieves information about the peers connected to the Kaspa node.
         /// Returned information: Peer ID, IP address and port, connection
         /// status, protocol version.

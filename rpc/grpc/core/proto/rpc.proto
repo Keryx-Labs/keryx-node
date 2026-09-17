@@ -1185,3 +1185,25 @@ message GetServiceStrikesResponseMessage {
 
   RPCError error = 1000;
 }
+
+// Eligible producers of one shard tier of the network model at the virtual.
+message ShardAvailabilityMessage {
+  uint32 tier = 1;
+  uint64 vramGb = 2;
+  uint32 producers = 3;
+}
+
+message GetNetworkModelAvailabilityRequestMessage {
+}
+
+// available iff every shard tier has at least one eligible producer; shards is empty before
+// the model-split activation.
+message GetNetworkModelAvailabilityResponseMessage {
+  uint64 virtualDaaScore = 1;
+  string modelId = 2;
+  bool active = 3;
+  bool available = 4;
+  repeated ShardAvailabilityMessage shards = 5;
+
+  RPCError error = 1000;
+}

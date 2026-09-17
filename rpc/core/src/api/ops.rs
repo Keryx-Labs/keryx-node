@@ -146,6 +146,8 @@ pub enum RpcApiOps {
     GetUtxoEntriesByOutpoints = 153,
     /// Service-bond strike, suspension and pending-burn state
     GetServiceStrikes = 154,
+    /// Eligible producers per shard tier of the network model (H14)
+    GetNetworkModelAvailability = 155,
 }
 
 impl RpcApiOps {

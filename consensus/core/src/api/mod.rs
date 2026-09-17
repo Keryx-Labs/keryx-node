@@ -164,6 +164,11 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Eligible producers per shard tier at the sink (H14).
+    fn get_network_model_availability(&self) -> crate::collateral::NetworkModelAvailability {
+        unimplemented!()
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         unimplemented!()
     }

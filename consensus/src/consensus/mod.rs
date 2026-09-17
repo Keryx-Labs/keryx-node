@@ -725,6 +725,11 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.pipeline_assignments()
     }
 
+    fn get_network_model_availability(&self) -> keryx_consensus_core::collateral::NetworkModelAvailability {
+        let state = self.lkg_virtual_state.load();
+        self.virtual_processor.network_model_availability(state.ghostdag_data.selected_parent, state.daa_score)
+    }
+
     fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {
         let Some(pp_daa) = self.headers_store.get_daa_score(pruning_point).optional().unwrap() else {
             return Err(ConsensusError::HeaderNotFound(pruning_point));

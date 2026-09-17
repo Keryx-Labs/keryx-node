@@ -6,7 +6,8 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiRequestMaxTokensExceeded, AiResponseLinksBeforeActivation, AiResponseModelCapMissing, AiResponseV2BeforeActivation,
+            AiAvailBeforeActivation, AiRequestMaxTokensExceeded, AiResponseLinksBeforeActivation, AiResponseModelCapMissing,
+            AiResponseV2BeforeActivation,
             BadAcceptedIDMerkleRoot,
             BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot, MissingServiceLedgerSnapshot,
             WrongHeaderPruningPoint,
@@ -553,6 +554,9 @@ impl VirtualStateProcessor {
             for tx in txs.iter().skip(1) {
                 if tx.is_ai_response() && tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
                     return Err(AiResponseLinksBeforeActivation(tx.id()));
+                }
+                if tx.is_ai_avail() {
+                    return Err(AiAvailBeforeActivation(tx.id()));
                 }
             }
         }

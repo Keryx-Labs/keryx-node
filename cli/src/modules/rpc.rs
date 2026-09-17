@@ -243,6 +243,10 @@ impl Rpc {
                 let result = rpc.get_service_strikes_call(None, GetServiceStrikesRequest {}).await?;
                 self.println(&ctx, result);
             }
+            RpcApiOps::GetNetworkModelAvailability => {
+                let result = rpc.get_network_model_availability_call(None, GetNetworkModelAvailabilityRequest {}).await?;
+                self.println(&ctx, result);
+            }
             RpcApiOps::GetDaaScoreTimestampEstimate => {
                 if argv.is_empty() {
                     return Err(Error::custom("Please specify a daa_score"));

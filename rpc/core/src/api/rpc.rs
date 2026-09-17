@@ -461,6 +461,16 @@ pub trait RpcApi: Sync + Send + AnySync {
         request: GetServiceStrikesRequest,
     ) -> RpcResult<GetServiceStrikesResponse>;
 
+    /// Eligible producers per shard tier of the network model at the virtual.
+    async fn get_network_model_availability(&self) -> RpcResult<GetNetworkModelAvailabilityResponse> {
+        self.get_network_model_availability_call(None, GetNetworkModelAvailabilityRequest {}).await
+    }
+    async fn get_network_model_availability_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetNetworkModelAvailabilityRequest,
+    ) -> RpcResult<GetNetworkModelAvailabilityResponse>;
+
     async fn get_daa_score_timestamp_estimate(&self, daa_scores: Vec<u64>) -> RpcResult<Vec<u64>> {
         Ok(self.get_daa_score_timestamp_estimate_call(None, GetDaaScoreTimestampEstimateRequest { daa_scores }).await?.timestamps)
     }

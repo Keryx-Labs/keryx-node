@@ -84,6 +84,18 @@ pub enum RuleError {
     #[error("request {0} already has the maximum number of pending AiResponses")]
     RejectAiResponsesSaturated(String),
 
+    #[error("AiAvail for request {0} before the model-split activation")]
+    RejectAiAvailBeforeActivation(String),
+
+    #[error("an AiAvail for request {0} by the same escrow key and tier is already in the mempool")]
+    RejectDuplicateAiAvail(String),
+
+    #[error("the AiAvail for request {0} has an invalid signature")]
+    RejectAiAvailSignature(String),
+
+    #[error("request {0} already has the maximum number of pending AiAvails")]
+    RejectAiAvailsSaturated(String),
+
     #[error("an AiChallenge for response {0} is already in the mempool")]
     RejectDuplicateAiChallenge(String),
 

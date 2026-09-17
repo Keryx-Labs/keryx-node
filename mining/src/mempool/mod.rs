@@ -57,6 +57,9 @@ pub(crate) struct Mempool {
     ai_response_index: HashMap<[u8; 32], Vec<(Option<[u8; 32]>, TransactionId)>>,
     /// Deduplication index: response_hash → tx_id. One AiChallenge per response.
     ai_challenge_index: HashMap<[u8; 32], TransactionId>,
+    /// Deduplication index: request_hash → pending (tier, escrow key, tx_id) declarations.
+    /// One AiAvail per (request, tier, escrow key).
+    ai_avail_index: HashMap<[u8; 32], Vec<(u8, [u8; 32], TransactionId)>>,
 }
 
 impl Mempool {
@@ -72,6 +75,7 @@ impl Mempool {
             counters,
             ai_response_index: HashMap::new(),
             ai_challenge_index: HashMap::new(),
+            ai_avail_index: HashMap::new(),
         }
     }
 

@@ -354,6 +354,14 @@ impl RpcApi for RpcCoreMock {
         Err(RpcError::NotImplemented)
     }
 
+    async fn get_network_model_availability_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetNetworkModelAvailabilityRequest,
+    ) -> RpcResult<GetNetworkModelAvailabilityResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
     async fn get_coin_supply_call(
         &self,
         _connection: Option<&DynRpcConnection>,

@@ -72,6 +72,7 @@ pub enum KaspadPayloadOps {
     GetUtxoCountByAddress,
     GetUtxoEntriesByOutpoints,
     GetServiceStrikes,
+    GetNetworkModelAvailability,
     GetBalanceByAddress,
     GetBalancesByAddresses,
     GetSinkBlueScore,

@@ -5,7 +5,7 @@ use crate::mempool::{
 };
 use keryx_consensus_core::tx::TransactionId;
 use keryx_core::debug;
-use keryx_inference::{AiChallengePayload, AiResponsePayload};
+use keryx_inference::{AiAvailPayload, AiChallengePayload, AiResponsePayload};
 use keryx_utils::iter::IterExtensions;
 
 impl Mempool {
@@ -48,6 +48,16 @@ impl Mempool {
             if tx.mtx.tx.is_ai_challenge() {
                 if let Some(rh) = AiChallengePayload::deserialize(&tx.mtx.tx.payload).map(|c| c.response_hash) {
                     self.ai_challenge_index.remove(&rh);
+                }
+            }
+            if tx.mtx.tx.is_ai_avail() {
+                if let Some(rh) = AiAvailPayload::deserialize(&tx.mtx.tx.payload).map(|a| a.request_hash) {
+                    if let Some(entries) = self.ai_avail_index.get_mut(&rh) {
+                        entries.retain(|(_, _, id)| id != tx_id);
+                        if entries.is_empty() {
+                            self.ai_avail_index.remove(&rh);
+                        }
+                    }
                 }
             }
             // Update/remove descendent orphan txs (depending on `remove_redeemers`)

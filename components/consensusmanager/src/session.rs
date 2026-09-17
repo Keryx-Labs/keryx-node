@@ -220,6 +220,10 @@ impl ConsensusSessionOwned {
         self.consensus.get_pipeline_assignments()
     }
 
+    pub fn get_network_model_availability(&self) -> keryx_consensus_core::collateral::NetworkModelAvailability {
+        self.consensus.get_network_model_availability()
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()

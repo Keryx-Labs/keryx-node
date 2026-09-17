@@ -6,9 +6,9 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
-    PipelineAssignment, ProductionIndexSnapshot, ResponseLinks, ServiceLedgerSnapshot,
-    ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
+    eligible_pairs, escrow_miner_key, miner_key, verify_avail_signature, verify_responder_signature, EscrowClaim, FoldOutcome,
+    NetworkModelAvailability, PipelineAssignment, ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger,
+    ServiceLedgerSnapshot, ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
     SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::NETWORK_MODEL_TIER;
@@ -17,7 +17,7 @@ use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiRequestPayload, AiResponsePayload};
+use keryx_inference::{AiAvailPayload, AiRequestPayload, AiResponsePayload};
 use keryx_txscript::script_class::ScriptClass;
 
 
@@ -35,6 +35,12 @@ fn csv_escrow_pubkey(script: &[u8]) -> Option<[u8; 32]> {
 fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
     let r = resp.responder.as_ref()?;
     verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()).then(|| escrow_miner_key(&r.escrow_pubkey))
+}
+
+/// The `(tier, escrow key)` of a declaration, iff its signature verifies.
+fn verified_declaration(avail: &AiAvailPayload) -> Option<(u8, Hash)> {
+    verify_avail_signature(&avail.escrow_pubkey, &avail.signature, &avail.signed_bytes())
+        .then(|| (avail.tier, escrow_miner_key(&avail.escrow_pubkey)))
 }
 
 /// The `(tier, escrow key)` of every link of a V3 response, iff every link signature verifies
@@ -245,6 +251,18 @@ impl VirtualStateProcessor {
         window_daa: u64,
         own_pp: Hash,
     ) -> Vec<(Hash, Hash)> {
+        eligible_pairs(&self.service_recent_producers_in(sc, seed, window_daa, own_pp), target_tier)
+    }
+
+    /// `(identity, tier, escrow key)` of every paid blue of the chain blocks whose daa lies in
+    /// `(seed.daa − window_daa, seed.daa]` — the input of every cohort at `seed`.
+    fn service_recent_producers_in(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        seed: Hash,
+        window_daa: u64,
+        own_pp: Hash,
+    ) -> Vec<(Hash, u8, Hash)> {
         let Ok(seed_idx) = sc.get_by_hash(seed) else {
             return vec![];
         };
@@ -277,7 +295,52 @@ impl VirtualStateProcessor {
         for i in (bottom + 1)..=seed_idx {
             recent.extend(self.service_producers_of_chain_block(sc.get_by_index(i).unwrap()));
         }
-        eligible_pairs(&recent, target_tier)
+        recent
+    }
+
+    /// The recent producers at the sink, cached per sink hash: the mempool reads them once per
+    /// virtual state, however many declarations and requests it admits.
+    fn service_recent_producers_at_sink(&self, sink: Hash, sink_daa: u64) -> std::sync::Arc<Vec<(Hash, u8, Hash)>> {
+        let window = if self.service_bond_v2_activation.is_active(sink_daa) {
+            SERVICE_ELIGIBILITY_WINDOW_DAA_V2
+        } else {
+            SERVICE_ELIGIBILITY_WINDOW_DAA
+        };
+        {
+            let cache = self.service_recent_at_sink.lock();
+            if let Some((cached, recent)) = cache.as_ref() {
+                if *cached == sink {
+                    return recent.clone();
+                }
+            }
+        }
+        let recent = {
+            let (own_pp, sc) = self.retained_pruning_point_and_chain();
+            std::sync::Arc::new(self.service_recent_producers_in(&*sc, sink, window, own_pp))
+        };
+        *self.service_recent_at_sink.lock() = Some((sink, recent.clone()));
+        recent
+    }
+
+    /// Eligible producers of every shard tier at the sink.
+    pub(crate) fn network_model_availability(&self, sink: Hash, sink_daa: u64) -> NetworkModelAvailability {
+        let active = self.model_split_activation.is_active(sink_daa);
+        let mut shards = Vec::new();
+        if active {
+            let recent = self.service_recent_producers_at_sink(sink, sink_daa);
+            for tier in self.network_model.shard_tiers() {
+                let producers = eligible_pairs(&recent, tier).len() as u32;
+                shards.push(ShardAvailability { tier, vram_gb: self.network_model.tier_weight(tier), producers });
+            }
+        }
+        NetworkModelAvailability { model_id: self.network_model.model_id(), virtual_daa_score: sink_daa, active, shards }
+    }
+
+    /// Whether `escrow` (a delegated escrow key) belongs to an eligible producer of `tier` at
+    /// the sink.
+    pub(crate) fn is_declaration_eligible(&self, sink: Hash, sink_daa: u64, tier: u8, escrow: Hash) -> bool {
+        let recent = self.service_recent_producers_at_sink(sink, sink_daa);
+        eligible_pairs(&recent, tier).iter().any(|(_, e)| *e == escrow)
     }
 
     #[allow(dead_code)]
@@ -289,17 +352,27 @@ impl VirtualStateProcessor {
     /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
     /// Requests for models outside the mineable tier set are skipped: the lineup before
     /// `model_split`, the network model and its shards after it. A v1 response or an invalid
-    /// responder signature yields `None` (a volunteer — never serves the assignment).
+    /// responder signature yields `None` (a volunteer — never serves the assignment). The last
+    /// output is the block's verified availability declarations as `(request_hash, tier,
+    /// escrow key)`, past the gate only.
+    #[allow(clippy::type_complexity)]
     fn service_events_of_chain_block(
         &self,
         hash: Hash,
         txid_identity: bool,
         model_split: bool,
-    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Option<Hash>)>, Vec<ResponseLinks>) {
+    ) -> (
+        Vec<([u8; 32], u8, u32)>,
+        Vec<([u8; 32], u64)>,
+        Vec<([u8; 32], Option<Hash>)>,
+        Vec<ResponseLinks>,
+        Vec<([u8; 32], u8, Hash)>,
+    ) {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
         let mut responses = Vec::new();
         let mut response_links = Vec::new();
+        let mut declarations = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
         for mbad in acceptance.iter() {
             let txs = self.block_transactions_store.get(mbad.block_hash).unwrap();
@@ -337,10 +410,16 @@ impl VirtualStateProcessor {
                         }
                         responses.push((resp.request_hash, head));
                     }
+                } else if model_split && tx.is_ai_avail() {
+                    if let Some(avail) = AiAvailPayload::deserialize(&tx.payload) {
+                        if let Some((tier, escrow)) = verified_declaration(&avail) {
+                            declarations.push((avail.request_hash, tier, escrow));
+                        }
+                    }
                 }
             }
         }
-        (requests, request_rewards, responses, response_links)
+        (requests, request_rewards, responses, response_links, declarations)
     }
 
     /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
@@ -478,7 +557,8 @@ impl VirtualStateProcessor {
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_network_model(self.network_model);
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, responses, response_links) = self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa), self.model_split_activation.is_active(daa));
+        let (requests, request_rewards, responses, response_links, declarations) =
+            self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa), self.model_split_activation.is_active(daa));
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -522,6 +602,7 @@ impl VirtualStateProcessor {
                 &escrows,
                 &producers,
                 &response_links,
+                &declarations,
                 &|op| burned.contains_key(op),
                 cohort,
             );
@@ -535,6 +616,7 @@ impl VirtualStateProcessor {
                 &escrows,
                 &producers,
                 &response_links,
+                &declarations,
                 |id| self.service_standing_at(id, daa),
                 cohort,
             );

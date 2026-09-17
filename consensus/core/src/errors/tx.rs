@@ -111,6 +111,9 @@ pub enum TxRuleError {
     #[error("AiResponse transaction has a null (all-zero) request_hash")]
     AiResponseNullRequestHash,
 
+    #[error("AiAvail transaction rejected: {0}")]
+    AiAvailRule(String),
+
     #[error("AiChallenge transaction has a null (all-zero) response_hash")]
     AiChallengeNullResponseHash,
 

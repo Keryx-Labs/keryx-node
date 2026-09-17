@@ -267,6 +267,15 @@ impl Transaction {
         self.subnetwork_id == subnets::SUBNETWORK_ID_AI_CHALLENGE
     }
 
+    pub fn is_ai_avail(&self) -> bool {
+        self.subnetwork_id == subnets::SUBNETWORK_ID_AI_AVAIL
+    }
+
+    /// Input-less data-publication transaction (AiResponse, AiChallenge, AiAvail).
+    pub fn is_ai_publication(&self) -> bool {
+        self.is_ai_response() || self.is_ai_challenge() || self.is_ai_avail()
+    }
+
     /// Recompute and finalize the tx id based on updated tx fields
     pub fn finalize(&mut self) {
         self.id = hashing::tx::id(self);

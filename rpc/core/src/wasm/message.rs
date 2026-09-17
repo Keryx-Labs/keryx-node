@@ -241,6 +241,51 @@ try_from! ( args: GetServiceStrikesResponse, IGetServiceStrikesResponse, {
     Ok(to_value(&args)?.into())
 });
 
+// ---
+
+declare! {
+    IGetNetworkModelAvailabilityRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetNetworkModelAvailabilityRequest { }
+    "#,
+}
+
+try_from! ( args: IGetNetworkModelAvailabilityRequest, GetNetworkModelAvailabilityRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetNetworkModelAvailabilityResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetNetworkModelAvailabilityResponse {
+        virtualDaaScore: bigint;
+        modelId: HexString;
+        active: boolean;
+        available: boolean;
+        shards: IShardAvailability[];
+    }
+
+    /**
+     * @category Node RPC
+     */
+    export interface IShardAvailability {
+        tier: number;
+        vramGb: bigint;
+        producers: number;
+    }
+    "#,
+}
+
+try_from! ( args: GetNetworkModelAvailabilityResponse, IGetNetworkModelAvailabilityResponse, {
+    Ok(to_value(&args)?.into())
+});
+
 declare! {
     IGetCoinSupplyRequest,
     r#"

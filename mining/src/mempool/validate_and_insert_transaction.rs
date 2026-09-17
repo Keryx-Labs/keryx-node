@@ -11,12 +11,12 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::verify_responder_signature,
+    collateral::{verify_avail_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
-use keryx_inference::{AiChallengePayload, AiResponsePayload};
+use keryx_inference::{AiAvailPayload, AiChallengePayload, AiResponsePayload};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -141,6 +141,11 @@ impl Mempool {
                 self.ai_challenge_index.insert(response_hash, accepted_transaction.id());
             }
         }
+        if accepted_transaction.is_ai_avail() {
+            if let Some(avail) = AiAvailPayload::deserialize(&accepted_transaction.payload) {
+                self.ai_avail_index.entry(avail.request_hash).or_default().push((avail.tier, avail.escrow_pubkey, accepted_transaction.id()));
+            }
+        }
 
         Ok(TransactionPostValidation { removed: removed_transaction, accepted: Some(accepted_transaction) })
     }
@@ -191,6 +196,26 @@ impl Mempool {
                     }
                     if entries.len() >= MAX_PENDING_AI_RESPONSES_PER_REQUEST {
                         return Err(RuleError::RejectAiResponsesSaturated(hex::encode(resp.request_hash)));
+                    }
+                }
+            }
+        }
+        // One AiAvail per (request, tier, escrow key), with a per-request cap; the signature
+        // must verify so the dedup key cannot be forged by third parties.
+        if transaction.tx.is_ai_avail() {
+            if let Some(avail) = AiAvailPayload::deserialize(&transaction.tx.payload) {
+                if virtual_daa < self.config.model_split_activation_daa {
+                    return Err(RuleError::RejectAiAvailBeforeActivation(hex::encode(avail.request_hash)));
+                }
+                if !verify_avail_signature(&avail.escrow_pubkey, &avail.signature, &avail.signed_bytes()) {
+                    return Err(RuleError::RejectAiAvailSignature(hex::encode(avail.request_hash)));
+                }
+                if let Some(entries) = self.ai_avail_index.get(&avail.request_hash) {
+                    if entries.iter().any(|(t, k, _)| *t == avail.tier && *k == avail.escrow_pubkey) {
+                        return Err(RuleError::RejectDuplicateAiAvail(hex::encode(avail.request_hash)));
+                    }
+                    if entries.len() >= MAX_PENDING_AI_AVAILS_PER_REQUEST {
+                        return Err(RuleError::RejectAiAvailsSaturated(hex::encode(avail.request_hash)));
                     }
                 }
             }
@@ -308,6 +333,9 @@ impl Mempool {
 /// Distinct pending AiResponses allowed per request — bounds mempool growth while leaving
 /// room for every cohort responder.
 const MAX_PENDING_AI_RESPONSES_PER_REQUEST: usize = 256;
+
+/// Distinct pending AiAvails allowed per request: every eligible producer of every shard tier.
+const MAX_PENDING_AI_AVAILS_PER_REQUEST: usize = 1_024;
 
 fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiChallengePayload::deserialize(payload).map(|c| c.response_hash)

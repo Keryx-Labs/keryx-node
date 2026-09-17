@@ -955,6 +955,26 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetBalancesByAddressesResponse::new(entries))
     }
 
+    async fn get_network_model_availability_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _: GetNetworkModelAvailabilityRequest,
+    ) -> RpcResult<GetNetworkModelAvailabilityResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let availability = session.get_network_model_availability();
+        Ok(GetNetworkModelAvailabilityResponse {
+            virtual_daa_score: availability.virtual_daa_score,
+            model_id: RpcHash::from_bytes(availability.model_id),
+            active: availability.active,
+            available: availability.available(),
+            shards: availability
+                .shards
+                .into_iter()
+                .map(|s| RpcShardAvailability { tier: s.tier, vram_gb: s.vram_gb, producers: s.producers })
+                .collect(),
+        })
+    }
+
     async fn get_service_strikes_call(
         &self,
         _connection: Option<&DynRpcConnection>,

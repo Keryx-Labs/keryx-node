@@ -33,6 +33,13 @@ pub const MAX_AI_RESPONSE_LINKS: usize = 15;
 pub const MIN_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_LEN;
 pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN + 1 + MAX_AI_RESPONSE_LINKS * AI_RESPONSE_LINK_LEN;
 
+/// Binary payload layout for `SUBNETWORK_ID_AI_AVAIL` transactions:
+/// `[request_hash: 32] [tier: 1] [escrow_pubkey: 32] [schnorr_signature: 64]`
+/// Fixed 129 bytes — a shard holder declaring itself available for a network-model request.
+/// The signature covers the 33 `[request_hash] [tier]` bytes.
+pub const AI_AVAIL_PAYLOAD_LEN: usize = 32 + 1 + 32 + 64;
+pub const AI_AVAIL_SIGNED_LEN: usize = 33;
+
 /// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
 /// `[response_hash: 32] [challenger_deposit: 8 LE] [challenger_spk_version: 2 LE] [challenger_spk: 32] [proof_data…]`
 /// `proof_data` is empty for Phase 3 A2b stubs; 32 bytes (request_hash) for Phase 3 C re-execution.
@@ -45,6 +52,7 @@ pub const MAX_AI_CHALLENGE_PAYLOAD_LEN: usize = 32_768;
 pub const SUBNETWORK_ID_AI_REQUEST_HEX: &str = "0300000000000000000000000000000000000000";
 pub const SUBNETWORK_ID_AI_RESPONSE_HEX: &str = "0400000000000000000000000000000000000000";
 pub const SUBNETWORK_ID_AI_CHALLENGE_HEX: &str = "0500000000000000000000000000000000000000";
+pub const SUBNETWORK_ID_AI_AVAIL_HEX: &str = "0600000000000000000000000000000000000000";
 
 /// Canonical keyless reward-vault script of a routed AiRequest (`OP_RETURN "aivault"`):
 /// provably unspendable, so the vaulted amount burns unless a coinbase mints it to the
@@ -242,6 +250,55 @@ impl AiResponsePayload {
     }
 }
 
+/// Payload of a `SUBNETWORK_ID_AI_AVAIL` transaction: a shard holder's availability
+/// declaration for one network-model request, signed by its escrow key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiAvailPayload {
+    pub request_hash: [u8; 32],
+    pub tier: u8,
+    pub escrow_pubkey: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl AiAvailPayload {
+    pub fn new(request_hash: [u8; 32], tier: u8, escrow_pubkey: [u8; 32], signature: [u8; 64]) -> Self {
+        Self { request_hash, tier, escrow_pubkey, signature }
+    }
+
+    /// The 33 bytes the declaration signature covers.
+    pub fn signed_bytes(&self) -> [u8; AI_AVAIL_SIGNED_LEN] {
+        let mut out = [0u8; AI_AVAIL_SIGNED_LEN];
+        out[..32].copy_from_slice(&self.request_hash);
+        out[32] = self.tier;
+        out
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AI_AVAIL_PAYLOAD_LEN);
+        out.extend_from_slice(&self.signed_bytes());
+        out.extend_from_slice(&self.escrow_pubkey);
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() != AI_AVAIL_PAYLOAD_LEN {
+            return None;
+        }
+        Some(Self {
+            request_hash: data[0..32].try_into().ok()?,
+            tier: data[32],
+            escrow_pubkey: data[33..65].try_into().ok()?,
+            signature: data[65..129].try_into().ok()?,
+        })
+    }
+
+    pub fn from_hex(payload_hex: &str) -> Option<Self> {
+        let bytes = hex::decode(payload_hex).ok()?;
+        Self::deserialize(&bytes)
+    }
+}
+
 /// Payload of a `SUBNETWORK_ID_AI_CHALLENGE` transaction.
 ///
 /// Submitted by anyone who believes a miner published a fraudulent AiResponse.
@@ -401,6 +458,21 @@ mod tests {
         let v2 = AiResponsePayload::new_v2([7u8; 32], 900_000, cid, 128, responder);
         assert!(!v2.is_v3());
         assert_eq!(v2.serialize().len(), AI_RESPONSE_PAYLOAD_V2_LEN);
+    }
+
+    #[test]
+    fn ai_avail_roundtrip_is_exact_length() {
+        let avail = AiAvailPayload::new([7u8; 32], 9, [0x33u8; 32], [0x44u8; 64]);
+        let bytes = avail.serialize();
+        assert_eq!(bytes.len(), AI_AVAIL_PAYLOAD_LEN);
+        assert_eq!(AiAvailPayload::deserialize(&bytes), Some(avail));
+        assert_eq!(&bytes[..AI_AVAIL_SIGNED_LEN], avail.signed_bytes().as_slice());
+        let mut short = bytes.clone();
+        short.pop();
+        assert!(AiAvailPayload::deserialize(&short).is_none());
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(AiAvailPayload::deserialize(&long).is_none());
     }
 
     #[test]

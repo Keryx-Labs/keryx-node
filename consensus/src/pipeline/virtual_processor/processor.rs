@@ -164,6 +164,8 @@ pub struct VirtualStateProcessor {
     pub(super) production_index_hashes: RwLock<HashMap<Hash, (Hash, Hash)>>,
     /// Producers below the pruning point, from the snapshot imported (or persisted) at it.
     pub(super) service_imported_producers: RwLock<Vec<(u64, Hash, u8, Hash)>>,
+    /// Recent producers at the last sink the mempool asked about (see `service_bond.rs`).
+    pub(super) service_recent_at_sink: parking_lot::Mutex<Option<(Hash, std::sync::Arc<Vec<(Hash, u8, Hash)>>)>>,
     pub(super) service_ledger_activation: ForkActivation,
     pub(super) production_index_activation: ForkActivation,
     pub(super) exact_verification_activation: ForkActivation,
@@ -397,6 +399,7 @@ impl VirtualStateProcessor {
             service_ledger_hashes: Default::default(),
             production_index_hashes: Default::default(),
             service_imported_producers: Default::default(),
+            service_recent_at_sink: Default::default(),
             service_ledger_activation: params.service_ledger_activation,
             production_index_activation: params.production_index_activation,
             exact_verification_activation: params.exact_verification_activation,
@@ -1500,12 +1503,14 @@ impl VirtualStateProcessor {
         (virtual_parents, ghostdag_data)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_mempool_transaction_impl(
         &self,
         mutable_tx: &mut MutableTransaction,
         virtual_utxo_view: &impl UtxoView,
         virtual_daa_score: u64,
         virtual_past_median_time: u64,
+        sink: Hash,
         args: &TransactionValidationArgs,
     ) -> TxResult<()> {
         self.transaction_validator.validate_tx_in_isolation(&mutable_tx.tx)?;
@@ -1535,6 +1540,33 @@ impl VirtualStateProcessor {
                 if req.max_tokens > cap {
                     return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
                 }
+                // A request the network cannot assemble would burn its reward: refuse it here,
+                // where the sender still holds the coins. Admission policy only.
+                if self.model_split_activation.is_active(virtual_daa_score) && req.model_id == self.network_model.model_id() {
+                    if let Some(tier) = self.network_model_availability(sink, virtual_daa_score).missing_tier() {
+                        return Err(TxRuleError::AiRequestPayloadRule(format!("no eligible producer for shard tier {}", tier)));
+                    }
+                }
+            }
+        }
+        // Declarations: block-valid past the gate only; admitted from eligible producers only,
+        // so a request's declaration set is bounded by its cohorts.
+        if mutable_tx.tx.is_ai_avail() {
+            if !self.model_split_activation.is_active(virtual_daa_score) {
+                return Err(TxRuleError::AiAvailRule("before the model-split activation".into()));
+            }
+            let Some(avail) = keryx_inference::AiAvailPayload::deserialize(&mutable_tx.tx.payload) else {
+                return Err(TxRuleError::AiAvailRule("malformed payload".into()));
+            };
+            if !keryx_consensus_core::collateral::verify_avail_signature(&avail.escrow_pubkey, &avail.signature, &avail.signed_bytes()) {
+                return Err(TxRuleError::AiAvailRule("invalid signature".into()));
+            }
+            if !self.network_model.shard_tiers().contains(&avail.tier) {
+                return Err(TxRuleError::AiAvailRule(format!("tier {} is not a shard tier", avail.tier)));
+            }
+            let escrow = keryx_consensus_core::collateral::escrow_miner_key(&avail.escrow_pubkey);
+            if !self.is_declaration_eligible(sink, virtual_daa_score, avail.tier, escrow) {
+                return Err(TxRuleError::AiAvailRule(format!("escrow key is not an eligible producer of tier {}", avail.tier)));
             }
         }
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
@@ -1547,9 +1579,10 @@ impl VirtualStateProcessor {
         let virtual_utxo_view = &virtual_read.utxo_set;
         let virtual_daa_score = virtual_state.daa_score;
         let virtual_past_median_time = virtual_state.past_median_time;
+        let sink = virtual_state.ghostdag_data.selected_parent;
         // Run within the thread pool since par_iter might be internally applied to inputs
         self.thread_pool.install(|| {
-            self.validate_mempool_transaction_impl(mutable_tx, virtual_utxo_view, virtual_daa_score, virtual_past_median_time, args)
+            self.validate_mempool_transaction_impl(mutable_tx, virtual_utxo_view, virtual_daa_score, virtual_past_median_time, sink, args)
         })
     }
 
@@ -1563,6 +1596,7 @@ impl VirtualStateProcessor {
         let virtual_utxo_view = &virtual_read.utxo_set;
         let virtual_daa_score = virtual_state.daa_score;
         let virtual_past_median_time = virtual_state.past_median_time;
+        let sink = virtual_state.ghostdag_data.selected_parent;
 
         self.thread_pool.install(|| {
             mutable_txs
@@ -1573,6 +1607,7 @@ impl VirtualStateProcessor {
                         &virtual_utxo_view,
                         virtual_daa_score,
                         virtual_past_median_time,
+                        sink,
                         args.get(&mtx.id()),
                     )
                 })

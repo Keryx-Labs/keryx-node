@@ -529,6 +529,15 @@ async fn sanity_test() {
                 })
             }
 
+            KaspadPayloadOps::GetNetworkModelAvailability => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response =
+                        rpc_client.get_network_model_availability_call(None, GetNetworkModelAvailabilityRequest {}).await.unwrap();
+                    assert!(!response.available);
+                })
+            }
+
             KaspadPayloadOps::GetCoinSupply => {
                 let rpc_client = client.clone();
                 tst!(op, {

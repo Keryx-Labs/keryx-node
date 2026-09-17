@@ -1156,6 +1156,28 @@ mod mockery {
 
     test!(GetServiceStrikesResponse);
 
+    impl Mock for GetNetworkModelAvailabilityRequest {
+        fn mock() -> Self {
+            GetNetworkModelAvailabilityRequest {}
+        }
+    }
+
+    test!(GetNetworkModelAvailabilityRequest);
+
+    impl Mock for GetNetworkModelAvailabilityResponse {
+        fn mock() -> Self {
+            GetNetworkModelAvailabilityResponse {
+                virtual_daa_score: mock(),
+                model_id: mock(),
+                active: true,
+                available: false,
+                shards: vec![RpcShardAvailability { tier: 6, vram_gb: 8, producers: 0 }, RpcShardAvailability { tier: 7, vram_gb: 12, producers: 3 }],
+            }
+        }
+    }
+
+    test!(GetNetworkModelAvailabilityResponse);
+
     impl Mock for GetCoinSupplyResponse {
         fn mock() -> Self {
             GetCoinSupplyResponse { max_sompi: mock(), circulating_sompi: mock() }

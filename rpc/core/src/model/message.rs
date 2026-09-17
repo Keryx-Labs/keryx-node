@@ -1957,6 +1957,69 @@ pub struct RpcServiceStrikeTotal {
     pub strikes: u32,
 }
 
+/// Eligible producers of one shard tier of the network model at the virtual.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcShardAvailability {
+    pub tier: u8,
+    pub vram_gb: u64,
+    pub producers: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetNetworkModelAvailabilityRequest {}
+
+impl Serializer for GetNetworkModelAvailabilityRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetNetworkModelAvailabilityRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        Ok(Self {})
+    }
+}
+
+/// Whether the network can assemble its model right now: `available` iff every shard tier has
+/// at least one eligible producer. `shards` is empty before the model-split activation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetNetworkModelAvailabilityResponse {
+    pub virtual_daa_score: u64,
+    pub model_id: RpcHash,
+    pub active: bool,
+    pub available: bool,
+    pub shards: Vec<RpcShardAvailability>,
+}
+
+impl Serializer for GetNetworkModelAvailabilityResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.virtual_daa_score, writer)?;
+        store!(RpcHash, &self.model_id, writer)?;
+        store!(bool, &self.active, writer)?;
+        store!(bool, &self.available, writer)?;
+        store!(Vec<RpcShardAvailability>, &self.shards, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetNetworkModelAvailabilityResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let virtual_daa_score = load!(u64, reader)?;
+        let model_id = load!(RpcHash, reader)?;
+        let active = load!(bool, reader)?;
+        let available = load!(bool, reader)?;
+        let shards = load!(Vec<RpcShardAvailability>, reader)?;
+        Ok(Self { virtual_daa_score, model_id, active, available, shards })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetServiceStrikesRequest {}

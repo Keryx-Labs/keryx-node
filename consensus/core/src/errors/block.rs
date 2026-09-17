@@ -195,6 +195,9 @@ pub enum RuleError {
     #[error("AiResponse tx {0} carries pipeline links (v3) before the model-split activation")]
     AiResponseLinksBeforeActivation(TransactionId),
 
+    #[error("AiAvail tx {0} before the model-split activation")]
+    AiAvailBeforeActivation(TransactionId),
+
     #[error("AiRequest tx {0} max_tokens {1} exceeds the cap {2}")]
     AiRequestMaxTokensExceeded(TransactionId, u32, u32),
 

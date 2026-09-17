@@ -452,6 +452,22 @@ from!(item: RpcResult<&keryx_rpc_core::GetServiceStrikesResponse>, protowire::Ge
     }
 });
 
+from!(&keryx_rpc_core::GetNetworkModelAvailabilityRequest, protowire::GetNetworkModelAvailabilityRequestMessage);
+from!(item: RpcResult<&keryx_rpc_core::GetNetworkModelAvailabilityResponse>, protowire::GetNetworkModelAvailabilityResponseMessage, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        model_id: item.model_id.to_string(),
+        active: item.active,
+        available: item.available,
+        shards: item
+            .shards
+            .iter()
+            .map(|s| protowire::ShardAvailabilityMessage { tier: s.tier as u32, vram_gb: s.vram_gb, producers: s.producers })
+            .collect(),
+        error: None,
+    }
+});
+
 from!(item: &keryx_rpc_core::GetDaaScoreTimestampEstimateRequest, protowire::GetDaaScoreTimestampEstimateRequestMessage, {
     Self {
         daa_scores: item.daa_scores.clone()
@@ -1034,6 +1050,21 @@ try_from!(item: &protowire::GetServiceStrikesResponseMessage, RpcResult<keryx_rp
             .iter()
             .map(|t| Ok(keryx_rpc_core::RpcServiceStrikeTotal { miner: RpcHash::from_str(&t.miner)?, strikes: t.strikes }))
             .collect::<RpcResult<Vec<_>>>()?,
+    }
+});
+
+try_from!(&protowire::GetNetworkModelAvailabilityRequestMessage, keryx_rpc_core::GetNetworkModelAvailabilityRequest);
+try_from!(item: &protowire::GetNetworkModelAvailabilityResponseMessage, RpcResult<keryx_rpc_core::GetNetworkModelAvailabilityResponse>, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        model_id: RpcHash::from_str(&item.model_id)?,
+        active: item.active,
+        available: item.available,
+        shards: item
+            .shards
+            .iter()
+            .map(|s| keryx_rpc_core::RpcShardAvailability { tier: s.tier as u8, vram_gb: s.vram_gb, producers: s.producers })
+            .collect(),
     }
 });
 
