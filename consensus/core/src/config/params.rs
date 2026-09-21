@@ -748,6 +748,71 @@ pub const NETWORK_MODEL_HEAD_TIER: u8 = NETWORK_MODEL_TIER + NETWORK_MODEL_SHARD
 /// its signer's share of a served request's reward.
 pub const NETWORK_MODEL_SHARD_VRAM_GB: [u64; 6] = [8, 12, 12, 16, 24, 32];
 
+/// Bench network model (devnet): Qwen3.5-9B, the H6 tier-0 model, cut in two shards, so the
+/// whole pipeline — declarations, links, V3 response, reward split — runs on one card.
+/// `model_id` of each shard = CIDv0[2..34] of the shard GGUF.
+pub const SPLIT9B_SHARD_0_MODEL_ID: [u8; 32] = [
+    0x8d, 0xba, 0x34, 0xd0, 0x28, 0x5b, 0xe2, 0x87, 0xf0, 0x22, 0xda, 0xd0, 0xf3, 0x3e, 0xa5, 0x88,
+    0xc8, 0x36, 0x94, 0xd4, 0x83, 0x59, 0x60, 0x8c, 0xc8, 0xd4, 0x74, 0x24, 0x26, 0x76, 0xf2, 0x79,
+];
+pub const SPLIT9B_SHARD_1_MODEL_ID: [u8; 32] = [
+    0xa1, 0x98, 0xfe, 0x36, 0x9a, 0x63, 0xde, 0x8d, 0x75, 0xc5, 0xeb, 0x4a, 0x46, 0xa8, 0x24, 0xe0,
+    0x20, 0x55, 0x4a, 0xc2, 0x65, 0x48, 0xad, 0x68, 0x8c, 0x90, 0xa9, 0x60, 0xdb, 0x52, 0x49, 0x2e,
+];
+
+/// Bench network model id. It must differ from every lineup tier's: a request is mapped to its
+/// tier by the first table entry carrying its `model_id`, so reusing the 9B's id here would
+/// resolve a network-model request to lineup tier 0 and drop it. Value: the digest of the
+/// packed head, unique to this bench.
+pub const SPLIT9B_WHOLE_MODEL_ID: [u8; 32] = [
+    0x1f, 0x22, 0xb2, 0x13, 0x3c, 0x40, 0xb1, 0x6d, 0x0b, 0xa1, 0x5d, 0xff, 0xb4, 0x82, 0x3f, 0x88,
+    0x9b, 0x76, 0xeb, 0x83, 0x4f, 0xe6, 0xc9, 0x0d, 0xed, 0xc6, 0xa3, 0x8d, 0x50, 0x4a, 0x46, 0xcb,
+];
+
+/// The H6 floors plus the bench network model, whose floor is the 9B's.
+pub const INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B: &[([u8; 32], u64)] = &[
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  100_000_000),
+    (GLM_4_9B_0414_MODEL_ID,           150_000_000),
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 200_000_000),
+    (QWEN3_6_27B_MODEL_ID,             250_000_000),
+    (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),
+    (SPLIT9B_WHOLE_MODEL_ID,           100_000_000),
+];
+
+/// Bench shards: layers 0-15 and 16-31, the second one being the head shard.
+pub const NETWORK_MODEL_SHARDS_SPLIT9B: &[([u8; 32], u32, u32)] =
+    &[(SPLIT9B_SHARD_0_MODEL_ID, 0, 15), (SPLIT9B_SHARD_1_MODEL_ID, 16, 31)];
+
+/// Bench H14 tier set: the H6 lineup, the 9B as network model (its H6 anchor), two shards.
+pub const POM_TIERS_H14_SPLIT9B: &[crate::pom::PomTier] = &[
+    POM_TIERS_H6[0],
+    POM_TIERS_H6[1],
+    POM_TIERS_H6[2],
+    POM_TIERS_H6[3],
+    POM_TIERS_H6[4],
+    crate::pom::PomTier { model_id: SPLIT9B_WHOLE_MODEL_ID, root: POM_TIERS_H6[0].root, chunks: POM_TIERS_H6[0].chunks },
+    crate::pom::PomTier {
+        model_id: SPLIT9B_SHARD_0_MODEL_ID,
+        root: [
+            0x16, 0x48, 0x26, 0xf1, 0x91, 0xdf, 0x42, 0x79, 0xe4, 0xfe, 0x2d, 0x53, 0x62, 0x8b, 0xc3, 0xf6,
+            0x1b, 0xb5, 0xad, 0xf3, 0x1c, 0x09, 0xaa, 0xfb, 0xd2, 0x48, 0x7e, 0x17, 0x09, 0x6c, 0x57, 0xb5,
+        ],
+        chunks: 77_797_920,
+    },
+    crate::pom::PomTier {
+        model_id: SPLIT9B_SHARD_1_MODEL_ID,
+        root: [
+            0x68, 0x7c, 0xfd, 0xe0, 0x0e, 0xc1, 0xb5, 0xef, 0xf2, 0x8c, 0x33, 0x6b, 0x86, 0xbb, 0xaf, 0x1f,
+            0xea, 0x99, 0x0b, 0x45, 0x9a, 0xec, 0xe7, 0xff, 0xf0, 0xac, 0xf1, 0x7b, 0x60, 0xc8, 0x31, 0xa4,
+        ],
+        chunks: 77_745_696,
+    },
+];
+
+pub const TIER_REWARD_BPS_H14_SPLIT9B: [u64; 8] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 6_000];
+
+pub const NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B: [u64; 2] = [8, 8];
+
 /// The network model of one network: its H14 tier table (lineup, whole model, shards), the
 /// matching reward schedule and request minimums, and the card class of each shard.
 #[derive(Debug)]
@@ -792,6 +857,14 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     reward_bps: &TIER_REWARD_BPS_H14,
     minimums: INFERENCE_REWARD_MINIMUMS_V2_H14,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
+};
+
+/// The 9B already has its H6 floor (1 KRX), so the H6 minimums serve the bench model too.
+pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
+    tiers: POM_TIERS_H14_SPLIT9B,
+    reward_bps: &TIER_REWARD_BPS_H14_SPLIT9B,
+    minimums: INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B,
+    shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -2280,7 +2353,7 @@ pub const DEVNET_PARAMS: Params = Params {
     max_block_level: 250,
     pruning_proof_m: 1000,
 
-    blockrate: BlockrateParams::new::<10>(),
+    blockrate: BlockrateParams::new::<10>().with_depths(6_000, 33_000, 6_000).with_sample_rates(10, 4),
 
     pre_crescendo_target_time_per_block: TenBps::target_time_per_block(),
 
@@ -2291,50 +2364,50 @@ pub const DEVNET_PARAMS: Params = Params {
     opoi_v2_activation: ForkActivation::always(),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
     // PoM possession: dormant until miner emission (§6) + P2P transport land; flip with §7.
-    pom_activation: ForkActivation::never(),
-    very_light_activation: ForkActivation::never(),
-    pom_level_activation: ForkActivation::never(),
-    inference_min_h2_activation: ForkActivation::never(),
+    pom_activation: ForkActivation::new(1),
+    very_light_activation: ForkActivation::new(0),
+    pom_level_activation: ForkActivation::new(1),
+    inference_min_h2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2_h2: INFERENCE_REWARD_MINIMUMS_V2_H2,
-    pow_salt_v2_activation: ForkActivation::never(),
-    pow_salt_v4_activation: ForkActivation::never(),
-    pom_maxlevel_v4_activation: ForkActivation::never(),
-    pom_v4_activation: ForkActivation::never(),
-    h10_activation: ForkActivation::never(),
-    ratio_reward_activation: ForkActivation::never(),
+    pow_salt_v2_activation: ForkActivation::new(0),
+    pow_salt_v4_activation: ForkActivation::new(0),
+    pom_maxlevel_v4_activation: ForkActivation::new(1),
+    pom_v4_activation: ForkActivation::new(1),
+    h10_activation: ForkActivation::new(1),
+    ratio_reward_activation: ForkActivation::new(0),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
     difficulty_reset_activation: ForkActivation::never(),
     difficulty_reset_activation_h4: ForkActivation::never(),
     difficulty_reset_activation_h5: ForkActivation::never(),
     difficulty_reset_activation_h5_3: ForkActivation::never(),
     difficulty_reset_activation_h5_4: ForkActivation::never(),
-    difficulty_reset_activation_h6: ForkActivation::never(),
-    difficulty_reset_activation_v4: ForkActivation::never(),
-    h6_reset_bits: None,
+    difficulty_reset_activation_h6: ForkActivation::new(1),
+    difficulty_reset_activation_v4: ForkActivation::new(1),
+    h6_reset_bits: Some(0x1f7fffff),
     difficulty_reset_activation_h9: ForkActivation::never(),
     h9_reset_bits: None,
-    h5_activation: ForkActivation::never(),
-    h5_1_activation: ForkActivation::never(),
-    h5_2_activation: ForkActivation::never(),
-    pom_v3_activation: ForkActivation::never(),
-    service_bond_v2_activation: ForkActivation::never(),
-    reward_routing_activation: ForkActivation::never(),
-    service_ledger_activation: ForkActivation::never(),
-    production_index_activation: ForkActivation::never(),
-    exact_verification_activation: ForkActivation::never(),
-    model_split_activation: ForkActivation::never(),
-    network_model: &NETWORK_MODEL_MAINNET,
-    service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
+    h5_activation: ForkActivation::new(0),
+    h5_1_activation: ForkActivation::new(0),
+    h5_2_activation: ForkActivation::new(0),
+    pom_v3_activation: ForkActivation::new(1),
+    service_bond_v2_activation: ForkActivation::new(0),
+    reward_routing_activation: ForkActivation::new(0),
+    service_ledger_activation: ForkActivation::new(1),
+    production_index_activation: ForkActivation::new(500),
+    exact_verification_activation: ForkActivation::new(1),
+    model_split_activation: ForkActivation::new(1_000),
+    network_model: &NETWORK_MODEL_SPLIT9B,
+    service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
-    ratio_reward_window: RATIO_REWARD_WINDOW,
-    ratio_reward_window_daa: RATIO_REWARD_WINDOW_DAA,
+    ratio_reward_window: 1_000,
+    ratio_reward_window_daa: 1_000,
 
     // Coin-age holder-reward (v3): DORMANT until the H4 hard fork is scheduled. The whole
     // machinery (effective_daa UtxoEntry field, bucket indexes, maturation queue) gates here.
-    coin_age_activation: ForkActivation::never(),
-    coin_age_verification_activation: ForkActivation::never(),
-    coin_age_maturity_w: COIN_AGE_MATURITY_W,
+    coin_age_activation: ForkActivation::new(0),
+    coin_age_verification_activation: ForkActivation::new(0),
+    coin_age_maturity_w: 2_000,
 };
 
 #[cfg(test)]
