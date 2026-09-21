@@ -1104,7 +1104,12 @@ impl VirtualStateProcessor {
     }
 
     /// Window-relative hash of the production-index snapshot at `sample` (`service_commitment_v4`).
+    /// Genesis carries the empty index, as it does for the canonical hash: a chain whose pruning
+    /// point is still genesis has no sample to hold, and without this it can build no template.
     pub(super) fn production_index_relative_hash_at(&self, sample: Hash) -> Option<Hash> {
+        if sample == self.genesis.hash {
+            return Some(ProductionIndexSnapshot::default().relative_hash());
+        }
         self.production_index_hashes.read().get(&sample).map(|(_, relative)| *relative)
     }
 
