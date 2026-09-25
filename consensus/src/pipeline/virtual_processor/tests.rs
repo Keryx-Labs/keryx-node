@@ -426,6 +426,39 @@ async fn private_response_body_is_gated_at_mempool_admission() {
     }
 }
 
+/// Private inference: before `private_inference_activation` a block carrying an AiResponse with an
+/// inline body is Invalid, the verdict a node without private inference reaches in isolation; at/after
+/// it the block is accepted.
+#[tokio::test]
+async fn private_response_body_invalidates_the_block_before_the_gate() {
+    use crate::errors::RuleError;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_inference::AiResponder;
+
+    for (gate, accepted) in [(ForkActivation::never(), false), (ForkActivation::always(), true)] {
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::always();
+        params.private_inference_activation = gate;
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let handles = tc.init();
+
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let payload = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder).with_private_body(vec![0xAB; 64]).serialize();
+        let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload);
+        let block: Hash = 1u64.into();
+        let result = tc.add_utxo_valid_block_with_parents(block, vec![config.genesis.hash], vec![tx]).await;
+        if accepted {
+            assert_eq!(result.unwrap(), BlockStatus::StatusUTXOValid);
+        } else {
+            assert!(matches!(result, Err(RuleError::AiResponseBodyBeforeActivation(_))), "{result:?}");
+            assert_eq!(tc.get_block_status(block), Some(BlockStatus::StatusInvalid));
+        }
+
+        tc.shutdown(handles);
+    }
+}
+
 // OPoI slashing removed (v1.2.3): the slash-behavior tests (fraud→slash, honest→no-slash,
 // unknown→no-slash, outside-window→no-slash) were dropped together with the slashing mechanism.
 // Escrows are now always spendable; there is no slash state to assert.

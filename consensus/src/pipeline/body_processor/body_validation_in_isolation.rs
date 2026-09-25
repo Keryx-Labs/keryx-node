@@ -32,6 +32,7 @@ impl BlockBodyProcessor {
         Self::check_only_one_coinbase(block)?;
         self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
+        self.check_ai_response_body_era(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
@@ -99,6 +100,20 @@ impl BlockBodyProcessor {
         for tx in block.transactions.iter() {
             if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx) {
                 return Err(RuleError::TxInIsolationValidationFailed(tx.id(), e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Before the private-inference gate an AiResponse longer than the signed V2 form invalidates
+    /// the block, trusted blocks included.
+    fn check_ai_response_body_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        if self.private_inference_activation.is_active(block.header.daa_score) {
+            return Ok(());
+        }
+        for tx in block.transactions.iter().skip(1) {
+            if tx.is_ai_response() && tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
+                return Err(RuleError::AiResponseBodyBeforeActivation(tx.id()));
             }
         }
         Ok(())
