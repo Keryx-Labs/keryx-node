@@ -1280,6 +1280,12 @@ pub struct Params {
     /// accepted responder once the win is finality-deep. Changes coinbase validation and the
     /// sealed service state — must be armed above every live tip before the binary ships.
     pub reward_routing_activation: ForkActivation,
+    /// Private inference: an AiRequest whose prompt is a private-inference envelope (sealed to
+    /// named responder escrow keys) restricts its audit cohort, credit and vault to those
+    /// responders, and a signed AiResponse may carry the sealed answer inline. Changes the audit
+    /// fold, hence the sealed service state, and admits longer response payloads — must be armed
+    /// above every live tip before the binary ships. `never()` = dormant.
+    pub private_inference_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1550,6 +1556,7 @@ impl Params {
             pom_v3_activation: self.pom_v3_activation,
             service_bond_v2_activation: self.service_bond_v2_activation,
             reward_routing_activation: self.reward_routing_activation,
+            private_inference_activation: self.private_inference_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -1761,6 +1768,9 @@ pub const MAINNET_PARAMS: Params = Params {
     // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
+    // Private inference — dormant until scheduled: arm ABOVE the live mainnet tip, together with
+    // a miner release that opens private envelopes (see docs/private-inference.md).
+    private_inference_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -1890,6 +1900,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // flipping it below already-folded history splits the testnet.
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(0),
+    // Private inference — arm ABOVE the live testnet tip before deploying: the fold is sealed,
+    // flipping it below already-folded history splits the testnet.
+    private_inference_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -1983,6 +1996,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pom_v3_activation: ForkActivation::never(),
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
+    private_inference_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2070,6 +2084,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pom_v3_activation: ForkActivation::never(),
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
+    private_inference_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),

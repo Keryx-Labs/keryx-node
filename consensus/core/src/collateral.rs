@@ -121,14 +121,21 @@ pub fn verify_escrow_delegation(payout_version: u16, payout_script: &[u8], escro
 /// Domain separator of the V2 AiResponse responder signature.
 pub const RESPONDER_SIG_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
 
-/// Verifies a V2 responder signature: schnorr by `escrow_pubkey` over the domain-tagged
-/// blake2b-256 of the v1 payload bytes.
-pub fn verify_responder_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+/// The message a V2 responder signs: the domain-tagged blake2b-256 of the payload's signed
+/// bytes (`AiResponsePayload::signed_bytes`).
+pub fn responder_signature_message(signed_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
     hasher.update(RESPONDER_SIG_DOMAIN);
     hasher.update(signed_bytes);
     let mut msg = [0u8; 32];
     msg.copy_from_slice(hasher.finalize().as_bytes());
+    msg
+}
+
+/// Verifies a V2 responder signature: schnorr by `escrow_pubkey` over
+/// [`responder_signature_message`] of the payload's signed bytes.
+pub fn verify_responder_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+    let msg = responder_signature_message(signed_bytes);
     let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(escrow_pubkey) else {
         return false;
     };
@@ -330,6 +337,23 @@ pub struct ServiceStrikesSnapshot {
     pub lifetime_strikes: Vec<(Hash, u32)>,
 }
 
+/// One service-eligible identity of a tier at the current sink: the miner (payout-SPK key), the
+/// escrow key it announces — what a private request is sealed to — and the tier it proved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceProvider {
+    pub tier: u8,
+    pub model_id: [u8; 32],
+    pub identity: Hash,
+    pub escrow_pubkey: [u8; 32],
+}
+
+/// Display snapshot of the currently eligible responders per tier (`getServiceProviders`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServiceProvidersSnapshot {
+    pub virtual_daa_score: u64,
+    pub providers: Vec<ServiceProvider>,
+}
+
 /// One escrow claim of a miner: a CSV-locked coinbase escrow output he can claim after the lock,
 /// unless burned by a service penalty first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,6 +392,11 @@ struct PendingRequest {
     /// gap where no audit exists yet to credit them. Drained into `responded` when the audit arms.
     /// Bounded by the AiResponses of a single chain block's acceptance data, then cleared.
     early_responders: Vec<Hash>,
+    /// Private inference: the escrow keys (sorted, deduplicated) the requester sealed the prompt
+    /// to; empty for a public request. A private request's audit cohort is the eligible tier set
+    /// restricted to these keys, so only a named responder is obligated to answer, credited when
+    /// it does, and paid the vault.
+    recipients: Vec<Hash>,
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
@@ -514,7 +543,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, &[], responses, escrows, &[], None, is_established, cohort)
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block`] with the reward-routing inputs: per-request vaulted amounts and
@@ -531,7 +560,25 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, None, is_established, cohort)
+    }
+
+    /// [`Self::on_chain_block_with_rewards`] with the private-inference input: per-request
+    /// recipient sets (sorted escrow keys). A request absent here, or with an empty set, is public.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_with_recipients(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        request_recipients: &[([u8; 32], Vec<Hash>)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        is_established: impl Fn(&Hash) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) -> FoldOutcome {
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, None, is_established, cohort)
     }
 
     /// Folds a chain block whose strike events are already persisted (daa at or below the store
@@ -547,7 +594,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, &[], responses, escrows, &[], Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], Some(is_burned), |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup`] with the reward-routing inputs.
@@ -563,7 +610,24 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, responses, escrows, producers, Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, Some(is_burned), |_| true, cohort);
+    }
+
+    /// [`Self::on_chain_block_warmup_with_rewards`] with the private-inference input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_warmup_with_recipients(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        request_recipients: &[([u8; 32], Vec<Hash>)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) {
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, Some(is_burned), |_| true, cohort);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -572,6 +636,7 @@ impl ServiceLedger {
         daa: u64,
         requests: &[([u8; 32], u8, u32)],
         request_rewards: &[([u8; 32], u64)],
+        request_recipients: &[([u8; 32], Vec<Hash>)],
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
@@ -641,6 +706,7 @@ impl ServiceLedger {
                 winner: None,
                 audit: None,
                 early_responders: Vec::new(),
+                recipients: request_recipients.iter().find(|(h, _)| h == rh).map(|(_, r)| r.clone()).unwrap_or_default(),
             });
             // Answers that beat their own request to acceptance.
             if entry.audit.is_none() {
@@ -741,7 +807,14 @@ impl ServiceLedger {
                 }
                 Some(_) => {}
                 None if daa > req.accepted_daa => {
-                    let set = cohort(req.tier);
+                    let mut set = cohort(req.tier);
+                    // A private request obligates (and pays) only the responders it was sealed
+                    // to: the rest of the tier cannot read it, so they are neither audited for
+                    // it nor able to claim its vault. Named responders outside the eligible set
+                    // are simply absent; none eligible = unservable, exactly like an empty tier.
+                    if !req.recipients.is_empty() {
+                        set.retain(|(_, escrow)| req.recipients.binary_search(escrow).is_ok());
+                    }
                     if set.is_empty() {
                         self.pending.remove(&rh);
                     } else {
@@ -821,6 +894,19 @@ impl ServiceLedger {
     /// The miner's still-locked escrow claims, chain order (newest last).
     pub fn vault_claims(&self, miner: &Hash) -> Vec<EscrowClaim> {
         self.vault.get(miner).map(|claims| claims.iter().copied().collect()).unwrap_or_default()
+    }
+
+    /// The private-inference recipients of a pending request: `Some(sorted escrow keys)` while
+    /// the request is pending and was sealed to named responders; `None` when it is unknown,
+    /// expired or public. Mempool admission reads it to accept an inline response body only
+    /// from a named responder of a live private request.
+    pub fn private_recipients(&self, request_hash: &[u8; 32]) -> Option<&[Hash]> {
+        self.pending.get(request_hash).filter(|r| !r.recipients.is_empty()).map(|r| r.recipients.as_slice())
+    }
+
+    /// The armed audit cohort (sorted identities) of a pending request, if armed. Diagnostics.
+    pub fn audit_cohort(&self, request_hash: &[u8; 32]) -> Option<Vec<Hash>> {
+        self.pending.get(request_hash).and_then(|r| r.audit.as_ref()).map(|a| a.cohort.clone())
     }
 
     /// Installs the persisted strike baseline the delta folds over (the store content at the
@@ -979,6 +1065,11 @@ pub struct ServiceLedgerSnapshot {
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
+/// Encoding 1 plus a trailing private-recipient section (`[n: u32] n × [request_hash: 32]
+/// [k: u32] [k × escrow key: 32]`, pending order, ascending keys). Emitted only when a pending
+/// request carries recipients, so every snapshot without one keeps its historical bytes and
+/// hash, and one byte form per state keeps the encoding canonical.
+const SNAPSHOT_ENCODING_VERSION_PRIVATE: u8 = 2;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1050,7 +1141,9 @@ impl ServiceLedgerSnapshot {
     /// Canonical byte form; the input of [`Self::hash`] and of the sync transfer.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(SNAPSHOT_ENCODING_VERSION);
+        let private: Vec<(&[u8; 32], &Vec<Hash>)> =
+            self.pending.iter().filter(|(_, r)| !r.recipients.is_empty()).map(|(rh, r)| (rh, &r.recipients)).collect();
+        out.push(if private.is_empty() { SNAPSHOT_ENCODING_VERSION } else { SNAPSHOT_ENCODING_VERSION_PRIVATE });
         out.extend_from_slice(&(self.vault.len() as u32).to_le_bytes());
         for (miner, claims) in self.vault.iter() {
             out.extend_from_slice(&miner.as_bytes());
@@ -1128,13 +1221,21 @@ impl ServiceLedgerSnapshot {
             out.push(*tier);
             out.extend_from_slice(&escrow.as_bytes());
         }
+        if !private.is_empty() {
+            out.extend_from_slice(&(private.len() as u32).to_le_bytes());
+            for (rh, recipients) in private {
+                out.extend_from_slice(rh);
+                put_hashes(&mut out, recipients);
+            }
+        }
         out
     }
 
     /// Parses [`Self::to_bytes`] output; rejects malformed, unordered or trailing data.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { bytes, pos: 0 };
-        if r.u8()? != SNAPSHOT_ENCODING_VERSION {
+        let version = r.u8()?;
+        if version != SNAPSHOT_ENCODING_VERSION && version != SNAPSHOT_ENCODING_VERSION_PRIVATE {
             return Err("unsupported snapshot encoding".into());
         }
         let mut snap = Self::default();
@@ -1184,7 +1285,7 @@ impl ServiceLedgerSnapshot {
                 _ => return Err("malformed audit".into()),
             };
             let early_responders = r.hashes()?;
-            let req = PendingRequest { tier, max_tokens, accepted_daa, reward, winner, audit, early_responders };
+            let req = PendingRequest { tier, max_tokens, accepted_daa, reward, winner, audit, early_responders, recipients: Vec::new() };
             if snap.pending.insert(rh, req).is_some() {
                 return Err("malformed pending".into());
             }
@@ -1240,6 +1341,23 @@ impl ServiceLedgerSnapshot {
             let tier = r.u8()?;
             let escrow = r.hash()?;
             snap.recent_producers.push((daa, id, tier, escrow));
+        }
+        if version == SNAPSHOT_ENCODING_VERSION_PRIVATE {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty private section".into());
+            }
+            for _ in 0..n {
+                let rh = r.key()?;
+                let keys = r.hashes()?;
+                if keys.is_empty() || keys.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err("malformed private recipients".into());
+                }
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if req.recipients.is_empty() => req.recipients = keys,
+                    _ => return Err("malformed private section".into()),
+                }
+            }
         }
         if r.pos != bytes.len() {
             return Err("trailing bytes".into());
@@ -1522,6 +1640,60 @@ impl ServiceLedger {
 mod tests {
 
     #[test]
+    fn snapshot_encodes_private_recipients_in_a_versioned_trailer() {
+        use crate::collateral::{ServiceLedger, ServiceLedgerSnapshot};
+        use keryx_hashes::Hash;
+        let b = Hash::from_u64_word(2);
+        let public = [1u8; 32];
+        let private = [2u8; 32];
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        ledger.on_chain_block_with_recipients(
+            100,
+            &[(public, 0, 1), (private, 0, 1)],
+            &[],
+            &[(private, vec![b])],
+            &[],
+            &[],
+            &[],
+            |_| true,
+            |_| vec![(b, b)],
+        );
+        let snap = ledger.snapshot();
+        let bytes = snap.to_bytes();
+        assert_eq!(bytes[0], 2);
+        let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, snap);
+        let mut restored = ServiceLedger::default();
+        restored.restore_snapshot(&parsed);
+        assert_eq!(restored.private_recipients(&private), Some(&[b][..]));
+        assert_eq!(restored.private_recipients(&public), None);
+
+        // Without private requests the encoding is the historical one, byte for byte.
+        let mut plain = ServiceLedger::default();
+        plain.set_window_v2_activation(0);
+        plain.set_reward_routing_activation(0);
+        plain.on_chain_block_with_recipients(100, &[(public, 0, 1)], &[], &[], &[], &[], &[], |_| true, |_| vec![(b, b)]);
+        let plain_bytes = plain.snapshot().to_bytes();
+        assert_eq!(plain_bytes[0], 1);
+        assert!(ServiceLedgerSnapshot::from_bytes(&plain_bytes).is_ok());
+
+        // A version-2 header without a trailer, or a trailer naming an unknown request, is rejected.
+        let mut bad = plain_bytes.clone();
+        bad[0] = 2;
+        assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
+        let mut bad = bytes.clone();
+        let at = bytes.len() - 32 - 4 - 32; // the request hash of the single trailer entry
+        bad[at] ^= 0xFF;
+        assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
+        // A version-1 header on bytes that carry a trailer is trailing data.
+        let mut bad = bytes.clone();
+        bad[0] = 1;
+        assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
+    }
+
+    #[test]
     fn persisted_baselines_replace_the_restored_strike_state() {
         use crate::collateral::{ServiceLedger, ServiceLedgerSnapshot, StrikeEntry};
         use keryx_hashes::Hash;
@@ -1684,6 +1856,121 @@ mod tests {
         assert!(ledger.on_chain_block(103, &[], &[(rh, Some(a))], &[], |_| true, cohort_of(&set)).misses.is_empty());
         assert!(ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, cohort_of(&set)).misses.is_empty());
         assert_eq!(ledger.pending_len(), 0);
+    }
+
+    /// Private inference: a request sealed to named responders audits, credits and pays only
+    /// those responders. A non-recipient's signed answer counts for nothing, nobody outside the
+    /// recipient set is struck when the window closes, and the recipient wins the vault.
+    #[test]
+    fn private_request_restricts_the_cohort_to_its_recipients() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let c = Hash::from_bytes([3u8; 32]);
+        let set = [a, b, c];
+        let spk_b = crate::tx::ScriptPublicKey::from_vec(0, vec![0xBB; 34]);
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let w = service_window_daa_at(0, 256, true);
+
+        let rh = [7u8; 32];
+        let out = ledger.on_chain_block_with_recipients(
+            100,
+            &[(rh, 0, 256)],
+            &[(rh, 5_000)],
+            &[(rh, vec![b])],
+            &[],
+            &[],
+            &[(b, spk_b.clone())],
+            |_| true,
+            cohort_of(&set),
+        );
+        assert!(out.misses.is_empty() && out.rewards.is_empty());
+        assert_eq!(ledger.private_recipients(&rh), Some(&[b][..]));
+        assert_eq!(ledger.audit_cohort(&rh), None);
+        // Arms with the recipient alone.
+        ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(ledger.audit_cohort(&rh), Some(vec![b]));
+        // A non-recipient's authenticated answer is ignored: no reward.
+        let out = ledger.on_chain_block_with_recipients(102, &[], &[], &[], &[(rh, Some(a))], &[], &[], |_| true, cohort_of(&set));
+        assert!(out.rewards.is_empty());
+        // The recipient answers and wins the vault.
+        let out = ledger.on_chain_block_with_recipients(103, &[], &[], &[], &[(rh, Some(b))], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(out.rewards, vec![ServiceReward { request_hash: rh, winner: b, amount: 5_000, spk: Some(spk_b) }]);
+        // Window close: nobody is struck for a request they could not read.
+        let out = ledger.on_chain_block_with_recipients(102 + w, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
+        assert!(out.misses.is_empty());
+        assert_eq!(ledger.pending_len(), 0);
+        assert_eq!(ledger.private_recipients(&rh), None);
+    }
+
+    /// A silent named responder is struck like any silent cohort member; the rest of the tier
+    /// is not.
+    #[test]
+    fn private_request_to_a_silent_recipient_strikes_only_that_recipient() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let set = [a, b];
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let w = service_window_daa_at(0, 256, true);
+        let rh = [8u8; 32];
+        ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[], &[(rh, vec![b])], &[], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
+        let out = ledger.on_chain_block_with_recipients(102 + w, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(out.misses.iter().map(|m| m.miner).collect::<Vec<_>>(), vec![b]);
+        assert_eq!(ledger.consecutive_misses(&b), 1);
+        assert_eq!(ledger.consecutive_misses(&a), 0);
+    }
+
+    /// A private request whose recipients are all outside the eligible set is unservable: it is
+    /// dropped at arming, exactly like a request for an empty tier, and strikes nobody.
+    #[test]
+    fn private_request_to_an_ineligible_recipient_is_unservable() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let set = [a];
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let rh = [9u8; 32];
+        ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[], &[(rh, vec![b])], &[], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(ledger.pending_len(), 1);
+        let out = ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
+        assert!(out.misses.is_empty());
+        assert_eq!(ledger.pending_len(), 0);
+        // An answer from the non-recipient afterwards is a stray response: nothing to credit.
+        let out = ledger.on_chain_block_with_recipients(102, &[], &[], &[], &[(rh, Some(a))], &[], &[], |_| true, cohort_of(&set));
+        assert!(out.rewards.is_empty());
+    }
+
+    /// An answer that lands before the audit arms is credited through the same recipient filter
+    /// as a live one: a non-recipient's early answer earns nothing, a recipient's wins.
+    #[test]
+    fn early_private_answers_pass_the_recipient_filter() {
+        let a = Hash::from_bytes([1u8; 32]);
+        let b = Hash::from_bytes([2u8; 32]);
+        let set = [a, b];
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let rh = [10u8; 32];
+        // Both answer in the request's own block: only b's answer survives arming.
+        ledger.on_chain_block_with_recipients(
+            100,
+            &[(rh, 0, 256)],
+            &[(rh, 1_000)],
+            &[(rh, vec![b])],
+            &[(rh, Some(a)), (rh, Some(b))],
+            &[],
+            &[],
+            |_| true,
+            cohort_of(&set),
+        );
+        let out = ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
+        assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![b]);
+        assert_eq!(ledger.audit_cohort(&rh), Some(vec![b]));
     }
 
     /// H8 routing: the first identity credited with an accepted response wins the reward,

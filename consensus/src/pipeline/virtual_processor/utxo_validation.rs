@@ -6,7 +6,8 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
+            AiRequestMaxTokensExceeded, AiResponseBodyBeforeActivation, AiResponseModelCapMissing, AiResponseV2BeforeActivation,
+            BadAcceptedIDMerkleRoot,
             BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot, MissingServiceLedgerSnapshot,
             WrongHeaderPruningPoint,
         },
@@ -552,6 +553,17 @@ impl VirtualStateProcessor {
                             return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
                         }
                     }
+                }
+            }
+        }
+
+        // Private inference: an AiResponse may carry the sealed answer inline (a payload longer
+        // than the signed V2 form) only at/after the gate. Before it every deployed node accepts
+        // the two exact lengths alone, so this is the rule an un-upgraded node enforces anyway.
+        if !self.private_inference_activation.is_active(header.daa_score) {
+            for tx in txs.iter().skip(1) {
+                if tx.is_ai_response() && tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
+                    return Err(AiResponseBodyBeforeActivation(tx.id()));
                 }
             }
         }

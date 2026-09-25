@@ -991,6 +991,28 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         })
     }
 
+    async fn get_service_providers_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _: GetServiceProvidersRequest,
+    ) -> RpcResult<GetServiceProvidersResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let snapshot = session.get_service_providers();
+        Ok(GetServiceProvidersResponse {
+            virtual_daa_score: snapshot.virtual_daa_score,
+            providers: snapshot
+                .providers
+                .into_iter()
+                .map(|p| RpcServiceProvider {
+                    tier: p.tier as u32,
+                    model_id: RpcHash::from_bytes(p.model_id),
+                    identity: p.identity,
+                    escrow_pubkey: RpcHash::from_bytes(p.escrow_pubkey),
+                })
+                .collect(),
+        })
+    }
+
     async fn get_coin_supply_call(
         &self,
         _connection: Option<&DynRpcConnection>,

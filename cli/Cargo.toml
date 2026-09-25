@@ -40,6 +40,7 @@ keryx-txscript.workspace = true
 keryx-consensus-core.workspace = true
 keryx-core.workspace = true
 keryx-daemon.workspace = true
+keryx-inference.workspace = true
 keryx-metrics-core.workspace = true
 keryx-rpc-core.workspace = true
 keryx-utils.workspace = true

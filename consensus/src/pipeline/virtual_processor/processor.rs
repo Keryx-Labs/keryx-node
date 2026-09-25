@@ -175,6 +175,8 @@ pub struct VirtualStateProcessor {
     >,
     /// H8 reward-routing activation (see `params.reward_routing_activation`).
     pub(super) reward_routing_activation: ForkActivation,
+    /// Private-inference activation (see `params.private_inference_activation`).
+    pub(super) private_inference_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -401,6 +403,7 @@ impl VirtualStateProcessor {
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
+            private_inference_activation: params.private_inference_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1532,6 +1535,21 @@ impl VirtualStateProcessor {
                     return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
                 }
             }
+        }
+        // Private inference: before its gate an inline response body is not a valid payload
+        // (mirrors the block rule); after it, a request wearing the envelope marker must parse,
+        // or its sender would pay for a prompt no responder can open while every node folds it
+        // as a public request over unreadable bytes.
+        if !self.private_inference_activation.is_active(virtual_daa_score) {
+            if mutable_tx.tx.is_ai_response() && mutable_tx.tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
+                return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN));
+            }
+        } else if mutable_tx.tx.is_ai_request()
+            && let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload)
+            && req.is_private()
+        {
+            keryx_inference::PrivateRequestEnvelope::parse(&req.prompt)
+                .map_err(|e| TxRuleError::AiRequestPayloadRule(format!("private-inference envelope: {e}")))?;
         }
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())

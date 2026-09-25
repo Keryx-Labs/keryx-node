@@ -16,7 +16,7 @@ use keryx_consensus_core::{
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
-use keryx_inference::{AiChallengePayload, AiResponsePayload};
+use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -29,6 +29,7 @@ impl Mempool {
         // Populate mass and estimated_size in the beginning, it will be used in multiple places throughout the validation and insertion.
         transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx));
         self.validate_transaction_in_isolation(&transaction)?;
+        self.validate_ai_response_body(consensus, &transaction)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
         self.populate_mempool_entries(&mut transaction);
         Ok(TransactionPreValidation { transaction, feerate_threshold })
@@ -129,6 +130,13 @@ impl Mempool {
             .tx
             .clone();
 
+        // Private-inference requests: remember the named responders while the request is here.
+        if accepted_transaction.is_ai_request()
+            && let Some(req) = AiRequestPayload::deserialize(&accepted_transaction.payload)
+            && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
+        {
+            self.ai_private_request_index.insert(accepted_transaction.id().as_bytes(), envelope.recipient_keys().copied().collect());
+        }
         // Register in dedup indexes so no duplicate AI txs for the same hash get in.
         if accepted_transaction.is_ai_response() {
             if let Some(resp) = AiResponsePayload::deserialize(&accepted_transaction.payload) {
@@ -195,6 +203,32 @@ impl Mempool {
 
         if !self.config.accept_non_standard {
             self.check_transaction_standard_in_isolation(transaction)?;
+        }
+        Ok(())
+    }
+
+    /// Admission policy for inline response bodies (private inference): an AiResponse carrying
+    /// one is accepted only from a responder its request was sealed to, while that request is
+    /// pending here or in the service ledger. Bodies run up to 32 KiB and AiResponses pay no
+    /// fee, so without this any key could relay large free transactions. Policy only — a block
+    /// that includes such a response is judged by consensus alone.
+    fn validate_ai_response_body(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_response() {
+            return Ok(());
+        }
+        let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
+        if resp.private_body.is_none() {
+            return Ok(());
+        }
+        let named = resp.responder.as_ref().is_some_and(|r| {
+            self.ai_private_request_index
+                .get(&resp.request_hash)
+                .map(|keys| keys.contains(&r.escrow_pubkey))
+                .or_else(|| consensus.private_request_recipients(&resp.request_hash).map(|keys| keys.contains(&r.escrow_pubkey)))
+                .unwrap_or(false)
+        });
+        if !named {
+            return Err(RuleError::RejectAiResponseBody(hex::encode(resp.request_hash)));
         }
         Ok(())
     }

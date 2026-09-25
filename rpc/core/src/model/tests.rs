@@ -1156,6 +1156,25 @@ mod mockery {
 
     test!(GetServiceStrikesResponse);
 
+    impl Mock for GetServiceProvidersRequest {
+        fn mock() -> Self {
+            GetServiceProvidersRequest {}
+        }
+    }
+
+    test!(GetServiceProvidersRequest);
+
+    impl Mock for GetServiceProvidersResponse {
+        fn mock() -> Self {
+            GetServiceProvidersResponse {
+                virtual_daa_score: mock(),
+                providers: vec![RpcServiceProvider { tier: 2, model_id: mock(), identity: mock(), escrow_pubkey: mock() }],
+            }
+        }
+    }
+
+    test!(GetServiceProvidersResponse);
+
     impl Mock for GetCoinSupplyResponse {
         fn mock() -> Self {
             GetCoinSupplyResponse { max_sompi: mock(), circulating_sompi: mock() }
