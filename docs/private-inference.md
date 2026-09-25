@@ -188,7 +188,7 @@ escrowPubkey }] }`: every identity that proved a block of each tier inside the e
 ending at the sink (the same walk the ledger arms cohorts with), with the escrow key it
 announces. This is the list a requester chooses recipients from — a private request to a miner
 that is not eligible when the request arms is unservable, so pick keys from this list (several,
-for redundancy; up to 16). Op `155`, gRPC message ids `1122`/`1123`; wired through gRPC, wRPC,
+for redundancy; up to 16). Op `156`, gRPC message ids `1124`/`1125`; wired through gRPC, wRPC,
 the wasm client and `keryx-cli rpc get-service-providers`.
 
 ## 6. Requester CLI (`cli/src/modules/inference.rs`)
