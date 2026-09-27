@@ -5,6 +5,7 @@ pub mod ghostdag;
 pub mod parents_builder;
 pub mod past_median_time;
 pub mod pruning;
+pub mod private_inference;
 pub mod pruning_proof;
 pub mod reachability;
 pub mod relations;

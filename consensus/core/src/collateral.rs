@@ -182,6 +182,15 @@ pub const SERVICE_ELIGIBILITY_WINDOW_DAA: u64 = 6_000;
 /// an identity leaves every cohort this long after its last proven block.
 pub const SERVICE_ELIGIBILITY_WINDOW_DAA_V2: u64 = 3_000;
 
+/// Widest window a service-providers query may cover (~1 hour at 10 BPS).
+pub const MAX_SERVICE_PROVIDERS_WINDOW_DAA: u64 = 36_000;
+
+/// Cohort members a private request may leave out and still be served: miners that entered the
+/// cohort between sealing and arming.
+pub fn private_cohort_tolerance(cohort_len: usize) -> usize {
+    cohort_len.div_ceil(4).max(3)
+}
+
 /// Standing evaluation lag AND probation length (~14 h at 10 BPS): an identity is in standing at
 /// POV `p` iff, looking only at events with daa ≤ `p − LAG`, it has been sighted (first certified
 /// block) and its strike count reads zero. The lag is finality + the ledger horizon, so every
@@ -808,12 +817,20 @@ impl ServiceLedger {
                 Some(_) => {}
                 None if daa > req.accepted_daa => {
                     let mut set = cohort(req.tier);
-                    // A private request obligates (and pays) only the responders it was sealed
-                    // to: the rest of the tier cannot read it, so they are neither audited for
-                    // it nor able to claim its vault. Named responders outside the eligible set
-                    // are simply absent; none eligible = unservable, exactly like an empty tier.
+                    // A private request is sealed to the whole cohort. One that leaves out more
+                    // than the tolerance is unservable. Otherwise it obligates (and pays) only
+                    // the members it was sealed to: the others cannot read it, so they are
+                    // neither audited for it nor able to claim its vault.
                     if !req.recipients.is_empty() {
-                        set.retain(|(_, escrow)| req.recipients.binary_search(escrow).is_ok());
+                        let mut escrows: Vec<Hash> = set.iter().map(|(_, escrow)| *escrow).collect();
+                        escrows.sort_unstable();
+                        escrows.dedup();
+                        let uncovered = escrows.iter().filter(|e| req.recipients.binary_search(e).is_err()).count();
+                        if uncovered > private_cohort_tolerance(escrows.len()) {
+                            set.clear();
+                        } else {
+                            set.retain(|(_, escrow)| req.recipients.binary_search(escrow).is_ok());
+                        }
                     }
                     if set.is_empty() {
                         self.pending.remove(&rh);
@@ -1811,8 +1828,8 @@ mod tests {
         assert!(ProductionIndexSnapshot::from_bytes(&padded).is_err());
     }
     use super::{
-        eligible_pairs, service_window_daa, service_window_daa_at, strike_penalty, strike_penalty_at, update_strikes,
-        FoldOutcome, ServiceLedger, ServicePenalty, ServiceReward,
+        eligible_pairs, private_cohort_tolerance, service_window_daa, service_window_daa_at, strike_penalty, strike_penalty_at,
+        update_strikes, FoldOutcome, ServiceLedger, ServicePenalty, ServiceReward,
         StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_EARLY_RESPONSE_HORIZON_DAA, SERVICE_LEDGER_HORIZON_DAA,
         SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
@@ -1861,6 +1878,41 @@ mod tests {
     /// Private inference: a request sealed to named responders audits, credits and pays only
     /// those responders. A non-recipient's signed answer counts for nothing, nobody outside the
     /// recipient set is struck when the window closes, and the recipient wins the vault.
+    #[test]
+    fn private_cohort_tolerance_is_a_quarter_with_a_floor_of_three() {
+        assert_eq!(private_cohort_tolerance(0), 3);
+        assert_eq!(private_cohort_tolerance(12), 3);
+        assert_eq!(private_cohort_tolerance(13), 4);
+        assert_eq!(private_cohort_tolerance(17), 5);
+        assert_eq!(private_cohort_tolerance(45), 12);
+    }
+
+    /// A private request must be sealed to the cohort it arms with: up to the tolerance of
+    /// members may be missing (they entered after sealing) and are neither obligated nor struck;
+    /// one more makes it unservable — nobody is obligated and the vault is never minted.
+    #[test]
+    fn private_request_leaving_out_more_than_the_tolerance_is_unservable() {
+        let set: Vec<Hash> = (1u8..=16).map(|i| Hash::from_bytes([i; 32])).collect();
+        let tol = private_cohort_tolerance(set.len());
+        assert_eq!(tol, 4);
+        let arm = |covered: usize| {
+            let mut ledger = ServiceLedger::default();
+            ledger.set_window_v2_activation(0);
+            ledger.set_reward_routing_activation(0);
+            let rh = [7u8; 32];
+            let recipients = set[..covered].to_vec();
+            ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[(rh, 5_000)], &[(rh, recipients)], &[], &[], &[], |_| true, cohort_of(&set));
+            ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
+            (ledger.audit_cohort(&rh), ledger.pending_len())
+        };
+        let (cohort, pending) = arm(set.len() - tol);
+        assert_eq!(cohort, Some(set[..set.len() - tol].to_vec()));
+        assert_eq!(pending, 1);
+        let (cohort, pending) = arm(set.len() - tol - 1);
+        assert_eq!(cohort, None);
+        assert_eq!(pending, 0);
+    }
+
     #[test]
     fn private_request_restricts_the_cohort_to_its_recipients() {
         let a = Hash::from_bytes([1u8; 32]);

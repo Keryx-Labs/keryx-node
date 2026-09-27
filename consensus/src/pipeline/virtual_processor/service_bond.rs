@@ -9,7 +9,7 @@ use keryx_consensus_core::collateral::{
     eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
     ProductionIndexSnapshot, ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
-    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
+    MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
 use keryx_consensus_core::config::params::POM_TIERS_H6;
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
@@ -308,9 +308,9 @@ impl VirtualStateProcessor {
                             }
                             requests.push((request_hash, tier as u8, req.max_tokens));
                             request_rewards.push((request_hash, req.inference_reward));
-                            // Past the private-inference gate a well-formed envelope names the
-                            // only responders obligated for (and paid by) this request; a
-                            // malformed one folds as a public request over opaque bytes.
+                            // Past the private-inference gate the envelope names the responders
+                            // obligated for (and paid by) this request. A plaintext request from a
+                            // block below the gate, merged past it, folds as a public request.
                             if private
                                 && req.is_private()
                                 && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
@@ -402,15 +402,23 @@ impl VirtualStateProcessor {
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
     }
 
-    /// The service-eligible responders of every tier at `sink`: the identities that proved a
-    /// block of the tier inside the eligibility window, each with the escrow key it announces —
-    /// the keys a private request can be sealed to. Sorted by (tier, identity, escrow key).
-    pub(crate) fn service_providers_snapshot(&self, sink: Hash, virtual_daa_score: u64) -> ServiceProvidersSnapshot {
-        let window = if self.service_bond_v2_activation.is_active(virtual_daa_score) {
+    /// The eligibility window a cohort arms with at `virtual_daa_score`.
+    fn eligibility_window_at(&self, virtual_daa_score: u64) -> u64 {
+        if self.service_bond_v2_activation.is_active(virtual_daa_score) {
             SERVICE_ELIGIBILITY_WINDOW_DAA_V2
         } else {
             SERVICE_ELIGIBILITY_WINDOW_DAA
-        };
+        }
+    }
+
+    /// The service-eligible responders of every tier at `sink`: the identities that proved a
+    /// block of the tier inside the eligibility window, each with the escrow key it announces —
+    /// the keys a private request is sealed to. `window_daa` widens the window (bounded by
+    /// `MAX_SERVICE_PROVIDERS_WINDOW_DAA`, never below the eligibility window) so a requester can
+    /// also cover miners that return before the request arms. Sorted by (tier, identity, escrow key).
+    pub(crate) fn service_providers_snapshot(&self, sink: Hash, virtual_daa_score: u64, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
+        let eligibility = self.eligibility_window_at(virtual_daa_score);
+        let window = window_daa.map_or(eligibility, |w| w.clamp(eligibility, MAX_SERVICE_PROVIDERS_WINDOW_DAA.max(eligibility)));
         let mut providers = Vec::new();
         for (tier, model) in POM_TIERS_H6.iter().enumerate() {
             for (identity, escrow) in self.service_eligible_miners_windowed(sink, tier as u8, window) {
@@ -419,6 +427,24 @@ impl VirtualStateProcessor {
         }
         providers.sort_by(|x, y| (x.tier, x.identity, x.escrow_pubkey).cmp(&(y.tier, y.identity, y.escrow_pubkey)));
         ServiceProvidersSnapshot { virtual_daa_score, providers }
+    }
+
+    /// The escrow keys a private AiRequest for `model_id` must be sealed to at `sink`: the
+    /// cohort its tier would arm with now. `None` before the private-inference activation or for
+    /// a model outside the tier set.
+    pub(crate) fn private_cohort_escrows(&self, sink: Hash, virtual_daa_score: u64, model_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        if !self.private_inference_activation.is_active(virtual_daa_score) {
+            return None;
+        }
+        let tier = POM_TIERS_H6.iter().position(|t| t.model_id == *model_id)? as u8;
+        let mut keys: Vec<[u8; 32]> = self
+            .service_eligible_miners_windowed(sink, tier, self.eligibility_window_at(virtual_daa_score))
+            .into_iter()
+            .map(|(_, escrow)| escrow.as_bytes())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Some(keys)
     }
 
     /// Escrow claims created by committed chain block `hash`'s coinbase, keyed by producing miner:

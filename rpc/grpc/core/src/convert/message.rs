@@ -446,7 +446,7 @@ from!(item: RpcResult<&keryx_rpc_core::GetServiceStrikesResponse>, protowire::Ge
     }
 });
 
-from!(&keryx_rpc_core::GetServiceProvidersRequest, protowire::GetServiceProvidersRequestMessage);
+from!(item: &keryx_rpc_core::GetServiceProvidersRequest, protowire::GetServiceProvidersRequestMessage, { Self { window_daa: item.window_daa } });
 from!(item: RpcResult<&keryx_rpc_core::GetServiceProvidersResponse>, protowire::GetServiceProvidersResponseMessage, {
     Self {
         virtual_daa_score: item.virtual_daa_score,
@@ -1048,7 +1048,7 @@ try_from!(item: &protowire::GetServiceStrikesResponseMessage, RpcResult<keryx_rp
     }
 });
 
-try_from!(&protowire::GetServiceProvidersRequestMessage, keryx_rpc_core::GetServiceProvidersRequest);
+try_from!(item: &protowire::GetServiceProvidersRequestMessage, keryx_rpc_core::GetServiceProvidersRequest, { Self { window_daa: item.window_daa } });
 try_from!(item: &protowire::GetServiceProvidersResponseMessage, RpcResult<keryx_rpc_core::GetServiceProvidersResponse>, {
     Self {
         virtual_daa_score: item.virtual_daa_score,

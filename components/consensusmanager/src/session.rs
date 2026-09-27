@@ -216,8 +216,8 @@ impl ConsensusSessionOwned {
         self.consensus.get_service_strikes()
     }
 
-    pub fn get_service_providers(&self) -> keryx_consensus_core::collateral::ServiceProvidersSnapshot {
-        self.consensus.get_service_providers()
+    pub fn get_service_providers(&self, window_daa: Option<u64>) -> keryx_consensus_core::collateral::ServiceProvidersSnapshot {
+        self.consensus.get_service_providers(window_daa)
     }
 
     pub fn get_virtual_bits(&self) -> u32 {

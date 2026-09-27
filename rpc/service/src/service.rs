@@ -994,10 +994,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     async fn get_service_providers_call(
         &self,
         _connection: Option<&DynRpcConnection>,
-        _: GetServiceProvidersRequest,
+        request: GetServiceProvidersRequest,
     ) -> RpcResult<GetServiceProvidersResponse> {
         let session = self.consensus_manager.consensus().unguarded_session();
-        let snapshot = session.get_service_providers();
+        let snapshot = session.get_service_providers(request.window_daa);
         Ok(GetServiceProvidersResponse {
             virtual_daa_score: snapshot.virtual_daa_score,
             providers: snapshot

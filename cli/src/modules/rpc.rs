@@ -244,7 +244,7 @@ impl Rpc {
                 self.println(&ctx, result);
             }
             RpcApiOps::GetServiceProviders => {
-                let result = rpc.get_service_providers_call(None, GetServiceProvidersRequest {}).await?;
+                let result = rpc.get_service_providers_call(None, GetServiceProvidersRequest::default()).await?;
                 self.println(&ctx, result);
             }
             RpcApiOps::GetDaaScoreTimestampEstimate => {

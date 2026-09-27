@@ -192,6 +192,15 @@ pub enum RuleError {
     #[error("AiResponse tx {0} carries an inline body before the private-inference activation")]
     AiResponseBodyBeforeActivation(TransactionId),
 
+    #[error("AiRequest tx {0} payload of {1} bytes exceeds the maximum before the private-inference activation")]
+    AiRequestTooLongBeforeActivation(TransactionId, usize),
+
+    #[error("AiRequest tx {0} is not a private-inference request: {1}")]
+    AiRequestNotPrivate(TransactionId, String),
+
+    #[error("AiResponse tx {0} carries no inline private body")]
+    AiResponseWithoutPrivateBody(TransactionId),
+
     #[error("AiRequest tx {0} max_tokens {1} exceeds the cap {2}")]
     AiRequestMaxTokensExceeded(TransactionId, u32, u32),
 

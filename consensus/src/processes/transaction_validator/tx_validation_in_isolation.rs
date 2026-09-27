@@ -2,7 +2,7 @@ use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
 use keryx_inference::{
     AiChallengePayload, AiResponsePayload,
-    MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
 };
 use std::collections::HashSet;
@@ -188,7 +188,7 @@ fn check_ai_response_request_hash(tx: &Transaction) -> TxResult<()> {
 
 fn check_ai_payload_len(tx: &Transaction) -> TxResult<()> {
     let (min, max) = if tx.is_ai_request() {
-        (MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PAYLOAD_LEN)
+        (MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN)
     } else if tx.is_ai_response() {
         (MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN)
     } else if tx.is_ai_challenge() {
@@ -268,6 +268,41 @@ mod tests {
         let mut truncated = head.serialize();
         truncated.extend_from_slice(&[0x01, 0x02]);
         assert_match!(tv.validate_tx_in_isolation(&response(truncated)), Err(TxRuleError::AiPayloadTooShort(_, _)));
+    }
+
+    /// AiRequest payloads are valid in isolation up to the private maximum; the era rule that
+    /// keeps them at the historical maximum before the gate lives in the block body check.
+    #[test]
+    fn ai_request_private_lengths_in_isolation() {
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
+        use keryx_inference::{MAX_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN};
+
+        let params = MAINNET_PARAMS.clone();
+        let tv = TransactionValidator::new_for_tests(
+            params.max_tx_inputs,
+            params.max_tx_outputs,
+            params.max_signature_script_len,
+            params.max_script_public_key_len,
+            params.coinbase_payload_script_public_key_max_len,
+            params.coinbase_maturity(),
+            params.ghostdag_k(),
+            Default::default(),
+        );
+        let input = || {
+            keryx_consensus_core::tx::TransactionInput::new(
+                keryx_consensus_core::tx::TransactionOutpoint::new(Default::default(), 0),
+                vec![],
+                0,
+                0,
+            )
+        };
+        let request = |len: usize| Transaction::new(TX_VERSION, vec![input()], vec![], 0, SUBNETWORK_ID_AI_REQUEST, 0, vec![0u8; len]);
+        tv.validate_tx_in_isolation(&request(MAX_AI_REQUEST_PAYLOAD_LEN + 1)).unwrap();
+        tv.validate_tx_in_isolation(&request(MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN)).unwrap();
+        assert_match!(
+            tv.validate_tx_in_isolation(&request(MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN + 1)),
+            Err(TxRuleError::AiPayloadTooLong(_, _))
+        );
     }
 
     #[test]

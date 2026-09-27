@@ -2043,21 +2043,27 @@ pub struct RpcServiceProvider {
     pub escrow_pubkey: RpcHash,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetServiceProvidersRequest {}
+pub struct GetServiceProvidersRequest {
+    /// Widens the eligibility window (DAA), bounded by the node; `None` = the eligibility window.
+    #[serde(default)]
+    pub window_daa: Option<u64>,
+}
 
 impl Serializer for GetServiceProvidersRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
+        store!(Option<u64>, &self.window_daa, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetServiceProvidersRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
-        Ok(Self {})
+        let version = load!(u16, reader)?;
+        let window_daa = if version > 1 { load!(Option<u64>, reader)? } else { None };
+        Ok(Self { window_daa })
     }
 }
 

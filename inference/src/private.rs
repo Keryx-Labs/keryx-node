@@ -1,10 +1,10 @@
 //! Private (end-to-end encrypted) inference.
 //!
-//! A requester encrypts its prompt to one or more responders — miners identified by the x-only
-//! escrow pubkey they announce in their coinbases (`/escrow:<hex>`) and sign V2 `AiResponse`s
-//! with — and a responder encrypts its answer back to the requester. Only the requester and the
-//! named responders can read either direction; every other node sees ciphertext in the
-//! transaction payloads.
+//! A requester encrypts its prompt to the whole cohort of the requested tier — miners identified
+//! by the x-only escrow pubkey they announce in their coinbases (`/escrow:<hex>`) and sign V2
+//! `AiResponse`s with — and a responder encrypts its answer back to the requester. Only the
+//! requester and the recipients can read either direction; every other node sees ciphertext in
+//! the transaction payloads.
 //!
 //! Everything the chain needs stays public and is bound into the ciphertext as associated data:
 //! the request header (`model_id`, `max_tokens`, `inference_reward`, `priority_fee`), the
@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! [magic: 4 = 00 'K' 'X' 'P'] [version: 1 = 0x01] [ephemeral_pubkey: 33 compressed secp256k1]
-//! [nonce: 12] [n_recipients: 1, 1..=16]
+//! [nonce: 12] [n_recipients: 1, 1..=128]
 //! n × { [escrow_pubkey: 32 x-only, strictly ascending] [wrapped_root_key: 48] }
 //! [ciphertext: ChaCha20-Poly1305(k_prompt, nonce, prompt) — at least the 16-byte tag]
 //! ```
@@ -56,14 +56,14 @@ use secp256k1::ecdh::SharedSecret;
 use secp256k1::{Parity, PublicKey, SECP256K1, SecretKey, XOnlyPublicKey};
 use sha2::Sha256;
 
-use crate::ai_payload::{AI_REQUEST_HEADER_LEN, AiRequestPayload, MAX_AI_REQUEST_PAYLOAD_LEN};
+use crate::ai_payload::{AI_REQUEST_HEADER_LEN, AiRequestPayload, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN};
 
 /// Envelope marker: a leading NUL so no UTF-8 prompt can collide with it.
 pub const PRIVATE_MAGIC: [u8; 4] = [0x00, b'K', b'X', b'P'];
 /// Envelope format version.
 pub const PRIVATE_VERSION: u8 = 1;
-/// Responders a single request may name.
-pub const MAX_PRIVATE_RECIPIENTS: usize = 16;
+/// Responders a single request may name: a whole tier cohort, with headroom.
+pub const MAX_PRIVATE_RECIPIENTS: usize = 128;
 /// ChaCha20-Poly1305 nonce length.
 pub const PRIVATE_NONCE_LEN: usize = 12;
 /// Poly1305 tag length.
@@ -126,7 +126,7 @@ impl PrivateRequestEnvelope {
         prompt.len() >= PRIVATE_MAGIC.len() && prompt[..PRIVATE_MAGIC.len()] == PRIVATE_MAGIC
     }
 
-    /// Strict parse: exact layout, supported version, valid ephemeral point, 1..=16 valid x-only
+    /// Strict parse: exact layout, supported version, valid ephemeral point, 1..=128 valid x-only
     /// recipient keys in strictly ascending order, and room for the ciphertext tag. Consensus
     /// classifies a request as private iff this succeeds, so it must stay a pure function of
     /// the bytes.
@@ -298,9 +298,9 @@ impl Drop for OpenedRequest {
 }
 
 /// Largest plaintext prompt a request naming `n_recipients` responders can carry, given the
-/// 4 KB AiRequest payload cap.
+/// private AiRequest payload cap.
 pub fn max_private_prompt_len(n_recipients: usize) -> usize {
-    (MAX_AI_REQUEST_PAYLOAD_LEN - AI_REQUEST_HEADER_LEN)
+    (MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN - AI_REQUEST_HEADER_LEN)
         .saturating_sub(PRIVATE_REQUEST_HEADER_LEN + n_recipients * PRIVATE_RECIPIENT_ENTRY_LEN + PRIVATE_TAG_LEN)
 }
 
@@ -520,7 +520,7 @@ mod tests {
         let (payload, secret) = seal(prompt, &[pk], &mut r);
 
         assert!(payload.is_private());
-        assert!(payload.serialize().len() <= MAX_AI_REQUEST_PAYLOAD_LEN);
+        assert!(payload.serialize().len() <= MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN);
         let envelope = PrivateRequestEnvelope::parse(&payload.prompt).unwrap();
         assert_eq!(envelope.recipients.len(), 1);
         assert_eq!(envelope.serialize(), payload.prompt);
@@ -645,8 +645,8 @@ mod tests {
         assert_eq!(PrivateRequestEnvelope::parse(&bad), Err(PrivateError::Malformed("no recipients")));
 
         let mut bad = good.clone();
-        bad[50] = 17;
-        assert_eq!(PrivateRequestEnvelope::parse(&bad), Err(PrivateError::TooManyRecipients(17)));
+        bad[50] = (MAX_PRIVATE_RECIPIENTS + 1) as u8;
+        assert_eq!(PrivateRequestEnvelope::parse(&bad), Err(PrivateError::TooManyRecipients(MAX_PRIVATE_RECIPIENTS + 1)));
 
         let mut bad = good.clone();
         bad[50] = 2;
@@ -683,21 +683,26 @@ mod tests {
         let (_, pk) = escrow_key(&mut r, None);
         assert_eq!(seal_request_with_rng(MODEL, 1, 1, 1, b"p", &[], &mut r).unwrap_err(), PrivateError::Malformed("no recipients"));
         assert_eq!(seal_request_with_rng(MODEL, 1, 1, 1, b"p", &[[0xFF; 32]], &mut r).unwrap_err(), PrivateError::InvalidKey);
-        let many: Vec<[u8; 32]> = (0..17).map(|_| escrow_key(&mut r, None).1).collect();
-        assert_eq!(seal_request_with_rng(MODEL, 1, 1, 1, b"p", &many, &mut r).unwrap_err(), PrivateError::TooManyRecipients(17));
+        let many: Vec<[u8; 32]> = (0..MAX_PRIVATE_RECIPIENTS + 1).map(|_| escrow_key(&mut r, None).1).collect();
+        assert_eq!(
+            seal_request_with_rng(MODEL, 1, 1, 1, b"p", &many, &mut r).unwrap_err(),
+            PrivateError::TooManyRecipients(MAX_PRIVATE_RECIPIENTS + 1)
+        );
 
         let max = max_private_prompt_len(1);
         let (payload, _) = seal(&vec![b'a'; max], &[pk], &mut r);
-        assert_eq!(payload.serialize().len(), MAX_AI_REQUEST_PAYLOAD_LEN);
+        assert_eq!(payload.serialize().len(), MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN);
         assert!(AiRequestPayload::deserialize(&payload.serialize()).is_some());
         assert_eq!(
             seal_request_with_rng(MODEL, 1, 1, 1, &vec![b'a'; max + 1], &[pk], &mut r).unwrap_err(),
             PrivateError::PromptTooLarge(max + 1, max)
         );
-        // Sixteen recipients still fit a useful prompt.
-        let sixteen: Vec<[u8; 32]> = many[..16].to_vec();
-        let (payload, _) = seal(&vec![b'b'; max_private_prompt_len(16)], &sixteen, &mut r);
-        assert_eq!(payload.serialize().len(), MAX_AI_REQUEST_PAYLOAD_LEN);
+        // A full cohort still fits a useful prompt, and parses back.
+        let full: Vec<[u8; 32]> = many[..MAX_PRIVATE_RECIPIENTS].to_vec();
+        assert!(max_private_prompt_len(MAX_PRIVATE_RECIPIENTS) >= 4_000);
+        let (payload, _) = seal(&vec![b'b'; max_private_prompt_len(MAX_PRIVATE_RECIPIENTS)], &full, &mut r);
+        assert_eq!(payload.serialize().len(), MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN);
+        assert_eq!(PrivateRequestEnvelope::parse(&payload.prompt).unwrap().recipients.len(), MAX_PRIVATE_RECIPIENTS);
     }
 
     #[test]

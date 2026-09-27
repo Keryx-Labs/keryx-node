@@ -160,9 +160,18 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     /// The service-eligible responders per tier at the current sink: identity and escrow key —
-    /// the keys a private-inference request can be sealed to.
-    fn get_service_providers(&self) -> ServiceProvidersSnapshot {
+    /// the keys a private-inference request is sealed to. `window_daa` widens the eligibility
+    /// window (bounded by `MAX_SERVICE_PROVIDERS_WINDOW_DAA`).
+    fn get_service_providers(&self, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
+        let _ = window_daa;
         unimplemented!()
+    }
+
+    /// The escrow keys a private AiRequest for `model_id` must be sealed to at the current sink;
+    /// `None` before the private-inference activation or for an unknown model.
+    fn private_cohort_escrows(&self, model_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        let _ = model_id;
+        None
     }
 
     /// The named responders (escrow keys) of a pending private AiRequest; `None` when the

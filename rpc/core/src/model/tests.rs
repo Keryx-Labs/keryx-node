@@ -1158,7 +1158,7 @@ mod mockery {
 
     impl Mock for GetServiceProvidersRequest {
         fn mock() -> Self {
-            GetServiceProvidersRequest {}
+            GetServiceProvidersRequest { window_daa: Some(18_000) }
         }
     }
 

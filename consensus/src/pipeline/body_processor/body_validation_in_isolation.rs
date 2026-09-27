@@ -4,7 +4,11 @@ use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
 use crate::model::stores::headers::HeaderStoreReader;
 use crate::model::stores::pom_proof::PomProofStoreReader;
-use crate::processes::{coinbase::coinbase_outputs_limit, transaction_validator::errors::TxRuleError};
+use crate::processes::{
+    coinbase::coinbase_outputs_limit,
+    private_inference::{PrivateEraViolation, check_private_inference_era},
+    transaction_validator::errors::TxRuleError,
+};
 use keryx_consensus_core::{
     block::Block,
     config::params::{POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
@@ -32,7 +36,7 @@ impl BlockBodyProcessor {
         Self::check_only_one_coinbase(block)?;
         self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
-        self.check_ai_response_body_era(block)?;
+        self.check_private_inference_era(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
@@ -105,15 +109,16 @@ impl BlockBodyProcessor {
         Ok(())
     }
 
-    /// Before the private-inference gate an AiResponse longer than the signed V2 form invalidates
-    /// the block, trusted blocks included.
-    fn check_ai_response_body_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
-        if self.private_inference_activation.is_active(block.header.daa_score) {
-            return Ok(());
-        }
+    /// AI transactions must match the private-inference era of the block, trusted blocks included.
+    fn check_private_inference_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         for tx in block.transactions.iter().skip(1) {
-            if tx.is_ai_response() && tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
-                return Err(RuleError::AiResponseBodyBeforeActivation(tx.id()));
+            if let Err(v) = check_private_inference_era(tx, block.header.daa_score, self.private_inference_activation) {
+                return Err(match v {
+                    PrivateEraViolation::RequestTooLongBeforeActivation(len) => RuleError::AiRequestTooLongBeforeActivation(tx.id(), len),
+                    PrivateEraViolation::ResponseBodyBeforeActivation(_) => RuleError::AiResponseBodyBeforeActivation(tx.id()),
+                    PrivateEraViolation::RequestNotPrivate(e) => RuleError::AiRequestNotPrivate(tx.id(), e),
+                    PrivateEraViolation::ResponseWithoutBody => RuleError::AiResponseWithoutPrivateBody(tx.id()),
+                });
             }
         }
         Ok(())

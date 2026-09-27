@@ -89,6 +89,7 @@ use keryx_notify::{events::EventType, notifier::Notify};
 use once_cell::unsync::Lazy;
 
 use super::utxo_validation::check_ai_request_tx_payload_rules;
+use crate::processes::private_inference::{PrivateEraViolation, check_private_inference_era};
 use super::errors::{PruningImportError, PruningImportResult};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use itertools::Itertools;
@@ -1536,21 +1537,16 @@ impl VirtualStateProcessor {
                 }
             }
         }
-        // Private inference: before its gate an inline response body is not a valid payload
-        // (mirrors the block rule); after it, a request wearing the envelope marker must parse,
-        // or its sender would pay for a prompt no responder can open while every node folds it
-        // as a public request over unreadable bytes.
-        if !self.private_inference_activation.is_active(virtual_daa_score) {
-            if mutable_tx.tx.is_ai_response() && mutable_tx.tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
-                return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN));
+        // Private inference: the block rule, evaluated at the virtual score.
+        check_private_inference_era(&mutable_tx.tx, virtual_daa_score, self.private_inference_activation).map_err(|v| match v {
+            PrivateEraViolation::RequestTooLongBeforeActivation(len) => {
+                TxRuleError::AiPayloadTooLong(len, keryx_inference::MAX_AI_REQUEST_PAYLOAD_LEN)
             }
-        } else if mutable_tx.tx.is_ai_request()
-            && let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload)
-            && req.is_private()
-        {
-            keryx_inference::PrivateRequestEnvelope::parse(&req.prompt)
-                .map_err(|e| TxRuleError::AiRequestPayloadRule(format!("private-inference envelope: {e}")))?;
-        }
+            PrivateEraViolation::ResponseBodyBeforeActivation(len) => {
+                TxRuleError::AiPayloadTooLong(len, keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN)
+            }
+            v => TxRuleError::AiRequestPayloadRule(v.to_string()),
+        })?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
     }

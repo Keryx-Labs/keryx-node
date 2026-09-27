@@ -30,6 +30,7 @@ impl Mempool {
         transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx));
         self.validate_transaction_in_isolation(&transaction)?;
         self.validate_ai_response_body(consensus, &transaction)?;
+        self.validate_private_request_coverage(consensus, &transaction)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
         self.populate_mempool_entries(&mut transaction);
         Ok(TransactionPreValidation { transaction, feerate_threshold })
@@ -229,6 +230,28 @@ impl Mempool {
         });
         if !named {
             return Err(RuleError::RejectAiResponseBody(hex::encode(resp.request_hash)));
+        }
+        Ok(())
+    }
+
+    /// Admission policy for private requests: the envelope must cover the whole cohort its tier
+    /// would arm with now. Consensus tolerates members that join between sealing and arming; the
+    /// mempool admits nothing short of full coverage, and nothing for an empty tier (it would
+    /// burn its vault). Malformed requests are left to the consensus rules.
+    fn validate_private_request_coverage(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_request() {
+            return Ok(());
+        }
+        let Some(req) = AiRequestPayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
+        let Some(cohort) = consensus.private_cohort_escrows(&req.model_id) else { return Ok(()) };
+        let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt) else { return Ok(()) };
+        if cohort.is_empty() {
+            return Err(RuleError::RejectPrivateRequestEmptyCohort);
+        }
+        let missing =
+            cohort.iter().filter(|key| envelope.recipients.binary_search_by(|r| r.escrow_pubkey.cmp(key)).is_err()).count();
+        if missing > 0 {
+            return Err(RuleError::RejectPrivateRequestCoverage(missing, cohort.len()));
         }
         Ok(())
     }

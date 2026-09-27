@@ -20,7 +20,11 @@ pub const MIN_AI_REQUEST_PRIORITY_FEE: u64 = 30_000_000;
 /// Enforced alongside model_cap_enforcement_activation (same hardfork gate).
 /// Formula: effective_min = base[model] + ceil(max_tokens / 64) * TOKEN_STEP  (0.005 KRX per step)
 pub const INFERENCE_REWARD_TOKEN_STEP: u64 = 5_000_000;
+/// Largest AiRequest payload before the private-inference activation.
 pub const MAX_AI_REQUEST_PAYLOAD_LEN: usize = 4_096;
+/// Largest AiRequest payload from the private-inference activation on: an envelope sealed to a
+/// whole tier cohort plus the prompt.
+pub const MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN: usize = 16_384;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_RESPONSE` transactions:
 /// `[request_hash: 32] [challenge_window_end: 8 LE] [response_ipfs_cid: 34] [response_length: 4 LE]`
@@ -35,10 +39,13 @@ pub const MAX_AI_REQUEST_PAYLOAD_LEN: usize = 4_096;
 /// requester. The responder signature then covers `v1 bytes || extension bytes`, so a relayer
 /// cannot swap the body under a signed head. Valid lengths: exactly 78, exactly 174, or
 /// `174 + 5 + ext_len` with `1 <= ext_len <= MAX_AI_RESPONSE_PRIVATE_BODY_LEN`.
+///
+/// Byte 174 selects what follows the V2 head: `1..=15` is reserved for the pipeline-link count
+/// of split models, `AI_RESPONSE_EXT_PRIVATE_BODY` for the inline body, which always comes last.
 pub const AI_RESPONSE_PAYLOAD_LEN: usize = 78;
 pub const AI_RESPONSE_PAYLOAD_V2_LEN: usize = AI_RESPONSE_PAYLOAD_LEN + 32 + 64;
 /// Extension kind: an inline (encrypted) answer body.
-pub const AI_RESPONSE_EXT_PRIVATE_BODY: u8 = 0x01;
+pub const AI_RESPONSE_EXT_PRIVATE_BODY: u8 = 0x80;
 /// `[ext_kind: 1] [ext_len: 4 LE]`.
 pub const AI_RESPONSE_EXT_HEADER_LEN: usize = 1 + 4;
 /// Largest inline body: a 4 096-token answer with envelope overhead fits comfortably.
@@ -119,7 +126,7 @@ impl AiRequestPayload {
     }
 
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < MIN_AI_REQUEST_PAYLOAD_LEN || data.len() > MAX_AI_REQUEST_PAYLOAD_LEN {
+        if data.len() < MIN_AI_REQUEST_PAYLOAD_LEN || data.len() > MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN {
             return None;
         }
         let model_id: [u8; 32] = data[0..32].try_into().ok()?;
@@ -439,10 +446,12 @@ mod tests {
     #[test]
     fn ai_response_rejects_malformed_extensions() {
         let good = v2_with_body(vec![9u8; 40]).serialize();
-        // Unknown extension kind.
-        let mut bad = good.clone();
-        bad[AI_RESPONSE_PAYLOAD_V2_LEN] = 0x02;
-        assert!(AiResponsePayload::deserialize(&bad).is_none());
+        // Unknown extension kind, including the pipeline-link count range.
+        for kind in [0x00, 0x01, 0x0F, 0x02, 0x81] {
+            let mut bad = good.clone();
+            bad[AI_RESPONSE_PAYLOAD_V2_LEN] = kind;
+            assert!(AiResponsePayload::deserialize(&bad).is_none(), "kind {kind:#x}");
+        }
         // Declared length shorter or longer than the remaining bytes.
         let mut bad = good.clone();
         bad[AI_RESPONSE_PAYLOAD_V2_LEN + 1..AI_RESPONSE_PAYLOAD_V2_LEN + 5].copy_from_slice(&39u32.to_le_bytes());
@@ -493,7 +502,9 @@ mod tests {
 
     #[test]
     fn ai_request_rejects_oversized() {
-        let huge = vec![0u8; MAX_AI_REQUEST_PAYLOAD_LEN + 1];
+        assert!(AiRequestPayload::deserialize(&vec![0u8; MAX_AI_REQUEST_PAYLOAD_LEN + 1]).is_some());
+        assert!(AiRequestPayload::deserialize(&vec![0u8; MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN]).is_some());
+        let huge = vec![0u8; MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN + 1];
         assert!(AiRequestPayload::deserialize(&huge).is_none());
     }
 

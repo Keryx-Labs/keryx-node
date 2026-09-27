@@ -321,10 +321,11 @@ mod tests {
                 let mempool = Mempool::new(Arc::new(config), counters);
 
                 let got = mempool.minimum_required_transaction_relay_fee(test.size);
-                if got != test.want {
-                    println!("test_calc_min_required_tx_relay_fee test '{}' failed: got {}, want {}", test.name, got, test.want);
+                let want = test.want.max(MINIMUM_FLAT_TX_FEE_SOMPI);
+                if got != want {
+                    println!("test_calc_min_required_tx_relay_fee test '{}' failed: got {}, want {}", test.name, got, want);
                 }
-                assert_eq!(test.want, got);
+                assert_eq!(want, got);
             }
         }
     }

@@ -25,11 +25,14 @@ const MIN_CHANGE_SOMPI: u64 = SOMPI_PER_KASPA;
 const MAX_INPUTS: usize = 32;
 const DEFAULT_MAX_TOKENS: u32 = 256;
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
+/// Window of the providers a request is sealed to beyond the current cohort (~30 min at 10 BPS),
+/// so miners that return before the request arms can read it too.
+const SEAL_WINDOW_DAA: u64 = 18_000;
 
-/// Private AI inference from the wallet: pick responders, seal a prompt to them, submit the
+/// Private AI inference from the wallet: seal a prompt to the whole cohort of a tier, submit the
 /// `AiRequest`, then wait for the sealed answer and decrypt it. The prompt and the answer are
-/// readable only by this wallet and the named responders; everything else on the chain is
-/// public. See `docs/private-inference.md`.
+/// readable only by this wallet and the tier's miners; everything else on the chain is public.
+/// See `docs/private-inference.md`.
 #[derive(Default, Handler)]
 #[help("Private AI inference: list responders, send a sealed request, fetch and decrypt the answer")]
 pub struct Inference;
@@ -54,8 +57,8 @@ impl Inference {
             &[
                 ("inference providers [tier]", "List the responders eligible right now per tier, with the escrow key to seal requests to"),
                 (
-                    "inference send --to <escrow>[,<escrow>..] --tier <0-4> [--max-tokens N] [--reward KRX] [--fee KRX] [--wait SECS] <prompt | @file>",
-                    "Seal a prompt to the named responders (up to 16) and submit the AiRequest",
+                    "inference send --tier <0-4> [--max-tokens N] [--reward KRX] [--fee KRX] [--wait SECS] <prompt | @file>",
+                    "Seal a prompt to the whole cohort of the tier and submit the AiRequest",
                 ),
                 (
                     "inference fetch <request id> <root key> [--since <block hash>] [--timeout SECS]",
@@ -78,7 +81,7 @@ impl Inference {
             Some(t) => Some(t.parse::<u32>().map_err(|_| Error::custom("tier must be a number 0-4"))?),
             None => None,
         };
-        let resp = ctx.wallet().rpc_api().get_service_providers().await?;
+        let resp = ctx.wallet().rpc_api().get_service_providers(None).await?;
         tprintln!(ctx, "Service-eligible responders at DAA {} (tier, model, escrow key, identity):", resp.virtual_daa_score);
         let mut shown = 0;
         for p in resp.providers.iter().filter(|p| tier_filter.is_none_or(|t| t == p.tier)) {
@@ -90,8 +93,8 @@ impl Inference {
             tprintln!(ctx, "  (none: no miner proved a block of that tier inside the eligibility window)");
         } else {
             tprintln!(ctx, "");
-            tprintln!(ctx, "A private request only obligates and pays the responders it names; name a listed escrow key,");
-            tprintln!(ctx, "or several for redundancy, with `inference send --to <escrow>[,<escrow>..]`.");
+            tprintln!(ctx, "`inference send --tier <n>` seals the prompt to every responder of the tier; the first");
+            tprintln!(ctx, "credited answer is paid.");
         }
         Ok(())
     }
@@ -99,7 +102,6 @@ impl Inference {
     // ── send ────────────────────────────────────────────────────────────────────────────────
 
     async fn send(&self, ctx: &Arc<KaspaCli>, args: &[String]) -> Result<()> {
-        let mut recipients: Vec<[u8; 32]> = Vec::new();
         let mut tier: Option<usize> = None;
         let mut model: Option<[u8; 32]> = None;
         let mut max_tokens = DEFAULT_MAX_TOKENS;
@@ -114,10 +116,7 @@ impl Inference {
             let value = |i: usize| -> Result<&String> { args.get(i + 1).ok_or_else(|| Error::custom(format!("{arg} needs a value"))) };
             match arg {
                 "--to" => {
-                    for key in value(i)?.split(',').filter(|s| !s.is_empty()) {
-                        recipients.push(parse_hex32(key, "escrow key")?);
-                    }
-                    i += 2;
+                    return Err(Error::custom("--to is gone: a request is sealed to the whole cohort of its tier"));
                 }
                 "--tier" => {
                     tier = Some(value(i)?.parse::<usize>().map_err(|_| Error::custom("--tier must be a number 0-4"))?);
@@ -150,17 +149,12 @@ impl Inference {
             }
         }
 
-        if recipients.is_empty() {
-            return Err(Error::custom("name at least one responder with --to <escrow key> (see `inference providers`)"));
-        }
-        if recipients.len() > MAX_PRIVATE_RECIPIENTS {
-            return Err(Error::custom(format!("at most {MAX_PRIVATE_RECIPIENTS} responders can be named")));
-        }
         let model_id = match (model, tier) {
             (Some(m), _) => m,
             (None, Some(t)) => POM_TIERS_H6.get(t).map(|m| m.model_id).ok_or_else(|| Error::custom("--tier must be 0-4"))?,
             (None, None) => return Err(Error::custom("choose the model with --tier <0-4> or --model <hex>")),
         };
+        let recipients = cohort_recipients(ctx, &model_id).await?;
         let prompt = read_text_argument(&prompt_words)?;
         if prompt.is_empty() {
             return Err(Error::custom("the prompt is empty: pass it as words after the options, or as @<file>"));
@@ -183,7 +177,7 @@ impl Inference {
             )));
         }
 
-        // Seal the prompt: only the named escrow keys can open it, and the root key stays here.
+        // Seal the prompt: only the tier's escrow keys can open it, and the root key stays here.
         let (payload, secret) = seal_request(model_id, max_tokens, reward, fee, prompt.as_bytes(), &recipients)
             .map_err(|e| Error::custom(e.to_string()))?;
 
@@ -251,7 +245,7 @@ impl Inference {
             sompi_to_kaspa_string(reward),
             sompi_to_kaspa_string(fee)
         );
-        tprintln!(ctx, "  responders : {}", recipients.iter().map(hex::encode).collect::<Vec<_>>().join(", "));
+        tprintln!(ctx, "  sealed to  : {} escrow keys of the tier cohort", recipients.len());
         tprintln!(ctx, "  since block: {since}");
         tprintln!(ctx, "");
         tprintln!(ctx, "Fetch the answer later with: inference fetch {request_id} {} --since {since}", secret.to_hex());
@@ -432,6 +426,36 @@ impl Inference {
         tprintln!(ctx, "{}", String::from_utf8_lossy(&answer));
         Ok(())
     }
+}
+
+/// The escrow keys a request for `model_id` is sealed to: the whole current cohort of its tier,
+/// completed with the tier's providers of the last `SEAL_WINDOW_DAA` up to the recipient cap.
+async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
+    let tier = POM_TIERS_H6.iter().position(|t| t.model_id == *model_id).ok_or_else(|| Error::custom("unknown model: no tier serves it"))?
+        as u32;
+    let rpc = ctx.wallet().rpc_api();
+    let keys_of = |resp: &keryx_rpc_core::GetServiceProvidersResponse| -> Vec<[u8; 32]> {
+        let mut keys: Vec<[u8; 32]> = resp.providers.iter().filter(|p| p.tier == tier).map(|p| p.escrow_pubkey.as_bytes()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    };
+    let mut recipients = keys_of(&rpc.get_service_providers(None).await?);
+    if recipients.is_empty() {
+        return Err(Error::custom("no miner of this tier is eligible right now: the request could not be served"));
+    }
+    if recipients.len() > MAX_PRIVATE_RECIPIENTS {
+        return Err(Error::custom(format!("the tier cohort has {} members, above the {MAX_PRIVATE_RECIPIENTS} recipient cap", recipients.len())));
+    }
+    for key in keys_of(&rpc.get_service_providers(Some(SEAL_WINDOW_DAA)).await?) {
+        if recipients.len() == MAX_PRIVATE_RECIPIENTS {
+            break;
+        }
+        if !recipients.contains(&key) {
+            recipients.push(key);
+        }
+    }
+    Ok(recipients)
 }
 
 fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32]> {

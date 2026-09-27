@@ -459,6 +459,48 @@ async fn private_response_body_invalidates_the_block_before_the_gate() {
     }
 }
 
+/// Private inference: before the gate an AiRequest above the historical maximum invalidates the
+/// block; from the gate on a plaintext AiRequest does.
+#[tokio::test]
+async fn private_inference_era_rules_for_requests_invalidate_the_block() {
+    use crate::errors::RuleError;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
+    use keryx_inference::{AiRequestPayload, MAX_AI_REQUEST_PAYLOAD_LEN};
+
+    let cases: [(ForkActivation, Vec<u8>, fn(&RuleError) -> bool); 2] = [
+        (ForkActivation::never(), vec![0u8; MAX_AI_REQUEST_PAYLOAD_LEN + 1], |e| {
+            matches!(e, RuleError::AiRequestTooLongBeforeActivation(_, _))
+        }),
+        (ForkActivation::always(), AiRequestPayload::new([5u8; 32], 64, 1, 1, b"plain".to_vec()).serialize(), |e| {
+            matches!(e, RuleError::AiRequestNotPrivate(_, _))
+        }),
+    ];
+    for (gate, payload, expected) in cases {
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::always();
+        params.private_inference_activation = gate;
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let handles = tc.init();
+
+        let input = keryx_consensus_core::tx::TransactionInput::new(
+            keryx_consensus_core::tx::TransactionOutpoint::new(Default::default(), 0),
+            vec![],
+            0,
+            0,
+        );
+        let tx = Transaction::new(TX_VERSION, vec![input], vec![], 0, SUBNETWORK_ID_AI_REQUEST, 0, payload);
+        let block = tc.build_block_with_parents_and_transactions(1u64.into(), vec![config.genesis.hash], vec![tx]);
+        let hash = block.header.hash;
+        let result = tc.validate_and_insert_block(block.to_immutable()).block_task.await;
+        assert!(result.as_ref().is_err_and(expected), "{result:?}");
+        assert_eq!(tc.get_block_status(hash), Some(BlockStatus::StatusInvalid));
+
+        tc.shutdown(handles);
+    }
+}
+
 // OPoI slashing removed (v1.2.3): the slash-behavior tests (fraud→slash, honest→no-slash,
 // unknown→no-slash, outside-window→no-slash) were dropped together with the slashing mechanism.
 // Escrows are now always spendable; there is no slash state to assert.

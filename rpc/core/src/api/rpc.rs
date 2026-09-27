@@ -462,9 +462,9 @@ pub trait RpcApi: Sync + Send + AnySync {
     ) -> RpcResult<GetServiceStrikesResponse>;
 
     /// Service-eligible responders per tier at the current sink: identity and escrow key — the
-    /// keys a private-inference request can be sealed to.
-    async fn get_service_providers(&self) -> RpcResult<GetServiceProvidersResponse> {
-        self.get_service_providers_call(None, GetServiceProvidersRequest {}).await
+    /// keys a private-inference request is sealed to. `window_daa` widens the eligibility window.
+    async fn get_service_providers(&self, window_daa: Option<u64>) -> RpcResult<GetServiceProvidersResponse> {
+        self.get_service_providers_call(None, GetServiceProvidersRequest { window_daa }).await
     }
     async fn get_service_providers_call(
         &self,

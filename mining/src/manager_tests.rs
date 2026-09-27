@@ -6,7 +6,7 @@ mod tests {
         errors::{MiningManagerError, MiningManagerResult},
         manager::MiningManager,
         mempool::{
-            config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE},
+            config::{Config, MINIMUM_FLAT_TX_FEE_SOMPI},
             errors::RuleError,
             model::frontier::selectors::TakeAllSelector,
             tx::{Orphan, Priority, RbfPolicy},
@@ -237,6 +237,49 @@ mod tests {
         assert_eq!(insert(signed_response(&late, request_hash, Some(body))), Err(RuleError::RejectAiResponseBody(hex::encode(request_hash))));
     }
 
+    /// Private inference: once the gate is active (the consensus reports a cohort), a request is
+    /// admitted only when sealed to every escrow key of its tier cohort, and never for an empty tier.
+    #[test]
+    fn test_private_request_cohort_coverage_admission() {
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
+        use keryx_inference::{escrow_pubkey_of, seal_request};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let keys: Vec<[u8; 32]> = (1u8..=5).map(|i| escrow_pubkey_of(&[i; 32]).unwrap()).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+
+        let request = |seed: u64, recipients: &[[u8; 32]]| {
+            let (payload, _) = seal_request([0xAA; 32], 64, 1, 1, b"sealed prompt", recipients).unwrap();
+            let funded = create_transaction_with_utxo_entry(seed as u32, 0);
+            let mut tx = funded.tx.as_ref().clone();
+            tx.subnetwork_id = SUBNETWORK_ID_AI_REQUEST;
+            tx.payload = payload.serialize();
+            tx.outputs[0].value = SOMPI_PER_KASPA - keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE;
+            tx.finalize();
+            let mut mtx = MutableTransaction::from_tx(tx);
+            mtx.entries = funded.entries.clone();
+            into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                mtx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+
+        consensus.set_private_cohort(Some(sorted.clone()));
+        assert_eq!(request(81, &keys[..4]).map(|_| ()), Err(RuleError::RejectPrivateRequestCoverage(1, 5)));
+        request(82, &keys).unwrap();
+        consensus.set_private_cohort(Some(vec![]));
+        assert_eq!(request(83, &keys).map(|_| ()), Err(RuleError::RejectPrivateRequestEmptyCohort));
+        // Before the gate the consensus reports no cohort and the mempool checks nothing.
+        consensus.set_private_cohort(None);
+        request(84, &keys[..1]).unwrap();
+    }
+
     #[test]
     fn test_simulated_error_in_consensus() {
         for (priority, orphan, rbf_policy) in all_priority_orphan_rbf_policy_combinations() {
@@ -405,7 +448,7 @@ mod tests {
     /// depending on varying factors.
     #[test]
     fn test_replace_by_fee_in_mempool() {
-        const BASE_FEE: u64 = DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE;
+        const BASE_FEE: u64 = MINIMUM_FLAT_TX_FEE_SOMPI;
 
         struct TxOp {
             /// Funding transaction indexes
@@ -1119,7 +1162,7 @@ mod tests {
         consensus.add_transaction(child_tx_2.clone(), 3);
 
         // Add to mempool a transaction that spends child_tx_2 (as high priority)
-        let spending_tx = create_transaction(&child_tx_2, 1_000);
+        let spending_tx = create_transaction(&child_tx_2, MINIMUM_FLAT_TX_FEE_SOMPI);
         let result = mining_manager.validate_and_insert_transaction(
             consensus.as_ref(),
             spending_tx.clone(),
@@ -1248,7 +1291,7 @@ mod tests {
             let mut inner_tx = (*(heavy_tx.tx)).clone();
             inner_tx.payload = vec![0u8; TX_COUNT / 2 * tx_size - inner_tx.estimate_mem_bytes()];
             heavy_tx.tx = inner_tx.into();
-            heavy_tx.calculated_fee = Some(2081);
+            heavy_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI * 2081 / 1000);
             heavy_tx
         };
         assert!(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), heavy_tx_low_fee.clone()).is_err());
@@ -1259,7 +1302,7 @@ mod tests {
             let mut inner_tx = (*(heavy_tx.tx)).clone();
             inner_tx.payload = vec![0u8; TX_COUNT / 2 * tx_size - inner_tx.estimate_mem_bytes()];
             heavy_tx.tx = inner_tx.into();
-            heavy_tx.calculated_fee = Some(500_000);
+            heavy_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI * 500);
             heavy_tx
         };
         validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), heavy_tx_high_fee.clone()).unwrap();
@@ -1271,7 +1314,7 @@ mod tests {
             let mut inner_tx = (*(heavy_tx.tx)).clone();
             inner_tx.payload = vec![0u8; size_limit];
             heavy_tx.tx = inner_tx.into();
-            heavy_tx.calculated_fee = Some(500_000);
+            heavy_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI * 500);
             heavy_tx
         };
         assert!(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), too_big_tx.clone()).is_err());
@@ -1445,11 +1488,11 @@ mod tests {
 
         let input = TransactionInput::new(previous_outpoint, signature_script, MAX_TX_IN_SEQUENCE_NUM, 1);
         let entry = UtxoEntry::new(SOMPI_PER_KASPA, script_public_key.clone(), block_daa_score, true);
-        let output = TransactionOutput::new(SOMPI_PER_KASPA - DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE, script_public_key);
+        let output = TransactionOutput::new(SOMPI_PER_KASPA - MINIMUM_FLAT_TX_FEE_SOMPI, script_public_key);
         let transaction = Transaction::new(TX_VERSION, vec![input], vec![output], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
 
         let mut mutable_tx = MutableTransaction::from_tx(transaction);
-        mutable_tx.calculated_fee = Some(DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        mutable_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI);
         // Please note: this is the ConsensusMock version of the calculated_mass which differs from Consensus
         let transaction_serialized_size = transaction_estimated_serialized_size(&mutable_tx.tx);
         mutable_tx.calculated_non_contextual_masses =
@@ -1496,7 +1539,7 @@ mod tests {
                         once(parent),
                         vec![i],
                         Some(output.value / 2),
-                        DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+                        MINIMUM_FLAT_TX_FEE_SOMPI,
                     )
                 }));
             }
@@ -1538,8 +1581,8 @@ mod tests {
         funding_amounts: Vec<u64>,
     ) -> (Transaction, Transaction) {
         let funding_tx = create_transaction_without_input(funding_amounts);
-        let parent_tx = create_transaction(&funding_tx, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
-        let child_tx = create_transaction(&parent_tx, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let parent_tx = create_transaction(&funding_tx, MINIMUM_FLAT_TX_FEE_SOMPI);
+        let child_tx = create_transaction(&parent_tx, MINIMUM_FLAT_TX_FEE_SOMPI);
         consensus.add_transaction(funding_tx, 1);
 
         (parent_tx, child_tx)
@@ -1547,7 +1590,8 @@ mod tests {
 
     fn create_child_and_parent_txs_and_add_parent_to_consensus(consensus: &Arc<ConsensusMock>) -> Transaction {
         let parent_tx = create_transaction_without_input(vec![500 * SOMPI_PER_KASPA]);
-        let child_tx = create_transaction(&parent_tx, 1000);
+        // One sompi above the minimum, so a double spend lowering the fee by one still pays it.
+        let child_tx = create_transaction(&parent_tx, MINIMUM_FLAT_TX_FEE_SOMPI + 1);
         consensus.add_transaction(parent_tx, 1);
         child_tx
     }

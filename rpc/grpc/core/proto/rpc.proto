@@ -1190,6 +1190,7 @@ message ServiceProviderMessage {
 }
 
 message GetServiceProvidersRequestMessage {
+  optional uint64 windowDaa = 1;
 }
 
 message GetServiceProvidersResponseMessage {

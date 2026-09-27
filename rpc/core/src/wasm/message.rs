@@ -247,7 +247,10 @@ declare! {
     /**
      * @category Node RPC
      */
-    export interface IGetServiceProvidersRequest { }
+    export interface IGetServiceProvidersRequest {
+        /** Widens the eligibility window (DAA), bounded by the node. */
+        windowDaa? : bigint;
+    }
     "#,
 }
 
