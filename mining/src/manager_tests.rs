@@ -287,7 +287,7 @@ mod tests {
         use keryx_consensus_core::collateral::{private_cohort_seed, private_target_cohort};
         use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
         use keryx_hashes::Hash;
-        use keryx_inference::{MAX_PRIVATE_RECIPIENTS, escrow_pubkey_of, seal_request};
+        use keryx_inference::{MAX_PRIVATE_RECIPIENTS, escrow_pubkey_of, max_private_prompt_len, seal_request};
 
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
@@ -296,17 +296,18 @@ mod tests {
         keys.sort_unstable();
         consensus.set_private_cohort(Some(keys.clone()));
 
-        let request = |funding: u32, pick: &dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]>| {
+        let request = |funding: u32, prompt: &[u8], pick: &dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]>| {
             let funded = create_transaction_with_utxo_entry(funding, 0);
             let seed = private_cohort_seed(&funded.tx.inputs[0].previous_outpoint);
             let cohort: Vec<Hash> = keys.iter().copied().map(Hash::from_bytes).collect();
             let target: Vec<[u8; 32]> = private_target_cohort(&seed, &cohort).into_iter().map(|k| k.as_bytes()).collect();
-            let (payload, _) = seal_request([0xAA; 32], 64, 1, 1, b"sealed prompt", &pick(&target)).unwrap();
+            let (payload, _) = seal_request([0xAA; 32], 64, 1, 1, prompt, &pick(&target)).unwrap();
             let mut tx = funded.tx.as_ref().clone();
             tx.subnetwork_id = SUBNETWORK_ID_AI_REQUEST;
             tx.payload = payload.serialize();
             tx.outputs[0].value = SOMPI_PER_KASPA - keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE;
             tx.finalize();
+            let id = tx.id();
             let mut mtx = MutableTransaction::from_tx(tx);
             mtx.entries = funded.entries.clone();
             into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
@@ -316,15 +317,19 @@ mod tests {
                 Orphan::Allowed,
                 RbfPolicy::Forbidden,
             ))
+            .map(|_| id)
         };
 
-        request(91, &|target| target.to_vec()).unwrap();
+        // A full-size private request (16 KiB payload, 128 recipients) is standard at the flat minimum fee.
+        let full = request(91, &vec![b'p'; max_private_prompt_len(MAX_PRIVATE_RECIPIENTS)], &|target| target.to_vec()).unwrap();
+        let pooled = mining_manager.get_transaction(&full, TransactionQuery::All).unwrap();
+        assert_eq!(pooled.tx.payload.len(), keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN);
         let swap_one = |target: &[[u8; 32]]| -> Vec<[u8; 32]> {
             let mut out: Vec<[u8; 32]> = target[1..].to_vec();
             out.push(*keys.iter().find(|k| !target.contains(k)).unwrap());
             out
         };
-        assert_eq!(request(92, &swap_one).map(|_| ()), Err(RuleError::RejectPrivateRequestCoverage(1, MAX_PRIVATE_RECIPIENTS)));
+        assert_eq!(request(92, b"sealed prompt", &swap_one).map(|_| ()), Err(RuleError::RejectPrivateRequestCoverage(1, MAX_PRIVATE_RECIPIENTS)));
     }
 
     #[test]
