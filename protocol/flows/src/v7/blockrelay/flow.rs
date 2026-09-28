@@ -10,7 +10,7 @@ use keryx_consensus_core::{
     errors::block::RuleError,
 };
 use keryx_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
-use keryx_core::{debug, info, warn};
+use keryx_core::{debug, warn};
 use keryx_hashes::Hash;
 use keryx_txscript::pay_to_address_script;
 use keryx_p2p_lib::{
@@ -24,7 +24,6 @@ use keryx_utils::channel::{JobSender, JobTrySendError as TrySendError};
 use std::{
     collections::VecDeque,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 pub struct RelayInvMessage {
@@ -69,10 +68,6 @@ impl TwoWayIncomingRoute {
 /// Honest nodes may relay a handful of pre-enforcement blocks; spammers relay many more.
 const RD_VIOLATION_BAN_THRESHOLD: u32 = 5;
 
-/// Minimum delay between two re-proof attempts on a relay flow. Each attempt re-downloads a full
-/// block, so it must not run at inv cadence.
-const POM_REPROOF_MIN_INTERVAL: Duration = Duration::from_secs(1);
-
 pub struct HandleRelayInvsFlow {
     ctx: FlowContext,
     router: Arc<Router>,
@@ -86,8 +81,6 @@ pub struct HandleRelayInvsFlow {
     header_format: HeaderFormat,
     /// Counts blocks relayed by this peer that were missing the R&D allocation output.
     rd_violation_count: u32,
-    /// Last time this flow consumed an item from the global PoM re-proof queue.
-    last_reproof_attempt: Instant,
 }
 
 #[async_trait::async_trait]
@@ -127,7 +120,6 @@ impl HandleRelayInvsFlow {
             ibd_sender,
             header_format,
             rd_violation_count: 0,
-            last_reproof_attempt: Instant::now(),
         }
     }
 
@@ -136,29 +128,8 @@ impl HandleRelayInvsFlow {
             // Loop over incoming block inv messages
             let inv = self.invs_route.dequeue().await?;
 
-            // Self-healing: re-fetch the possession proof of blocks flagged naked-recent (by the
-            // serving guard-rail or the IBD receive path). Piggybacks on the inv cadence so it
-            // needs no timer, rate-limited by `POM_REPROOF_MIN_INTERVAL`. A candidate that cannot
-            // be repaired here returns to the tail of the queue for another peer to try.
             let session = self.ctx.consensus().unguarded_session();
 
-            if self.last_reproof_attempt.elapsed() >= POM_REPROOF_MIN_INTERVAL {
-                self.last_reproof_attempt = Instant::now();
-                if let Some(naked_hash) = self.ctx.take_pom_reproof_candidates(1).into_iter().next() {
-                    // A re-proof grafts a proof onto a body we hold; a block we only have the
-                    // header of belongs to the relay and IBD paths, and asking peers for it in a
-                    // loop is how one bodyless header cut the whole network into pieces.
-                    if session.async_get_block_status(naked_hash).await == Some(BlockStatus::StatusHeaderOnly) {
-                        self.ctx.abandon_pom_reproof(naked_hash);
-                        debug!("PoM re-proof: {} is header-only here, dropped from the re-fetch queue", naked_hash);
-                    } else if let Err(e) = self.try_readopt_pom_proof(naked_hash).await {
-                        // Never the peer's fault: re-queue (within the attempt budget) and keep
-                        // the connection; a closed one surfaces on the next dequeue anyway.
-                        self.ctx.enqueue_pom_reproof(naked_hash);
-                        debug!("PoM re-proof: re-fetch of {} via peer {} failed: {} — re-queued", naked_hash, self.router, e);
-                    }
-                }
-            }
             let is_ibd_in_transitional_state = session.async_is_consensus_in_transitional_ibd_state().await;
 
             match session.async_get_block_status(inv.hash).await {
@@ -400,55 +371,6 @@ impl HandleRelayInvsFlow {
 
     fn enqueue_orphan_roots(&mut self, _orphan: Hash, roots: Vec<Hash>, known_within_range: bool) {
         self.invs_route.enqueue_indirect_invs(roots, known_within_range)
-    }
-
-    /// Re-fetches a block whose possession proof is missing locally and adopts the proof it
-    /// carries. Every path that fails to obtain a usable proof re-queues the hash at the tail, so
-    /// another peer (or the same one, once healed itself) gets a turn.
-    ///
-    /// Two cases: the block is stored but naked (graft the proof onto it), or it was never
-    /// inserted because the proof-required relay path skipped it (submit the proof-carrying block
-    /// through the enforcing path — there is no stored header to graft onto).
-    async fn try_readopt_pom_proof(&mut self, requested_hash: Hash) -> Result<(), ProtocolError> {
-        let Some((block, request_scope)) = self.request_block(requested_hash, self.msg_route.id(), self.header_format).await? else {
-            // Another flow owns this request; the candidate would be lost when that scope closes.
-            self.ctx.enqueue_pom_reproof(requested_hash);
-            return Ok(());
-        };
-        request_scope.report_obtained();
-        let Some(proof) = block.pom_proof else {
-            self.ctx.enqueue_pom_reproof(requested_hash);
-            debug!("PoM re-proof: peer {} also serves {} without its proof — re-queued", self.router, requested_hash);
-            return Ok(());
-        };
-        let session = self.ctx.consensus().unguarded_session();
-        // Adoption grafts the proof onto a block we already store. A block skipped by the
-        // proof-required relay path was never inserted, so there is no stored header to graft
-        // onto — submit the proof-carrying block itself through the enforcing path instead.
-        if session.async_get_block_status(requested_hash).await.is_none() {
-            let block =
-                Block { header: block.header, transactions: block.transactions, pom_proof: Some(proof), pom_tier: block.pom_tier };
-            match session.validate_and_insert_block(block).block_task.await {
-                Ok(_) => info!("PoM re-proof: inserted {} with the proof served by peer {}", requested_hash, self.router),
-                Err(e) => {
-                    self.ctx.enqueue_pom_reproof(requested_hash);
-                    debug!(
-                        "PoM re-proof: proof-carrying {} from peer {} still rejected: {} — re-queued",
-                        requested_hash, self.router, e
-                    );
-                }
-            }
-            return Ok(());
-        }
-        match session.async_adopt_pom_proof(requested_hash, (*proof).clone()).await {
-            Ok(true) => info!("PoM re-proof: adopted the possession proof of {} from peer {}", requested_hash, self.router),
-            Ok(false) => {}
-            Err(e) => {
-                self.ctx.enqueue_pom_reproof(requested_hash);
-                debug!("PoM re-proof: proof of {} from peer {} not adopted: {} — re-queued", requested_hash, self.router, e);
-            }
-        }
-        Ok(())
     }
 
     async fn request_block(
