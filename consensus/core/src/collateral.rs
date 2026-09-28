@@ -191,6 +191,48 @@ pub fn private_cohort_tolerance(cohort_len: usize) -> usize {
     cohort_len.div_ceil(4).max(3)
 }
 
+/// Largest cohort a private request is sealed to in full; a larger one is sealed to its
+/// [`private_target_cohort`]. Must equal the envelope's recipient cap.
+pub const PRIVATE_COHORT_TARGET: usize = 128;
+
+/// Seed of a private request's target cohort: the outpoint its first input spends
+/// (`txid ‖ index u32 LE`).
+pub type PrivateCohortSeed = [u8; 36];
+
+/// The [`PrivateCohortSeed`] of a request whose first input spends `outpoint`.
+pub fn private_cohort_seed(outpoint: &crate::tx::TransactionOutpoint) -> PrivateCohortSeed {
+    let mut seed = [0u8; 36];
+    seed[..32].copy_from_slice(&outpoint.transaction_id.as_bytes());
+    seed[32..].copy_from_slice(&outpoint.index.to_le_bytes());
+    seed
+}
+
+/// Rank of escrow key `key` in the target cohort drawn from `seed`; lower ranks are kept.
+pub fn private_cohort_rank(seed: &PrivateCohortSeed, key: &[u8; 32]) -> [u8; 32] {
+    let mut state = blake2b_simd::Params::new().hash_length(32).to_state();
+    state.update(b"KeryxPrivateCohortV1");
+    state.update(seed);
+    state.update(key);
+    let mut rank = [0u8; 32];
+    rank.copy_from_slice(state.finalize().as_bytes());
+    rank
+}
+
+/// The escrow keys a private request seeded with `seed` must cover among `cohort`: all of them
+/// up to [`PRIVATE_COHORT_TARGET`], else the [`PRIVATE_COHORT_TARGET`] of lowest rank. Sorted,
+/// deduplicated.
+pub fn private_target_cohort(seed: &PrivateCohortSeed, cohort: &[Hash]) -> Vec<Hash> {
+    let mut keys: Vec<Hash> = cohort.to_vec();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.len() > PRIVATE_COHORT_TARGET {
+        keys.sort_by_cached_key(|k| (private_cohort_rank(seed, &k.as_bytes()), *k));
+        keys.truncate(PRIVATE_COHORT_TARGET);
+        keys.sort_unstable();
+    }
+    keys
+}
+
 /// Standing evaluation lag AND probation length (~14 h at 10 BPS): an identity is in standing at
 /// POV `p` iff, looking only at events with daa ≤ `p − LAG`, it has been sighted (first certified
 /// block) and its strike count reads zero. The lag is finality + the ledger horizon, so every
@@ -406,6 +448,9 @@ struct PendingRequest {
     /// restricted to these keys, so only a named responder is obligated to answer, credited when
     /// it does, and paid the vault.
     recipients: Vec<Hash>,
+    /// Private inference: the seed of the target cohort the recipients must cover; zero for a
+    /// public request.
+    cohort_seed: PrivateCohortSeed,
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
@@ -580,7 +625,7 @@ impl ServiceLedger {
         daa: u64,
         requests: &[([u8; 32], u8, u32)],
         request_rewards: &[([u8; 32], u64)],
-        request_recipients: &[([u8; 32], Vec<Hash>)],
+        request_recipients: &[([u8; 32], PrivateCohortSeed, Vec<Hash>)],
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
@@ -629,7 +674,7 @@ impl ServiceLedger {
         daa: u64,
         requests: &[([u8; 32], u8, u32)],
         request_rewards: &[([u8; 32], u64)],
-        request_recipients: &[([u8; 32], Vec<Hash>)],
+        request_recipients: &[([u8; 32], PrivateCohortSeed, Vec<Hash>)],
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
@@ -645,7 +690,7 @@ impl ServiceLedger {
         daa: u64,
         requests: &[([u8; 32], u8, u32)],
         request_rewards: &[([u8; 32], u64)],
-        request_recipients: &[([u8; 32], Vec<Hash>)],
+        request_recipients: &[([u8; 32], PrivateCohortSeed, Vec<Hash>)],
         responses: &[([u8; 32], Option<Hash>)],
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
@@ -715,7 +760,8 @@ impl ServiceLedger {
                 winner: None,
                 audit: None,
                 early_responders: Vec::new(),
-                recipients: request_recipients.iter().find(|(h, _)| h == rh).map(|(_, r)| r.clone()).unwrap_or_default(),
+                recipients: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, _, r)| r.clone()).unwrap_or_default(),
+                cohort_seed: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, s, _)| *s).unwrap_or([0u8; 36]),
             });
             // Answers that beat their own request to acceptance.
             if entry.audit.is_none() {
@@ -817,16 +863,15 @@ impl ServiceLedger {
                 Some(_) => {}
                 None if daa > req.accepted_daa => {
                     let mut set = cohort(req.tier);
-                    // A private request is sealed to the whole cohort. One that leaves out more
+                    // A private request is sealed to its target cohort. One that leaves out more
                     // than the tolerance is unservable. Otherwise it obligates (and pays) only
                     // the members it was sealed to: the others cannot read it, so they are
                     // neither audited for it nor able to claim its vault.
                     if !req.recipients.is_empty() {
-                        let mut escrows: Vec<Hash> = set.iter().map(|(_, escrow)| *escrow).collect();
-                        escrows.sort_unstable();
-                        escrows.dedup();
-                        let uncovered = escrows.iter().filter(|e| req.recipients.binary_search(e).is_err()).count();
-                        if uncovered > private_cohort_tolerance(escrows.len()) {
+                        let escrows: Vec<Hash> = set.iter().map(|(_, escrow)| *escrow).collect();
+                        let target = private_target_cohort(&req.cohort_seed, &escrows);
+                        let uncovered = target.iter().filter(|e| req.recipients.binary_search(e).is_err()).count();
+                        if uncovered > private_cohort_tolerance(target.len()) {
                             set.clear();
                         } else {
                             set.retain(|(_, escrow)| req.recipients.binary_search(escrow).is_ok());
@@ -1083,7 +1128,7 @@ pub struct ServiceLedgerSnapshot {
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
 /// Encoding 1 plus a trailing private-recipient section (`[n: u32] n × [request_hash: 32]
-/// [k: u32] [k × escrow key: 32]`, pending order, ascending keys). Emitted only when a pending
+/// [cohort seed: 36] [k: u32] [k × escrow key: 32]`, pending order, ascending keys). Emitted only when a pending
 /// request carries recipients, so every snapshot without one keeps its historical bytes and
 /// hash, and one byte form per state keeps the encoding canonical.
 const SNAPSHOT_ENCODING_VERSION_PRIVATE: u8 = 2;
@@ -1158,8 +1203,12 @@ impl ServiceLedgerSnapshot {
     /// Canonical byte form; the input of [`Self::hash`] and of the sync transfer.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let private: Vec<(&[u8; 32], &Vec<Hash>)> =
-            self.pending.iter().filter(|(_, r)| !r.recipients.is_empty()).map(|(rh, r)| (rh, &r.recipients)).collect();
+        let private: Vec<(&[u8; 32], &PrivateCohortSeed, &Vec<Hash>)> = self
+            .pending
+            .iter()
+            .filter(|(_, r)| !r.recipients.is_empty())
+            .map(|(rh, r)| (rh, &r.cohort_seed, &r.recipients))
+            .collect();
         out.push(if private.is_empty() { SNAPSHOT_ENCODING_VERSION } else { SNAPSHOT_ENCODING_VERSION_PRIVATE });
         out.extend_from_slice(&(self.vault.len() as u32).to_le_bytes());
         for (miner, claims) in self.vault.iter() {
@@ -1240,8 +1289,9 @@ impl ServiceLedgerSnapshot {
         }
         if !private.is_empty() {
             out.extend_from_slice(&(private.len() as u32).to_le_bytes());
-            for (rh, recipients) in private {
+            for (rh, seed, recipients) in private {
                 out.extend_from_slice(rh);
+                out.extend_from_slice(seed);
                 put_hashes(&mut out, recipients);
             }
         }
@@ -1302,7 +1352,7 @@ impl ServiceLedgerSnapshot {
                 _ => return Err("malformed audit".into()),
             };
             let early_responders = r.hashes()?;
-            let req = PendingRequest { tier, max_tokens, accepted_daa, reward, winner, audit, early_responders, recipients: Vec::new() };
+            let req = PendingRequest { tier, max_tokens, accepted_daa, reward, winner, audit, early_responders, recipients: Vec::new(), cohort_seed: [0u8; 36] };
             if snap.pending.insert(rh, req).is_some() {
                 return Err("malformed pending".into());
             }
@@ -1366,12 +1416,16 @@ impl ServiceLedgerSnapshot {
             }
             for _ in 0..n {
                 let rh = r.key()?;
+                let seed: PrivateCohortSeed = r.take(36)?.try_into().unwrap();
                 let keys = r.hashes()?;
                 if keys.is_empty() || keys.windows(2).any(|w| w[0] >= w[1]) {
                     return Err("malformed private recipients".into());
                 }
                 match snap.pending.get_mut(&rh) {
-                    Some(req) if req.recipients.is_empty() => req.recipients = keys,
+                    Some(req) if req.recipients.is_empty() => {
+                        req.recipients = keys;
+                        req.cohort_seed = seed;
+                    }
                     _ => return Err("malformed private section".into()),
                 }
             }
@@ -1670,7 +1724,7 @@ mod tests {
             100,
             &[(public, 0, 1), (private, 0, 1)],
             &[],
-            &[(private, vec![b])],
+            &[(private, [7u8; 36], vec![b])],
             &[],
             &[],
             &[],
@@ -1686,6 +1740,7 @@ mod tests {
         restored.restore_snapshot(&parsed);
         assert_eq!(restored.private_recipients(&private), Some(&[b][..]));
         assert_eq!(restored.private_recipients(&public), None);
+        assert_eq!(restored.pending.get(&private).unwrap().cohort_seed, [7u8; 36]);
 
         // Without private requests the encoding is the historical one, byte for byte.
         let mut plain = ServiceLedger::default();
@@ -1701,7 +1756,7 @@ mod tests {
         bad[0] = 2;
         assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
         let mut bad = bytes.clone();
-        let at = bytes.len() - 32 - 4 - 32; // the request hash of the single trailer entry
+        let at = bytes.len() - 32 - 4 - 36 - 32; // the request hash of the single trailer entry
         bad[at] ^= 0xFF;
         assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
         // A version-1 header on bytes that carry a trailer is trailing data.
@@ -1828,8 +1883,8 @@ mod tests {
         assert!(ProductionIndexSnapshot::from_bytes(&padded).is_err());
     }
     use super::{
-        eligible_pairs, private_cohort_tolerance, service_window_daa, service_window_daa_at, strike_penalty, strike_penalty_at,
-        update_strikes, FoldOutcome, ServiceLedger, ServicePenalty, ServiceReward,
+        eligible_pairs, private_cohort_rank, private_cohort_tolerance, private_target_cohort, service_window_daa, service_window_daa_at,
+        strike_penalty, strike_penalty_at, update_strikes, FoldOutcome, PRIVATE_COHORT_TARGET, ServiceLedger, ServicePenalty, ServiceReward,
         StrikeEntry, AI_REQUEST_MAX_TOKENS_CAP, SERVICE_EARLY_RESPONSE_HORIZON_DAA, SERVICE_LEDGER_HORIZON_DAA,
         SERVICE_STRIKE_INTERVAL_DAA, STRIKE_1_BURN_CLAIMS,
     };
@@ -1901,7 +1956,7 @@ mod tests {
             ledger.set_reward_routing_activation(0);
             let rh = [7u8; 32];
             let recipients = set[..covered].to_vec();
-            ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[(rh, 5_000)], &[(rh, recipients)], &[], &[], &[], |_| true, cohort_of(&set));
+            ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[(rh, 5_000)], &[(rh, [0u8; 36], recipients)], &[], &[], &[], |_| true, cohort_of(&set));
             ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
             (ledger.audit_cohort(&rh), ledger.pending_len())
         };
@@ -1911,6 +1966,69 @@ mod tests {
         let (cohort, pending) = arm(set.len() - tol - 1);
         assert_eq!(cohort, None);
         assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn private_target_cohort_keeps_everyone_up_to_the_cap_and_the_lowest_ranks_above() {
+        let keys = |n: usize| -> Vec<Hash> { (0..n as u64).map(|i| Hash::from_u64_word(i + 1)).collect() };
+        let seed = [3u8; 36];
+        let full = keys(PRIVATE_COHORT_TARGET);
+        assert_eq!(private_target_cohort(&seed, &full), full);
+
+        let big = keys(150);
+        let target = private_target_cohort(&seed, &big);
+        assert_eq!(target.len(), PRIVATE_COHORT_TARGET);
+        assert!(target.windows(2).all(|w| w[0] < w[1]));
+        assert!(target.iter().all(|k| big.contains(k)));
+        let worst_kept = target.iter().map(|k| private_cohort_rank(&seed, &k.as_bytes())).max().unwrap();
+        assert!(big.iter().filter(|k| !target.contains(k)).all(|k| private_cohort_rank(&seed, &k.as_bytes()) > worst_kept));
+
+        let mut shuffled = big.clone();
+        shuffled.reverse();
+        shuffled.push(big[0]);
+        assert_eq!(private_target_cohort(&seed, &shuffled), target);
+        assert_ne!(private_target_cohort(&[4u8; 36], &big), target);
+    }
+
+    /// Above the cap the coverage is measured against the target cohort: sealing to it is served,
+    /// leaving out more than the tolerance of it is not, and a recipient the target dropped by
+    /// churn stays obligated (it can read).
+    #[test]
+    fn private_request_above_the_cap_is_covered_against_its_target_cohort() {
+        let seed = [9u8; 36];
+        let set: Vec<Hash> = (0..150u64).map(|i| Hash::from_u64_word(i + 1)).collect();
+        let target = private_target_cohort(&seed, &set);
+        let tol = private_cohort_tolerance(target.len());
+        assert_eq!(tol, 32);
+        let arm = |recipients: Vec<Hash>, cohort: &[Hash]| {
+            let mut ledger = ServiceLedger::default();
+            ledger.set_window_v2_activation(0);
+            ledger.set_reward_routing_activation(0);
+            let rh = [7u8; 32];
+            ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[(rh, 5_000)], &[(rh, seed, recipients)], &[], &[], &[], |_| true, cohort_of(cohort));
+            ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(cohort));
+            ledger.audit_cohort(&rh)
+        };
+        assert_eq!(arm(target.clone(), &set), Some(target.clone()));
+
+        let short: Vec<Hash> = target[tol..].to_vec();
+        assert_eq!(arm(short.clone(), &set), Some(short));
+        let too_short: Vec<Hash> = target[tol + 1..].to_vec();
+        assert_eq!(arm(too_short, &set), None);
+
+        let outside: Vec<Hash> = set.iter().filter(|k| !target.contains(k)).copied().collect();
+        assert_eq!(arm(outside, &set), None);
+
+        let worst_kept = target.iter().map(|k| private_cohort_rank(&seed, &k.as_bytes())).max().unwrap();
+        let evicted = *target.iter().find(|k| private_cohort_rank(&seed, &k.as_bytes()) == worst_kept).unwrap();
+        let newcomer =
+            (1000u64..).map(Hash::from_u64_word).find(|k| private_cohort_rank(&seed, &k.as_bytes()) < worst_kept).unwrap();
+        let mut grown = set.clone();
+        grown.push(newcomer);
+        assert!(!private_target_cohort(&seed, &grown).contains(&evicted));
+        let cohort = arm(target.clone(), &grown).unwrap();
+        assert!(cohort.contains(&evicted));
+        assert!(!cohort.contains(&newcomer));
     }
 
     #[test]
@@ -1930,7 +2048,7 @@ mod tests {
             100,
             &[(rh, 0, 256)],
             &[(rh, 5_000)],
-            &[(rh, vec![b])],
+            &[(rh, [0u8; 36], vec![b])],
             &[],
             &[],
             &[(b, spk_b.clone())],
@@ -1968,7 +2086,7 @@ mod tests {
         ledger.set_reward_routing_activation(0);
         let w = service_window_daa_at(0, 256, true);
         let rh = [8u8; 32];
-        ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[], &[(rh, vec![b])], &[], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[], &[(rh, [0u8; 36], vec![b])], &[], &[], &[], |_| true, cohort_of(&set));
         ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
         let out = ledger.on_chain_block_with_recipients(102 + w, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
         assert_eq!(out.misses.iter().map(|m| m.miner).collect::<Vec<_>>(), vec![b]);
@@ -1987,7 +2105,7 @@ mod tests {
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [9u8; 32];
-        ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[], &[(rh, vec![b])], &[], &[], &[], |_| true, cohort_of(&set));
+        ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[], &[(rh, [0u8; 36], vec![b])], &[], &[], &[], |_| true, cohort_of(&set));
         assert_eq!(ledger.pending_len(), 1);
         let out = ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
         assert!(out.misses.is_empty());
@@ -2013,7 +2131,7 @@ mod tests {
             100,
             &[(rh, 0, 256)],
             &[(rh, 1_000)],
-            &[(rh, vec![b])],
+            &[(rh, [0u8; 36], vec![b])],
             &[(rh, Some(a)), (rh, Some(b))],
             &[],
             &[],

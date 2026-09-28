@@ -167,10 +167,10 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
-    /// The escrow keys a private AiRequest for `model_id` must be sealed to at the current sink;
-    /// `None` before the private-inference activation or for an unknown model.
-    fn private_cohort_escrows(&self, model_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
-        let _ = model_id;
+    /// The escrow keys a private AiRequest for `model_id` seeded with `seed` must be sealed to at
+    /// the current sink; `None` before the private-inference activation or for an unknown model.
+    fn private_cohort_escrows(&self, model_id: &[u8; 32], seed: &crate::collateral::PrivateCohortSeed) -> Option<Vec<[u8; 32]>> {
+        let _ = (model_id, seed);
         None
     }
 

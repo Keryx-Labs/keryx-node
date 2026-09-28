@@ -6,7 +6,8 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, verify_responder_signature, EscrowClaim, FoldOutcome, RewardEntry, ServiceLedger,
+    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_responder_signature, EscrowClaim,
+    FoldOutcome, PrivateCohortSeed, RewardEntry, ServiceLedger,
     ProductionIndexSnapshot, ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
@@ -19,6 +20,8 @@ use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
 use keryx_inference::{AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 use keryx_txscript::script_class::ScriptClass;
+
+const _: () = assert!(keryx_consensus_core::collateral::PRIVATE_COHORT_TARGET == keryx_inference::private::MAX_PRIVATE_RECIPIENTS);
 
 
 /// The escrow pubkey locked by a CSV escrow script, if the script is one.
@@ -282,7 +285,7 @@ impl VirtualStateProcessor {
         hash: Hash,
         txid_identity: bool,
         private: bool,
-    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], Vec<Hash>)>, Vec<([u8; 32], Option<Hash>)>) {
+    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>, Vec<([u8; 32], Option<Hash>)>) {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
         let mut request_recipients = Vec::new();
@@ -314,11 +317,12 @@ impl VirtualStateProcessor {
                             if private
                                 && req.is_private()
                                 && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
+                                && let Some(first) = tx.inputs.first()
                             {
                                 let mut recipients: Vec<Hash> = envelope.recipient_keys().map(escrow_miner_key).collect();
                                 recipients.sort_unstable();
                                 recipients.dedup();
-                                request_recipients.push((request_hash, recipients));
+                                request_recipients.push((request_hash, private_cohort_seed(&first.previous_outpoint), recipients));
                             }
                         }
                     }
@@ -429,22 +433,26 @@ impl VirtualStateProcessor {
         ServiceProvidersSnapshot { virtual_daa_score, providers }
     }
 
-    /// The escrow keys a private AiRequest for `model_id` must be sealed to at `sink`: the
-    /// cohort its tier would arm with now. `None` before the private-inference activation or for
-    /// a model outside the tier set.
-    pub(crate) fn private_cohort_escrows(&self, sink: Hash, virtual_daa_score: u64, model_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+    /// The escrow keys a private AiRequest for `model_id` seeded with `seed` must be sealed to at
+    /// `sink`: the target cohort of the cohort its tier would arm with now. `None` before the
+    /// private-inference activation or for a model outside the tier set.
+    pub(crate) fn private_cohort_escrows(
+        &self,
+        sink: Hash,
+        virtual_daa_score: u64,
+        model_id: &[u8; 32],
+        seed: &PrivateCohortSeed,
+    ) -> Option<Vec<[u8; 32]>> {
         if !self.private_inference_activation.is_active(virtual_daa_score) {
             return None;
         }
         let tier = POM_TIERS_H6.iter().position(|t| t.model_id == *model_id)? as u8;
-        let mut keys: Vec<[u8; 32]> = self
+        let cohort: Vec<Hash> = self
             .service_eligible_miners_windowed(sink, tier, self.eligibility_window_at(virtual_daa_score))
             .into_iter()
-            .map(|(_, escrow)| escrow.as_bytes())
+            .map(|(_, escrow)| escrow)
             .collect();
-        keys.sort_unstable();
-        keys.dedup();
-        Some(keys)
+        Some(private_target_cohort(seed, &cohort).into_iter().map(|k| k.as_bytes()).collect())
     }
 
     /// Escrow claims created by committed chain block `hash`'s coinbase, keyed by producing miner:

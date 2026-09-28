@@ -11,7 +11,7 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::verify_responder_signature,
+    collateral::{private_cohort_seed, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
@@ -234,8 +234,8 @@ impl Mempool {
         Ok(())
     }
 
-    /// Admission policy for private requests: the envelope must cover the whole cohort its tier
-    /// would arm with now. Consensus tolerates members that join between sealing and arming; the
+    /// Admission policy for private requests: the envelope must cover the whole target cohort its
+    /// tier would arm with now. Consensus tolerates members that join between sealing and arming; the
     /// mempool admits nothing short of full coverage, and nothing for an empty tier (it would
     /// burn its vault). Malformed requests are left to the consensus rules.
     fn validate_private_request_coverage(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
@@ -243,7 +243,10 @@ impl Mempool {
             return Ok(());
         }
         let Some(req) = AiRequestPayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
-        let Some(cohort) = consensus.private_cohort_escrows(&req.model_id) else { return Ok(()) };
+        let Some(first) = transaction.tx.inputs.first() else { return Ok(()) };
+        let Some(cohort) = consensus.private_cohort_escrows(&req.model_id, &private_cohort_seed(&first.previous_outpoint)) else {
+            return Ok(());
+        };
         let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt) else { return Ok(()) };
         if cohort.is_empty() {
             return Err(RuleError::RejectPrivateRequestEmptyCohort);

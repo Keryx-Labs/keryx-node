@@ -1,4 +1,5 @@
 use crate::imports::*;
+use keryx_consensus_core::collateral::{PrivateCohortSeed, private_cohort_rank, private_cohort_seed, private_target_cohort};
 use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H6, POM_TIERS_H6};
 use keryx_consensus_core::constants::{SOMPI_PER_KASPA, TX_VERSION};
 use keryx_consensus_core::sign::{Signed, sign_with_multiple_v2};
@@ -154,7 +155,6 @@ impl Inference {
             (None, Some(t)) => POM_TIERS_H6.get(t).map(|m| m.model_id).ok_or_else(|| Error::custom("--tier must be 0-4"))?,
             (None, None) => return Err(Error::custom("choose the model with --tier <0-4> or --model <hex>")),
         };
-        let recipients = cohort_recipients(ctx, &model_id).await?;
         let prompt = read_text_argument(&prompt_words)?;
         if prompt.is_empty() {
             return Err(Error::custom("the prompt is empty: pass it as words after the options, or as @<file>"));
@@ -177,12 +177,9 @@ impl Inference {
             )));
         }
 
-        // Seal the prompt: only the tier's escrow keys can open it, and the root key stays here.
-        let (payload, secret) = seal_request(model_id, max_tokens, reward, fee, prompt.as_bytes(), &recipients)
-            .map_err(|e| Error::custom(e.to_string()))?;
-
         // Fund it from the wallet: inputs covering reward + fee + change, change at outputs[0],
-        // the keyless reward vault at outputs[1] (the layout consensus checks).
+        // the keyless reward vault at outputs[1] (the layout consensus checks). The inputs come
+        // first: the first one seeds the target cohort the prompt is sealed to.
         let account = ctx.wallet().account()?;
         let needed = reward + fee + MIN_CHANGE_SOMPI;
         let mut utxos = account.utxo_context().get_utxos(None, None).await?;
@@ -205,6 +202,13 @@ impl Inference {
                 sompi_to_kaspa_string(MIN_CHANGE_SOMPI)
             )));
         }
+        let seed = private_cohort_seed(&TransactionOutpoint::from(&selected[0].outpoint));
+        let recipients = cohort_recipients(ctx, &model_id, &seed).await?;
+
+        // Seal the prompt: only the tier's escrow keys can open it, and the root key stays here.
+        let (payload, secret) = seal_request(model_id, max_tokens, reward, fee, prompt.as_bytes(), &recipients)
+            .map_err(|e| Error::custom(e.to_string()))?;
+
         let change = total - reward - fee;
         let change_address = account.change_address()?;
         let mut addresses: Vec<Address> = selected.iter().filter_map(|u| u.address.clone()).collect();
@@ -428,9 +432,10 @@ impl Inference {
     }
 }
 
-/// The escrow keys a request for `model_id` is sealed to: the whole current cohort of its tier,
-/// completed with the tier's providers of the last `SEAL_WINDOW_DAA` up to the recipient cap.
-async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32]) -> Result<Vec<[u8; 32]>> {
+/// The escrow keys a request for `model_id` seeded with `seed` is sealed to: the target cohort of
+/// its tier, completed by rank with the tier's providers of the last `SEAL_WINDOW_DAA` up to the
+/// recipient cap.
+async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32], seed: &PrivateCohortSeed) -> Result<Vec<[u8; 32]>> {
     let tier = POM_TIERS_H6.iter().position(|t| t.model_id == *model_id).ok_or_else(|| Error::custom("unknown model: no tier serves it"))?
         as u32;
     let rpc = ctx.wallet().rpc_api();
@@ -440,21 +445,16 @@ async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32]) -> Result<V
         keys.dedup();
         keys
     };
-    let mut recipients = keys_of(&rpc.get_service_providers(None).await?);
+    let cohort: Vec<RpcHash> = keys_of(&rpc.get_service_providers(None).await?).into_iter().map(RpcHash::from_bytes).collect();
+    let mut recipients: Vec<[u8; 32]> = private_target_cohort(seed, &cohort).into_iter().map(|k| k.as_bytes()).collect();
     if recipients.is_empty() {
         return Err(Error::custom("no miner of this tier is eligible right now: the request could not be served"));
     }
-    if recipients.len() > MAX_PRIVATE_RECIPIENTS {
-        return Err(Error::custom(format!("the tier cohort has {} members, above the {MAX_PRIVATE_RECIPIENTS} recipient cap", recipients.len())));
-    }
-    for key in keys_of(&rpc.get_service_providers(Some(SEAL_WINDOW_DAA)).await?) {
-        if recipients.len() == MAX_PRIVATE_RECIPIENTS {
-            break;
-        }
-        if !recipients.contains(&key) {
-            recipients.push(key);
-        }
-    }
+    let mut extra: Vec<[u8; 32]> =
+        keys_of(&rpc.get_service_providers(Some(SEAL_WINDOW_DAA)).await?).into_iter().filter(|k| !recipients.contains(k)).collect();
+    extra.sort_by_cached_key(|k| (private_cohort_rank(seed, k), *k));
+    extra.truncate(MAX_PRIVATE_RECIPIENTS.saturating_sub(recipients.len()));
+    recipients.extend(extra);
     Ok(recipients)
 }
 

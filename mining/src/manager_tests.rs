@@ -280,6 +280,53 @@ mod tests {
         request(84, &keys[..1]).unwrap();
     }
 
+    /// Private inference above the recipient cap: a request must cover the target cohort drawn
+    /// from its first input, and covering 128 other members of the tier is not enough.
+    #[test]
+    fn test_private_request_target_cohort_admission() {
+        use keryx_consensus_core::collateral::{private_cohort_seed, private_target_cohort};
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
+        use keryx_hashes::Hash;
+        use keryx_inference::{MAX_PRIVATE_RECIPIENTS, escrow_pubkey_of, seal_request};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let mut keys: Vec<[u8; 32]> = (1u8..=150).map(|i| escrow_pubkey_of(&[i; 32]).unwrap()).collect();
+        keys.sort_unstable();
+        consensus.set_private_cohort(Some(keys.clone()));
+
+        let request = |funding: u32, pick: &dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]>| {
+            let funded = create_transaction_with_utxo_entry(funding, 0);
+            let seed = private_cohort_seed(&funded.tx.inputs[0].previous_outpoint);
+            let cohort: Vec<Hash> = keys.iter().copied().map(Hash::from_bytes).collect();
+            let target: Vec<[u8; 32]> = private_target_cohort(&seed, &cohort).into_iter().map(|k| k.as_bytes()).collect();
+            let (payload, _) = seal_request([0xAA; 32], 64, 1, 1, b"sealed prompt", &pick(&target)).unwrap();
+            let mut tx = funded.tx.as_ref().clone();
+            tx.subnetwork_id = SUBNETWORK_ID_AI_REQUEST;
+            tx.payload = payload.serialize();
+            tx.outputs[0].value = SOMPI_PER_KASPA - keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE;
+            tx.finalize();
+            let mut mtx = MutableTransaction::from_tx(tx);
+            mtx.entries = funded.entries.clone();
+            into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                mtx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+
+        request(91, &|target| target.to_vec()).unwrap();
+        let swap_one = |target: &[[u8; 32]]| -> Vec<[u8; 32]> {
+            let mut out: Vec<[u8; 32]> = target[1..].to_vec();
+            out.push(*keys.iter().find(|k| !target.contains(k)).unwrap());
+            out
+        };
+        assert_eq!(request(92, &swap_one).map(|_| ()), Err(RuleError::RejectPrivateRequestCoverage(1, MAX_PRIVATE_RECIPIENTS)));
+    }
+
     #[test]
     fn test_simulated_error_in_consensus() {
         for (priority, orphan, rbf_policy) in all_priority_orphan_rbf_policy_combinations() {

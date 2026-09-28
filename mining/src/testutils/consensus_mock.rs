@@ -81,8 +81,13 @@ impl ConsensusMock {
 }
 
 impl ConsensusApi for ConsensusMock {
-    fn private_cohort_escrows(&self, _model_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
-        self.private_cohort.read().clone()
+    fn private_cohort_escrows(
+        &self,
+        _model_id: &[u8; 32],
+        seed: &keryx_consensus_core::collateral::PrivateCohortSeed,
+    ) -> Option<Vec<[u8; 32]>> {
+        let cohort: Vec<Hash> = self.private_cohort.read().clone()?.into_iter().map(Hash::from_bytes).collect();
+        Some(keryx_consensus_core::collateral::private_target_cohort(seed, &cohort).into_iter().map(|k| k.as_bytes()).collect())
     }
 
     fn build_block_template(

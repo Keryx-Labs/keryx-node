@@ -725,9 +725,13 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.service_providers_snapshot(virtual_state.ghostdag_data.selected_parent, virtual_state.daa_score, window_daa)
     }
 
-    fn private_cohort_escrows(&self, model_id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+    fn private_cohort_escrows(
+        &self,
+        model_id: &[u8; 32],
+        seed: &keryx_consensus_core::collateral::PrivateCohortSeed,
+    ) -> Option<Vec<[u8; 32]>> {
         let virtual_state = self.lkg_virtual_state.load();
-        self.virtual_processor.private_cohort_escrows(virtual_state.ghostdag_data.selected_parent, virtual_state.daa_score, model_id)
+        self.virtual_processor.private_cohort_escrows(virtual_state.ghostdag_data.selected_parent, virtual_state.daa_score, model_id, seed)
     }
 
     fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {

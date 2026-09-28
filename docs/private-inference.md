@@ -46,7 +46,7 @@ sequenceDiagram
     N-->>R: eligible responders of the tier with their escrow keys
     Note over R: seal_request: draw root_key, wrap it to every cohort escrow key (ECDH + HKDF),<br/>encrypt the prompt under k_prompt with the request header as associated data
     R->>N: AiRequest tx: public header, keyless reward vault, prompt = sealed envelope
-    Note over N: mempool: the envelope must parse and cover the whole current cohort
+    Note over N: mempool: the envelope must parse and cover the current target cohort
     N-->>M: block template / block carrying the AiRequest
     N-->>O: the same bytes - ciphertext only, nothing to run
     Note over M: open_request with the escrow secret: unwrap root_key, decrypt the prompt
@@ -161,14 +161,19 @@ every live tip before the binary ships**, and mirrored by the miner release that
     before the gate still be answered the old way.
 * **Service ledger** (`service_bond.rs::service_events_of_chain_block`, `collateral.rs`): after
   the gate a request's envelope yields its recipient set (escrow keys → `escrow_miner_key`,
-  sorted). `PendingRequest.recipients` carries it. At arming, with `C` the cohort's escrow keys:
-  if more than `private_cohort_tolerance(|C|) = max(3, ⌈|C|/4⌉)` of them are not recipients, the
-  request is unservable (dropped, nobody obligated or struck, the vault never minted); otherwise
+  sorted) and its first input's outpoint yields its cohort seed (`private_cohort_seed`).
+  `PendingRequest.recipients` and `PendingRequest.cohort_seed` carry them. At arming, with `C` the
+  cohort's escrow keys and `T = private_target_cohort(seed, C)` — `C` itself up to
+  `PRIVATE_COHORT_TARGET` (128) keys, else the 128 keys of lowest
+  `BLAKE2b-256("KeryxPrivateCohortV1" ‖ seed ‖ key)`: if more than
+  `private_cohort_tolerance(|T|) = max(3, ⌈|T|/4⌉)` of `T` are not recipients, the request is
+  unservable (dropped, nobody obligated or struck, the vault never minted); otherwise
   the cohort is filtered to the recipients. Delegations, early responses, crediting, the reward
   win and strikes then flow through the existing code. The tolerance covers miners that enter the
   cohort between sealing and arming.
 * **Snapshot encoding** (`ServiceLedgerSnapshot`): encoding byte `2` = encoding `1` plus a
-  trailing section `[n: u32] n × [request_hash: 32] [k: u32] [k × escrow key: 32]`, emitted only
+  trailing section `[n: u32] n × [request_hash: 32] [cohort seed: 36] [k: u32] [k × escrow key: 32]`,
+  emitted only
   when a pending request carries recipients. Every snapshot without one keeps its historical
   bytes and hash; one byte form per state keeps the encoding canonical (`from_bytes` re-encodes
   and compares). Version-2 bytes without a trailer, or a trailer naming an unknown request, are
@@ -176,8 +181,9 @@ every live tip before the binary ships**, and mirrored by the miner release that
 * **Mempool admission** (`processor.rs::validate_mempool_transaction_impl`): the era rules above,
   evaluated at the virtual DAA score.
 * **Mempool admission policy** (`mining/src/mempool/validate_and_insert_transaction.rs`):
-  * a private `AiRequest` must be sealed to every escrow key of the cohort its tier would arm with
-    at the sink (`ConsensusApi::private_cohort_escrows`), and is refused for an empty tier
+  * a private `AiRequest` must be sealed to every escrow key of the target cohort (seeded by its
+    first input) its tier would arm with at the sink (`ConsensusApi::private_cohort_escrows`), and
+    is refused for an empty tier
     (`RejectPrivateRequestCoverage`, `RejectPrivateRequestEmptyCohort`);
   * an `AiResponse` with an inline body is admitted only when its responder is a recipient of the
     request, looked up in the mempool's own private-request index (request tx id → recipients,
@@ -208,9 +214,9 @@ inference fetch <request id> <root key> [--since <block hash>] [--timeout SECS]
 inference decrypt <request id> <root key> <responder escrow> <@file | hex>
 ```
 
-`send` seals the prompt to the whole current cohort of the tier, completed with the tier's
-providers of the last 18 000 DAA (~30 min) up to the 128-key cap, funds the request from the open
-account (inputs covering `reward + fee + ≥ 1 KRX change`; change at `outputs[0]`, the keyless
+`send` selects the funding inputs first (the first one seeds the target cohort), seals the prompt
+to the target cohort of the tier, completed by rank with the tier's providers of the last 18 000
+DAA (~30 min) up to the 128-key cap, funds the request from the open account (inputs covering `reward + fee + ≥ 1 KRX change`; change at `outputs[0]`, the keyless
 reward vault at `outputs[1]`), signs it with the account keys, submits it, and prints the request
 id, the root key (the only way to read the answer — keep it) and the sink block to scan from. It
 refuses to send when no miner of the tier is eligible. `--reward` defaults to the model's floor
@@ -259,7 +265,8 @@ the gate, and every reader of AI transactions (indexer, explorer, wallets) must 
   here means confidentiality and integrity between the requester and the tier's miners, not
   verified inference.
 * Every miner of the tier can read the prompt (about 45 keys on the busiest tier in September
-  2026). Nobody else — including the node relaying the transaction — can.
+  2026), or the 128 of its target cohort once the tier is larger. Nobody else — including the
+  node relaying the transaction — can.
 * Metadata stays public: the model, token budget, reward, the requester's funding addresses, the
   recipient keys, the answer length in tokens and the ciphertext sizes.
 * A request pays for its envelope: about 80 bytes per cohort member, so requests are several KB.
@@ -279,7 +286,9 @@ the gate, and every reader of AI transactions (indexer, explorer, wallets) must 
 * `inference/src/ai_payload.rs` — extension round-trip, signed bytes cover the body, malformed
   extensions (including the pipeline-link byte range) and a v1 head with an extension rejected,
   size bounds.
-* `consensus/core/src/collateral.rs` — coverage tolerance, recipient-filtered cohort (credit,
+* `consensus/core/src/collateral.rs` — target cohort (all keys up to the cap, lowest ranks above,
+  order-independent, seed-dependent), coverage against it above the cap, coverage tolerance,
+  recipient-filtered cohort (credit,
   reward, no strikes for outsiders), under-covered request unservable, silent recipient struck
   alone, ineligible recipient unservable, early answers filtered, snapshot trailer round-trip /
   canonical form / rejection cases.
@@ -289,7 +298,8 @@ the gate, and every reader of AI transactions (indexer, explorer, wallets) must 
   inline-body payload lengths in isolation; `consensus/src/pipeline/virtual_processor/tests.rs` —
   the body is refused at mempool admission before the gate and admitted after it; oversized
   requests before the gate and plaintext requests after it invalidate the block.
-* `mining/src/manager_tests.rs` — cohort coverage at admission; inline bodies admitted only from a
+* `mining/src/manager_tests.rs` — cohort coverage at admission, target-cohort coverage above the
+  cap; inline bodies admitted only from a
   recipient of a pending private request, and refused again once the request leaves the mempool.
 * `rpc/core/src/model/tests.rs` — `getServiceProviders` message serialization mocks;
   `testing/integration/src/rpc_tests.rs` — sanity call over gRPC.
