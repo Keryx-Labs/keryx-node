@@ -219,8 +219,11 @@ to the target cohort of the tier, completed by rank with the tier's providers of
 DAA (~30 min) up to the 128-key cap, funds the request from the open account (inputs covering `reward + fee + ≥ 1 KRX change`; change at `outputs[0]`, the keyless
 reward vault at `outputs[1]`), signs it with the account keys, submits it, and prints the request
 id, the root key (the only way to read the answer — keep it) and the sink block to scan from. It
-refuses to send when no miner of the tier is eligible. `--reward` defaults to the model's floor
-plus the token surcharge; `--fee` to the 0.3 KRX minimum. `fetch` (or `send --wait`) polls the
+refuses to send when no miner of the tier is eligible. `--reward` defaults to the floor in force at the
+node's DAA: the model's base plus the token surcharge, or the model's fixed price once
+`flat_inference_price_activation` is live (0.5 KRX for tier 0, 0.5 KRX more per tier, whatever
+`--max-tokens`, plus the fee);
+`--fee` to the 0.3 KRX minimum. `fetch` (or `send --wait`) polls the
 mempool and the blocks past `--since` for a signed response to the request, decrypts the first
 inline body that opens, and otherwise prints the IPFS CID to fetch and `decrypt` by hand. The
 change output is at least 1 KRX because a smaller one pushes the transaction's KIP-9 storage mass

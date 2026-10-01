@@ -178,6 +178,8 @@ pub struct VirtualStateProcessor {
     pub(super) reward_routing_activation: ForkActivation,
     /// Private-inference activation (see `params.private_inference_activation`).
     pub(super) private_inference_activation: ForkActivation,
+    /// Flat inference price activation (see `params.flat_inference_price_activation`).
+    pub(super) flat_inference_price_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -405,6 +407,7 @@ impl VirtualStateProcessor {
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
             private_inference_activation: params.private_inference_activation,
+            flat_inference_price_activation: params.flat_inference_price_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1520,7 +1523,7 @@ impl VirtualStateProcessor {
         // Local admission policy over the same rules the block check enforces, evaluated at the
         // virtual score: no gate, and no way for it to reject a block a peer would accept.
         if self.model_cap_enforcement_activation.is_active(virtual_daa_score) {
-            check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score), self.reward_routing_activation.is_active(virtual_daa_score))
+            check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score), self.ai_reward_token_step(virtual_daa_score), self.reward_routing_activation.is_active(virtual_daa_score))
                 .map_err(|e| TxRuleError::AiRequestPayloadRule(e.to_string()))?;
         }
         // Same admission rules as the block check: signed (v2) AiResponses only after the

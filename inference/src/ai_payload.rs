@@ -16,9 +16,9 @@ pub const AI_REQUEST_HEADER_LEN: usize = MIN_AI_REQUEST_PAYLOAD_LEN;
 /// Requesters may set a higher value to get their request processed faster.
 pub const MIN_AI_REQUEST_PRIORITY_FEE: u64 = 30_000_000;
 
-/// Surcharge added to the per-model inference_reward minimum per 64-token increment of max_tokens.
-/// Enforced alongside model_cap_enforcement_activation (same hardfork gate).
-/// Formula: effective_min = base[model] + ceil(max_tokens / 64) * TOKEN_STEP  (0.005 KRX per step)
+/// Surcharge added to the per-model inference_reward minimum per 64-token increment of max_tokens
+/// until `flat_inference_price_activation`, after which the floor is flat and the surcharge is zero.
+/// Formula before the gate: effective_min = base[model] + ceil(max_tokens / 64) * TOKEN_STEP (0.05 KRX per step).
 pub const INFERENCE_REWARD_TOKEN_STEP: u64 = 5_000_000;
 /// Largest AiRequest payload before the private-inference activation.
 pub const MAX_AI_REQUEST_PAYLOAD_LEN: usize = 4_096;

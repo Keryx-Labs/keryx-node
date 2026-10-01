@@ -1,6 +1,6 @@
 use crate::imports::*;
 use keryx_consensus_core::collateral::{PrivateCohortSeed, private_cohort_rank, private_cohort_seed, private_target_cohort};
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H6, POM_TIERS_H6};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_FLAT, INFERENCE_REWARD_MINIMUMS_V2_H6, POM_TIERS_H6, Params};
 use keryx_consensus_core::constants::{SOMPI_PER_KASPA, TX_VERSION};
 use keryx_consensus_core::sign::{Signed, sign_with_multiple_v2};
 use keryx_consensus_core::subnets::{SUBNETWORK_ID_AI_REQUEST, SUBNETWORK_ID_AI_RESPONSE};
@@ -162,12 +162,16 @@ impl Inference {
         let reward = match reward {
             Some(r) => r,
             None => {
-                let base = INFERENCE_REWARD_MINIMUMS_V2_H6
+                let params = Params::from(ctx.wallet().network_id()?);
+                let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
+                let flat = params.flat_inference_price_activation.is_active(daa);
+                let table = if flat { INFERENCE_REWARD_MINIMUMS_FLAT } else { INFERENCE_REWARD_MINIMUMS_V2_H6 };
+                let base = table
                     .iter()
                     .find(|(id, _)| *id == model_id)
                     .map(|(_, base)| *base)
                     .ok_or_else(|| Error::custom("this model has no known reward floor: pass --reward <KRX>"))?;
-                base + (max_tokens as u64).div_ceil(64) * INFERENCE_REWARD_TOKEN_STEP
+                if flat { base } else { base + (max_tokens as u64).div_ceil(64) * INFERENCE_REWARD_TOKEN_STEP }
             }
         };
         if fee < MIN_AI_REQUEST_PRIORITY_FEE {
