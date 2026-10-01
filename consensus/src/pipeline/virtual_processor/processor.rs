@@ -178,8 +178,6 @@ pub struct VirtualStateProcessor {
     pub(super) reward_routing_activation: ForkActivation,
     /// Private-inference activation (see `params.private_inference_activation`).
     pub(super) private_inference_activation: ForkActivation,
-    /// Flat inference price activation (see `params.flat_inference_price_activation`).
-    pub(super) flat_inference_price_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -407,7 +405,6 @@ impl VirtualStateProcessor {
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
             private_inference_activation: params.private_inference_activation,
-            flat_inference_price_activation: params.flat_inference_price_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),

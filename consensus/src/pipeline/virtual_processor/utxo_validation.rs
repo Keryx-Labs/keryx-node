@@ -82,6 +82,7 @@ static H10_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -488,6 +489,16 @@ impl VirtualStateProcessor {
             info!("═══════════════════════════════════════════════════════════════");
         }
 
+        if banner_should_fire(self.private_inference_activation, header)
+            && H14_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H14 · DAA {} ════════════════", self.private_inference_activation.daa_score());
+            info!("  Privacy       — every AiRequest is sealed to the whole cohort of its tier; plaintext requests are rejected");
+            info!("  Pricing       — fixed inference reward per model (0.5 KRX for tier 0, +0.5 KRX per tier), no token surcharge");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         // H6 banner. Same latching shape as the others — fires once, on the first block at or
         // after the gate, only for a live crossing (see `banner_should_fire`).
         if banner_should_fire(self.pom_v3_activation, header)
@@ -601,7 +612,7 @@ impl VirtualStateProcessor {
     /// OPoI v2 introduced the uncensored lineup. Resolved in one place so the pre-UTXO fast path,
     /// the full block check and mempool admission cannot read different tables for the same score.
     pub(super) fn ai_reward_minimums(&self, daa_score: u64) -> &[([u8; 32], u64)] {
-        if self.flat_inference_price_activation.is_active(daa_score) {
+        if self.private_inference_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_FLAT
         } else if self.pom_v3_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_V2_H6
@@ -616,9 +627,9 @@ impl VirtualStateProcessor {
         }
     }
 
-    /// Per-64-token `inference_reward` surcharge in force at `daa_score`: none once the flat price is live.
+    /// Per-64-token `inference_reward` surcharge in force at `daa_score`: none from H14 on.
     pub(super) fn ai_reward_token_step(&self, daa_score: u64) -> u64 {
-        if self.flat_inference_price_activation.is_active(daa_score) { 0 } else { INFERENCE_REWARD_TOKEN_STEP }
+        if self.private_inference_activation.is_active(daa_score) { 0 } else { INFERENCE_REWARD_TOKEN_STEP }
     }
 
     fn verify_header_pruning_point(

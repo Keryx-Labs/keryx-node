@@ -221,7 +221,7 @@ reward vault at `outputs[1]`), signs it with the account keys, submits it, and p
 id, the root key (the only way to read the answer — keep it) and the sink block to scan from. It
 refuses to send when no miner of the tier is eligible. `--reward` defaults to the floor in force at the
 node's DAA: the model's base plus the token surcharge, or the model's fixed price once
-`flat_inference_price_activation` is live (0.5 KRX for tier 0, 0.5 KRX more per tier, whatever
+`private_inference_activation` (H14) is live (0.5 KRX for tier 0, 0.5 KRX more per tier, whatever
 `--max-tokens`, plus the fee);
 `--fee` to the 0.3 KRX minimum. `fetch` (or `send --wait`) polls the
 mempool and the blocks past `--since` for a signed response to the request, decrypts the first

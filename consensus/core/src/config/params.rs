@@ -333,7 +333,7 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H6: &[([u8; 32], u64)] = &[
     (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),   // 4.0 KRX  (--very-high)
 ];
 
-/// Per-model `inference_reward` floors once `flat_inference_price_activation` is live: fixed per
+/// Per-model `inference_reward` floors once `private_inference_activation` (H14) is live: fixed per
 /// tier, 0.5 KRX more at each step up, no per-token surcharge (the 0.3 KRX priority fee comes on top).
 pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
     (QWEN3_5_9B_ABLITERATED_MODEL_ID,   50_000_000), // 0.5 KRX
@@ -1294,12 +1294,10 @@ pub struct Params {
     /// named responder escrow keys) restricts its audit cohort, credit and vault to those
     /// responders, and a signed AiResponse may carry the sealed answer inline. Changes the audit
     /// fold, hence the sealed service state, and admits longer response payloads — must be armed
-    /// above every live tip before the binary ships. `never()` = dormant.
+    /// above every live tip before the binary ships. `never()` = dormant. This is the H14
+    /// hardfork: it also switches the `inference_reward` floors to `INFERENCE_REWARD_MINIMUMS_FLAT`
+    /// (fixed per model, no per-token surcharge).
     pub private_inference_activation: ForkActivation,
-    /// The `inference_reward` floors switch to `INFERENCE_REWARD_MINIMUMS_FLAT` (fixed per model)
-    /// and the per-token surcharge is dropped. Consensus rule on AiRequest admission — must be
-    /// armed above every live tip. `never()` = dormant.
-    pub flat_inference_price_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1571,7 +1569,6 @@ impl Params {
             service_bond_v2_activation: self.service_bond_v2_activation,
             reward_routing_activation: self.reward_routing_activation,
             private_inference_activation: self.private_inference_activation,
-            flat_inference_price_activation: self.flat_inference_price_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -1786,7 +1783,6 @@ pub const MAINNET_PARAMS: Params = Params {
     // Private inference — dormant until scheduled: arm ABOVE the live mainnet tip, together with
     // a miner release that opens private envelopes (see docs/private-inference.md).
     private_inference_activation: ForkActivation::never(),
-    flat_inference_price_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -1919,7 +1915,6 @@ pub const TESTNET_PARAMS: Params = Params {
     // Private inference — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
     private_inference_activation: ForkActivation::new(2_000),
-    flat_inference_price_activation: ForkActivation::new(200_000),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2014,7 +2009,6 @@ pub const SIMNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     private_inference_activation: ForkActivation::never(),
-    flat_inference_price_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2103,7 +2097,6 @@ pub const DEVNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     private_inference_activation: ForkActivation::never(),
-    flat_inference_price_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),

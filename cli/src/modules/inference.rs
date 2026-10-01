@@ -164,7 +164,7 @@ impl Inference {
             None => {
                 let params = Params::from(ctx.wallet().network_id()?);
                 let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
-                let flat = params.flat_inference_price_activation.is_active(daa);
+                let flat = params.private_inference_activation.is_active(daa);
                 let table = if flat { INFERENCE_REWARD_MINIMUMS_FLAT } else { INFERENCE_REWARD_MINIMUMS_V2_H6 };
                 let base = table
                     .iter()
