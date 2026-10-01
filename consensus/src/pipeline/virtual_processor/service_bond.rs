@@ -716,7 +716,7 @@ impl VirtualStateProcessor {
             log_new_service_misses(logged, daa, &outcome.misses);
             if !warmup && self.is_pruning_sample_block(hash) && !self.service_ledger_hashes.read().contains_key(&hash) {
                 let mut snapshot = ledger.snapshot();
-                snapshot.recent_producers = self.recent_producers_below(sc, i, daa);
+                snapshot.recent_producers = self.recent_producers_below(sc, i, daa, pruning_point);
                 let bytes = snapshot.to_bytes();
                 let snapshot_hash = ServiceLedgerSnapshot::hash_of_bytes(&bytes);
                 self.service_ledger_hashes.write().insert(hash, snapshot_hash);
@@ -835,7 +835,7 @@ impl VirtualStateProcessor {
             sync.snapshots.insert(idx, snapshot);
             if self.is_pruning_sample_block(*h) {
                 let mut snapshot = sync.ledger.snapshot();
-                snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa);
+                snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa, pruning_point);
                 let bytes = snapshot.to_bytes();
                 self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
@@ -966,12 +966,25 @@ impl VirtualStateProcessor {
     }
 
     /// Producers of the chain blocks with daa in `(daa − SERVICE_ELIGIBILITY_WINDOW_DAA, daa]`
-    /// ending at chain index `idx`, chain order.
-    fn recent_producers_below(&self, sc: &impl SelectedChainStoreReader, idx: u64, daa: u64) -> Vec<(u64, Hash, u8, Hash)> {
+    /// ending at chain index `idx`, chain order. At and below the pruning point the entries are
+    /// read from the imported snapshot.
+    pub(super) fn recent_producers_below(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        idx: u64,
+        daa: u64,
+        pruning_point: Hash,
+    ) -> Vec<(u64, Hash, u8, Hash)> {
         let bound = daa.saturating_sub(SERVICE_ELIGIBILITY_WINDOW_DAA);
+        let pruning_idx = sc.get_by_hash(pruning_point).ok();
         let mut out = Vec::new();
         let mut i = idx;
+        let mut at_pruning_point = false;
         loop {
+            if pruning_idx == Some(i) {
+                at_pruning_point = true;
+                break;
+            }
             let Ok(h) = sc.get_by_index(i) else { break };
             let block_daa = self.headers_store.get_daa_score(h).unwrap();
             if block_daa <= bound {
@@ -986,6 +999,17 @@ impl VirtualStateProcessor {
             i -= 1;
         }
         out.reverse();
+        if at_pruning_point {
+            let pp_daa = self.headers_store.get_daa_score(pruning_point).unwrap();
+            let below: Vec<_> = self
+                .service_imported_producers
+                .read()
+                .iter()
+                .filter(|(d, _, _, _)| *d > bound && *d <= pp_daa)
+                .cloned()
+                .collect();
+            out.splice(0..0, below);
+        }
         out
     }
 

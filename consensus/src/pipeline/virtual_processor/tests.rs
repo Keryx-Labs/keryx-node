@@ -1757,6 +1757,33 @@ async fn cohort_below_the_pruned_horizon_reads_the_imported_producers() {
     assert!(vp.service_eligible_miners_windowed(early, 2, 100).is_empty());
 }
 
+/// A sample snapshot whose eligibility window crosses the pruning point takes the part at and
+/// below it from the imported producers and walks only the retained chain above.
+#[tokio::test]
+async fn recent_producers_below_the_pruning_point_come_from_the_imported_snapshot() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::pruning::PruningStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use keryx_consensus_core::collateral::SERVICE_ELIGIBILITY_WINDOW_DAA;
+
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+    let sc = vp.selected_chain_store.read();
+    let pp = vp.pruning_point_store.read().pruning_point().unwrap();
+    let pp_idx = sc.get_by_hash(pp).unwrap();
+    let pp_daa = vp.headers_store.get_daa_score(pp).unwrap();
+    let idx = pp_idx + 3;
+    let daa = vp.headers_store.get_daa_score(sc.get_by_index(idx).unwrap()).unwrap();
+    let bound = daa.saturating_sub(SERVICE_ELIGIBILITY_WINDOW_DAA);
+    let id = Hash::from_bytes([0xAAu8; 32]);
+    let escrow = Hash::from_bytes([0xBBu8; 32]);
+
+    assert!(vp.recent_producers_below(&*sc, idx, daa, pp).is_empty());
+    *vp.service_imported_producers.write() =
+        vec![(bound, id, 0, escrow), (bound + 1, id, 1, escrow), (pp_daa, id, 2, escrow), (pp_daa + 1, id, 3, escrow)];
+    assert_eq!(vp.recent_producers_below(&*sc, idx, daa, pp), vec![(bound + 1, id, 1, escrow), (pp_daa, id, 2, escrow)]);
+}
+
 /// A node that imports the production snapshot at its pruning point with no history below it
 /// (chain store holding only the pruning point at index 0) rebases to the network numbering,
 /// resolves window bottoms below the pruning point from the imported daa table, verifies the
