@@ -23,8 +23,9 @@ pub const INFERENCE_REWARD_TOKEN_STEP: u64 = 5_000_000;
 /// Largest AiRequest payload before the private-inference activation.
 pub const MAX_AI_REQUEST_PAYLOAD_LEN: usize = 4_096;
 /// Largest AiRequest payload from the private-inference activation on: an envelope sealed to a
-/// whole tier cohort plus the prompt.
-pub const MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN: usize = 16_384;
+/// whole tier cohort plus the prompt. Leaves the standard-mass budget room for the inputs of any
+/// wallet.
+pub const MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN: usize = 65_536;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_RESPONSE` transactions:
 /// `[request_hash: 32] [challenge_window_end: 8 LE] [response_ipfs_cid: 34] [response_length: 4 LE]`
