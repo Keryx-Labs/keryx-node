@@ -189,6 +189,18 @@ fn log_new_service_misses(
     }
 }
 
+/// At most one empty-cohort line per 10 s, whatever the caller.
+fn log_empty_cohort(seed: Hash, tier: u8, reason: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 10 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        warn!("service-bond: empty cohort for tier {} at seed {}: {}", tier, seed, reason);
+    }
+}
+
 impl VirtualStateProcessor {
     /// `(identity, proven tier, delegated escrow key)` of each paid mergeset blue of chain block
     /// `hash` — the same blue set the coinbase rewards. The identity is [`miner_key`] of the
@@ -235,6 +247,7 @@ impl VirtualStateProcessor {
         own_pp: Hash,
     ) -> Vec<(Hash, Hash)> {
         let Ok(seed_idx) = sc.get_by_hash(seed) else {
+            log_empty_cohort(seed, target_tier, "seed is not on the retained selected chain");
             return vec![];
         };
         let seed_header = self.headers_store.get_header(seed).unwrap();
@@ -247,9 +260,15 @@ impl VirtualStateProcessor {
             Some(idx) => (idx, false),
             None if self.service_ledger_activation.is_active(seed_header.daa_score) => match sc.get_by_hash(own_pp) {
                 Ok(idx) => (idx, true),
-                Err(_) => return vec![],
+                Err(_) => {
+                    log_empty_cohort(seed, target_tier, "pruning point is not on the retained selected chain");
+                    return vec![];
+                }
             },
-            None => return vec![],
+            None => {
+                log_empty_cohort(seed, target_tier, "window reaches below retained history before the ledger gate");
+                return vec![];
+            }
         };
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, seed_idx, pruning_idx).max(pruning_idx);
         let mut recent = Vec::new();
@@ -266,7 +285,15 @@ impl VirtualStateProcessor {
         for i in (bottom + 1)..=seed_idx {
             recent.extend(self.service_producers_of_chain_block(sc.get_by_index(i).unwrap()));
         }
-        eligible_pairs(&recent, target_tier)
+        let set = eligible_pairs(&recent, target_tier);
+        if set.is_empty() {
+            if recent.is_empty() {
+                log_empty_cohort(seed, target_tier, "no bonded producer in the window");
+            } else {
+                log_empty_cohort(seed, target_tier, "no bonded producer of this tier in the window");
+            }
+        }
+        set
     }
 
     #[allow(dead_code)]
@@ -415,17 +442,23 @@ impl VirtualStateProcessor {
         }
     }
 
-    /// The service-eligible responders of every tier at `sink`: the identities that proved a
+    /// The service-eligible responders of every tier at the chain tip: the identities that proved a
     /// block of the tier inside the eligibility window, each with the escrow key it announces —
     /// the keys a private request is sealed to. `window_daa` widens the window (bounded by
     /// `MAX_SERVICE_PROVIDERS_WINDOW_DAA`, never below the eligibility window) so a requester can
     /// also cover miners that return before the request arms. Sorted by (tier, identity, escrow key).
-    pub(crate) fn service_providers_snapshot(&self, sink: Hash, virtual_daa_score: u64, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
+    pub(crate) fn service_providers_snapshot(&self, virtual_daa_score: u64, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
         let eligibility = self.eligibility_window_at(virtual_daa_score);
         let window = window_daa.map_or(eligibility, |w| w.clamp(eligibility, MAX_SERVICE_PROVIDERS_WINDOW_DAA.max(eligibility)));
         let mut providers = Vec::new();
+        // One chain snapshot for every tier: the sink is read from the chain itself, under the
+        // same lock, never from a virtual state published ahead of the chain index.
+        let (own_pp, sc) = self.retained_pruning_point_and_chain();
+        let Ok((_, sink)) = sc.get_tip() else {
+            return ServiceProvidersSnapshot { virtual_daa_score, providers };
+        };
         for (tier, model) in POM_TIERS_H6.iter().enumerate() {
-            for (identity, escrow) in self.service_eligible_miners_windowed(sink, tier as u8, window) {
+            for (identity, escrow) in self.service_eligible_miners_in(&*sc, sink, tier as u8, window, own_pp) {
                 providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
             }
         }
@@ -434,11 +467,10 @@ impl VirtualStateProcessor {
     }
 
     /// The escrow keys a private AiRequest for `model_id` seeded with `seed` must be sealed to at
-    /// `sink`: the target cohort of the cohort its tier would arm with now. `None` before the
-    /// private-inference activation or for a model outside the tier set.
+    /// the chain tip: the target cohort of the cohort its tier would arm with now. `None` before
+    /// the private-inference activation or for a model outside the tier set.
     pub(crate) fn private_cohort_escrows(
         &self,
-        sink: Hash,
         virtual_daa_score: u64,
         model_id: &[u8; 32],
         seed: &PrivateCohortSeed,
@@ -447,8 +479,10 @@ impl VirtualStateProcessor {
             return None;
         }
         let tier = POM_TIERS_H6.iter().position(|t| t.model_id == *model_id)? as u8;
+        let (own_pp, sc) = self.retained_pruning_point_and_chain();
+        let sink = sc.get_tip().ok()?.1;
         let cohort: Vec<Hash> = self
-            .service_eligible_miners_windowed(sink, tier, self.eligibility_window_at(virtual_daa_score))
+            .service_eligible_miners_in(&*sc, sink, tier, self.eligibility_window_at(virtual_daa_score), own_pp)
             .into_iter()
             .map(|(_, escrow)| escrow)
             .collect();

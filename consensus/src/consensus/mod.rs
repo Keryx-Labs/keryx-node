@@ -721,8 +721,7 @@ impl ConsensusApi for Consensus {
     }
 
     fn get_service_providers(&self, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
-        let virtual_state = self.lkg_virtual_state.load();
-        self.virtual_processor.service_providers_snapshot(virtual_state.ghostdag_data.selected_parent, virtual_state.daa_score, window_daa)
+        self.virtual_processor.service_providers_snapshot(self.lkg_virtual_state.load().daa_score, window_daa)
     }
 
     fn private_cohort_escrows(
@@ -730,8 +729,7 @@ impl ConsensusApi for Consensus {
         model_id: &[u8; 32],
         seed: &keryx_consensus_core::collateral::PrivateCohortSeed,
     ) -> Option<Vec<[u8; 32]>> {
-        let virtual_state = self.lkg_virtual_state.load();
-        self.virtual_processor.private_cohort_escrows(virtual_state.ghostdag_data.selected_parent, virtual_state.daa_score, model_id, seed)
+        self.virtual_processor.private_cohort_escrows(self.lkg_virtual_state.load().daa_score, model_id, seed)
     }
 
     fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
