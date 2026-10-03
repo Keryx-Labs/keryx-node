@@ -1,6 +1,9 @@
 use crate::imports::*;
 use keryx_consensus_core::collateral::{PrivateCohortSeed, private_cohort_rank, private_cohort_seed, private_target_cohort};
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_FLAT, INFERENCE_REWARD_MINIMUMS_V2_H6, POM_TIERS_H6, Params};
+use keryx_consensus_core::config::params::{
+    GEMMA_4_12B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, INFERENCE_REWARD_MINIMUMS_FLAT, INFERENCE_REWARD_MINIMUMS_V2_H6,
+    KIMI_LINEAR_48B_MODEL_ID, Params, QWEN3_5_9B_ABLITERATED_MODEL_ID, QWEN3_6_27B_MODEL_ID, QWEN3_8_27B_MODEL_ID, service_tiers,
+};
 use keryx_consensus_core::constants::{SOMPI_PER_KASPA, TX_VERSION};
 use keryx_consensus_core::sign::{Signed, sign_with_multiple_v2};
 use keryx_consensus_core::subnets::{SUBNETWORK_ID_AI_REQUEST, SUBNETWORK_ID_AI_RESPONSE};
@@ -18,8 +21,15 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use workflow_core::task::sleep;
 
-/// Display names of the H6 tier lineup (index = `Header.pom_tier`), see `POM_TIERS_H6`.
-const TIER_NAMES: [&str; 5] = ["Qwen3.5-9B", "GLM-4-9B", "Gemma-4-12B", "Qwen3.6-27B", "Kimi-Linear-48B"];
+/// Display names of the tier models, H6 and H14 lineups.
+const MODEL_NAMES: [([u8; 32], &str); 6] = [
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID, "Qwen3.5-9B"),
+    (GLM_4_9B_0414_MODEL_ID, "GLM-4-9B"),
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, "Gemma-4-12B"),
+    (QWEN3_6_27B_MODEL_ID, "Qwen3.6-27B"),
+    (QWEN3_8_27B_MODEL_ID, "Qwen3.8-27B"),
+    (KIMI_LINEAR_48B_MODEL_ID, "Kimi-Linear-48B"),
+];
 /// A request always leaves at least this much change: a tiny change output makes the KIP-9
 /// storage mass of the transaction exceed the standard limit and the mempool rejects it.
 const MIN_CHANGE_SOMPI: u64 = SOMPI_PER_KASPA;
@@ -86,7 +96,7 @@ impl Inference {
         tprintln!(ctx, "Service-eligible responders at DAA {} (tier, model, escrow key, identity):", resp.virtual_daa_score);
         let mut shown = 0;
         for p in resp.providers.iter().filter(|p| tier_filter.is_none_or(|t| t == p.tier)) {
-            let name = TIER_NAMES.get(p.tier as usize).copied().unwrap_or("?");
+            let name = MODEL_NAMES.iter().find(|(id, _)| *id == p.model_id.as_bytes()).map_or("?", |(_, n)| *n);
             tprintln!(ctx, "  tier {} {:<16} escrow {}  identity {}", p.tier, name, p.escrow_pubkey, p.identity);
             shown += 1;
         }
@@ -152,7 +162,14 @@ impl Inference {
 
         let model_id = match (model, tier) {
             (Some(m), _) => m,
-            (None, Some(t)) => POM_TIERS_H6.get(t).map(|m| m.model_id).ok_or_else(|| Error::custom("--tier must be 0-4"))?,
+            (None, Some(t)) => {
+                let params = Params::from(ctx.wallet().network_id()?);
+                let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
+                service_tiers(params.private_inference_activation.is_active(daa))
+                    .get(t)
+                    .map(|m| m.model_id)
+                    .ok_or_else(|| Error::custom("--tier must be 0-4"))?
+            }
             (None, None) => return Err(Error::custom("choose the model with --tier <0-4> or --model <hex>")),
         };
         let prompt = read_text_argument(&prompt_words)?;
@@ -440,7 +457,7 @@ impl Inference {
 /// its tier, completed by rank with the tier's providers of the last `SEAL_WINDOW_DAA` up to the
 /// recipient cap.
 async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32], seed: &PrivateCohortSeed) -> Result<Vec<[u8; 32]>> {
-    let tier = POM_TIERS_H6.iter().position(|t| t.model_id == *model_id).ok_or_else(|| Error::custom("unknown model: no tier serves it"))?
+    let tier = service_tiers(true).iter().position(|t| t.model_id == *model_id).ok_or_else(|| Error::custom("unknown model: no tier serves it"))?
         as u32;
     let rpc = ctx.wallet().rpc_api();
     let keys_of = |resp: &keryx_rpc_core::GetServiceProvidersResponse| -> Vec<[u8; 32]> {

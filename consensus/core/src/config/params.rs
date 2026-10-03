@@ -303,6 +303,16 @@ pub const QWEN3_6_27B_MODEL_ID: [u8; 32] = [
     0x1f, 0x55, 0x96, 0x98, 0xa5, 0x28, 0x47, 0x46,
 ];
 
+/// Qwen3.8-27B-abliterated Q4_K (huihui-ai, arch qwen35 hybrid-SSM). H14 tier 3 (--high), replaces
+/// Qwen3.6-27B. `model_id` = CIDv0[2..34] of the pinned GGUF
+/// (IPFS QmW7LDz7ZTfw9vpAR9jMhFHWriLhxh728Kihp7oTSLgvyg).
+pub const QWEN3_8_27B_MODEL_ID: [u8; 32] = [
+    0x73, 0x74, 0x0b, 0x44, 0x3b, 0xdc, 0x00, 0xaf,
+    0xda, 0x5f, 0xa3, 0x4e, 0xb9, 0x99, 0x9d, 0x3f,
+    0xea, 0x77, 0xdc, 0xc3, 0xf6, 0xde, 0x23, 0x8f,
+    0xab, 0x70, 0x13, 0x94, 0xcd, 0xc9, 0x6f, 0xb3,
+];
+
 /// Kimi-Linear-48B-A3B-abliterated Q4_K_M (Moonshot, MoE). H4 tier 4 (--very-high), replaces Llama-70B-Q2.
 pub const KIMI_LINEAR_48B_MODEL_ID: [u8; 32] = [
     0x3d, 0xc0, 0x93, 0x58, 0xad, 0x75, 0xc6, 0xef,
@@ -339,7 +349,7 @@ pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
     (QWEN3_5_9B_ABLITERATED_MODEL_ID,   50_000_000), // 0.5 KRX
     (GLM_4_9B_0414_MODEL_ID,           100_000_000), // 1.0 KRX
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000), // 1.5 KRX
-    (QWEN3_6_27B_MODEL_ID,             200_000_000), // 2.0 KRX
+    (QWEN3_8_27B_MODEL_ID,             200_000_000), // 2.0 KRX
     (KIMI_LINEAR_48B_MODEL_ID,         250_000_000), // 2.5 KRX
 ];
 
@@ -592,18 +602,45 @@ pub const POM_TIERS_H6: &[crate::pom::PomTier] = &[
     POM_TIERS_H4[4], // Kimi-Linear-48B, unchanged
 ];
 
-/// Possession anchors for a block at `daa_score`: the H5 set once `h5_activation` is live (tier-0
-/// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
-/// else the legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
+/// H14 possession anchors — the H6 set with tier 3 swapped to Qwen3.8-27B. Gated by
+/// `private_inference_activation`.
+pub const POM_TIERS_H14: &[crate::pom::PomTier] = &[
+    POM_TIERS_H6[0],
+    POM_TIERS_H6[1],
+    POM_TIERS_H6[2],
+    crate::pom::PomTier {
+        model_id: QWEN3_8_27B_MODEL_ID,
+        root: [
+            0x40, 0x6c, 0x19, 0x56, 0xf9, 0xf5, 0xdd, 0x13, 0x4d, 0x34, 0x61, 0xc6, 0x19, 0x11, 0x32, 0xa3,
+            0xb1, 0x57, 0x2c, 0xc1, 0x6f, 0x39, 0x5a, 0x2b, 0xc2, 0xf1, 0xc6, 0x69, 0xfa, 0xe3, 0x74, 0xa1,
+        ],
+        chunks: 524_991_232,
+    },
+    POM_TIERS_H6[4],
+];
+
+/// Tier lineup of the service ledger and the provider queries: the H14 set once
+/// `private_inference_activation` is live, else the H6 set.
+pub fn service_tiers(private_inference_active: bool) -> &'static [crate::pom::PomTier] {
+    if private_inference_active { POM_TIERS_H14 } else { POM_TIERS_H6 }
+}
+
+/// Possession anchors for a block at `daa_score`: the H14 set once `private_inference_activation`
+/// is live, else the H6 set, else the H5 set once `h5_activation` is live (tier-0 model swap),
+/// else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`, else the
+/// legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
 /// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
 /// against the wrong anchors and reject the chain.
 pub fn pom_tiers(
+    private_inference_active: bool,
     pom_v3_active: bool,
     h5_active: bool,
     coin_age_active: bool,
     very_light_active: bool,
 ) -> &'static [crate::pom::PomTier] {
-    if pom_v3_active {
+    if private_inference_active {
+        POM_TIERS_H14
+    } else if pom_v3_active {
         POM_TIERS_H6
     } else if h5_active {
         POM_TIERS_H5
@@ -2156,5 +2193,32 @@ mod ratio_reward_bps_tests {
         // Off-by-one just under each threshold must NOT round up to the next bracket.
         assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
         assert_eq!(ratio_reward_bps_v2(90 * P - 1, P), 9_000);
+    }
+}
+
+#[cfg(test)]
+mod h14_lineup_tests {
+    use super::*;
+
+    #[test]
+    fn h14_swaps_only_tier_3() {
+        let anchors = |tiers: &[crate::pom::PomTier]| tiers.iter().map(|t| (t.model_id, t.root, t.chunks)).collect::<Vec<_>>();
+        assert_eq!(anchors(pom_tiers(true, true, true, true, true)), anchors(POM_TIERS_H14));
+        assert_eq!(anchors(pom_tiers(false, true, true, true, true)), anchors(POM_TIERS_H6));
+        assert_eq!(anchors(service_tiers(true)), anchors(POM_TIERS_H14));
+        assert_eq!(anchors(service_tiers(false)), anchors(POM_TIERS_H6));
+        assert_eq!(POM_TIERS_H14.len(), POM_TIERS_H6.len());
+        for (i, (h6, h14)) in POM_TIERS_H6.iter().zip(POM_TIERS_H14).enumerate() {
+            if i == 3 {
+                assert_eq!(h14.model_id, QWEN3_8_27B_MODEL_ID);
+                assert_eq!(h14.chunks, 524_991_232);
+                assert_ne!(h14.root, h6.root);
+            } else {
+                assert_eq!((h6.model_id, h6.root, h6.chunks), (h14.model_id, h14.root, h14.chunks));
+            }
+        }
+        assert!(INFERENCE_REWARD_MINIMUMS_FLAT.iter().all(|(id, _)| POM_TIERS_H14.iter().any(|t| t.model_id == *id)));
+        let id: String = QWEN3_8_27B_MODEL_ID.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(id, "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3");
     }
 }

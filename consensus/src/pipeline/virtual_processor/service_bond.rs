@@ -12,7 +12,7 @@ use keryx_consensus_core::collateral::{
     ServiceMiss, ServicePenalty, ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
-use keryx_consensus_core::config::params::POM_TIERS_H6;
+use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
@@ -251,7 +251,14 @@ impl VirtualStateProcessor {
             return vec![];
         };
         let seed_header = self.headers_store.get_header(seed).unwrap();
-        let daa_bound = seed_header.daa_score.saturating_sub(window_daa);
+        let mut daa_bound = seed_header.daa_score.saturating_sub(window_daa);
+        // A tier whose model changes at the H14 gate only counts blocks proven with the new model.
+        if self.private_inference_activation.is_active(seed_header.daa_score)
+            && POM_TIERS_H6.get(target_tier as usize).map(|t| t.model_id)
+                != POM_TIERS_H14.get(target_tier as usize).map(|t| t.model_id)
+        {
+            daa_bound = daa_bound.max(self.private_inference_activation.daa_score().saturating_sub(1));
+        }
         // A window crossing below retained history only happens while re-validating blocks near
         // the local pruning point (fresh IBD / restart catch-up). Past the ledger gate the part
         // below the pruning point is read from the imported snapshot; before it the audit arms
@@ -324,7 +331,7 @@ impl VirtualStateProcessor {
                 let tx = &txs[entry.index_within_block as usize];
                 if tx.is_ai_request() {
                     if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        if let Some(tier) = POM_TIERS_H6.iter().position(|t| t.model_id == req.model_id) {
+                        if let Some(tier) = service_tiers(private).iter().position(|t| t.model_id == req.model_id) {
                             // Past the gate a request is identified by its transaction id, which is
                             // unique by construction. The payload digest is not: the same prompt with
                             // the same parameters is the same hash, so two senders — or one retry —
@@ -457,7 +464,7 @@ impl VirtualStateProcessor {
         let Ok((_, sink)) = sc.get_tip() else {
             return ServiceProvidersSnapshot { virtual_daa_score, providers };
         };
-        for (tier, model) in POM_TIERS_H6.iter().enumerate() {
+        for (tier, model) in service_tiers(self.private_inference_activation.is_active(virtual_daa_score)).iter().enumerate() {
             for (identity, escrow) in self.service_eligible_miners_in(&*sc, sink, tier as u8, window, own_pp) {
                 providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
             }
@@ -478,7 +485,7 @@ impl VirtualStateProcessor {
         if !self.private_inference_activation.is_active(virtual_daa_score) {
             return None;
         }
-        let tier = POM_TIERS_H6.iter().position(|t| t.model_id == *model_id)? as u8;
+        let tier = service_tiers(true).iter().position(|t| t.model_id == *model_id)? as u8;
         let (own_pp, sc) = self.retained_pruning_point_and_chain();
         let sink = sc.get_tip().ok()?.1;
         let cohort: Vec<Hash> = self
