@@ -576,9 +576,29 @@ pub fn pom_block_seed_h10(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -
     hash.iter_le_u64().next().unwrap()
 }
 
+/// Domain tag XORed into `pre_pow_hash` for the H14 walk seed.
+pub const SEED_H14_TAG: [u8; 32] = *b"KERYX-H14-PRIVATE-INFERENCE-SEED";
+
+/// `pre_pow_hash` as fed to the H14 walk seed.
+pub fn seed_h14_pph(pre_pow_hash: &[u8; 32]) -> [u8; 32] {
+    let mut out = *pre_pow_hash;
+    for (b, t) in out.iter_mut().zip(SEED_H14_TAG.iter()) {
+        *b ^= t;
+    }
+    out
+}
+
+/// H14 block seed: the H10 seed over the H14-tagged `pre_pow_hash`. BYTE-IDENTICAL to the
+/// miner's `pom_block_seed_h14`.
+pub fn pom_block_seed_h14(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64) -> u64 {
+    pom_block_seed_h10(&seed_h14_pph(pre_pow_hash), timestamp, nonce)
+}
+
 /// Re-walk-era (v4 proof format) block seed for a block at `daa_score`.
 pub fn pom_block_seed_rewalk_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce: u64, daa_score: u64) -> u64 {
-    if pom_seed_h10_active(daa_score) {
+    if private_inference_active(daa_score) {
+        pom_block_seed_h14(pre_pow_hash, timestamp, nonce)
+    } else if pom_seed_h10_active(daa_score) {
         pom_block_seed_h10(pre_pow_hash, timestamp, nonce)
     } else {
         pom_block_seed_v4(pre_pow_hash, timestamp, nonce)
@@ -1183,6 +1203,19 @@ mod seed_h10_tests {
         assert_ne!(h10, pom_block_seed_h10(&pph, ts, nonce ^ 1));
         assert_ne!(h10, pom_block_seed_h10(&pph, ts + 1, nonce));
         assert_eq!(pom_block_seed_h10(&[0xa5u8; 32], ts, u64::MAX), 0x60977326f8e922ab);
+    }
+
+    #[test]
+    fn seed_h14_vectors() {
+        let pph = [0x5au8; 32];
+        let (ts, nonce) = (1_788_000_000_000u64, 0x0123_4567_89ab_cdefu64);
+        // Cross-implementation vectors, pinned in the miner's `pom::seed_h14_tests`.
+        assert_eq!(pom_block_seed_h14(&[0u8; 32], 0, 0), 0xacda16263d02e8a8);
+        assert_eq!(pom_block_seed_h14(&pph, ts, nonce), 0xcb49e5584c867af5);
+        assert_eq!(pom_block_seed_h14(&[0xa5u8; 32], ts, u64::MAX), 0xf198e8412c2f6255);
+        assert_ne!(pom_block_seed_h14(&pph, ts, nonce), pom_block_seed_h10(&pph, ts, nonce));
+        assert_eq!(pom_block_seed_h14(&pph, ts, nonce), pom_block_seed_h10(&seed_h14_pph(&pph), ts, nonce));
+        assert_eq!(pom_block_seed_rewalk_era(&pph, ts, nonce, u64::MAX), pom_block_seed_h14(&pph, ts, nonce));
     }
 
     #[test]

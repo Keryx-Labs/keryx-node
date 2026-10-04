@@ -17,7 +17,7 @@ use keryx_consensus_core::{
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
     pom::{
-        PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_block_seed_v4, pom_block_seed_h10, pom_pow_value,
+        PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_block_seed_v4, pom_block_seed_h10, pom_block_seed_h14, pom_pow_value,
         pom_pow_value_h3, verify_pom_proof, verify_pom_proof_v2,
     },
     pom_v3::verify_pom_proof_v3_container,
@@ -296,7 +296,10 @@ impl BlockBodyProcessor {
         // mechanism as H5.1, capping every pre-gate fork point of the relaunched chain.
         let h5_2 = self.h5_2_activation.is_active(header.daa_score);
         let h10 = self.h10_activation.is_active(header.daa_score);
-        let seed = if h10 {
+        let h14 = self.private_inference_activation.is_active(header.daa_score);
+        let seed = if h14 {
+            pom_block_seed_h14(&pre_pow_hash, header.timestamp, header.nonce)
+        } else if h10 {
             pom_block_seed_h10(&pre_pow_hash, header.timestamp, header.nonce)
         } else if pom_v4 {
             pom_block_seed_v4(&pre_pow_hash, header.timestamp, header.nonce)

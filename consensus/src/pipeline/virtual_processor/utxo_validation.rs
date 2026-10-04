@@ -499,6 +499,7 @@ impl VirtualStateProcessor {
             info!("  Pricing       — fixed inference reward per model (0.5 KRX for tier 0, +0.5 KRX per tier), no token surcharge");
             info!("  Models        — tier 3: Qwen3.8-27B replaces Qwen3.6-27B");
             info!("  IBD           — recent blocks received during sync must carry a verified possession proof");
+            info!("  Seed          — new PoM walk seed: miners must run the H14 release");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }

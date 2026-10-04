@@ -1953,7 +1953,7 @@ pub const TESTNET_PARAMS: Params = Params {
     reward_routing_activation: ForkActivation::new(0),
     // Private inference — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
-    private_inference_activation: ForkActivation::new(2_000),
+    private_inference_activation: ForkActivation::new(6_000),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
