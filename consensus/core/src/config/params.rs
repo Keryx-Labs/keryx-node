@@ -217,6 +217,10 @@ pub const H12_ACTIVATION_DAA: u64 = 92_550_000;
 /// Targets 2026-09-06 ~19:45 UTC (from daa 92_654_952 at 2026-09-05 18:59 UTC, ~10.0 daa/s).
 pub const H13_ACTIVATION_DAA: u64 = 93_550_000;
 
+/// H14: private inference (`private_inference_activation`). Node and miner.
+/// Targets 2026-10-09 ~14:00 UTC (from daa 117_774_522 at 2026-10-04 18:37 UTC, ~10.13 daa/s).
+pub const H14_ACTIVATION_DAA: u64 = 121_985_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -1817,9 +1821,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
-    // Private inference — dormant until scheduled: arm ABOVE the live mainnet tip, together with
-    // a miner release that opens private envelopes (see docs/private-inference.md).
-    private_inference_activation: ForkActivation::never(),
+    private_inference_activation: ForkActivation::new(H14_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
