@@ -4,7 +4,11 @@ use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
 use crate::model::stores::headers::HeaderStoreReader;
 use crate::model::stores::pom_proof::PomProofStoreReader;
-use crate::processes::{coinbase::coinbase_outputs_limit, transaction_validator::errors::TxRuleError};
+use crate::processes::{
+    coinbase::coinbase_outputs_limit,
+    private_inference::{PrivateEraViolation, check_private_inference_era},
+    transaction_validator::errors::TxRuleError,
+};
 use keryx_consensus_core::{
     block::Block,
     config::params::{POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
@@ -32,6 +36,7 @@ impl BlockBodyProcessor {
         Self::check_only_one_coinbase(block)?;
         self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
+        self.check_private_inference_era(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
@@ -99,6 +104,21 @@ impl BlockBodyProcessor {
         for tx in block.transactions.iter() {
             if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx) {
                 return Err(RuleError::TxInIsolationValidationFailed(tx.id(), e));
+            }
+        }
+        Ok(())
+    }
+
+    /// AI transactions must match the private-inference era of the block, trusted blocks included.
+    fn check_private_inference_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        for tx in block.transactions.iter().skip(1) {
+            if let Err(v) = check_private_inference_era(tx, block.header.daa_score, self.private_inference_activation) {
+                return Err(match v {
+                    PrivateEraViolation::RequestTooLongBeforeActivation(len) => RuleError::AiRequestTooLongBeforeActivation(tx.id(), len),
+                    PrivateEraViolation::ResponseBodyBeforeActivation(_) => RuleError::AiResponseBodyBeforeActivation(tx.id()),
+                    PrivateEraViolation::RequestNotPrivate(e) => RuleError::AiRequestNotPrivate(tx.id(), e),
+                    PrivateEraViolation::ResponseWithoutBody => RuleError::AiResponseWithoutPrivateBody(tx.id()),
+                });
             }
         }
         Ok(())
@@ -250,6 +270,7 @@ impl BlockBodyProcessor {
         let pom_v3 = self.pom_v3_activation.is_active(header.daa_score);
         let pom_v4 = self.pom_v4_activation.is_active(header.daa_score);
         let tiers = pom_tiers(
+            self.private_inference_activation.is_active(header.daa_score),
             pom_v3,
             self.h5_activation.is_active(header.daa_score),
             self.coin_age_verification_activation.is_active(header.daa_score),

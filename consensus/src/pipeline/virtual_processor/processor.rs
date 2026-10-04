@@ -89,6 +89,7 @@ use keryx_notify::{events::EventType, notifier::Notify};
 use once_cell::unsync::Lazy;
 
 use super::utxo_validation::check_ai_request_tx_payload_rules;
+use crate::processes::private_inference::{PrivateEraViolation, check_private_inference_era};
 use super::errors::{PruningImportError, PruningImportResult};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use itertools::Itertools;
@@ -175,6 +176,8 @@ pub struct VirtualStateProcessor {
     >,
     /// H8 reward-routing activation (see `params.reward_routing_activation`).
     pub(super) reward_routing_activation: ForkActivation,
+    /// Private-inference activation (see `params.private_inference_activation`).
+    pub(super) private_inference_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -401,6 +404,7 @@ impl VirtualStateProcessor {
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
+            private_inference_activation: params.private_inference_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1516,7 +1520,7 @@ impl VirtualStateProcessor {
         // Local admission policy over the same rules the block check enforces, evaluated at the
         // virtual score: no gate, and no way for it to reject a block a peer would accept.
         if self.model_cap_enforcement_activation.is_active(virtual_daa_score) {
-            check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score), self.reward_routing_activation.is_active(virtual_daa_score))
+            check_ai_request_tx_payload_rules(&mutable_tx.tx, self.ai_reward_minimums(virtual_daa_score), self.ai_reward_token_step(virtual_daa_score), self.reward_routing_activation.is_active(virtual_daa_score))
                 .map_err(|e| TxRuleError::AiRequestPayloadRule(e.to_string()))?;
         }
         // Same admission rules as the block check: signed (v2) AiResponses only after the
@@ -1533,6 +1537,16 @@ impl VirtualStateProcessor {
                 }
             }
         }
+        // Private inference: the block rule, evaluated at the virtual score.
+        check_private_inference_era(&mutable_tx.tx, virtual_daa_score, self.private_inference_activation).map_err(|v| match v {
+            PrivateEraViolation::RequestTooLongBeforeActivation(len) => {
+                TxRuleError::AiPayloadTooLong(len, keryx_inference::MAX_AI_REQUEST_PAYLOAD_LEN)
+            }
+            PrivateEraViolation::ResponseBodyBeforeActivation(len) => {
+                TxRuleError::AiPayloadTooLong(len, keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN)
+            }
+            v => TxRuleError::AiRequestPayloadRule(v.to_string()),
+        })?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
     }

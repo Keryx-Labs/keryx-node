@@ -81,6 +81,15 @@ pub enum RuleError {
     #[error("request {0} already has the maximum number of pending AiResponses")]
     RejectAiResponsesSaturated(String),
 
+    #[error("the AiResponse for request {0} carries an inline body, but that is not a pending private request naming this responder")]
+    RejectAiResponseBody(String),
+
+    #[error("the private AiRequest is not sealed to {0} of the {1} escrow keys of its tier cohort")]
+    RejectPrivateRequestCoverage(usize, usize),
+
+    #[error("the private AiRequest targets a tier with no eligible responder")]
+    RejectPrivateRequestEmptyCohort,
+
     #[error("an AiChallenge for response {0} is already in the mempool")]
     RejectDuplicateAiChallenge(String),
 

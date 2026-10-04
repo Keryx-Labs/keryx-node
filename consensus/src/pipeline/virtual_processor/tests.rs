@@ -383,6 +383,124 @@ async fn opoi_response_registered_on_chain() {
     tc.shutdown(handles);
 }
 
+/// Private inference: a signed AiResponse carrying an inline (sealed) body is rejected at mempool
+/// admission before `private_inference_activation` — the same rule the block check enforces — and
+/// admitted at/after it.
+#[tokio::test]
+async fn private_response_body_is_gated_at_mempool_admission() {
+    use keryx_consensus_core::api::ConsensusApi;
+    use keryx_consensus_core::api::args::TransactionValidationArgs;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::errors::tx::TxRuleError;
+    use keryx_consensus_core::tx::MutableTransaction;
+    use keryx_inference::{AI_RESPONSE_PAYLOAD_V2_LEN, AiResponder};
+
+    fn body_response() -> Transaction {
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let payload = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder).with_private_body(vec![0xAB; 64]).serialize();
+        Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload)
+    }
+
+    for (gate, admitted) in [(ForkActivation::never(), false), (ForkActivation::always(), true)] {
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::always();
+        params.private_inference_activation = gate;
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let handles = tc.init();
+
+        let mut mtx = MutableTransaction::from_tx(body_response());
+        let result = tc.validate_mempool_transaction(&mut mtx, &TransactionValidationArgs::new(None));
+        if admitted {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(TxRuleError::AiPayloadTooLong(_, AI_RESPONSE_PAYLOAD_V2_LEN))), "{result:?}");
+        }
+        // A body-less V2 response is admitted on both sides of the gate.
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let plain = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder).serialize();
+        let mut mtx = MutableTransaction::from_tx(Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, plain));
+        tc.validate_mempool_transaction(&mut mtx, &TransactionValidationArgs::new(None)).unwrap();
+
+        tc.shutdown(handles);
+    }
+}
+
+/// Private inference: before `private_inference_activation` a block carrying an AiResponse with an
+/// inline body is Invalid, the verdict a node without private inference reaches in isolation; at/after
+/// it the block is accepted.
+#[tokio::test]
+async fn private_response_body_invalidates_the_block_before_the_gate() {
+    use crate::errors::RuleError;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_inference::AiResponder;
+
+    for (gate, accepted) in [(ForkActivation::never(), false), (ForkActivation::always(), true)] {
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::always();
+        params.private_inference_activation = gate;
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let handles = tc.init();
+
+        let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
+        let payload = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder).with_private_body(vec![0xAB; 64]).serialize();
+        let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload);
+        let block: Hash = 1u64.into();
+        let result = tc.add_utxo_valid_block_with_parents(block, vec![config.genesis.hash], vec![tx]).await;
+        if accepted {
+            assert_eq!(result.unwrap(), BlockStatus::StatusUTXOValid);
+        } else {
+            assert!(matches!(result, Err(RuleError::AiResponseBodyBeforeActivation(_))), "{result:?}");
+            assert_eq!(tc.get_block_status(block), Some(BlockStatus::StatusInvalid));
+        }
+
+        tc.shutdown(handles);
+    }
+}
+
+/// Private inference: before the gate an AiRequest above the historical maximum invalidates the
+/// block; from the gate on a plaintext AiRequest does.
+#[tokio::test]
+async fn private_inference_era_rules_for_requests_invalidate_the_block() {
+    use crate::errors::RuleError;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
+    use keryx_inference::{AiRequestPayload, MAX_AI_REQUEST_PAYLOAD_LEN};
+
+    let cases: [(ForkActivation, Vec<u8>, fn(&RuleError) -> bool); 2] = [
+        (ForkActivation::never(), vec![0u8; MAX_AI_REQUEST_PAYLOAD_LEN + 1], |e| {
+            matches!(e, RuleError::AiRequestTooLongBeforeActivation(_, _))
+        }),
+        (ForkActivation::always(), AiRequestPayload::new([5u8; 32], 64, 1, 1, b"plain".to_vec()).serialize(), |e| {
+            matches!(e, RuleError::AiRequestNotPrivate(_, _))
+        }),
+    ];
+    for (gate, payload, expected) in cases {
+        let mut params = MAINNET_PARAMS;
+        params.pom_v3_activation = ForkActivation::always();
+        params.private_inference_activation = gate;
+        let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+        let tc = TestConsensus::new(&config);
+        let handles = tc.init();
+
+        let input = keryx_consensus_core::tx::TransactionInput::new(
+            keryx_consensus_core::tx::TransactionOutpoint::new(Default::default(), 0),
+            vec![],
+            0,
+            0,
+        );
+        let tx = Transaction::new(TX_VERSION, vec![input], vec![], 0, SUBNETWORK_ID_AI_REQUEST, 0, payload);
+        let block = tc.build_block_with_parents_and_transactions(1u64.into(), vec![config.genesis.hash], vec![tx]);
+        let hash = block.header.hash;
+        let result = tc.validate_and_insert_block(block.to_immutable()).block_task.await;
+        assert!(result.as_ref().is_err_and(expected), "{result:?}");
+        assert_eq!(tc.get_block_status(hash), Some(BlockStatus::StatusInvalid));
+
+        tc.shutdown(handles);
+    }
+}
+
 // OPoI slashing removed (v1.2.3): the slash-behavior tests (fraud→slash, honest→no-slash,
 // unknown→no-slash, outside-window→no-slash) were dropped together with the slashing mechanism.
 // Escrows are now always spendable; there is no slash state to assert.
@@ -1637,6 +1755,33 @@ async fn cohort_below_the_pruned_horizon_reads_the_imported_producers() {
     assert_eq!(vp.service_eligible_miners_windowed(early, 0, 100), vec![(id, escrow)]);
     assert_eq!(vp.service_eligible_miners_windowed(early, 1, 100), vec![(id, escrow)]);
     assert!(vp.service_eligible_miners_windowed(early, 2, 100).is_empty());
+}
+
+/// A sample snapshot whose eligibility window crosses the pruning point takes the part at and
+/// below it from the imported producers and walks only the retained chain above.
+#[tokio::test]
+async fn recent_producers_below_the_pruning_point_come_from_the_imported_snapshot() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::pruning::PruningStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use keryx_consensus_core::collateral::SERVICE_ELIGIBILITY_WINDOW_DAA;
+
+    let (tc, _db, _handles) = pruned_floor_fixture().await;
+    let vp = tc.virtual_processor().clone();
+    let sc = vp.selected_chain_store.read();
+    let pp = vp.pruning_point_store.read().pruning_point().unwrap();
+    let pp_idx = sc.get_by_hash(pp).unwrap();
+    let pp_daa = vp.headers_store.get_daa_score(pp).unwrap();
+    let idx = pp_idx + 3;
+    let daa = vp.headers_store.get_daa_score(sc.get_by_index(idx).unwrap()).unwrap();
+    let bound = daa.saturating_sub(SERVICE_ELIGIBILITY_WINDOW_DAA);
+    let id = Hash::from_bytes([0xAAu8; 32]);
+    let escrow = Hash::from_bytes([0xBBu8; 32]);
+
+    assert!(vp.recent_producers_below(&*sc, idx, daa, pp).is_empty());
+    *vp.service_imported_producers.write() =
+        vec![(bound, id, 0, escrow), (bound + 1, id, 1, escrow), (pp_daa, id, 2, escrow), (pp_daa + 1, id, 3, escrow)];
+    assert_eq!(vp.recent_producers_below(&*sc, idx, daa, pp), vec![(bound + 1, id, 1, escrow), (pp_daa, id, 2, escrow)]);
 }
 
 /// A node that imports the production snapshot at its pruning point with no history below it

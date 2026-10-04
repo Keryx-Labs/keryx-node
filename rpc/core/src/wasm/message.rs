@@ -242,6 +242,52 @@ try_from! ( args: GetServiceStrikesResponse, IGetServiceStrikesResponse, {
 });
 
 declare! {
+    IGetServiceProvidersRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetServiceProvidersRequest {
+        /** Widens the eligibility window (DAA), bounded by the node. */
+        windowDaa? : bigint;
+    }
+    "#,
+}
+
+try_from! ( args: IGetServiceProvidersRequest, GetServiceProvidersRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetServiceProvidersResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetServiceProvidersResponse {
+        virtualDaaScore: bigint;
+        providers: IServiceProvider[];
+    }
+
+    /**
+     * One service-eligible responder of a tier: the escrow pubkey is what a
+     * private-inference request is sealed to.
+     * @category Node RPC
+     */
+    export interface IServiceProvider {
+        tier: number;
+        modelId: HexString;
+        identity: HexString;
+        escrowPubkey: HexString;
+    }
+    "#,
+}
+
+try_from! ( args: GetServiceProvidersResponse, IGetServiceProvidersResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
     IGetCoinSupplyRequest,
     r#"
     /**
