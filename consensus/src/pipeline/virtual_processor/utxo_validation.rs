@@ -494,7 +494,11 @@ impl VirtualStateProcessor {
         {
             info!("════════════════ KERYX HARDFORK H14 · DAA {} ════════════════", self.private_inference_activation.daa_score());
             info!("  Privacy       — every AiRequest is sealed to the whole cohort of its tier; plaintext requests are rejected");
+            info!("  Answers       — sealed answers travel inline on-chain; miners no longer need IPFS");
+            info!("  Requests      — prompts up to 64 KiB (compressed)");
             info!("  Pricing       — fixed inference reward per model (0.5 KRX for tier 0, +0.5 KRX per tier), no token surcharge");
+            info!("  Models        — tier 3: Qwen3.8-27B replaces Qwen3.6-27B");
+            info!("  IBD           — recent blocks received during sync must carry a verified possession proof");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
