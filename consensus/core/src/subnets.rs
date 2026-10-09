@@ -159,5 +159,5 @@ pub const SUBNETWORK_ID_AI_RESPONSE: SubnetworkId = SubnetworkId::from_byte(4);
 /// Subnetwork ID for OPoI fraud challenges.
 pub const SUBNETWORK_ID_AI_CHALLENGE: SubnetworkId = SubnetworkId::from_byte(5);
 
-/// Subnetwork ID for network-model availability declarations (H14).
+/// Subnetwork ID for network-model availability declarations (model split).
 pub const SUBNETWORK_ID_AI_AVAIL: SubnetworkId = SubnetworkId::from_byte(6);

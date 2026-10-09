@@ -57,7 +57,7 @@ use keryx_consensus_core::{
     blockhash::BlockHashExtensions,
     blockstatus::BlockStatus,
     coinbase::MinerData,
-    collateral::ServiceStrikesSnapshot,
+    collateral::{ServiceProvidersSnapshot, ServiceStrikesSnapshot},
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         coinbase::CoinbaseResult,
@@ -187,6 +187,7 @@ impl Consensus {
         // to `service_state_hash` from the H6 gate on.
         keryx_consensus_core::pom::init_service_commit_activation(params.pom_v3_activation.daa_score());
         keryx_consensus_core::pom::init_pom_seed_h10_activation(params.h10_activation.daa_score());
+        keryx_consensus_core::pom::init_private_inference_activation(params.private_inference_activation.daa_score());
 
         //
         // Storage layer
@@ -728,6 +729,22 @@ impl ConsensusApi for Consensus {
     fn get_network_model_availability(&self) -> keryx_consensus_core::collateral::NetworkModelAvailability {
         let state = self.lkg_virtual_state.load();
         self.virtual_processor.network_model_availability(state.ghostdag_data.selected_parent, state.daa_score)
+    }
+
+    fn get_service_providers(&self, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
+        self.virtual_processor.service_providers_snapshot(self.lkg_virtual_state.load().daa_score, window_daa)
+    }
+
+    fn private_cohort_escrows(
+        &self,
+        model_id: &[u8; 32],
+        seed: &keryx_consensus_core::collateral::PrivateCohortSeed,
+    ) -> Option<Vec<[u8; 32]>> {
+        self.virtual_processor.private_cohort_escrows(self.lkg_virtual_state.load().daa_score, model_id, seed)
+    }
+
+    fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        self.virtual_processor.private_request_recipients(request_hash)
     }
 
     fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {

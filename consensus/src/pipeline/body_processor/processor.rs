@@ -96,6 +96,7 @@ pub struct BlockBodyProcessor {
     pub(super) network_model: &'static keryx_consensus_core::config::params::NetworkModelLayout,
     pub(super) pom_v4_activation: ForkActivation,
     pub(super) h10_activation: ForkActivation,
+    pub(super) private_inference_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
@@ -181,6 +182,7 @@ pub(super) fn witness_scoped_error(e: &RuleError) -> bool {
             | RuleError::BadPomProofV4(_)
             | RuleError::PomFinalStateMismatch(_, _)
             | RuleError::PomUnknownTier(_)
+            | RuleError::PomDeclaredTierMismatch(_, _)
     )
 }
 
@@ -255,6 +257,7 @@ impl BlockBodyProcessor {
             network_model: params.network_model,
             pom_v4_activation: params.pom_v4_activation,
             h10_activation: params.h10_activation,
+            private_inference_activation: params.private_inference_activation,
 
             statuses_store: storage.statuses_store.clone(),
             _ghostdag_store: storage.ghostdag_store.clone(),
@@ -485,6 +488,7 @@ mod tests {
             RuleError::BadPomProofV4(PomV4VerifyError::MissingV4),
             RuleError::PomFinalStateMismatch(1, 2),
             RuleError::PomUnknownTier(7),
+            RuleError::PomDeclaredTierMismatch(3, 2),
         ];
         for e in &witness_scoped {
             assert!(!marks_block_invalid(e, true), "{e:?} must not poison the block hash post-gate");

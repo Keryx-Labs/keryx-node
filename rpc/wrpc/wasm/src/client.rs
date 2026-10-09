@@ -939,6 +939,10 @@ build_wrpc_wasm_bindgen_interface!(
         /// production suspensions and misses awaiting finality.
         GetServiceStrikes,
         GetNetworkModelAvailability,
+        /// Returns the service-eligible responders per tier at the current
+        /// sink: identity and escrow pubkey — the keys a private-inference
+        /// request is sealed to.
+        GetServiceProviders,
         /// Retrieves information about the peers connected to the Kaspa node.
         /// Returned information: Peer ID, IP address and port, connection
         /// status, protocol version.

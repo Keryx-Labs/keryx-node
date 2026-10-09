@@ -61,20 +61,24 @@ pub enum PomWireError {
 /// Both are what [`encode_v4_deduped`]/[`decode_v4_deduped`] need, and both are derivable by any
 /// peer holding the header — which is why the compact form can omit them.
 ///
-/// The tier table is pinned to `POM_TIERS_H14`, a superset of `POM_TIERS_H6` with the same
-/// indices: `pom_v4_activation` is strictly later than `pom_v3_activation`, so every v4 block
-/// selects one of those two tables in `pom_tiers`, and the superset resolves both. A tier outside
-/// it is rejected here rather than guessed, and the caller falls back to the legacy encoding;
-/// body validation still rejects a tier the block's own era does not know.
+/// The tier table is `POM_TIERS_H6` before the private-inference activation, then the network's
+/// model-split table, a superset of `POM_TIERS_H14` with the same indices: `pom_v4_activation` is
+/// strictly later than `pom_v3_activation`, and `model_split_activation` is never earlier than
+/// `private_inference_activation`, so every v4 block selects a table this resolves. A tier outside
+/// it is rejected here rather than guessed, and the caller falls back to the legacy encoding; body
+/// validation still rejects a tier the block's own era does not know.
 static ACTIVE_TIERS: std::sync::OnceLock<&'static [crate::pom::PomTier]> = std::sync::OnceLock::new();
 
-/// Installs the tier table of the running network (its H14 layout); mainnet until set.
+/// Installs the model-split tier table of the running network; mainnet until set.
 pub fn set_active_tiers(tiers: &'static [crate::pom::PomTier]) {
     let _ = ACTIVE_TIERS.set(tiers);
 }
-
 pub fn v4_wire_context(header: &Header, tier: u8) -> Result<(u64, u64), PomWireError> {
-    let tiers = ACTIVE_TIERS.get().copied().unwrap_or(crate::config::params::POM_TIERS_H14);
+    let tiers = if crate::pom::private_inference_active(header.daa_score) {
+        ACTIVE_TIERS.get().copied().unwrap_or(crate::config::params::POM_TIERS_MODEL_SPLIT)
+    } else {
+        crate::config::params::POM_TIERS_H6
+    };
     let t = tiers.get(tier as usize).ok_or(PomWireError::UnknownTier(tier))?;
     let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
     Ok((pom_block_seed_rewalk_era(&pre_pow_hash, header.timestamp, header.nonce, header.daa_score), t.chunks))

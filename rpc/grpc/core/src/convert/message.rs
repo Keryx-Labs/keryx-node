@@ -468,6 +468,24 @@ from!(item: RpcResult<&keryx_rpc_core::GetNetworkModelAvailabilityResponse>, pro
     }
 });
 
+from!(item: &keryx_rpc_core::GetServiceProvidersRequest, protowire::GetServiceProvidersRequestMessage, { Self { window_daa: item.window_daa } });
+from!(item: RpcResult<&keryx_rpc_core::GetServiceProvidersResponse>, protowire::GetServiceProvidersResponseMessage, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        providers: item
+            .providers
+            .iter()
+            .map(|p| protowire::ServiceProviderMessage {
+                tier: p.tier,
+                model_id: p.model_id.to_string(),
+                identity: p.identity.to_string(),
+                escrow_pubkey: p.escrow_pubkey.to_string(),
+            })
+            .collect(),
+        error: None,
+    }
+});
+
 from!(item: &keryx_rpc_core::GetDaaScoreTimestampEstimateRequest, protowire::GetDaaScoreTimestampEstimateRequestMessage, {
     Self {
         daa_scores: item.daa_scores.clone()
@@ -1065,6 +1083,25 @@ try_from!(item: &protowire::GetNetworkModelAvailabilityResponseMessage, RpcResul
             .iter()
             .map(|s| keryx_rpc_core::RpcShardAvailability { tier: s.tier as u8, vram_gb: s.vram_gb, producers: s.producers })
             .collect(),
+    }
+});
+
+try_from!(item: &protowire::GetServiceProvidersRequestMessage, keryx_rpc_core::GetServiceProvidersRequest, { Self { window_daa: item.window_daa } });
+try_from!(item: &protowire::GetServiceProvidersResponseMessage, RpcResult<keryx_rpc_core::GetServiceProvidersResponse>, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        providers: item
+            .providers
+            .iter()
+            .map(|p| {
+                Ok(keryx_rpc_core::RpcServiceProvider {
+                    tier: p.tier,
+                    model_id: RpcHash::from_str(&p.model_id)?,
+                    identity: RpcHash::from_str(&p.identity)?,
+                    escrow_pubkey: RpcHash::from_str(&p.escrow_pubkey)?,
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
     }
 });
 

@@ -67,6 +67,7 @@ impl Factory {
                 GetUtxoEntriesByOutpoints,
                 GetServiceStrikes,
                 GetNetworkModelAvailability,
+                GetServiceProviders,
                 GetBalanceByAddress,
                 GetBalancesByAddresses,
                 GetSinkBlueScore,

@@ -11,12 +11,12 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::{verify_avail_signature, verify_responder_signature},
+    collateral::{private_cohort_seed, verify_avail_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
-use keryx_inference::{AiAvailPayload, AiChallengePayload, AiResponsePayload};
+use keryx_inference::{AiAvailPayload, AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -29,6 +29,8 @@ impl Mempool {
         // Populate mass and estimated_size in the beginning, it will be used in multiple places throughout the validation and insertion.
         transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx));
         self.validate_transaction_in_isolation(&transaction, consensus.get_virtual_daa_score())?;
+        self.validate_ai_response_body(consensus, &transaction)?;
+        self.validate_private_request_coverage(consensus, &transaction)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
         self.populate_mempool_entries(&mut transaction);
         Ok(TransactionPreValidation { transaction, feerate_threshold })
@@ -129,6 +131,13 @@ impl Mempool {
             .tx
             .clone();
 
+        // Private-inference requests: remember the named responders while the request is here.
+        if accepted_transaction.is_ai_request()
+            && let Some(req) = AiRequestPayload::deserialize(&accepted_transaction.payload)
+            && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
+        {
+            self.ai_private_request_index.insert(accepted_transaction.id().as_bytes(), envelope.recipient_keys().copied().collect());
+        }
         // Register in dedup indexes so no duplicate AI txs for the same hash get in.
         if accepted_transaction.is_ai_response() {
             if let Some(resp) = AiResponsePayload::deserialize(&accepted_transaction.payload) {
@@ -231,6 +240,57 @@ impl Mempool {
 
         if !self.config.accept_non_standard {
             self.check_transaction_standard_in_isolation(transaction)?;
+        }
+        Ok(())
+    }
+
+    /// Admission policy for inline response bodies (private inference): an AiResponse carrying
+    /// one is accepted only from a responder its request was sealed to, while that request is
+    /// pending here or in the service ledger. Bodies run up to 32 KiB and AiResponses pay no
+    /// fee, so without this any key could relay large free transactions. Policy only — a block
+    /// that includes such a response is judged by consensus alone.
+    fn validate_ai_response_body(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_response() {
+            return Ok(());
+        }
+        let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
+        if resp.private_body.is_none() {
+            return Ok(());
+        }
+        let named = resp.responder.as_ref().is_some_and(|r| {
+            self.ai_private_request_index
+                .get(&resp.request_hash)
+                .map(|keys| keys.contains(&r.escrow_pubkey))
+                .or_else(|| consensus.private_request_recipients(&resp.request_hash).map(|keys| keys.contains(&r.escrow_pubkey)))
+                .unwrap_or(false)
+        });
+        if !named {
+            return Err(RuleError::RejectAiResponseBody(hex::encode(resp.request_hash)));
+        }
+        Ok(())
+    }
+
+    /// Admission policy for private requests: the envelope must cover the whole target cohort its
+    /// tier would arm with now. Consensus tolerates members that join between sealing and arming; the
+    /// mempool admits nothing short of full coverage, and nothing for an empty tier (it would
+    /// burn its vault). Malformed requests are left to the consensus rules.
+    fn validate_private_request_coverage(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_request() {
+            return Ok(());
+        }
+        let Some(req) = AiRequestPayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
+        let Some(first) = transaction.tx.inputs.first() else { return Ok(()) };
+        let Some(cohort) = consensus.private_cohort_escrows(&req.model_id, &private_cohort_seed(&first.previous_outpoint)) else {
+            return Ok(());
+        };
+        let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt) else { return Ok(()) };
+        if cohort.is_empty() {
+            return Err(RuleError::RejectPrivateRequestEmptyCohort);
+        }
+        let missing =
+            cohort.iter().filter(|key| envelope.recipients.binary_search_by(|r| r.escrow_pubkey.cmp(key)).is_err()).count();
+        if missing > 0 {
+            return Err(RuleError::RejectPrivateRequestCoverage(missing, cohort.len()));
         }
         Ok(())
     }

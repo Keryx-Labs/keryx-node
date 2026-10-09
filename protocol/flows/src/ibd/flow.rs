@@ -9,7 +9,7 @@ use keryx_consensus_core::{
     BlockHashSet,
     api::BlockValidationFuture,
     block::Block,
-    config::params::POM_PROOF_SERVE_DEPTH_DAA,
+    config::params::{ForkActivation, POM_PROOF_SERVE_DEPTH_DAA},
     header::Header,
     pruning::{PruningPointProof, PruningPointsList, PruningProofMetadata},
     trusted::TrustedBlock,
@@ -1230,9 +1230,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         chunk: &[Hash],
         high_daa: u64,
     ) -> Result<QueueChunkOutput, ProtocolError> {
-        let mut jobs = Vec::with_capacity(chunk.len());
-        let mut current_daa_score = 0;
-        let mut current_timestamp = 0;
+        let mut blocks = Vec::with_capacity(chunk.len());
         self.router
             .enqueue(make_message!(
                 Payload::RequestIbdBlocks,
@@ -1263,11 +1261,9 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 // for the relay flow to re-fetch the proof from another peer.
                 self.ctx.enqueue_pom_reproof(block.hash());
             }
-            current_daa_score = block.header.daa_score;
-            current_timestamp = block.header.timestamp;
-            jobs.push(consensus.validate_and_insert_block_ibd(block).virtual_state_task);
+            blocks.push(block);
         }
-        Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
+        self.insert_ibd_chunk(consensus, blocks, high_daa)
     }
 
     async fn queue_block_processing_chunk_body_only(
@@ -1276,9 +1272,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
         chunk: &[Hash],
         high_daa: u64,
     ) -> Result<QueueChunkOutput, ProtocolError> {
-        let mut jobs = Vec::with_capacity(chunk.len());
-        let mut current_daa_score = 0;
-        let mut current_timestamp = 0;
+        let mut blocks = Vec::with_capacity(chunk.len());
         self.router
             .enqueue(make_request!(
                 Payload::RequestBlockBodies,
@@ -1325,10 +1319,51 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 (pom_proof, pom_tier)
             };
             let block = Block { header: blk_header, transactions: blk_body.into(), pom_proof, pom_tier };
-            current_daa_score = block.header.daa_score;
-            current_timestamp = block.header.timestamp;
-            jobs.push(consensus.validate_and_insert_block_ibd(block).virtual_state_task);
+            blocks.push(block);
         }
-        Ok(QueueChunkOutput { jobs, daa_score: current_daa_score, timestamp: current_timestamp })
+        self.insert_ibd_chunk(consensus, blocks, high_daa)
+    }
+
+    /// Queue a received chunk for insertion. Fails before inserting anything when a block that
+    /// must be proven arrived without its possession proof.
+    fn insert_ibd_chunk(&self, consensus: &ConsensusProxy, blocks: Vec<Block>, high_daa: u64) -> Result<QueueChunkOutput, ProtocolError> {
+        let gate = self.ctx.config.private_inference_activation;
+        if let Some(naked) = blocks.iter().find(|b| b.pom_proof.is_none() && ibd_block_needs_proof(gate, b.header.daa_score, high_daa)) {
+            return Err(ProtocolError::OtherOwned(format!("recent block {} sent without its possession proof", naked.hash())));
+        }
+        let mut jobs = Vec::with_capacity(blocks.len());
+        let (mut daa_score, mut timestamp) = (0, 0);
+        for block in blocks {
+            daa_score = block.header.daa_score;
+            timestamp = block.header.timestamp;
+            let futures = if ibd_block_needs_proof(gate, daa_score, high_daa) {
+                consensus.validate_and_insert_block(block)
+            } else {
+                consensus.validate_and_insert_block_ibd(block)
+            };
+            jobs.push(futures.virtual_state_task);
+        }
+        Ok(QueueChunkOutput { jobs, daa_score, timestamp })
+    }
+}
+
+/// Whether an IBD block must arrive with a verified possession proof.
+fn ibd_block_needs_proof(gate: ForkActivation, daa_score: u64, high_daa: u64) -> bool {
+    gate.is_active(daa_score) && high_daa.saturating_sub(daa_score) <= POM_PROOF_SERVE_DEPTH_DAA
+}
+
+#[cfg(test)]
+mod proof_window_tests {
+    use super::*;
+
+    #[test]
+    fn ibd_block_needs_proof_only_recent_and_past_gate() {
+        let gate = ForkActivation::new(1_000);
+        let high = 100_000;
+        assert!(ibd_block_needs_proof(gate, high, high));
+        assert!(ibd_block_needs_proof(gate, high - POM_PROOF_SERVE_DEPTH_DAA, high));
+        assert!(!ibd_block_needs_proof(gate, high - POM_PROOF_SERVE_DEPTH_DAA - 1, high));
+        assert!(!ibd_block_needs_proof(ForkActivation::new(high + 1), high, high));
+        assert!(!ibd_block_needs_proof(ForkActivation::never(), high, high));
     }
 }

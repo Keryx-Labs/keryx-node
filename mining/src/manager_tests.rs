@@ -6,7 +6,7 @@ mod tests {
         errors::{MiningManagerError, MiningManagerResult},
         manager::MiningManager,
         mempool::{
-            config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE},
+            config::{Config, MINIMUM_FLAT_TX_FEE_SOMPI},
             errors::RuleError,
             model::frontier::selectors::TakeAllSelector,
             tx::{Orphan, Priority, RbfPolicy},
@@ -154,6 +154,184 @@ mod tests {
     /// test_simulated_error_in_consensus verifies that a predefined result is actually
     /// returned by the consensus mock as expected when the mempool tries to validate and
     /// insert a transaction.
+    /// Private inference: an AiResponse carrying an inline (sealed) body is admitted only from a
+    /// responder its request was sealed to, and only while that request is pending — here in the
+    /// mempool's own index (the consensus mock knows no ledger). Body-less responses are unaffected.
+    #[test]
+    fn test_private_response_body_admission() {
+        use keryx_consensus_core::collateral::responder_signature_message;
+        use keryx_consensus_core::subnets::{SUBNETWORK_ID_AI_REQUEST, SUBNETWORK_ID_AI_RESPONSE};
+        use keryx_inference::{AiResponder, AiResponsePayload, seal_request};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        fn escrow(seed: u8) -> Keypair {
+            Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap()
+        }
+
+        fn signed_response(keypair: &Keypair, request_hash: [u8; 32], body: Option<Vec<u8>>) -> Transaction {
+            let mut resp = AiResponsePayload::new(request_hash, 1, [0x12u8; 34], 1);
+            if let Some(body) = body {
+                resp = resp.with_private_body(body);
+            }
+            let sig = keypair.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+            resp.responder = Some(AiResponder { escrow_pubkey: keypair.x_only_public_key().0.serialize(), signature: *sig.as_ref() });
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
+        }
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+
+        let named = escrow(1);
+        let stranger = escrow(2);
+        let late = escrow(3);
+        let named_key = named.x_only_public_key().0.serialize();
+        let body = vec![0xAB; 64];
+
+        // The request the responses answer: a funded transaction turned into a private AiRequest
+        // sealed to `named` alone.
+        let (payload, _secret) = seal_request([0xAA; 32], 64, 1, 1, b"a prompt nobody else may read", &[named_key]).unwrap();
+        // The 1 KRX funding entry of the fixture, spent with the 0.3 KRX flat minimum fee the
+        // mempool enforces on every fee-paying transaction.
+        let funded = create_transaction_with_utxo_entry(77, 0);
+        let mut tx = funded.tx.as_ref().clone();
+        tx.subnetwork_id = SUBNETWORK_ID_AI_REQUEST;
+        tx.payload = payload.serialize();
+        tx.outputs[0].value = SOMPI_PER_KASPA - keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE;
+        tx.finalize();
+        let mut request = MutableTransaction::from_tx(tx);
+        request.entries = funded.entries.clone();
+        let request_hash = request.id().as_bytes();
+
+        // Nothing pending: a body-carrying response is refused, whoever signs it.
+        assert_eq!(insert(signed_response(&named, request_hash, Some(body.clone()))), Err(RuleError::RejectAiResponseBody(hex::encode(request_hash))));
+
+        // The request enters the mempool, so its recipients are known here.
+        into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            request.clone(),
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Forbidden,
+        ))
+        .unwrap();
+        assert_eq!(insert(signed_response(&stranger, request_hash, Some(body.clone()))), Err(RuleError::RejectAiResponseBody(hex::encode(request_hash))));
+        // A body-less answer from anyone is still admitted (the ledger, not the mempool, decides credit).
+        insert(signed_response(&stranger, request_hash, None)).unwrap();
+        // The named responder's sealed answer is admitted.
+        insert(signed_response(&named, request_hash, Some(body.clone()))).unwrap();
+
+        // Once the request leaves the mempool (mined), the mempool index forgets it; with no ledger
+        // behind the mock, a later body-carrying answer is refused again.
+        let block = build_block_transactions(once(request.tx.as_ref()));
+        mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block).unwrap();
+        assert_eq!(insert(signed_response(&late, request_hash, Some(body))), Err(RuleError::RejectAiResponseBody(hex::encode(request_hash))));
+    }
+
+    /// Private inference: once the gate is active (the consensus reports a cohort), a request is
+    /// admitted only when sealed to every escrow key of its tier cohort, and never for an empty tier.
+    #[test]
+    fn test_private_request_cohort_coverage_admission() {
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
+        use keryx_inference::{escrow_pubkey_of, seal_request};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let keys: Vec<[u8; 32]> = (1u8..=5).map(|i| escrow_pubkey_of(&[i; 32]).unwrap()).collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+
+        let request = |seed: u64, recipients: &[[u8; 32]]| {
+            let (payload, _) = seal_request([0xAA; 32], 64, 1, 1, b"sealed prompt", recipients).unwrap();
+            let funded = create_transaction_with_utxo_entry(seed as u32, 0);
+            let mut tx = funded.tx.as_ref().clone();
+            tx.subnetwork_id = SUBNETWORK_ID_AI_REQUEST;
+            tx.payload = payload.serialize();
+            tx.outputs[0].value = SOMPI_PER_KASPA - keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE;
+            tx.finalize();
+            let mut mtx = MutableTransaction::from_tx(tx);
+            mtx.entries = funded.entries.clone();
+            into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                mtx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+
+        consensus.set_private_cohort(Some(sorted.clone()));
+        assert_eq!(request(81, &keys[..4]).map(|_| ()), Err(RuleError::RejectPrivateRequestCoverage(1, 5)));
+        request(82, &keys).unwrap();
+        consensus.set_private_cohort(Some(vec![]));
+        assert_eq!(request(83, &keys).map(|_| ()), Err(RuleError::RejectPrivateRequestEmptyCohort));
+        // Before the gate the consensus reports no cohort and the mempool checks nothing.
+        consensus.set_private_cohort(None);
+        request(84, &keys[..1]).unwrap();
+    }
+
+    /// Private inference above the recipient cap: a request must cover the target cohort drawn
+    /// from its first input, and covering 128 other members of the tier is not enough.
+    #[test]
+    fn test_private_request_target_cohort_admission() {
+        use keryx_consensus_core::collateral::{private_cohort_seed, private_target_cohort};
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
+        use keryx_hashes::Hash;
+        use keryx_inference::{MAX_PRIVATE_RECIPIENTS, escrow_pubkey_of, max_private_prompt_len, seal_request};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let mut keys: Vec<[u8; 32]> = (1u8..=150).map(|i| escrow_pubkey_of(&[i; 32]).unwrap()).collect();
+        keys.sort_unstable();
+        consensus.set_private_cohort(Some(keys.clone()));
+
+        let request = |funding: u32, prompt: &[u8], pick: &dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]>| {
+            let funded = create_transaction_with_utxo_entry(funding, 0);
+            let seed = private_cohort_seed(&funded.tx.inputs[0].previous_outpoint);
+            let cohort: Vec<Hash> = keys.iter().copied().map(Hash::from_bytes).collect();
+            let target: Vec<[u8; 32]> = private_target_cohort(&seed, &cohort).into_iter().map(|k| k.as_bytes()).collect();
+            let (payload, _) = seal_request([0xAA; 32], 64, 1, 1, prompt, &pick(&target)).unwrap();
+            let mut tx = funded.tx.as_ref().clone();
+            tx.subnetwork_id = SUBNETWORK_ID_AI_REQUEST;
+            tx.payload = payload.serialize();
+            tx.outputs[0].value = SOMPI_PER_KASPA - keryx_inference::MIN_AI_REQUEST_PRIORITY_FEE;
+            tx.finalize();
+            let id = tx.id();
+            let mut mtx = MutableTransaction::from_tx(tx);
+            mtx.entries = funded.entries.clone();
+            into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                mtx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+            .map(|_| id)
+        };
+
+        // A full-size private request (16 KiB payload, 128 recipients) is standard at the flat minimum fee.
+        let full = request(91, &vec![b'p'; max_private_prompt_len(MAX_PRIVATE_RECIPIENTS)], &|target| target.to_vec()).unwrap();
+        let pooled = mining_manager.get_transaction(&full, TransactionQuery::All).unwrap();
+        assert_eq!(pooled.tx.payload.len(), keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN);
+        let swap_one = |target: &[[u8; 32]]| -> Vec<[u8; 32]> {
+            let mut out: Vec<[u8; 32]> = target[1..].to_vec();
+            out.push(*keys.iter().find(|k| !target.contains(k)).unwrap());
+            out
+        };
+        assert_eq!(request(92, b"sealed prompt", &swap_one).map(|_| ()), Err(RuleError::RejectPrivateRequestCoverage(1, MAX_PRIVATE_RECIPIENTS)));
+    }
+
     #[test]
     fn test_simulated_error_in_consensus() {
         for (priority, orphan, rbf_policy) in all_priority_orphan_rbf_policy_combinations() {
@@ -322,7 +500,7 @@ mod tests {
     /// depending on varying factors.
     #[test]
     fn test_replace_by_fee_in_mempool() {
-        const BASE_FEE: u64 = DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE;
+        const BASE_FEE: u64 = MINIMUM_FLAT_TX_FEE_SOMPI;
 
         struct TxOp {
             /// Funding transaction indexes
@@ -1036,7 +1214,7 @@ mod tests {
         consensus.add_transaction(child_tx_2.clone(), 3);
 
         // Add to mempool a transaction that spends child_tx_2 (as high priority)
-        let spending_tx = create_transaction(&child_tx_2, 1_000);
+        let spending_tx = create_transaction(&child_tx_2, MINIMUM_FLAT_TX_FEE_SOMPI);
         let result = mining_manager.validate_and_insert_transaction(
             consensus.as_ref(),
             spending_tx.clone(),
@@ -1165,7 +1343,7 @@ mod tests {
             let mut inner_tx = (*(heavy_tx.tx)).clone();
             inner_tx.payload = vec![0u8; TX_COUNT / 2 * tx_size - inner_tx.estimate_mem_bytes()];
             heavy_tx.tx = inner_tx.into();
-            heavy_tx.calculated_fee = Some(2081);
+            heavy_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI * 2081 / 1000);
             heavy_tx
         };
         assert!(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), heavy_tx_low_fee.clone()).is_err());
@@ -1176,7 +1354,7 @@ mod tests {
             let mut inner_tx = (*(heavy_tx.tx)).clone();
             inner_tx.payload = vec![0u8; TX_COUNT / 2 * tx_size - inner_tx.estimate_mem_bytes()];
             heavy_tx.tx = inner_tx.into();
-            heavy_tx.calculated_fee = Some(500_000);
+            heavy_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI * 500);
             heavy_tx
         };
         validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), heavy_tx_high_fee.clone()).unwrap();
@@ -1188,7 +1366,7 @@ mod tests {
             let mut inner_tx = (*(heavy_tx.tx)).clone();
             inner_tx.payload = vec![0u8; size_limit];
             heavy_tx.tx = inner_tx.into();
-            heavy_tx.calculated_fee = Some(500_000);
+            heavy_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI * 500);
             heavy_tx
         };
         assert!(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), too_big_tx.clone()).is_err());
@@ -1362,11 +1540,11 @@ mod tests {
 
         let input = TransactionInput::new(previous_outpoint, signature_script, MAX_TX_IN_SEQUENCE_NUM, 1);
         let entry = UtxoEntry::new(SOMPI_PER_KASPA, script_public_key.clone(), block_daa_score, true);
-        let output = TransactionOutput::new(SOMPI_PER_KASPA - DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE, script_public_key);
+        let output = TransactionOutput::new(SOMPI_PER_KASPA - MINIMUM_FLAT_TX_FEE_SOMPI, script_public_key);
         let transaction = Transaction::new(TX_VERSION, vec![input], vec![output], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
 
         let mut mutable_tx = MutableTransaction::from_tx(transaction);
-        mutable_tx.calculated_fee = Some(DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        mutable_tx.calculated_fee = Some(MINIMUM_FLAT_TX_FEE_SOMPI);
         // Please note: this is the ConsensusMock version of the calculated_mass which differs from Consensus
         let transaction_serialized_size = transaction_estimated_serialized_size(&mutable_tx.tx);
         mutable_tx.calculated_non_contextual_masses =
@@ -1413,7 +1591,7 @@ mod tests {
                         once(parent),
                         vec![i],
                         Some(output.value / 2),
-                        DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+                        MINIMUM_FLAT_TX_FEE_SOMPI,
                     )
                 }));
             }
@@ -1455,8 +1633,8 @@ mod tests {
         funding_amounts: Vec<u64>,
     ) -> (Transaction, Transaction) {
         let funding_tx = create_transaction_without_input(funding_amounts);
-        let parent_tx = create_transaction(&funding_tx, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
-        let child_tx = create_transaction(&parent_tx, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let parent_tx = create_transaction(&funding_tx, MINIMUM_FLAT_TX_FEE_SOMPI);
+        let child_tx = create_transaction(&parent_tx, MINIMUM_FLAT_TX_FEE_SOMPI);
         consensus.add_transaction(funding_tx, 1);
 
         (parent_tx, child_tx)
@@ -1464,7 +1642,8 @@ mod tests {
 
     fn create_child_and_parent_txs_and_add_parent_to_consensus(consensus: &Arc<ConsensusMock>) -> Transaction {
         let parent_tx = create_transaction_without_input(vec![500 * SOMPI_PER_KASPA]);
-        let child_tx = create_transaction(&parent_tx, 1000);
+        // One sompi above the minimum, so a double spend lowering the fee by one still pays it.
+        let child_tx = create_transaction(&parent_tx, MINIMUM_FLAT_TX_FEE_SOMPI + 1);
         consensus.add_transaction(parent_tx, 1);
         child_tx
     }

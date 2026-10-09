@@ -71,6 +71,7 @@ message KaspadRequest {
     GetUtxoEntriesByOutpointsRequestMessage getUtxoEntriesByOutpointsRequest = 1118;
     GetServiceStrikesRequestMessage getServiceStrikesRequest = 1120;
     GetNetworkModelAvailabilityRequestMessage getNetworkModelAvailabilityRequest = 1122;
+    GetServiceProvidersRequestMessage getServiceProvidersRequest = 1124;
   }
 }
 
@@ -142,6 +143,7 @@ message KaspadResponse {
     GetUtxoEntriesByOutpointsResponseMessage getUtxoEntriesByOutpointsResponse = 1119;
     GetServiceStrikesResponseMessage getServiceStrikesResponse = 1121;
     GetNetworkModelAvailabilityResponseMessage getNetworkModelAvailabilityResponse = 1123;
+    GetServiceProvidersResponseMessage getServiceProvidersResponse = 1125;
   }
 }
 

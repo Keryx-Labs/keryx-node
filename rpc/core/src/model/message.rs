@@ -168,7 +168,7 @@ pub struct GetBlockTemplateResponse {
     /// responds with the inference result in the next GetBlockTemplateRequest.inference_result.
     pub inference_challenge: String,
 
-    /// H14: the armed network-model audits, `;`-separated `PipelineAssignment::encode` entries
+    /// Model split: the armed network-model audits, `;`-separated `PipelineAssignment::encode` entries
     /// (`hash:accepted:window_end:tier-escrowhex,...`). Empty when none.
     pub pipeline_assignments: String,
 }
@@ -2094,6 +2094,70 @@ impl Deserializer for GetServiceStrikesResponse {
         let lifetime_strikes =
             if version >= 2 { load!(Vec<RpcServiceStrikeTotal>, reader)? } else { Vec::new() };
         Ok(Self { virtual_daa_score, strikes, suspended, pending_burns, lifetime_strikes })
+    }
+}
+
+/// One service-eligible responder of a tier at the current sink (see `getServiceProviders`).
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcServiceProvider {
+    /// Proven PoM tier (index into the current tier lineup).
+    pub tier: u32,
+    /// Model id of that tier — the `AiRequest.model_id` to use.
+    pub model_id: RpcHash,
+    /// Service identity (payout-SPK key): what strikes and rewards are booked to.
+    pub identity: RpcHash,
+    /// The x-only escrow pubkey the miner announces: what a private request is sealed to and
+    /// what signs its V2 responses.
+    pub escrow_pubkey: RpcHash,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceProvidersRequest {
+    /// Widens the eligibility window (DAA), bounded by the node; `None` = the eligibility window.
+    #[serde(default)]
+    pub window_daa: Option<u64>,
+}
+
+impl Serializer for GetServiceProvidersRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &2, writer)?;
+        store!(Option<u64>, &self.window_daa, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceProvidersRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let version = load!(u16, reader)?;
+        let window_daa = if version > 1 { load!(Option<u64>, reader)? } else { None };
+        Ok(Self { window_daa })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceProvidersResponse {
+    pub virtual_daa_score: u64,
+    pub providers: Vec<RpcServiceProvider>,
+}
+
+impl Serializer for GetServiceProvidersResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.virtual_daa_score, writer)?;
+        store!(Vec<RpcServiceProvider>, &self.providers, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetServiceProvidersResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let virtual_daa_score = load!(u64, reader)?;
+        let providers = load!(Vec<RpcServiceProvider>, reader)?;
+        Ok(Self { virtual_daa_score, providers })
     }
 }
 

@@ -199,7 +199,7 @@ message GetBlockTemplateResponseMessage {
   // GetBlockTemplateRequest.inferenceResult field. Mining is suspended (isSynced=false) until passed.
   string inferenceChallenge = 10;
 
-  // H14: armed network-model audits for pipeline heads, ";"-separated
+  // Model split: armed network-model audits for pipeline heads, ";"-separated
   // "hash:accepted:window_end:tier-escrowhex,..." entries. Empty when none.
   string pipelineAssignments = 11;
 
@@ -1204,6 +1204,24 @@ message GetNetworkModelAvailabilityResponseMessage {
   bool active = 3;
   bool available = 4;
   repeated ShardAvailabilityMessage shards = 5;
+
+  RPCError error = 1000;
+}
+
+message ServiceProviderMessage {
+  uint32 tier = 1;
+  string modelId = 2;
+  string identity = 3;
+  string escrowPubkey = 4;
+}
+
+message GetServiceProvidersRequestMessage {
+  optional uint64 windowDaa = 1;
+}
+
+message GetServiceProvidersResponseMessage {
+  uint64 virtualDaaScore = 1;
+  repeated ServiceProviderMessage providers = 2;
 
   RPCError error = 1000;
 }

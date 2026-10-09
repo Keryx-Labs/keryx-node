@@ -533,7 +533,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             })
         };
 
-        // H14: pipeline heads read the drawn links of every armed network-model audit here.
+        // Model split: pipeline heads read the drawn links of every armed network-model audit here.
         let pipeline_assignments = if self.config.model_split_activation.is_active(current_daa) {
             let session = self.consensus_manager.consensus().unguarded_session();
             session.get_pipeline_assignments().iter().map(|a| a.encode()).collect::<Vec<_>>().join(";")
@@ -1016,6 +1016,28 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 .lifetime_strikes
                 .into_iter()
                 .map(|(miner, strikes)| RpcServiceStrikeTotal { miner, strikes })
+                .collect(),
+        })
+    }
+
+    async fn get_service_providers_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetServiceProvidersRequest,
+    ) -> RpcResult<GetServiceProvidersResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let snapshot = session.get_service_providers(request.window_daa);
+        Ok(GetServiceProvidersResponse {
+            virtual_daa_score: snapshot.virtual_daa_score,
+            providers: snapshot
+                .providers
+                .into_iter()
+                .map(|p| RpcServiceProvider {
+                    tier: p.tier as u32,
+                    model_id: RpcHash::from_bytes(p.model_id),
+                    identity: p.identity,
+                    escrow_pubkey: RpcHash::from_bytes(p.escrow_pubkey),
+                })
                 .collect(),
         })
     }

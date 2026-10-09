@@ -60,6 +60,9 @@ impl Mempool {
                     }
                 }
             }
+            if tx.mtx.tx.is_ai_request() {
+                self.ai_private_request_index.remove(&tx_id.as_bytes());
+            }
             // Update/remove descendent orphan txs (depending on `remove_redeemers`)
             let txs = self.orphan_pool.update_orphans_after_transaction_removed(&tx, remove_redeemers)?;
             removed_orphans.extend(txs.into_iter().map(|x| x.id()));

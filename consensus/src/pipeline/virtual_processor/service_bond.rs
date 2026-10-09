@@ -6,19 +6,22 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, verify_avail_signature, verify_responder_signature, EscrowClaim, FoldOutcome,
-    NetworkModelAvailability, PipelineAssignment, ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger,
-    ServiceLedgerSnapshot, ServiceMiss, ServicePenalty, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
-    SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
+    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_avail_signature,
+    verify_responder_signature, EscrowClaim, FoldOutcome, NetworkModelAvailability, PipelineAssignment, PrivateCohortSeed,
+    ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
+    ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
+    MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
 };
-use keryx_consensus_core::config::params::NETWORK_MODEL_TIER;
+use keryx_consensus_core::config::params::{NETWORK_MODEL_TIER, POM_TIERS_H6, POM_TIERS_H14, service_tiers};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiAvailPayload, AiRequestPayload, AiResponsePayload};
+use keryx_inference::{AiAvailPayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 use keryx_txscript::script_class::ScriptClass;
+
+const _: () = assert!(keryx_consensus_core::collateral::PRIVATE_COHORT_TARGET == keryx_inference::private::MAX_PRIVATE_RECIPIENTS);
 
 
 /// The escrow pubkey locked by a CSV escrow script, if the script is one.
@@ -206,6 +209,18 @@ fn log_new_service_misses(
     }
 }
 
+/// At most one empty-cohort line per 10 s, whatever the caller.
+fn log_empty_cohort(seed: Hash, tier: u8, reason: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 10 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        warn!("service-bond: empty cohort for tier {} at seed {}: {}", tier, seed, reason);
+    }
+}
+
 impl VirtualStateProcessor {
     /// `(identity, proven tier, delegated escrow key)` of each paid mergeset blue of chain block
     /// `hash` — the same blue set the coinbase rewards. The identity is [`miner_key`] of the
@@ -251,23 +266,48 @@ impl VirtualStateProcessor {
         window_daa: u64,
         own_pp: Hash,
     ) -> Vec<(Hash, Hash)> {
-        eligible_pairs(&self.service_recent_producers_in(sc, seed, window_daa, own_pp), target_tier)
+        let recent = self.service_recent_producers_in(sc, seed, window_daa, own_pp, Some(target_tier));
+        let set = eligible_pairs(&recent, target_tier);
+        if set.is_empty() {
+            if recent.is_empty() {
+                log_empty_cohort(seed, target_tier, "no bonded producer in the window");
+            } else {
+                log_empty_cohort(seed, target_tier, "no bonded producer of this tier in the window");
+            }
+        }
+        set
     }
 
     /// `(identity, tier, escrow key)` of every paid blue of the chain blocks whose daa lies in
-    /// `(seed.daa − window_daa, seed.daa]` — the input of every cohort at `seed`.
+    /// `(seed.daa − window_daa, seed.daa]` — the input of every cohort at `seed`. With `tier`
+    /// set, a tier whose model changes at the H14 gate only counts blocks from the gate on, and
+    /// an empty result is logged against that tier.
     fn service_recent_producers_in(
         &self,
         sc: &impl SelectedChainStoreReader,
         seed: Hash,
         window_daa: u64,
         own_pp: Hash,
+        tier: Option<u8>,
     ) -> Vec<(Hash, u8, Hash)> {
+        let log_empty = |reason: &str| {
+            if let Some(target_tier) = tier {
+                log_empty_cohort(seed, target_tier, reason);
+            }
+        };
         let Ok(seed_idx) = sc.get_by_hash(seed) else {
+            log_empty("seed is not on the retained selected chain");
             return vec![];
         };
         let seed_header = self.headers_store.get_header(seed).unwrap();
-        let daa_bound = seed_header.daa_score.saturating_sub(window_daa);
+        let mut daa_bound = seed_header.daa_score.saturating_sub(window_daa);
+        // A tier whose model changes at the H14 gate only counts blocks proven with the new model.
+        let model_changes_at_h14 = |t: u8| {
+            POM_TIERS_H6.get(t as usize).map(|x| x.model_id) != POM_TIERS_H14.get(t as usize).map(|x| x.model_id)
+        };
+        if self.private_inference_activation.is_active(seed_header.daa_score) && tier.is_some_and(model_changes_at_h14) {
+            daa_bound = daa_bound.max(self.private_inference_activation.daa_score().saturating_sub(1));
+        }
         // A window crossing below retained history only happens while re-validating blocks near
         // the local pruning point (fresh IBD / restart catch-up). Past the ledger gate the part
         // below the pruning point is read from the imported snapshot; before it the audit arms
@@ -276,9 +316,15 @@ impl VirtualStateProcessor {
             Some(idx) => (idx, false),
             None if self.service_ledger_activation.is_active(seed_header.daa_score) => match sc.get_by_hash(own_pp) {
                 Ok(idx) => (idx, true),
-                Err(_) => return vec![],
+                Err(_) => {
+                    log_empty("pruning point is not on the retained selected chain");
+                    return vec![];
+                }
             },
-            None => return vec![],
+            None => {
+                log_empty("window reaches below retained history before the ledger gate");
+                return vec![];
+            }
         };
         let bottom = self.chain_index_at_or_below_daa(sc, daa_bound, seed_idx, pruning_idx).max(pruning_idx);
         let mut recent = Vec::new();
@@ -316,7 +362,7 @@ impl VirtualStateProcessor {
         }
         let recent = {
             let (own_pp, sc) = self.retained_pruning_point_and_chain();
-            std::sync::Arc::new(self.service_recent_producers_in(&*sc, sink, window, own_pp))
+            std::sync::Arc::new(self.service_recent_producers_in(&*sc, sink, window, own_pp, None))
         };
         *self.service_recent_at_sink.lock() = Some((sink, recent.clone()));
         recent
@@ -352,24 +398,28 @@ impl VirtualStateProcessor {
     /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
     /// Requests for models outside the mineable tier set are skipped: the lineup before
     /// `model_split`, the network model and its shards after it. A v1 response or an invalid
-    /// responder signature yields `None` (a volunteer — never serves the assignment). The last
-    /// output is the block's verified availability declarations as `(request_hash, tier,
-    /// escrow key)`, past the gate only.
+    /// responder signature yields `None` (a volunteer — never serves the assignment). With
+    /// `private` set, a request sealed to named responders also yields its recipient set. The
+    /// last output is the block's verified availability declarations as `(request_hash, tier,
+    /// escrow key)`, past the model-split gate only.
     #[allow(clippy::type_complexity)]
     fn service_events_of_chain_block(
         &self,
         hash: Hash,
         txid_identity: bool,
+        private: bool,
         model_split: bool,
     ) -> (
         Vec<([u8; 32], u8, u32)>,
         Vec<([u8; 32], u64)>,
+        Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>,
         Vec<([u8; 32], Option<Hash>)>,
         Vec<ResponseLinks>,
         Vec<([u8; 32], u8, Hash)>,
     ) {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
+        let mut request_recipients = Vec::new();
         let mut responses = Vec::new();
         let mut response_links = Vec::new();
         let mut declarations = Vec::new();
@@ -380,13 +430,16 @@ impl VirtualStateProcessor {
                 let tx = &txs[entry.index_within_block as usize];
                 if tx.is_ai_request() {
                     if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        if let Some(tier) = self
-                            .network_model
-                            .tiers
-                            .iter()
-                            .position(|t| t.model_id == req.model_id)
-                            .filter(|&tier| model_split == (tier >= NETWORK_MODEL_TIER as usize))
-                        {
+                        let tier = if model_split {
+                            self.network_model
+                                .tiers
+                                .iter()
+                                .position(|t| t.model_id == req.model_id)
+                                .filter(|&tier| tier >= NETWORK_MODEL_TIER as usize)
+                        } else {
+                            service_tiers(private).iter().position(|t| t.model_id == req.model_id)
+                        };
+                        if let Some(tier) = tier {
                             // Past the gate a request is identified by its transaction id, which is
                             // unique by construction. The payload digest is not: the same prompt with
                             // the same parameters is the same hash, so two senders — or one retry —
@@ -400,6 +453,19 @@ impl VirtualStateProcessor {
                             }
                             requests.push((request_hash, tier as u8, req.max_tokens));
                             request_rewards.push((request_hash, req.inference_reward));
+                            // Past the private-inference gate the envelope names the responders
+                            // obligated for (and paid by) this request. A plaintext request from a
+                            // block below the gate, merged past it, folds as a public request.
+                            if private
+                                && req.is_private()
+                                && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
+                                && let Some(first) = tx.inputs.first()
+                            {
+                                let mut recipients: Vec<Hash> = envelope.recipient_keys().map(escrow_miner_key).collect();
+                                recipients.sort_unstable();
+                                recipients.dedup();
+                                request_recipients.push((request_hash, private_cohort_seed(&first.previous_outpoint), recipients));
+                            }
                         }
                     }
                 } else if tx.is_ai_response() {
@@ -419,7 +485,7 @@ impl VirtualStateProcessor {
                 }
             }
         }
-        (requests, request_rewards, responses, response_links, declarations)
+        (requests, request_rewards, request_recipients, responses, response_links, declarations)
     }
 
     /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
@@ -490,6 +556,69 @@ impl VirtualStateProcessor {
         snapshot
     }
 
+    /// The private-inference recipients of a pending request (see
+    /// [`ServiceLedger::private_recipients`]), as raw escrow pubkeys.
+    pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        let sync = self.service_ledger.lock();
+        sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
+    }
+
+    /// The eligibility window a cohort arms with at `virtual_daa_score`.
+    fn eligibility_window_at(&self, virtual_daa_score: u64) -> u64 {
+        if self.service_bond_v2_activation.is_active(virtual_daa_score) {
+            SERVICE_ELIGIBILITY_WINDOW_DAA_V2
+        } else {
+            SERVICE_ELIGIBILITY_WINDOW_DAA
+        }
+    }
+
+    /// The service-eligible responders of every tier at the chain tip: the identities that proved a
+    /// block of the tier inside the eligibility window, each with the escrow key it announces —
+    /// the keys a private request is sealed to. `window_daa` widens the window (bounded by
+    /// `MAX_SERVICE_PROVIDERS_WINDOW_DAA`, never below the eligibility window) so a requester can
+    /// also cover miners that return before the request arms. Sorted by (tier, identity, escrow key).
+    pub(crate) fn service_providers_snapshot(&self, virtual_daa_score: u64, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
+        let eligibility = self.eligibility_window_at(virtual_daa_score);
+        let window = window_daa.map_or(eligibility, |w| w.clamp(eligibility, MAX_SERVICE_PROVIDERS_WINDOW_DAA.max(eligibility)));
+        let mut providers = Vec::new();
+        // One chain snapshot for every tier: the sink is read from the chain itself, under the
+        // same lock, never from a virtual state published ahead of the chain index.
+        let (own_pp, sc) = self.retained_pruning_point_and_chain();
+        let Ok((_, sink)) = sc.get_tip() else {
+            return ServiceProvidersSnapshot { virtual_daa_score, providers };
+        };
+        for (tier, model) in service_tiers(self.private_inference_activation.is_active(virtual_daa_score)).iter().enumerate() {
+            for (identity, escrow) in self.service_eligible_miners_in(&*sc, sink, tier as u8, window, own_pp) {
+                providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
+            }
+        }
+        providers.sort_by(|x, y| (x.tier, x.identity, x.escrow_pubkey).cmp(&(y.tier, y.identity, y.escrow_pubkey)));
+        ServiceProvidersSnapshot { virtual_daa_score, providers }
+    }
+
+    /// The escrow keys a private AiRequest for `model_id` seeded with `seed` must be sealed to at
+    /// the chain tip: the target cohort of the cohort its tier would arm with now. `None` before
+    /// the private-inference activation or for a model outside the tier set.
+    pub(crate) fn private_cohort_escrows(
+        &self,
+        virtual_daa_score: u64,
+        model_id: &[u8; 32],
+        seed: &PrivateCohortSeed,
+    ) -> Option<Vec<[u8; 32]>> {
+        if !self.private_inference_activation.is_active(virtual_daa_score) {
+            return None;
+        }
+        let tier = service_tiers(true).iter().position(|t| t.model_id == *model_id)? as u8;
+        let (own_pp, sc) = self.retained_pruning_point_and_chain();
+        let sink = sc.get_tip().ok()?.1;
+        let cohort: Vec<Hash> = self
+            .service_eligible_miners_in(&*sc, sink, tier, self.eligibility_window_at(virtual_daa_score), own_pp)
+            .into_iter()
+            .map(|(_, escrow)| escrow)
+            .collect();
+        Some(private_target_cohort(seed, &cohort).into_iter().map(|k| k.as_bytes()).collect())
+    }
+
     /// Escrow claims created by committed chain block `hash`'s coinbase, keyed by producing miner:
     /// for each paid mergeset blue, the CSV escrow output locking the escrow key that blue's own
     /// coinbase announces. Standard miners (escrow burned at emission) contribute none.
@@ -557,8 +686,12 @@ impl VirtualStateProcessor {
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_network_model(self.network_model);
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, responses, response_links, declarations) =
-            self.service_events_of_chain_block(hash, self.reward_routing_activation.is_active(daa), self.model_split_activation.is_active(daa));
+        let (requests, request_rewards, request_recipients, responses, response_links, declarations) = self.service_events_of_chain_block(
+            hash,
+            self.reward_routing_activation.is_active(daa),
+            self.private_inference_activation.is_active(daa),
+            self.model_split_activation.is_active(daa),
+        );
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -594,10 +727,11 @@ impl VirtualStateProcessor {
         };
         if warmup {
             let burned = self.service_burned.read();
-            ledger.on_chain_block_warmup_with_rewards(
+            ledger.on_chain_block_warmup_with_pipeline(
                 daa,
                 &requests,
                 &request_rewards,
+                &request_recipients,
                 &responses,
                 &escrows,
                 &producers,
@@ -608,10 +742,11 @@ impl VirtualStateProcessor {
             );
             (FoldOutcome::default(), escrows)
         } else {
-            let outcome = ledger.on_chain_block_with_rewards(
+            let outcome = ledger.on_chain_block_with_pipeline(
                 daa,
                 &requests,
                 &request_rewards,
+                &request_recipients,
                 &responses,
                 &escrows,
                 &producers,
@@ -751,7 +886,7 @@ impl VirtualStateProcessor {
             log_new_service_misses(logged, daa, &outcome.misses);
             if !warmup && self.is_pruning_sample_block(hash) && !self.service_ledger_hashes.read().contains_key(&hash) {
                 let mut snapshot = ledger.snapshot();
-                snapshot.recent_producers = self.recent_producers_below(sc, i, daa);
+                snapshot.recent_producers = self.recent_producers_below(sc, i, daa, pruning_point);
                 let bytes = snapshot.to_bytes();
                 let snapshot_hash = ServiceLedgerSnapshot::hash_of_bytes(&bytes);
                 self.service_ledger_hashes.write().insert(hash, snapshot_hash);
@@ -870,7 +1005,7 @@ impl VirtualStateProcessor {
             sync.snapshots.insert(idx, snapshot);
             if self.is_pruning_sample_block(*h) {
                 let mut snapshot = sync.ledger.snapshot();
-                snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa);
+                snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa, pruning_point);
                 let bytes = snapshot.to_bytes();
                 self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
@@ -1001,12 +1136,25 @@ impl VirtualStateProcessor {
     }
 
     /// Producers of the chain blocks with daa in `(daa − SERVICE_ELIGIBILITY_WINDOW_DAA, daa]`
-    /// ending at chain index `idx`, chain order.
-    fn recent_producers_below(&self, sc: &impl SelectedChainStoreReader, idx: u64, daa: u64) -> Vec<(u64, Hash, u8, Hash)> {
+    /// ending at chain index `idx`, chain order. At and below the pruning point the entries are
+    /// read from the imported snapshot.
+    pub(super) fn recent_producers_below(
+        &self,
+        sc: &impl SelectedChainStoreReader,
+        idx: u64,
+        daa: u64,
+        pruning_point: Hash,
+    ) -> Vec<(u64, Hash, u8, Hash)> {
         let bound = daa.saturating_sub(SERVICE_ELIGIBILITY_WINDOW_DAA);
+        let pruning_idx = sc.get_by_hash(pruning_point).ok();
         let mut out = Vec::new();
         let mut i = idx;
+        let mut at_pruning_point = false;
         loop {
+            if pruning_idx == Some(i) {
+                at_pruning_point = true;
+                break;
+            }
             let Ok(h) = sc.get_by_index(i) else { break };
             let block_daa = self.headers_store.get_daa_score(h).unwrap();
             if block_daa <= bound {
@@ -1021,6 +1169,17 @@ impl VirtualStateProcessor {
             i -= 1;
         }
         out.reverse();
+        if at_pruning_point {
+            let pp_daa = self.headers_store.get_daa_score(pruning_point).unwrap();
+            let below: Vec<_> = self
+                .service_imported_producers
+                .read()
+                .iter()
+                .filter(|(d, _, _, _)| *d > bound && *d <= pp_daa)
+                .cloned()
+                .collect();
+            out.splice(0..0, below);
+        }
         out
     }
 

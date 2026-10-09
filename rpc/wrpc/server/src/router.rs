@@ -43,6 +43,7 @@ impl Router {
                 GetUtxoEntriesByOutpoints,
                 GetServiceStrikes,
                 GetNetworkModelAvailability,
+                GetServiceProviders,
                 GetBlock,
                 GetBlockCount,
                 GetBlockDagInfo,

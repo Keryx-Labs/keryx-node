@@ -9,7 +9,7 @@ use crate::{
     block::{Block, BlockTemplate, TemplateBuildMode, TemplateTransactionSelector, VirtualStateApproxId},
     blockstatus::BlockStatus,
     coinbase::MinerData,
-    collateral::ServiceStrikesSnapshot,
+    collateral::{ServiceProvidersSnapshot, ServiceStrikesSnapshot},
     daa_score_timestamp::DaaScoreTimestamp,
     errors::{
         block::{BlockProcessResult, RuleError},
@@ -159,14 +159,36 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
-    /// The armed network-model audits (H14), for pipeline heads.
+    /// The armed network-model audits (model split), for pipeline heads.
     fn get_pipeline_assignments(&self) -> Vec<crate::collateral::PipelineAssignment> {
         unimplemented!()
     }
 
-    /// Eligible producers per shard tier at the sink (H14).
+    /// Eligible producers per shard tier at the sink (model split).
     fn get_network_model_availability(&self) -> crate::collateral::NetworkModelAvailability {
         unimplemented!()
+    }
+
+    /// The service-eligible responders per tier at the current sink: identity and escrow key —
+    /// the keys a private-inference request is sealed to. `window_daa` widens the eligibility
+    /// window (bounded by `MAX_SERVICE_PROVIDERS_WINDOW_DAA`).
+    fn get_service_providers(&self, window_daa: Option<u64>) -> ServiceProvidersSnapshot {
+        let _ = window_daa;
+        unimplemented!()
+    }
+
+    /// The escrow keys a private AiRequest for `model_id` seeded with `seed` must be sealed to at
+    /// the current sink; `None` before the private-inference activation or for an unknown model.
+    fn private_cohort_escrows(&self, model_id: &[u8; 32], seed: &crate::collateral::PrivateCohortSeed) -> Option<Vec<[u8; 32]>> {
+        let _ = (model_id, seed);
+        None
+    }
+
+    /// The named responders (escrow keys) of a pending private AiRequest; `None` when the
+    /// request is unknown, expired or public.
+    fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        let _ = request_hash;
+        None
     }
 
     fn get_virtual_bits(&self) -> u32 {

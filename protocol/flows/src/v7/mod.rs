@@ -1,7 +1,7 @@
 use crate::ibd::IbdFlow;
 use crate::v7::{
     address::{ReceiveAddressesFlow, SendAddressesFlow},
-    blockrelay::{flow::HandleRelayInvsFlow, handle_requests::HandleRelayBlockRequests},
+    blockrelay::{flow::HandleRelayInvsFlow, handle_requests::HandleRelayBlockRequests, reproof::PomReproofFlow},
     ping::{ReceivePingsFlow, SendPingsFlow},
     request_antipast::HandleAntipastRequests,
     request_block_locator::RequestBlockLocatorFlow,
@@ -162,6 +162,8 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             router.subscribe(vec![KaspadMessagePayloadType::RequestBlockLocator]),
         )),
     ];
+
+    flows.push(Box::new(PomReproofFlow::new(ctx.clone(), router.clone(), header_format)));
 
     let invs_route = router.subscribe_with_capacity(vec![KaspadMessagePayloadType::InvRelayBlock], ctx.block_invs_channel_size());
     let shared_invs_route = SharedIncomingRoute::new(invs_route);

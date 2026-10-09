@@ -4,7 +4,11 @@ use super::BlockBodyProcessor;
 use crate::errors::{BlockProcessResult, RuleError};
 use crate::model::stores::headers::HeaderStoreReader;
 use crate::model::stores::pom_proof::PomProofStoreReader;
-use crate::processes::{coinbase::coinbase_outputs_limit, transaction_validator::errors::TxRuleError};
+use crate::processes::{
+    coinbase::coinbase_outputs_limit,
+    private_inference::{PrivateEraViolation, check_private_inference_era},
+    transaction_validator::errors::TxRuleError,
+};
 use keryx_consensus_core::{
     block::Block,
     config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
@@ -13,7 +17,7 @@ use keryx_consensus_core::{
     mass::{ContextualMasses, Mass, NonContextualMasses},
     merkle::calc_hash_merkle_root,
     pom::{
-        PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_block_seed_v4, pom_block_seed_h10, pom_pow_value,
+        PomProof, pom_block_seed, pom_block_seed_h3, pom_block_seed_h5_1, pom_block_seed_h5_2, pom_block_seed_v4, pom_block_seed_h10, pom_block_seed_h14, pom_pow_value,
         pom_pow_value_h3, verify_pom_proof, verify_pom_proof_v2,
     },
     pom_v3::verify_pom_proof_v3_container,
@@ -32,6 +36,7 @@ impl BlockBodyProcessor {
         Self::check_only_one_coinbase(block)?;
         self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
+        self.check_private_inference_era(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
@@ -40,7 +45,7 @@ impl BlockBodyProcessor {
         self.check_escrow_delegation(block)?;
         // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
-        // H14: the lineup tiers stay in the registry for older blocks but are no longer mineable,
+        // Model split: the lineup tiers stay in the registry for older blocks but are no longer mineable,
         // and the network model itself is a request target, never a mined tier.
         // Keyed on the committed header tier, so the IBD proof skip does not bypass it.
         if self.model_split_activation.is_active(block.header.daa_score) && block.header.pom_tier <= NETWORK_MODEL_TIER {
@@ -105,6 +110,21 @@ impl BlockBodyProcessor {
         for tx in block.transactions.iter() {
             if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx) {
                 return Err(RuleError::TxInIsolationValidationFailed(tx.id(), e));
+            }
+        }
+        Ok(())
+    }
+
+    /// AI transactions must match the private-inference era of the block, trusted blocks included.
+    fn check_private_inference_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        for tx in block.transactions.iter().skip(1) {
+            if let Err(v) = check_private_inference_era(tx, block.header.daa_score, self.private_inference_activation) {
+                return Err(match v {
+                    PrivateEraViolation::RequestTooLongBeforeActivation(len) => RuleError::AiRequestTooLongBeforeActivation(tx.id(), len),
+                    PrivateEraViolation::ResponseBodyBeforeActivation(_) => RuleError::AiResponseBodyBeforeActivation(tx.id()),
+                    PrivateEraViolation::RequestNotPrivate(e) => RuleError::AiRequestNotPrivate(tx.id(), e),
+                    PrivateEraViolation::ResponseWithoutBody => RuleError::AiResponseWithoutPrivateBody(tx.id()),
+                });
             }
         }
         Ok(())
@@ -257,6 +277,7 @@ impl BlockBodyProcessor {
         let pom_v4 = self.pom_v4_activation.is_active(header.daa_score);
         let tiers = pom_tiers(
             self.model_split_activation.is_active(header.daa_score).then_some(self.network_model.tiers),
+            self.private_inference_activation.is_active(header.daa_score),
             pom_v3,
             self.h5_activation.is_active(header.daa_score),
             self.coin_age_verification_activation.is_active(header.daa_score),
@@ -282,7 +303,10 @@ impl BlockBodyProcessor {
         // mechanism as H5.1, capping every pre-gate fork point of the relaunched chain.
         let h5_2 = self.h5_2_activation.is_active(header.daa_score);
         let h10 = self.h10_activation.is_active(header.daa_score);
-        let seed = if h10 {
+        let h14 = self.private_inference_activation.is_active(header.daa_score);
+        let seed = if h14 {
+            pom_block_seed_h14(&pre_pow_hash, header.timestamp, header.nonce)
+        } else if h10 {
             pom_block_seed_h10(&pre_pow_hash, header.timestamp, header.nonce)
         } else if pom_v4 {
             pom_block_seed_v4(&pre_pow_hash, header.timestamp, header.nonce)

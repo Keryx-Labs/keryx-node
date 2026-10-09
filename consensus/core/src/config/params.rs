@@ -217,6 +217,10 @@ pub const H12_ACTIVATION_DAA: u64 = 92_550_000;
 /// Targets 2026-09-06 ~19:45 UTC (from daa 92_654_952 at 2026-09-05 18:59 UTC, ~10.0 daa/s).
 pub const H13_ACTIVATION_DAA: u64 = 93_550_000;
 
+/// H14: private inference (`private_inference_activation`). Node and miner.
+/// Targets 2026-10-09 ~14:00 UTC (from daa 117_774_522 at 2026-10-04 18:37 UTC, ~10.13 daa/s).
+pub const H14_ACTIVATION_DAA: u64 = 121_985_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -303,6 +307,16 @@ pub const QWEN3_6_27B_MODEL_ID: [u8; 32] = [
     0x1f, 0x55, 0x96, 0x98, 0xa5, 0x28, 0x47, 0x46,
 ];
 
+/// Qwen3.8-27B-abliterated Q4_K (huihui-ai, arch qwen35 hybrid-SSM). H14 tier 3 (--high), replaces
+/// Qwen3.6-27B. `model_id` = CIDv0[2..34] of the pinned GGUF
+/// (IPFS QmW7LDz7ZTfw9vpAR9jMhFHWriLhxh728Kihp7oTSLgvyg).
+pub const QWEN3_8_27B_MODEL_ID: [u8; 32] = [
+    0x73, 0x74, 0x0b, 0x44, 0x3b, 0xdc, 0x00, 0xaf,
+    0xda, 0x5f, 0xa3, 0x4e, 0xb9, 0x99, 0x9d, 0x3f,
+    0xea, 0x77, 0xdc, 0xc3, 0xf6, 0xde, 0x23, 0x8f,
+    0xab, 0x70, 0x13, 0x94, 0xcd, 0xc9, 0x6f, 0xb3,
+];
+
 /// Kimi-Linear-48B-A3B-abliterated Q4_K_M (Moonshot, MoE). H4 tier 4 (--very-high), replaces Llama-70B-Q2.
 pub const KIMI_LINEAR_48B_MODEL_ID: [u8; 32] = [
     0x3d, 0xc0, 0x93, 0x58, 0xad, 0x75, 0xc6, 0xef,
@@ -333,18 +347,27 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_H6: &[([u8; 32], u64)] = &[
     (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),   // 4.0 KRX  (--very-high)
 ];
 
-/// Per-model minimum inference_reward in sompi, H14 — enforced from `model_split_activation`.
-/// The H6 lineup floors are kept (its requests stay valid, they are just no longer assigned);
-/// the network model floor is the Kimi floor, shared by its six signers by VRAM weight.
-pub const INFERENCE_REWARD_MINIMUMS_V2_H14: &[([u8; 32], u64)] = &[
-    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  100_000_000),
-    (GLM_4_9B_0414_MODEL_ID,           150_000_000),
-    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 200_000_000),
-    (QWEN3_6_27B_MODEL_ID,             250_000_000),
-    (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),
-    (NETWORK_MODEL_V4_FLASH_MODEL_ID,    400_000_000), // 4.0 KRX, six signers
+/// Per-model `inference_reward` floors once `private_inference_activation` (H14) is live: fixed per
+/// tier, 0.5 KRX more at each step up, no per-token surcharge (the 0.3 KRX priority fee comes on top).
+pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,   50_000_000), // 0.5 KRX
+    (GLM_4_9B_0414_MODEL_ID,           100_000_000), // 1.0 KRX
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000), // 1.5 KRX
+    (QWEN3_8_27B_MODEL_ID,             200_000_000), // 2.0 KRX
+    (KIMI_LINEAR_48B_MODEL_ID,         250_000_000), // 2.5 KRX
 ];
 
+/// Per-model minimum inference_reward in sompi once `model_split_activation` is live: the flat
+/// lineup floors (its requests stay valid, they are just no longer assigned), then the network
+/// model, shared by its six signers by VRAM weight.
+pub const INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT: &[([u8; 32], u64)] = &[
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,   50_000_000),
+    (GLM_4_9B_0414_MODEL_ID,           100_000_000),
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000),
+    (QWEN3_8_27B_MODEL_ID,             200_000_000),
+    (KIMI_LINEAR_48B_MODEL_ID,         250_000_000),
+    (NETWORK_MODEL_V4_FLASH_MODEL_ID,  400_000_000), // 4.0 KRX, six signers
+];
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
 
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
@@ -594,14 +617,37 @@ pub const POM_TIERS_H6: &[crate::pom::PomTier] = &[
     POM_TIERS_H4[4], // Kimi-Linear-48B, unchanged
 ];
 
-/// First tier index of the network model (H14). Tier `NETWORK_MODEL_TIER` is the whole model —
+/// H14 possession anchors — the H6 set with tier 3 swapped to Qwen3.8-27B. Gated by
+/// `private_inference_activation`.
+pub const POM_TIERS_H14: &[crate::pom::PomTier] = &[
+    POM_TIERS_H6[0],
+    POM_TIERS_H6[1],
+    POM_TIERS_H6[2],
+    crate::pom::PomTier {
+        model_id: QWEN3_8_27B_MODEL_ID,
+        root: [
+            0x40, 0x6c, 0x19, 0x56, 0xf9, 0xf5, 0xdd, 0x13, 0x4d, 0x34, 0x61, 0xc6, 0x19, 0x11, 0x32, 0xa3,
+            0xb1, 0x57, 0x2c, 0xc1, 0x6f, 0x39, 0x5a, 0x2b, 0xc2, 0xf1, 0xc6, 0x69, 0xfa, 0xe3, 0x74, 0xa1,
+        ],
+        chunks: 524_991_232,
+    },
+    POM_TIERS_H6[4],
+];
+
+/// Tier lineup of the service ledger and the provider queries: the H14 set once
+/// `private_inference_activation` is live, else the H6 set.
+pub fn service_tiers(private_inference_active: bool) -> &'static [crate::pom::PomTier] {
+    if private_inference_active { POM_TIERS_H14 } else { POM_TIERS_H6 }
+}
+
+/// First tier index of the network model (model split). Tier `NETWORK_MODEL_TIER` is the whole model —
 /// the id AiRequests target and pipeline heads declare; nobody mines it. The tiers after it are
 /// its shards, in layer order, each a possession anchor of its own.
 pub const NETWORK_MODEL_TIER: u8 = 5;
 
-/// DeepSeek-V4-Flash abliterated (huihui-ai, ds4, Q2: IQ2_XXS + Q2_K experts), the H14 network
+/// DeepSeek-V4-Flash abliterated (huihui-ai, ds4, Q2: IQ2_XXS + Q2_K experts), the network
 /// model. `model_id` = CIDv0[2..34] of the complete GGUF; AiRequests target it and pipeline
-/// heads declare it. Its possession anchor is `POM_TIERS_H14[NETWORK_MODEL_TIER]`.
+/// heads declare it. Its possession anchor is `POM_TIERS_MODEL_SPLIT[NETWORK_MODEL_TIER]`.
 pub const NETWORK_MODEL_V4_FLASH_MODEL_ID: [u8; 32] = [
     0x91, 0x85, 0x70, 0xa8, 0x4e, 0x9e, 0x18, 0x32,
     0x21, 0x10, 0x17, 0x03, 0x32, 0xf8, 0x0a, 0x92,
@@ -658,7 +704,7 @@ pub const V4_FLASH_SHARD_5_MODEL_ID: [u8; 32] = [
 ];
 
 /// `(shard model_id, first layer, last layer)` of the network model, in pipeline order. Tooling
-/// only; validation reads `POM_TIERS_H14`.
+/// only; validation reads `POM_TIERS_MODEL_SPLIT`.
 pub const NETWORK_MODEL_SHARDS: &[([u8; 32], u32, u32)] = &[
     (V4_FLASH_SHARD_0_MODEL_ID, 0, 2),
     (V4_FLASH_SHARD_1_MODEL_ID, 3, 7),
@@ -668,14 +714,14 @@ pub const NETWORK_MODEL_SHARDS: &[([u8; 32], u32, u32)] = &[
     (V4_FLASH_SHARD_5_MODEL_ID, 30, 42),
 ];
 
-/// H14 tier set: the H6 lineup unchanged, then the network model (tier 5) and its six shards
+/// Model-split tier set: the H14 lineup unchanged, then the network model (tier 5) and its six shards
 /// (tiers 6-11, layer order). Gated by `model_split_activation`.
-pub const POM_TIERS_H14: &[crate::pom::PomTier] = &[
-    POM_TIERS_H6[0],
-    POM_TIERS_H6[1],
-    POM_TIERS_H6[2],
-    POM_TIERS_H6[3],
-    POM_TIERS_H6[4],
+pub const POM_TIERS_MODEL_SPLIT: &[crate::pom::PomTier] = &[
+    POM_TIERS_H14[0],
+    POM_TIERS_H14[1],
+    POM_TIERS_H14[2],
+    POM_TIERS_H14[3],
+    POM_TIERS_H14[4],
     crate::pom::PomTier {
         model_id: NETWORK_MODEL_V4_FLASH_MODEL_ID,
         root: [
@@ -769,27 +815,27 @@ pub const SPLIT9B_WHOLE_MODEL_ID: [u8; 32] = [
     0x9b, 0x76, 0xeb, 0x83, 0x4f, 0xe6, 0xc9, 0x0d, 0xed, 0xc6, 0xa3, 0x8d, 0x50, 0x4a, 0x46, 0xcb,
 ];
 
-/// The H6 floors plus the bench network model, whose floor is the 9B's.
+/// The flat floors plus the bench network model, whose floor is the 9B's.
 pub const INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B: &[([u8; 32], u64)] = &[
-    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  100_000_000),
-    (GLM_4_9B_0414_MODEL_ID,           150_000_000),
-    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 200_000_000),
-    (QWEN3_6_27B_MODEL_ID,             250_000_000),
-    (KIMI_LINEAR_48B_MODEL_ID,         400_000_000),
-    (SPLIT9B_WHOLE_MODEL_ID,           100_000_000),
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,   50_000_000),
+    (GLM_4_9B_0414_MODEL_ID,           100_000_000),
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000),
+    (QWEN3_8_27B_MODEL_ID,             200_000_000),
+    (KIMI_LINEAR_48B_MODEL_ID,         250_000_000),
+    (SPLIT9B_WHOLE_MODEL_ID,            50_000_000),
 ];
 
 /// Bench shards: layers 0-15 and 16-31, the second one being the head shard.
 pub const NETWORK_MODEL_SHARDS_SPLIT9B: &[([u8; 32], u32, u32)] =
     &[(SPLIT9B_SHARD_0_MODEL_ID, 0, 15), (SPLIT9B_SHARD_1_MODEL_ID, 16, 31)];
 
-/// Bench H14 tier set: the H6 lineup, the 9B as network model (its H6 anchor), two shards.
-pub const POM_TIERS_H14_SPLIT9B: &[crate::pom::PomTier] = &[
-    POM_TIERS_H6[0],
-    POM_TIERS_H6[1],
-    POM_TIERS_H6[2],
-    POM_TIERS_H6[3],
-    POM_TIERS_H6[4],
+/// Bench model-split tier set: the H14 lineup, the 9B as network model (its H6 anchor), two shards.
+pub const POM_TIERS_MODEL_SPLIT_9B: &[crate::pom::PomTier] = &[
+    POM_TIERS_H14[0],
+    POM_TIERS_H14[1],
+    POM_TIERS_H14[2],
+    POM_TIERS_H14[3],
+    POM_TIERS_H14[4],
     crate::pom::PomTier { model_id: SPLIT9B_WHOLE_MODEL_ID, root: POM_TIERS_H6[0].root, chunks: POM_TIERS_H6[0].chunks },
     crate::pom::PomTier {
         model_id: SPLIT9B_SHARD_0_MODEL_ID,
@@ -809,11 +855,11 @@ pub const POM_TIERS_H14_SPLIT9B: &[crate::pom::PomTier] = &[
     },
 ];
 
-pub const TIER_REWARD_BPS_H14_SPLIT9B: [u64; 8] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 6_000];
+pub const TIER_REWARD_BPS_MODEL_SPLIT_9B: [u64; 8] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 6_000];
 
 pub const NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B: [u64; 2] = [8, 8];
 
-/// The network model of one network: its H14 tier table (lineup, whole model, shards), the
+/// The network model of one network: its model-split tier table (lineup, whole model, shards), the
 /// matching reward schedule and request minimums, and the card class of each shard.
 #[derive(Debug)]
 pub struct NetworkModelLayout {
@@ -853,16 +899,16 @@ impl NetworkModelLayout {
 }
 
 pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
-    tiers: POM_TIERS_H14,
-    reward_bps: &TIER_REWARD_BPS_H14,
-    minimums: INFERENCE_REWARD_MINIMUMS_V2_H14,
+    tiers: POM_TIERS_MODEL_SPLIT,
+    reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT,
+    minimums: INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
 };
 
-/// The 9B already has its H6 floor (1 KRX), so the H6 minimums serve the bench model too.
+/// The bench network model floor is the 9B flat floor (0.5 KRX).
 pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
-    tiers: POM_TIERS_H14_SPLIT9B,
-    reward_bps: &TIER_REWARD_BPS_H14_SPLIT9B,
+    tiers: POM_TIERS_MODEL_SPLIT_9B,
+    reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT_9B,
     minimums: INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
 };
@@ -881,14 +927,16 @@ pub fn network_model_shard_tiers() -> impl Iterator<Item = u8> {
     (NETWORK_MODEL_TIER + 1)..=NETWORK_MODEL_HEAD_TIER
 }
 
-/// Possession anchors for a block at `daa_score`: the H14 set once `model_split_activation` is
-/// live, else the H6 set once `pom_v3_activation`, else the H5 set once `h5_activation` (tier-0
-/// model swap), else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`,
-/// else the legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
+/// Possession anchors for a block at `daa_score`: the model-split set once `model_split_activation`
+/// is live, else the H14 set once `private_inference_activation`, else the H6 set once
+/// `pom_v3_activation`, else the H5 set once `h5_activation` (tier-0 model swap), else the H4
+/// candle-free set, else the 5-tier H2 set once `very_light_activation`, else the legacy 4-tier
+/// set. The choice MUST be made per block from that block's own DAA (never
 /// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
 /// against the wrong anchors and reject the chain.
 pub fn pom_tiers(
     model_split_tiers: Option<&'static [crate::pom::PomTier]>,
+    private_inference_active: bool,
     pom_v3_active: bool,
     h5_active: bool,
     coin_age_active: bool,
@@ -896,6 +944,8 @@ pub fn pom_tiers(
 ) -> &'static [crate::pom::PomTier] {
     if let Some(tiers) = model_split_tiers {
         tiers
+    } else if private_inference_active {
+        POM_TIERS_H14
     } else if pom_v3_active {
         POM_TIERS_H6
     } else if h5_active {
@@ -951,11 +1001,11 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 ///   4  Kimi-48B        0%
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
-/// H14 schedule: H6 values, the network model itself (nobody mines it: floor), then one entry
+/// Model-split schedule: H6 values, the network model itself (nobody mines it: floor), then one entry
 /// per shard at the rate of its card class (8 GB = tier 0 … 32 GB = tier 4).
-pub const TIER_REWARD_BPS_H14: [u64; 12] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 7_000, 7_000, 8_000, 9_000, 10_000];
+pub const TIER_REWARD_BPS_MODEL_SPLIT: [u64; 12] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 7_000, 7_000, 8_000, 9_000, 10_000];
 
-/// Tier-reward schedule for a block at `daa_score`: H14 once `model_split_activation` is live,
+/// Tier-reward schedule for a block at `daa_score`: model split once `model_split_activation` is live,
 /// 5-tier H6 once `pom_v3_activation`, 5-tier H2 once `very_light_activation`, legacy 4-tier
 /// before. Chosen per block from that block's own DAA (never frozen) — same gating discipline as
 /// `pom_tiers`, so archival/IBD recomputation of older blocks stays canonical.
@@ -1589,6 +1639,14 @@ pub struct Params {
     /// accepted responder once the win is finality-deep. Changes coinbase validation and the
     /// sealed service state — must be armed above every live tip before the binary ships.
     pub reward_routing_activation: ForkActivation,
+    /// Private inference: an AiRequest whose prompt is a private-inference envelope (sealed to
+    /// named responder escrow keys) restricts its audit cohort, credit and vault to those
+    /// responders, and a signed AiResponse may carry the sealed answer inline. Changes the audit
+    /// fold, hence the sealed service state, and admits longer response payloads — must be armed
+    /// above every live tip before the binary ships. `never()` = dormant. This is the H14
+    /// hardfork: it also switches the `inference_reward` floors to `INFERENCE_REWARD_MINIMUMS_FLAT`
+    /// (fixed per model, no per-token surcharge).
+    pub private_inference_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1596,10 +1654,10 @@ pub struct Params {
     pub production_index_activation: ForkActivation,
     /// H13: coinbase and service-state verification enforced by every node; trusted before.
     pub exact_verification_activation: ForkActivation,
-    /// H14: model split — network-model and shard tiers (`POM_TIERS_H14`), shard-aware service
+    /// Model split: network-model and shard tiers (`POM_TIERS_MODEL_SPLIT`), shard-aware service
     /// cohorts and windows. Scheduled once the shard roots are pinned.
     pub model_split_activation: ForkActivation,
-    /// H14: the network model of this network (tier table, schedule, minimums, shard classes).
+    /// Model split: the network model of this network (tier table, schedule, minimums, shard classes).
     pub network_model: &'static NetworkModelLayout,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
@@ -1864,6 +1922,7 @@ impl Params {
             pom_v3_activation: self.pom_v3_activation,
             service_bond_v2_activation: self.service_bond_v2_activation,
             reward_routing_activation: self.reward_routing_activation,
+            private_inference_activation: self.private_inference_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2077,6 +2136,7 @@ pub const MAINNET_PARAMS: Params = Params {
     // 09:01 UTC at the chain's own rate over the preceding hours (~10.12 daa/s).
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
+    private_inference_activation: ForkActivation::new(H14_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2208,6 +2268,9 @@ pub const TESTNET_PARAMS: Params = Params {
     // flipping it below already-folded history splits the testnet.
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(0),
+    // Private inference — arm ABOVE the live testnet tip before deploying: the fold is sealed,
+    // flipping it below already-folded history splits the testnet.
+    private_inference_activation: ForkActivation::new(6_000),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2303,6 +2366,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pom_v3_activation: ForkActivation::never(),
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
+    private_inference_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2392,6 +2456,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pom_v3_activation: ForkActivation::new(1),
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(0),
+    private_inference_activation: ForkActivation::new(1),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(1),
@@ -2415,19 +2480,19 @@ mod model_split_tables_tests {
     use super::*;
 
     #[test]
-    fn h14_tier_tables_stay_aligned() {
-        assert_eq!(POM_TIERS_H14.len(), TIER_REWARD_BPS_H14.len());
-        assert!(POM_TIERS_H14.len() >= POM_TIERS_H6.len());
-        for (i, t) in POM_TIERS_H6.iter().enumerate() {
-            assert_eq!(POM_TIERS_H14[i].model_id, t.model_id);
-            assert_eq!(POM_TIERS_H14[i].root, t.root);
-            assert_eq!(POM_TIERS_H14[i].chunks, t.chunks);
-            assert_eq!(TIER_REWARD_BPS_H14[i], TIER_REWARD_BPS_H6[i]);
+    fn model_split_tier_tables_stay_aligned() {
+        assert_eq!(POM_TIERS_MODEL_SPLIT.len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
+        assert!(POM_TIERS_MODEL_SPLIT.len() >= POM_TIERS_H14.len());
+        for (i, t) in POM_TIERS_H14.iter().enumerate() {
+            assert_eq!(POM_TIERS_MODEL_SPLIT[i].model_id, t.model_id);
+            assert_eq!(POM_TIERS_MODEL_SPLIT[i].root, t.root);
+            assert_eq!(POM_TIERS_MODEL_SPLIT[i].chunks, t.chunks);
+            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[i], TIER_REWARD_BPS_H6[i]);
         }
-        assert_eq!(NETWORK_MODEL_TIER as usize, POM_TIERS_H6.len());
-        assert_eq!(pom_tiers(Some(POM_TIERS_H14), true, true, true, true).len(), POM_TIERS_H14.len());
-        assert_eq!(pom_tiers(None, true, true, true, true).len(), POM_TIERS_H6.len());
-        assert_eq!(tier_reward_bps(true, true, Some(&TIER_REWARD_BPS_H14)).len(), TIER_REWARD_BPS_H14.len());
+        assert_eq!(NETWORK_MODEL_TIER as usize, POM_TIERS_H14.len());
+        assert_eq!(pom_tiers(Some(POM_TIERS_MODEL_SPLIT), true, true, true, true, true).len(), POM_TIERS_MODEL_SPLIT.len());
+        assert_eq!(pom_tiers(None, true, true, true, true, true).len(), POM_TIERS_H14.len());
+        assert_eq!(tier_reward_bps(true, true, Some(&TIER_REWARD_BPS_MODEL_SPLIT)).len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
         assert_eq!(tier_reward_bps(true, true, None).len(), TIER_REWARD_BPS_H6.len());
     }
 
@@ -2452,7 +2517,7 @@ mod model_split_tables_tests {
             assert!(layout.minimums.iter().any(|(id, _)| *id == layout.model_id()));
             assert_eq!(layout.tier_weight(NETWORK_MODEL_TIER), 0);
             assert!(layout.tier_weight(layout.head_tier()) > 0);
-            for (i, t) in POM_TIERS_H6.iter().enumerate() {
+            for (i, t) in POM_TIERS_H14.iter().enumerate() {
                 assert_eq!(layout.tiers[i].model_id, t.model_id);
             }
         }
@@ -2462,7 +2527,7 @@ mod model_split_tables_tests {
 
     #[test]
     fn network_model_head_and_weights_follow_the_shard_table() {
-        assert_eq!(NETWORK_MODEL_HEAD_TIER as usize, POM_TIERS_H14.len() - 1);
+        assert_eq!(NETWORK_MODEL_HEAD_TIER as usize, POM_TIERS_MODEL_SPLIT.len() - 1);
         assert_eq!(NETWORK_MODEL_SHARD_VRAM_GB.len(), NETWORK_MODEL_SHARDS.len());
         assert_eq!(network_model_shard_tiers().count(), NETWORK_MODEL_SHARDS.len());
         assert_eq!(network_model_tier_weight(NETWORK_MODEL_TIER + 1), 8);
@@ -2473,12 +2538,13 @@ mod model_split_tables_tests {
         // each shard is paid at the rate of its card class
         for (k, gb) in NETWORK_MODEL_SHARD_VRAM_GB.iter().enumerate() {
             let class = match gb { 8 => 0, 12 => 1, 16 => 2, 24 => 3, _ => 4 };
-            assert_eq!(TIER_REWARD_BPS_H14[NETWORK_MODEL_TIER as usize + 1 + k], TIER_REWARD_BPS_H6[class]);
+            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize + 1 + k], TIER_REWARD_BPS_H6[class]);
         }
-        // the network model has a floor and it is the H6 lineup plus one entry
-        assert_eq!(INFERENCE_REWARD_MINIMUMS_V2_H14.len(), INFERENCE_REWARD_MINIMUMS_V2_H6.len() + 1);
-        let min = INFERENCE_REWARD_MINIMUMS_V2_H14.iter().find(|(id, _)| *id == NETWORK_MODEL_V4_FLASH_MODEL_ID).unwrap().1;
-        assert_eq!(min, INFERENCE_REWARD_MINIMUMS_V2_H6[4].1);
+        // the network model has a floor and it is the flat lineup plus one entry
+        assert_eq!(&INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT[..INFERENCE_REWARD_MINIMUMS_FLAT.len()], INFERENCE_REWARD_MINIMUMS_FLAT);
+        assert_eq!(INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.len(), INFERENCE_REWARD_MINIMUMS_FLAT.len() + 1);
+        let min = INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.iter().find(|(id, _)| *id == NETWORK_MODEL_V4_FLASH_MODEL_ID).unwrap().1;
+        assert_eq!(min, 400_000_000);
     }
 }
 
@@ -2525,5 +2591,32 @@ mod ratio_reward_bps_tests {
         // Off-by-one just under each threshold must NOT round up to the next bracket.
         assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
         assert_eq!(ratio_reward_bps_v2(90 * P - 1, P), 9_000);
+    }
+}
+
+#[cfg(test)]
+mod h14_lineup_tests {
+    use super::*;
+
+    #[test]
+    fn h14_swaps_only_tier_3() {
+        let anchors = |tiers: &[crate::pom::PomTier]| tiers.iter().map(|t| (t.model_id, t.root, t.chunks)).collect::<Vec<_>>();
+        assert_eq!(anchors(pom_tiers(None, true, true, true, true, true)), anchors(POM_TIERS_H14));
+        assert_eq!(anchors(pom_tiers(None, false, true, true, true, true)), anchors(POM_TIERS_H6));
+        assert_eq!(anchors(service_tiers(true)), anchors(POM_TIERS_H14));
+        assert_eq!(anchors(service_tiers(false)), anchors(POM_TIERS_H6));
+        assert_eq!(POM_TIERS_H14.len(), POM_TIERS_H6.len());
+        for (i, (h6, h14)) in POM_TIERS_H6.iter().zip(POM_TIERS_H14).enumerate() {
+            if i == 3 {
+                assert_eq!(h14.model_id, QWEN3_8_27B_MODEL_ID);
+                assert_eq!(h14.chunks, 524_991_232);
+                assert_ne!(h14.root, h6.root);
+            } else {
+                assert_eq!((h6.model_id, h6.root, h6.chunks), (h14.model_id, h14.root, h14.chunks));
+            }
+        }
+        assert!(INFERENCE_REWARD_MINIMUMS_FLAT.iter().all(|(id, _)| POM_TIERS_H14.iter().any(|t| t.model_id == *id)));
+        let id: String = QWEN3_8_27B_MODEL_ID.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(id, "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3");
     }
 }
