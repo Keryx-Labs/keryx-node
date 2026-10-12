@@ -11,8 +11,9 @@ use keryx_consensus_core::collateral::{
     ProductionIndexSnapshot, ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
+    TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
 };
-use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers};
+use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_tier_ctx};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
@@ -370,6 +371,49 @@ impl VirtualStateProcessor {
         (requests, request_rewards, request_recipients, responses)
     }
 
+    /// Traced responses with a verified responder, and correctly signed openings, accepted by
+    /// chain block `hash`, in acceptance order.
+    fn trace_events_of_chain_block(&self, hash: Hash) -> (Vec<TraceResponseEvent>, Vec<TraceOpeningEvent>) {
+        use keryx_verifiable_inference::opening::{Opening, SignedPayload};
+        let mut responses = Vec::new();
+        let mut openings = Vec::new();
+        let acceptance = self.acceptance_data_store.get(hash).unwrap();
+        for mbad in acceptance.iter() {
+            let txs = self.block_transactions_store.get(mbad.block_hash).unwrap();
+            for entry in mbad.accepted_transactions.iter() {
+                let tx = &txs[entry.index_within_block as usize];
+                if tx.is_ai_response() {
+                    let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else { continue };
+                    let (Some(trace), Some(r), Some(responder)) = (resp.trace, resp.responder.as_ref(), verified_responder(&resp)) else {
+                        continue;
+                    };
+                    let mut response_txid = [0u8; 32];
+                    response_txid.copy_from_slice(&tx.id().as_bytes());
+                    responses.push(TraceResponseEvent {
+                        response_txid,
+                        request_hash: resp.request_hash,
+                        responder,
+                        escrow_pubkey: r.escrow_pubkey,
+                        trace_root: trace.trace_root,
+                        n_prompt: trace.n_prompt,
+                        n_pos: trace.n_pos,
+                    });
+                } else if tx.is_ai_opening() {
+                    let Some(signed) = SignedPayload::split(&tx.payload) else { continue };
+                    if !verify_opening_signature(&signed.escrow_pubkey, &signed.signature, signed.body) {
+                        continue;
+                    }
+                    let Some(response_txid) = signed.body.get(1..33).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { continue };
+                    if Opening::decode(signed.body).is_none() {
+                        continue;
+                    }
+                    openings.push(TraceOpeningEvent { response_txid, escrow_pubkey: signed.escrow_pubkey, body: signed.body.to_vec() });
+                }
+            }
+        }
+        (responses, openings)
+    }
+
     /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
     /// resolution input, from the same walk as [`Self::service_producers_of_chain_block`].
     fn service_producer_spks_of_chain_block(&self, hash: Hash) -> Vec<(Hash, ScriptPublicKey)> {
@@ -600,6 +644,41 @@ impl VirtualStateProcessor {
             }
             set
         };
+        if self.verifiable_inference_activation.is_active(daa) {
+            let (trace_responses, trace_openings) = self.trace_events_of_chain_block(hash);
+            let h14 = self.private_inference_activation.is_active(daa);
+            let tier = |t: u8| if h14 { trace_tier_ctx(t) } else { None };
+            let traces = TraceInputs { chain_hash: hash, responses: &trace_responses, openings: &trace_openings, tier: &tier };
+            if warmup {
+                let burned = self.service_burned.read();
+                ledger.on_chain_block_warmup_with_traces(
+                    daa,
+                    &requests,
+                    &request_rewards,
+                    &request_recipients,
+                    &responses,
+                    &escrows,
+                    &producers,
+                    &traces,
+                    &|op| burned.contains_key(op),
+                    cohort,
+                );
+                return (FoldOutcome::default(), escrows);
+            }
+            let outcome = ledger.on_chain_block_with_traces(
+                daa,
+                &requests,
+                &request_rewards,
+                &request_recipients,
+                &responses,
+                &escrows,
+                &producers,
+                &traces,
+                |id| self.service_standing_at(id, daa),
+                cohort,
+            );
+            return (outcome, escrows);
+        }
         if warmup {
             let burned = self.service_burned.read();
             ledger.on_chain_block_warmup_with_recipients(
