@@ -1,0 +1,11 @@
+[package]
+name = "keryx-verifiable-inference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+description = "Verification of inference trace openings"
+
+[dependencies]
+blake3 = "1"

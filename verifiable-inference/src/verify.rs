@@ -1,0 +1,223 @@
+//! Verification of opened points.
+
+use crate::dot::{self, Recomputed};
+use crate::draw;
+use crate::manifest::{self, Entry};
+use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify, rt_verify_range};
+use crate::opening::{ChunkRange, EntryOpening, Point};
+use crate::{q8, quant};
+
+pub const EPS: f64 = 1e-5;
+const MMVQ_MAX_BATCH: u32 = 8;
+const MATRIX_ROW_PADDING: u64 = 512;
+
+/// Consensus data of a tier.
+pub struct TierCtx {
+    pub r_t: Hash,
+    pub n_chunks: u64,
+    pub m_t: Hash,
+    pub n_entries: u64,
+    pub n_products: u64,
+}
+
+/// Committed data of the response.
+pub struct ResponseCtx {
+    pub trace_root: Hash,
+    pub n_prompt: u32,
+    pub n_gen: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fail {
+    Shape,
+    Manifest,
+    Weights,
+    Trace,
+    Unsupported,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Report {
+    pub t: u64,
+    pub rank: u64,
+    pub row: u64,
+    pub y: f64,
+    pub y_hat: f64,
+    pub tol: f64,
+}
+
+fn open_entry(tier: &TierCtx, e: &EntryOpening, expected_index: u64) -> Result<Entry, Fail> {
+    if e.index as u64 != expected_index || !manifest::verify_entry(&tier.m_t, tier.n_entries, expected_index, &e.bytes, &e.path) {
+        return Err(Fail::Manifest);
+    }
+    let (entry, len) = Entry::parse(&e.bytes).ok_or(Fail::Manifest)?;
+    (len == e.bytes.len()).then_some(entry).ok_or(Fail::Manifest)
+}
+
+/// Tensor bytes proven against the model root.
+fn open_bytes(tier: &TierCtx, entry: &Entry, r: &ChunkRange, offset: u64, len: u64) -> Result<Vec<u8>, Fail> {
+    let end = offset + len;
+    if len == 0 || end > entry.n_bytes / 32 * 32 {
+        return Err(Fail::Shape);
+    }
+    let first = entry.chunk_base + offset / 32;
+    let last = entry.chunk_base + (end - 1) / 32;
+    if r.first_chunk != first || r.chunks.len() as u64 != (last - first + 1) * 32 {
+        return Err(Fail::Shape);
+    }
+    let leaves: Vec<Hash> = r.chunks.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+    if !rt_verify_range(&tier.r_t, tier.n_chunks, first, &leaves, &r.proof) {
+        return Err(Fail::Weights);
+    }
+    let o = (offset % 32) as usize;
+    Ok(r.chunks[o..o + len as usize].to_vec())
+}
+
+fn open_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, row: u64) -> Result<Vec<u8>, Fail> {
+    if row >= entry.m || entry.n_exp != 1 {
+        return Err(Fail::Shape);
+    }
+    let rb = entry.row_bytes as u64;
+    open_bytes(tier, entry, r, row * rb, rb)
+}
+
+fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
+    if n_ubatch <= MMVQ_MAX_BATCH {
+        q8::MMVQ
+    } else if matches!(wtype, 2 | 3 | 7 | quant::Q4_K | quant::Q5_K) {
+        q8::MMQ_DS4
+    } else {
+        q8::MMQ_D4
+    }
+}
+
+fn x_len(k: u64, layout: u8) -> u64 {
+    let kp = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+    if layout == q8::MMVQ { kp / 32 * 36 } else { kp / 128 * 144 }
+}
+
+fn glu(op: u8, g: f64) -> Option<(f64, f64)> {
+    match op {
+        manifest::GLU_SWIGLU => {
+            let s = 1.0 / (1.0 + (-g).exp());
+            Some((g * s, s * (1.0 + g * (1.0 - s))))
+        }
+        manifest::GLU_GEGLU => {
+            let a = (2.0 / std::f64::consts::PI).sqrt();
+            let t = (a * (g + 0.044715 * g * g * g)).tanh();
+            Some((0.5 * g * (1.0 + t), 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * a * (1.0 + 3.0 * 0.044715 * g * g)))
+        }
+        _ => None,
+    }
+}
+
+/// Verify point `i` of an opening.
+pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: &Point) -> Result<Report, Fail> {
+    let n_traced = (resp.n_prompt as u64 + resp.n_gen as u64).checked_sub(1).filter(|&n| n > 0).ok_or(Fail::Shape)?;
+    if tier.n_products == 0 || tier.n_products > tier.n_entries {
+        return Err(Fail::Shape);
+    }
+    let d = draw::point(seed, i);
+    let (t, rank) = (d[0] % n_traced, d[1] % tier.n_products);
+
+    let first = open_entry(tier, &p.entry, rank)?;
+    if first.role != manifest::ROLE_PRODUCT {
+        return Err(Fail::Manifest);
+    }
+    let (gate, up) = match first.glu_form {
+        manifest::FORM_NONE | manifest::FORM_SPLIT => {
+            if p.partner.is_some() {
+                return Err(Fail::Shape);
+            }
+            ((first.clone(), rank), None)
+        }
+        manifest::FORM_PAIR_GATE | manifest::FORM_PAIR_UP => {
+            let po = p.partner.as_ref().ok_or(Fail::Shape)?;
+            let other = open_entry(tier, po, first.partner as u64)?;
+            if other.partner as u64 != rank || other.k != first.k || other.m != first.m {
+                return Err(Fail::Manifest);
+            }
+            if first.glu_form == manifest::FORM_PAIR_GATE {
+                ((first.clone(), rank), Some(other))
+            } else {
+                ((other, first.partner as u64), Some(first.clone()))
+            }
+        }
+        _ => return Err(Fail::Unsupported),
+    };
+    let (g_entry, g_rank) = gate;
+    if g_entry.n_exp != 1 {
+        return Err(Fail::Unsupported);
+    }
+    let split = g_entry.glu_form == manifest::FORM_SPLIT;
+    let m_out = if split { g_entry.m / 2 } else { g_entry.m };
+    let row = d[2] % m_out;
+
+    let n_pos_leaves = 2 * tier.n_products + 1;
+    let layout = layout_for(p.n_ubatch, g_entry.wtype);
+    if p.x.len() as u64 != x_len(g_entry.k, layout) {
+        return Err(Fail::Shape);
+    }
+    let pos_root = b3_fold(n_pos_leaves, 2 * g_rank, blake3::hash(&p.x).as_bytes(), &p.x_path).ok_or(Fail::Trace)?;
+    if !b3_verify(&resp.trace_root, n_traced, t, &pos_root, &p.pos_path) {
+        return Err(Fail::Trace);
+    }
+    let mut meta = [0u8; 8];
+    meta[..4].copy_from_slice(&(t as u32).to_le_bytes());
+    meta[4..].copy_from_slice(&p.n_ubatch.to_le_bytes());
+    if !b3_verify(&pos_root, n_pos_leaves, 2 * tier.n_products, blake3::hash(&meta).as_bytes(), &p.meta_path) {
+        return Err(Fail::Trace);
+    }
+    if p.y_total_len as u64 != m_out * 4 || p.y_chunk_index as u64 != row * 4 / B3_CHUNK as u64 {
+        return Err(Fail::Shape);
+    }
+    let y_leaf = b3_leaf_from_chunk(p.y_total_len as u64, p.y_chunk_index as u64, &p.y_chunk, &p.y_chunk_path).ok_or(Fail::Trace)?;
+    if !b3_verify(&pos_root, n_pos_leaves, 2 * g_rank + 1, &y_leaf, &p.y_path) {
+        return Err(Fail::Trace);
+    }
+    let o = (row * 4 % B3_CHUNK as u64) as usize;
+    let y = f32::from_le_bytes(p.y_chunk[o..o + 4].try_into().unwrap()) as f64;
+
+    let k = g_entry.k as usize;
+    let dot_row = |entry: &Entry, r: &ChunkRange, rr: u64| -> Result<Recomputed, Fail> {
+        let bytes = open_row(tier, entry, r, rr)?;
+        dot::canonical_dot(entry.wtype, &bytes, k, &p.x, layout).ok_or(Fail::Unsupported)
+    };
+
+    let (y_hat, tol) = if g_entry.glu_form == manifest::FORM_NONE {
+        if p.rows.len() != 1 {
+            return Err(Fail::Shape);
+        }
+        let r = dot_row(&g_entry, &p.rows[0], row)?;
+        let b = match (g_entry.bias, &p.bias) {
+            (manifest::NONE, None) => 0.0,
+            (bi, Some((be, br))) if bi != manifest::NONE => {
+                let bias_entry = open_entry(tier, be, bi as u64)?;
+                if bias_entry.role != manifest::ROLE_BIAS || bias_entry.wtype != 0 || bias_entry.k != g_entry.m {
+                    return Err(Fail::Manifest);
+                }
+                let v = open_bytes(tier, &bias_entry, br, row * 4, 4)?;
+                f32::from_le_bytes(v.try_into().unwrap()) as f64
+            }
+            _ => return Err(Fail::Shape),
+        };
+        (r.y_hat + b, EPS * (r.scale + b.abs()))
+    } else {
+        if p.rows.len() != 2 || p.bias.is_some() {
+            return Err(Fail::Shape);
+        }
+        let (rg, ru) = if split {
+            (dot_row(&g_entry, &p.rows[0], row)?, dot_row(&g_entry, &p.rows[1], row + m_out)?)
+        } else {
+            (dot_row(&g_entry, &p.rows[0], row)?, dot_row(up.as_ref().unwrap(), &p.rows[1], row)?)
+        };
+        let (f, df) = glu(g_entry.glu_op, rg.y_hat).ok_or(Fail::Unsupported)?;
+        let h = f * ru.y_hat;
+        (h, EPS * ((df * ru.y_hat).abs() * rg.scale + f.abs() * ru.scale + (rg.y_hat * ru.y_hat).abs()))
+    };
+    if (y - y_hat).abs() > tol {
+        return Err(Fail::Mismatch);
+    }
+    Ok(Report { t, rank, row, y, y_hat, tol })
+}

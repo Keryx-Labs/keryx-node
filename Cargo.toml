@@ -63,6 +63,7 @@ members = [
     "metrics/perf_monitor",
     "utils/alloc",
     "inference",
+    "verifiable-inference",
 ]
 
 [workspace.package]
@@ -141,6 +142,7 @@ keryx-wrpc-example-subscriber = { version = "1.1.0", path = "rpc/wrpc/examples/s
 keryxd = { version = "1.1.0", path = "keryxd" }
 keryx-alloc = { version = "1.1.0", path = "utils/alloc" }
 keryx-inference = { version = "1.1.0", path = "inference" }
+keryx-verifiable-inference = { version = "1.1.0", path = "verifiable-inference" }
 
 # external
 aes = "0.8.3"
