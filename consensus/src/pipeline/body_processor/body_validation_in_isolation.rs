@@ -7,6 +7,7 @@ use crate::model::stores::pom_proof::PomProofStoreReader;
 use crate::processes::{
     coinbase::coinbase_outputs_limit,
     private_inference::{PrivateEraViolation, check_private_inference_era},
+    verifiable_inference::{VerifiableEraViolation, check_verifiable_inference_era},
     transaction_validator::errors::TxRuleError,
 };
 use keryx_consensus_core::{
@@ -37,6 +38,7 @@ impl BlockBodyProcessor {
         self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
         self.check_private_inference_era(block)?;
+        self.check_verifiable_inference_era(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
@@ -105,6 +107,27 @@ impl BlockBodyProcessor {
             if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx) {
                 return Err(RuleError::TxInIsolationValidationFailed(tx.id(), e));
             }
+        }
+        Ok(())
+    }
+
+    /// AI transactions must match the verifiable-inference era of the block, trusted blocks included,
+    /// and a block carries at most one opening once the gate is active.
+    fn check_verifiable_inference_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let mut openings = 0usize;
+        for tx in block.transactions.iter().skip(1) {
+            if let Err(v) = check_verifiable_inference_era(tx, block.header.daa_score, self.verifiable_inference_activation) {
+                return Err(match v {
+                    VerifiableEraViolation::OpeningBeforeActivation => RuleError::AiOpeningBeforeActivation(tx.id()),
+                    VerifiableEraViolation::TraceBeforeActivation => RuleError::AiTraceBeforeActivation(tx.id()),
+                    VerifiableEraViolation::ResponseWithoutTrace => RuleError::AiResponseWithoutTrace(tx.id()),
+                    VerifiableEraViolation::MalformedOpening => RuleError::AiOpeningMalformed(tx.id()),
+                });
+            }
+            openings += tx.is_ai_opening() as usize;
+        }
+        if openings > 1 {
+            return Err(RuleError::TooManyAiOpenings(openings));
         }
         Ok(())
     }

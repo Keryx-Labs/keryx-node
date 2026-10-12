@@ -61,6 +61,7 @@ impl SubnetworkId {
             || *self == SUBNETWORK_ID_AI_REQUEST
             || *self == SUBNETWORK_ID_AI_RESPONSE
             || *self == SUBNETWORK_ID_AI_CHALLENGE
+            || *self == SUBNETWORK_ID_AI_OPENING
     }
 
     /// Returns true if this is an OPoI AI transaction subnetwork.
@@ -69,6 +70,7 @@ impl SubnetworkId {
         *self == SUBNETWORK_ID_AI_REQUEST
             || *self == SUBNETWORK_ID_AI_RESPONSE
             || *self == SUBNETWORK_ID_AI_CHALLENGE
+            || *self == SUBNETWORK_ID_AI_OPENING
     }
 
     /// Returns true if the subnetwork is the native subnetwork
@@ -156,3 +158,6 @@ pub const SUBNETWORK_ID_AI_RESPONSE: SubnetworkId = SubnetworkId::from_byte(4);
 
 /// Subnetwork ID for OPoI fraud challenges.
 pub const SUBNETWORK_ID_AI_CHALLENGE: SubnetworkId = SubnetworkId::from_byte(5);
+
+/// The SUBNETWORK_ID_AI_OPENING is the subnetwork of inference trace openings.
+pub const SUBNETWORK_ID_AI_OPENING: SubnetworkId = SubnetworkId::from_byte(6);

@@ -3,6 +3,30 @@
 use crate::merkle::Hash;
 
 pub const VERSION: u8 = 1;
+/// Largest opening body.
+pub const MAX_BODY_LEN: usize = 80 * 1024;
+/// `[escrow_pubkey: 32] [signature: 64]` after the body.
+pub const SIGNATURE_LEN: usize = 32 + 64;
+/// Smallest opening payload: version, response id, point count and the signature.
+pub const MIN_PAYLOAD_LEN: usize = 1 + 32 + 1 + SIGNATURE_LEN;
+pub const MAX_PAYLOAD_LEN: usize = MAX_BODY_LEN + SIGNATURE_LEN;
+
+/// Signed opening payload split into its body, signer key and signature.
+pub struct SignedPayload<'a> {
+    pub body: &'a [u8],
+    pub escrow_pubkey: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl<'a> SignedPayload<'a> {
+    pub fn split(payload: &'a [u8]) -> Option<Self> {
+        if payload.len() < MIN_PAYLOAD_LEN || payload.len() > MAX_PAYLOAD_LEN {
+            return None;
+        }
+        let (body, tail) = payload.split_at(payload.len() - SIGNATURE_LEN);
+        Some(Self { body, escrow_pubkey: tail[..32].try_into().ok()?, signature: tail[32..].try_into().ok()? })
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EntryOpening {

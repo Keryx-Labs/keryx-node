@@ -201,6 +201,21 @@ pub enum RuleError {
     #[error("AiResponse tx {0} carries no inline private body")]
     AiResponseWithoutPrivateBody(TransactionId),
 
+    #[error("opening tx {0} before the verifiable-inference activation")]
+    AiOpeningBeforeActivation(TransactionId),
+
+    #[error("AiResponse tx {0} carries a trace commitment before the verifiable-inference activation")]
+    AiTraceBeforeActivation(TransactionId),
+
+    #[error("AiResponse tx {0} carries no trace commitment")]
+    AiResponseWithoutTrace(TransactionId),
+
+    #[error("opening tx {0} does not decode")]
+    AiOpeningMalformed(TransactionId),
+
+    #[error("block carries {0} opening transactions, at most one is allowed")]
+    TooManyAiOpenings(usize),
+
     #[error("AiRequest tx {0} max_tokens {1} exceeds the cap {2}")]
     AiRequestMaxTokensExceeded(TransactionId, u32, u32),
 
