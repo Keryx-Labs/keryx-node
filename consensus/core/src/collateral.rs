@@ -1221,6 +1221,11 @@ impl ServiceLedger {
     /// the request is pending and was sealed to named responders; `None` when it is unknown,
     /// expired or public. Mempool admission reads it to accept an inline response body only
     /// from a named responder of a live private request.
+    /// Escrow key expected to sign the opening of a drawn response still awaiting it.
+    pub fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.escrow_pubkey)
+    }
+
     pub fn private_recipients(&self, request_hash: &[u8; 32]) -> Option<&[Hash]> {
         self.pending.get(request_hash).filter(|r| !r.recipients.is_empty()).map(|r| r.recipients.as_slice())
     }

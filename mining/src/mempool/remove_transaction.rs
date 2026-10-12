@@ -53,6 +53,11 @@ impl Mempool {
             if tx.mtx.tx.is_ai_request() {
                 self.ai_private_request_index.remove(&tx_id.as_bytes());
             }
+            if tx.mtx.tx.is_ai_opening()
+                && let Some(response_txid) = super::validate_and_insert_transaction::ai_opening_response_txid(&tx.mtx.tx.payload)
+            {
+                self.ai_opening_index.remove(&response_txid);
+            }
             // Update/remove descendent orphan txs (depending on `remove_redeemers`)
             let txs = self.orphan_pool.update_orphans_after_transaction_removed(&tx, remove_redeemers)?;
             removed_orphans.extend(txs.into_iter().map(|x| x.id()));

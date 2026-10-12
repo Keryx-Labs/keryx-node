@@ -181,6 +181,13 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// The escrow key expected to sign the opening of a drawn response; `None` when no opening
+    /// is awaited for it.
+    fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        let _ = response_txid;
+        None
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         unimplemented!()
     }

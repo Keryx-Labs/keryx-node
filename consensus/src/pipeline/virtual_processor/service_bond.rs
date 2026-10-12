@@ -479,6 +479,10 @@ impl VirtualStateProcessor {
 
     /// The private-inference recipients of a pending request (see
     /// [`ServiceLedger::private_recipients`]), as raw escrow pubkeys.
+    pub(crate) fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.service_ledger.lock().ledger.awaited_opening_key(response_txid)
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())

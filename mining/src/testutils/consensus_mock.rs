@@ -29,6 +29,7 @@ pub(crate) struct ConsensusMock {
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
     private_cohort: RwLock<Option<Vec<[u8; 32]>>>,
+    awaited_openings: RwLock<HashMap<[u8; 32], [u8; 32]>>,
 }
 
 impl ConsensusMock {
@@ -38,11 +39,16 @@ impl ConsensusMock {
             statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
             private_cohort: RwLock::new(None),
+            awaited_openings: RwLock::new(HashMap::default()),
         }
     }
 
     pub(crate) fn set_private_cohort(&self, cohort: Option<Vec<[u8; 32]>>) {
         *self.private_cohort.write() = cohort;
+    }
+
+    pub(crate) fn await_opening(&self, response_txid: [u8; 32], escrow_pubkey: [u8; 32]) {
+        self.awaited_openings.write().insert(response_txid, escrow_pubkey);
     }
 
     pub(crate) fn set_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
@@ -81,6 +87,10 @@ impl ConsensusMock {
 }
 
 impl ConsensusApi for ConsensusMock {
+    fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.awaited_openings.read().get(response_txid).copied()
+    }
+
     fn private_cohort_escrows(
         &self,
         _model_id: &[u8; 32],

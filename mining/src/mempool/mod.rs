@@ -57,6 +57,8 @@ pub(crate) struct Mempool {
     ai_response_index: HashMap<[u8; 32], Vec<(Option<[u8; 32]>, TransactionId)>>,
     /// Deduplication index: response_hash → tx_id. One AiChallenge per response.
     ai_challenge_index: HashMap<[u8; 32], TransactionId>,
+    /// Deduplication index: response tx id → opening tx_id. One opening per response.
+    ai_opening_index: HashMap<[u8; 32], TransactionId>,
     /// Private-inference index: request tx id → the escrow keys the pending AiRequest is sealed
     /// to. Admits a named responder's inline-body AiResponse while its request still sits here.
     ai_private_request_index: HashMap<[u8; 32], Vec<[u8; 32]>>,
@@ -75,6 +77,7 @@ impl Mempool {
             counters,
             ai_response_index: HashMap::new(),
             ai_challenge_index: HashMap::new(),
+            ai_opening_index: HashMap::new(),
             ai_private_request_index: HashMap::new(),
         }
     }

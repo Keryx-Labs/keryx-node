@@ -1671,11 +1671,17 @@ impl VirtualStateProcessor {
         let virtual_utxo_view = &virtual_read.utxo_set;
 
         let mut invalid_transactions = HashMap::new();
+        let mut deferred = std::collections::HashSet::new();
+        let mut has_opening = false;
         let results = self.validate_block_template_transactions_in_parallel(&txs, &virtual_state, &virtual_utxo_view);
         for (tx, res) in txs.iter().zip(results) {
             match res {
                 Err(e) => {
                     invalid_transactions.insert(tx.id(), e);
+                    tx_selector.reject_selection(tx.id());
+                }
+                Ok(_) if tx.is_ai_opening() && std::mem::replace(&mut has_opening, true) => {
+                    deferred.insert(tx.id());
                     tx_selector.reject_selection(tx.id());
                 }
                 Ok(fee) => {
@@ -1684,9 +1690,9 @@ impl VirtualStateProcessor {
             }
         }
 
-        let mut has_rejections = !invalid_transactions.is_empty();
+        let mut has_rejections = !invalid_transactions.is_empty() || !deferred.is_empty();
         if has_rejections {
-            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()));
+            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()) && !deferred.contains(&tx.id()));
         }
 
         while has_rejections {
@@ -1698,6 +1704,10 @@ impl VirtualStateProcessor {
                 match res {
                     Err(e) => {
                         invalid_transactions.insert(tx.id(), e);
+                        tx_selector.reject_selection(tx.id());
+                        has_rejections = true;
+                    }
+                    Ok(_) if tx.is_ai_opening() && std::mem::replace(&mut has_opening, true) => {
                         tx_selector.reject_selection(tx.id());
                         has_rejections = true;
                     }

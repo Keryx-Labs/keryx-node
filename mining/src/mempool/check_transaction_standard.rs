@@ -43,6 +43,10 @@ const MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
 const MAXIMUM_STANDARD_AI_REQUEST_TRANSIENT_MASS: u64 =
     (keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
 
+/// Maximum standard transient mass of an opening: the largest payload plus the transaction header.
+const MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS: u64 =
+    (keryx_verifiable_inference::opening::MAX_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
+
 impl Mempool {
     pub(crate) fn check_transaction_standard_in_isolation(&self, transaction: &MutableTransaction) -> NonStandardResult<()> {
         let transaction_id = transaction.id();
@@ -73,6 +77,8 @@ impl Mempool {
         }
         let max_transient_mass = if transaction.tx.is_ai_request() {
             MAXIMUM_STANDARD_AI_REQUEST_TRANSIENT_MASS
+        } else if transaction.tx.is_ai_opening() {
+            MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS
         } else {
             MAXIMUM_STANDARD_TRANSACTION_MASS
         };
@@ -195,7 +201,7 @@ impl Mempool {
 
         // AiResponse and AiChallenge transactions carry no inputs/outputs and are feeless by design.
         // All other transactions must pay the flat minimum fee of 0.3 KRX.
-        if !transaction.tx.is_ai_response() && !transaction.tx.is_ai_challenge() {
+        if !transaction.tx.is_ai_response() && !transaction.tx.is_ai_challenge() && !transaction.tx.is_ai_opening() {
             let fee = transaction.calculated_fee.unwrap();
             if fee < MINIMUM_FLAT_TX_FEE_SOMPI {
                 return Err(NonStandardError::RejectInsufficientFee(transaction_id, fee, MINIMUM_FLAT_TX_FEE_SOMPI));
