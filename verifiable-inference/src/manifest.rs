@@ -4,6 +4,7 @@ use crate::merkle::{self, Hash};
 
 pub const ROLE_PRODUCT: u8 = 0;
 pub const ROLE_BIAS: u8 = 1;
+pub const ROLE_OUTPUT: u8 = 2;
 pub const FORM_NONE: u8 = 0;
 pub const FORM_SPLIT: u8 = 1;
 pub const FORM_PAIR_GATE: u8 = 2;

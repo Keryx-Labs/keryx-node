@@ -119,12 +119,19 @@ pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: 
         return Err(Fail::Shape);
     }
     let d = draw::point(seed, i);
-    let (t, rank) = (d[0] % n_traced, d[1] % tier.n_products);
+    let rank = d[1] % tier.n_products;
 
     let first = open_entry(tier, &p.entry, rank)?;
-    if first.role != manifest::ROLE_PRODUCT {
+    let output_only = first.role == manifest::ROLE_OUTPUT;
+    if first.role != manifest::ROLE_PRODUCT && !output_only {
         return Err(Fail::Manifest);
     }
+    let t = if output_only {
+        let first_pos = (resp.n_prompt as u64).checked_sub(1).ok_or(Fail::Shape)?;
+        first_pos + d[0] % n_traced.checked_sub(first_pos).filter(|&n| n > 0).ok_or(Fail::Shape)?
+    } else {
+        d[0] % n_traced
+    };
     let (gate, up) = match first.glu_form {
         manifest::FORM_NONE | manifest::FORM_SPLIT => {
             if p.partner.is_some() {
@@ -155,7 +162,7 @@ pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: 
     let row = d[2] % m_out;
 
     let n_pos_leaves = 2 * tier.n_products + 1;
-    let layout = layout_for(p.n_ubatch, g_entry.wtype);
+    let layout = if output_only { q8::MMVQ } else { layout_for(p.n_ubatch, g_entry.wtype) };
     if p.x.len() as u64 != x_len(g_entry.k, layout) {
         return Err(Fail::Shape);
     }
