@@ -24,7 +24,7 @@ pub struct TierCtx {
 pub struct ResponseCtx {
     pub trace_root: Hash,
     pub n_prompt: u32,
-    pub n_gen: u32,
+    pub n_pos: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,12 +100,12 @@ fn x_len(k: u64, layout: u8) -> u64 {
 fn glu(op: u8, g: f64) -> Option<(f64, f64)> {
     match op {
         manifest::GLU_SWIGLU => {
-            let s = 1.0 / (1.0 + (-g).exp());
+            let s = 1.0 / (1.0 + libm::exp(-g));
             Some((g * s, s * (1.0 + g * (1.0 - s))))
         }
         manifest::GLU_GEGLU => {
             let a = (2.0 / std::f64::consts::PI).sqrt();
-            let t = (a * (g + 0.044715 * g * g * g)).tanh();
+            let t = libm::tanh(a * (g + 0.044715 * g * g * g));
             Some((0.5 * g * (1.0 + t), 0.5 * (1.0 + t) + 0.5 * g * (1.0 - t * t) * a * (1.0 + 3.0 * 0.044715 * g * g)))
         }
         _ => None,
@@ -114,7 +114,10 @@ fn glu(op: u8, g: f64) -> Option<(f64, f64)> {
 
 /// Verify point `i` of an opening.
 pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: &Point) -> Result<Report, Fail> {
-    let n_traced = (resp.n_prompt as u64 + resp.n_gen as u64).checked_sub(1).filter(|&n| n > 0).ok_or(Fail::Shape)?;
+    let n_traced = resp.n_pos as u64;
+    if n_traced == 0 || resp.n_prompt == 0 || resp.n_prompt > resp.n_pos {
+        return Err(Fail::Shape);
+    }
     if tier.n_products == 0 || tier.n_products > tier.n_entries {
         return Err(Fail::Shape);
     }

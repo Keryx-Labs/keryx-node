@@ -145,6 +145,85 @@ pub fn verify_responder_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64]
     secp256k1::SECP256K1.verify_schnorr(&sig, &secp256k1::Message::from_digest(msg), &pk).is_ok()
 }
 
+/// Delay between a traced response's acceptance and the chain block whose hash seeds its draw.
+pub const TRACE_SEED_DELAY_DAA: u64 = 100;
+/// Domain separator of the trace draw seed.
+pub const TRACE_DRAW_DOMAIN: &[u8] = b"KeryxTraceDrawV1";
+
+/// A signed response carrying a trace commitment, accepted in a chain block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceResponseEvent {
+    pub response_txid: [u8; 32],
+    pub request_hash: [u8; 32],
+    pub responder: Hash,
+    pub escrow_pubkey: [u8; 32],
+    pub trace_root: [u8; 32],
+    pub n_prompt: u32,
+    pub n_pos: u32,
+}
+
+/// An opening accepted in a chain block whose signature verifies under `escrow_pubkey`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceOpeningEvent {
+    pub response_txid: [u8; 32],
+    pub escrow_pubkey: [u8; 32],
+    pub body: Vec<u8>,
+}
+
+/// Trace inputs of one chain block.
+pub struct TraceInputs<'a> {
+    pub chain_hash: Hash,
+    pub responses: &'a [TraceResponseEvent],
+    pub openings: &'a [TraceOpeningEvent],
+    pub tier: &'a dyn Fn(u8) -> Option<keryx_verifiable_inference::verify::TierCtx>,
+}
+
+const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TraceAudit {
+    request_hash: [u8; 32],
+    responder: Hash,
+    escrow_pubkey: [u8; 32],
+    trace_root: [u8; 32],
+    n_prompt: u32,
+    n_pos: u32,
+    accepted_daa: u64,
+    tier: u8,
+    max_tokens: u32,
+    identities: Vec<Hash>,
+    seed: Option<[u8; 32]>,
+    deadline_daa: u64,
+}
+
+/// Draw seed of a traced response.
+pub fn trace_seed(chain_hash: &Hash, response_txid: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(TRACE_DRAW_DOMAIN);
+    hasher.update(&chain_hash.as_bytes());
+    hasher.update(response_txid);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(hasher.finalize().as_bytes());
+    seed
+}
+
+/// Whether an opening body proves every drawn point of `audit` under `seed`.
+fn trace_opening_valid(
+    ctx: &keryx_verifiable_inference::verify::TierCtx,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> bool {
+    use keryx_verifiable_inference::{draw::POINTS, opening::Opening, verify};
+    let Some(opening) = Opening::decode(body) else { return false };
+    if &opening.response_txid != txid || opening.points.len() != POINTS as usize {
+        return false;
+    }
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    opening.points.iter().enumerate().all(|(i, p)| verify::verify_point(ctx, &resp, seed, i as u32, p).is_ok())
+}
+
 /// Domain separator of the trace opening signature.
 pub const OPENING_SIG_DOMAIN: &[u8] = b"KeryxTraceOpeningV1";
 
@@ -561,6 +640,7 @@ pub struct LightSnapshot {
     first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>,
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
     audited: std::collections::BTreeMap<[u8; 32], u64>,
+    trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -601,6 +681,8 @@ pub struct ServiceLedger {
     /// Latest coinbase payout script seen per identity, folded from chain-block producers —
     /// resolves a reward winner to a mintable script.
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
+    /// Traced responses awaiting their draw or their opening, by response transaction id.
+    trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
 }
 
 impl ServiceLedger {
@@ -622,7 +704,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], None, is_established, cohort)
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], None, None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block`] with the reward-routing inputs: per-request vaulted amounts and
@@ -639,7 +721,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, None, None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block_with_rewards`] with the private-inference input: per-request
@@ -657,7 +739,25 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, None, None, is_established, cohort)
+    }
+
+    /// [`Self::on_chain_block_with_recipients`] with the trace inputs of the block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_with_traces(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        request_recipients: &[([u8; 32], PrivateCohortSeed, Vec<Hash>)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        traces: &TraceInputs,
+        is_established: impl Fn(&Hash) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) -> FoldOutcome {
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, None, Some(traces), is_established, cohort)
     }
 
     /// Folds a chain block whose strike events are already persisted (daa at or below the store
@@ -673,7 +773,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup`] with the reward-routing inputs.
@@ -689,7 +789,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup_with_rewards`] with the private-inference input.
@@ -706,7 +806,25 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, Some(is_burned), None, |_| true, cohort);
+    }
+
+    /// [`Self::on_chain_block_warmup_with_recipients`] with the trace inputs of the block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_warmup_with_traces(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        request_recipients: &[([u8; 32], PrivateCohortSeed, Vec<Hash>)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        traces: &TraceInputs,
+        is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) {
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, Some(is_burned), Some(traces), |_| true, cohort);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -720,6 +838,7 @@ impl ServiceLedger {
         escrows: &[(Hash, EscrowClaim)],
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
+        traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
         mut cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
@@ -846,6 +965,10 @@ impl ServiceLedger {
             self.early_responses.remove(&victim);
         }
 
+        if let Some(tr) = traces {
+            self.fold_traces(daa, tr, warmup, &is_established, &mut outcome);
+        }
+
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
         let mut served_at_arm: Vec<Hash> = Vec::new();
         for rh in hashes {
@@ -947,6 +1070,117 @@ impl ServiceLedger {
         }
 
         outcome
+    }
+
+    /// Fills the tier, token budget and sanctioned identities of a trace audit from its request,
+    /// once that request's audit is armed.
+    fn resolve_trace_audit(&self, a: &mut TraceAudit) {
+        if !a.identities.is_empty() {
+            return;
+        }
+        let Some(req) = self.pending.get(&a.request_hash) else { return };
+        let Some(audit) = req.audit.as_ref() else { return };
+        a.tier = req.tier;
+        a.max_tokens = req.max_tokens;
+        a.identities = audit
+            .delegations
+            .iter()
+            .filter(|(e, id)| *e == a.responder && audit.cohort.binary_search(id).is_ok())
+            .map(|(_, id)| *id)
+            .collect();
+    }
+
+    /// Records the block's traced responses, draws the ripe ones, judges the openings and closes
+    /// the audits whose deadline passed.
+    fn fold_traces(&mut self, daa: u64, tr: &TraceInputs, warmup: bool, is_established: &dyn Fn(&Hash) -> bool, outcome: &mut FoldOutcome) {
+        for ev in tr.responses {
+            if self.trace_audits.contains_key(&ev.response_txid) {
+                continue;
+            }
+            let mut a = TraceAudit {
+                request_hash: ev.request_hash,
+                responder: ev.responder,
+                escrow_pubkey: ev.escrow_pubkey,
+                trace_root: ev.trace_root,
+                n_prompt: ev.n_prompt,
+                n_pos: ev.n_pos,
+                accepted_daa: daa,
+                tier: TRACE_TIER_UNKNOWN,
+                max_tokens: 0,
+                identities: Vec::new(),
+                seed: None,
+                deadline_daa: 0,
+            };
+            self.resolve_trace_audit(&mut a);
+            self.trace_audits.insert(ev.response_txid, a);
+        }
+
+        let ripe: Vec<[u8; 32]> = self
+            .trace_audits
+            .iter()
+            .filter(|(_, a)| a.seed.is_none() && daa >= a.accepted_daa + TRACE_SEED_DELAY_DAA)
+            .map(|(k, _)| *k)
+            .collect();
+        for txid in ripe {
+            let mut a = self.trace_audits.remove(&txid).unwrap();
+            self.resolve_trace_audit(&mut a);
+            let seed = trace_seed(&tr.chain_hash, &txid);
+            let auditable = a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() && (tr.tier)(a.tier).is_some();
+            if auditable && keryx_verifiable_inference::draw::audited(&seed) {
+                a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa));
+                a.seed = Some(seed);
+                self.trace_audits.insert(txid, a);
+            }
+        }
+
+        for op in tr.openings {
+            let Some(a) = self.trace_audits.get(&op.response_txid) else { continue };
+            let Some(seed) = a.seed else { continue };
+            if op.escrow_pubkey != a.escrow_pubkey {
+                continue;
+            }
+            let a = self.trace_audits.remove(&op.response_txid).unwrap();
+            let valid = (tr.tier)(a.tier).is_some_and(|ctx| trace_opening_valid(&ctx, &a, &seed, &op.response_txid, &op.body));
+            if !valid {
+                for miner in a.identities.iter() {
+                    if warmup {
+                        continue;
+                    }
+                    let count = (self.consecutive_misses(miner) + 1).max(2);
+                    let penalty = strike_penalty_at(count, is_established(miner), self.v2_at(daa));
+                    self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
+                    let burned = self.burn(miner, penalty);
+                    if penalty == ServicePenalty::Suspend {
+                        self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: daa });
+                    }
+                    outcome.misses.push(ServiceMiss { request_hash: a.request_hash, miner: *miner, consecutive_misses: count, penalty, burned });
+                }
+            }
+        }
+
+        let late: Vec<[u8; 32]> =
+            self.trace_audits.iter().filter(|(_, a)| a.seed.is_some() && daa > a.deadline_daa).map(|(k, _)| *k).collect();
+        for txid in late {
+            let a = self.trace_audits.remove(&txid).unwrap();
+            for miner in a.identities.iter() {
+                if warmup {
+                    continue;
+                }
+                if self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA) {
+                    continue;
+                }
+                let count = self.consecutive_misses(miner) + 1;
+                self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
+                let penalty = strike_penalty_at(count, is_established(miner), self.v2_at(daa));
+                let burned = self.burn(miner, penalty);
+                if penalty == ServicePenalty::Suspend {
+                    self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: daa });
+                }
+                outcome.misses.push(ServiceMiss { request_hash: a.request_hash, miner: *miner, consecutive_misses: count, penalty, burned });
+            }
+        }
+
+        self.trace_audits.retain(|_, a| a.seed.is_some() || a.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
     }
 
     /// Last-strike daa a served-response reset carries forward, so a serve no longer disarms
@@ -1069,6 +1303,7 @@ impl ServiceLedger {
             first_seen_base: self.first_seen_base.clone(),
             producer_spk: self.producer_spk.clone(),
             audited: self.audited.clone(),
+            trace_audits: self.trace_audits.clone(),
         }
     }
 
@@ -1082,6 +1317,7 @@ impl ServiceLedger {
         self.first_seen_base = snap.first_seen_base.clone();
         self.producer_spk = snap.producer_spk.clone();
         self.audited = snap.audited.clone();
+        self.trace_audits = snap.trace_audits.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -1149,6 +1385,7 @@ pub struct ServiceLedgerSnapshot {
     /// the eligibility window ending at the snapshot block, chain order — what a cohort walk
     /// below the pruning point reads.
     pub recent_producers: Vec<(u64, Hash, u8, Hash)>,
+    trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
@@ -1157,6 +1394,8 @@ const SNAPSHOT_ENCODING_VERSION: u8 = 1;
 /// request carries recipients, so every snapshot without one keeps its historical bytes and
 /// hash, and one byte form per state keeps the encoding canonical.
 const SNAPSHOT_ENCODING_VERSION_PRIVATE: u8 = 2;
+/// Private section (possibly empty) followed by the trace audits.
+const SNAPSHOT_ENCODING_VERSION_TRACE: u8 = 3;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1234,7 +1473,13 @@ impl ServiceLedgerSnapshot {
             .filter(|(_, r)| !r.recipients.is_empty())
             .map(|(rh, r)| (rh, &r.cohort_seed, &r.recipients))
             .collect();
-        out.push(if private.is_empty() { SNAPSHOT_ENCODING_VERSION } else { SNAPSHOT_ENCODING_VERSION_PRIVATE });
+        out.push(if !self.trace_audits.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_TRACE
+        } else if private.is_empty() {
+            SNAPSHOT_ENCODING_VERSION
+        } else {
+            SNAPSHOT_ENCODING_VERSION_PRIVATE
+        });
         out.extend_from_slice(&(self.vault.len() as u32).to_le_bytes());
         for (miner, claims) in self.vault.iter() {
             out.extend_from_slice(&miner.as_bytes());
@@ -1312,12 +1557,36 @@ impl ServiceLedgerSnapshot {
             out.push(*tier);
             out.extend_from_slice(&escrow.as_bytes());
         }
-        if !private.is_empty() {
+        if !private.is_empty() || !self.trace_audits.is_empty() {
             out.extend_from_slice(&(private.len() as u32).to_le_bytes());
             for (rh, seed, recipients) in private {
                 out.extend_from_slice(rh);
                 out.extend_from_slice(seed);
                 put_hashes(&mut out, recipients);
+            }
+        }
+        if !self.trace_audits.is_empty() {
+            out.extend_from_slice(&(self.trace_audits.len() as u32).to_le_bytes());
+            for (txid, a) in self.trace_audits.iter() {
+                out.extend_from_slice(txid);
+                out.extend_from_slice(&a.request_hash);
+                out.extend_from_slice(&a.responder.as_bytes());
+                out.extend_from_slice(&a.escrow_pubkey);
+                out.extend_from_slice(&a.trace_root);
+                out.extend_from_slice(&a.n_prompt.to_le_bytes());
+                out.extend_from_slice(&a.n_pos.to_le_bytes());
+                out.extend_from_slice(&a.accepted_daa.to_le_bytes());
+                out.push(a.tier);
+                out.extend_from_slice(&a.max_tokens.to_le_bytes());
+                put_hashes(&mut out, &a.identities);
+                match &a.seed {
+                    Some(s) => {
+                        out.push(1);
+                        out.extend_from_slice(s);
+                        out.extend_from_slice(&a.deadline_daa.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
             }
         }
         out
@@ -1327,7 +1596,7 @@ impl ServiceLedgerSnapshot {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { bytes, pos: 0 };
         let version = r.u8()?;
-        if version != SNAPSHOT_ENCODING_VERSION && version != SNAPSHOT_ENCODING_VERSION_PRIVATE {
+        if version != SNAPSHOT_ENCODING_VERSION && version != SNAPSHOT_ENCODING_VERSION_PRIVATE && version != SNAPSHOT_ENCODING_VERSION_TRACE {
             return Err("unsupported snapshot encoding".into());
         }
         let mut snap = Self::default();
@@ -1434,9 +1703,9 @@ impl ServiceLedgerSnapshot {
             let escrow = r.hash()?;
             snap.recent_producers.push((daa, id, tier, escrow));
         }
-        if version == SNAPSHOT_ENCODING_VERSION_PRIVATE {
+        if version == SNAPSHOT_ENCODING_VERSION_PRIVATE || version == SNAPSHOT_ENCODING_VERSION_TRACE {
             let n = r.u32()?;
-            if n == 0 {
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_PRIVATE {
                 return Err("empty private section".into());
             }
             for _ in 0..n {
@@ -1452,6 +1721,40 @@ impl ServiceLedgerSnapshot {
                         req.cohort_seed = seed;
                     }
                     _ => return Err("malformed private section".into()),
+                }
+            }
+        }
+        if version == SNAPSHOT_ENCODING_VERSION_TRACE {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty trace section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let mut a = TraceAudit {
+                    request_hash: r.key()?,
+                    responder: r.hash()?,
+                    escrow_pubkey: r.key()?,
+                    trace_root: r.key()?,
+                    n_prompt: r.u32()?,
+                    n_pos: r.u32()?,
+                    accepted_daa: r.u64()?,
+                    tier: r.u8()?,
+                    max_tokens: r.u32()?,
+                    identities: r.hashes()?,
+                    seed: None,
+                    deadline_daa: 0,
+                };
+                match r.u8()? {
+                    0 => {}
+                    1 => {
+                        a.seed = Some(r.key()?);
+                        a.deadline_daa = r.u64()?;
+                    }
+                    _ => return Err("malformed trace audit".into()),
+                }
+                if snap.trace_audits.insert(txid, a).is_some() {
+                    return Err("malformed trace section".into());
                 }
             }
         }
@@ -1715,6 +2018,7 @@ impl ServiceLedger {
             audited: self.audited.clone(),
             producer_spk: self.producer_spk.clone(),
             recent_producers: Vec::new(),
+            trace_audits: self.trace_audits.clone(),
         }
     }
 
@@ -1729,6 +2033,7 @@ impl ServiceLedger {
         self.first_seen_base = std::sync::Arc::new(Default::default());
         self.audited = snap.audited.clone();
         self.producer_spk = snap.producer_spk.clone();
+        self.trace_audits = snap.trace_audits.clone();
     }
 }
 
@@ -2975,5 +3280,168 @@ mod tests {
             c = update_strikes(c, false);
         }
         assert_eq!(c, 0);
+    }
+
+    mod traces {
+        use super::super::{ServiceLedger, ServiceLedgerSnapshot, TraceInputs, TraceOpeningEvent, TraceResponseEvent, trace_seed};
+        use keryx_hashes::Hash;
+        use keryx_verifiable_inference::{draw, testkit::Model, verify::TierCtx};
+
+        const RH: [u8; 32] = [7u8; 32];
+        const TXID: [u8; 32] = [0x51u8; 32];
+        const ESCROW_PK: [u8; 32] = [0xA5u8; 32];
+
+        fn miner() -> Hash {
+            Hash::from_bytes([1u8; 32])
+        }
+
+        fn chain_hash(drawn: bool) -> Hash {
+            (0u64..)
+                .map(|i| {
+                    let mut b = [0u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    Hash::from_bytes(b)
+                })
+                .find(|h| draw::audited(&trace_seed(h, &TXID)) == drawn)
+                .unwrap()
+        }
+
+        struct Run {
+            ledger: ServiceLedger,
+            model: Model,
+            auditable: bool,
+        }
+
+        impl Run {
+            fn new(auditable: bool) -> Self {
+                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable }
+            }
+
+            fn fold(&mut self, daa: u64, chain: Hash, responses: &[TraceResponseEvent], openings: &[TraceOpeningEvent]) -> Vec<(Hash, u32)> {
+                let tier = |t: u8| -> Option<TierCtx> { (self.auditable && t == 0).then(|| self.model.tier()) };
+                let tr = TraceInputs { chain_hash: chain, responses, openings, tier: &tier };
+                let set = [miner()];
+                let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
+                let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
+                self.ledger
+                    .on_chain_block_with_traces(daa, &req, &[], &[], &resp, &[], &[], &tr, |_| true, |_| set.iter().map(|m| (*m, *m)).collect())
+                    .misses
+                    .iter()
+                    .map(|m| (m.miner, m.consecutive_misses))
+                    .collect()
+            }
+
+            /// Request at 100, traced response at 102, draw at 202. Returns the opening deadline.
+            fn until_draw(&mut self, honest: bool, drawn: bool) -> (u64, Vec<u8>) {
+                let r = self.model.response(3, 9, honest);
+                let ev = TraceResponseEvent {
+                    response_txid: TXID,
+                    request_hash: RH,
+                    responder: miner(),
+                    escrow_pubkey: ESCROW_PK,
+                    trace_root: r.trace_root,
+                    n_prompt: r.n_prompt,
+                    n_pos: r.n_pos,
+                };
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(self.fold(100, h0, &[], &[]).is_empty());
+                assert!(self.fold(102, h0, &[ev], &[]).is_empty());
+                let ch = chain_hash(drawn);
+                assert!(self.fold(202, ch, &[], &[]).is_empty());
+                let body = self.model.open(&r, TXID, &trace_seed(&ch, &TXID)).encode();
+                (self.ledger.trace_audits.get(&TXID).map(|a| a.deadline_daa).unwrap_or(0), body)
+            }
+        }
+
+        fn opening(pk: [u8; 32], body: Vec<u8>) -> TraceOpeningEvent {
+            TraceOpeningEvent { response_txid: TXID, escrow_pubkey: pk, body }
+        }
+
+        #[test]
+        fn valid_opening_closes_the_audit() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(true, true);
+            assert!(deadline > 203);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn fraudulent_opening_slashes_immediately() {
+            let mut run = Run::new(true);
+            let (_, body) = run.until_draw(false, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn malformed_opening_is_fraud() {
+            let mut run = Run::new(true);
+            let (_, mut body) = run.until_draw(true, true);
+            body.pop();
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+        }
+
+        #[test]
+        fn missing_opening_strikes_at_the_deadline() {
+            let mut run = Run::new(true);
+            let (deadline, _) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(deadline, h, &[], &[]).is_empty());
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn opening_under_another_key_is_ignored() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(false, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening([0x11u8; 32], body)]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 1);
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn undrawn_response_is_dropped() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(false, false);
+            assert_eq!(deadline, 0);
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]).is_empty());
+        }
+
+        #[test]
+        fn tier_without_manifest_is_not_audited() {
+            let mut run = Run::new(false);
+            let (deadline, _) = run.until_draw(false, true);
+            assert_eq!(deadline, 0);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn trace_audits_round_trip_through_the_snapshot() {
+            let mut run = Run::new(true);
+            assert_eq!(run.ledger.snapshot().to_bytes()[0], 1);
+            let (deadline, body) = run.until_draw(true, true);
+            let snap = run.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], 3);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+
+            let mut restored = Run::new(true);
+            restored.ledger.restore_snapshot(&parsed);
+            assert_eq!(restored.ledger.trace_audits.get(&TXID).unwrap().deadline_daa, deadline);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(restored.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(restored.ledger.snapshot().to_bytes()[0], 1);
+        }
     }
 }

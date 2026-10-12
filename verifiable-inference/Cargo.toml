@@ -9,3 +9,7 @@ description = "Verification of inference trace openings"
 
 [dependencies]
 blake3 = "1"
+libm = "0.2"
+
+[features]
+testkit = []

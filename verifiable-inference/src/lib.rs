@@ -8,4 +8,6 @@ pub mod merkle;
 pub mod opening;
 pub mod q8;
 pub mod quant;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 pub mod verify;
