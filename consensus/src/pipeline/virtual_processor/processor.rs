@@ -1680,11 +1680,15 @@ impl VirtualStateProcessor {
                     invalid_transactions.insert(tx.id(), e);
                     tx_selector.reject_selection(tx.id());
                 }
-                Ok(_) if tx.is_ai_opening() && std::mem::replace(&mut has_opening, true) => {
-                    deferred.insert(tx.id());
-                    tx_selector.reject_selection(tx.id());
-                }
                 Ok(fee) => {
+                    if tx.is_ai_opening() {
+                        if has_opening {
+                            deferred.insert(tx.id());
+                            tx_selector.reject_selection(tx.id());
+                            continue;
+                        }
+                        has_opening = true;
+                    }
                     calculated_fees.push(fee);
                 }
             }
@@ -1707,11 +1711,15 @@ impl VirtualStateProcessor {
                         tx_selector.reject_selection(tx.id());
                         has_rejections = true;
                     }
-                    Ok(_) if tx.is_ai_opening() && std::mem::replace(&mut has_opening, true) => {
-                        tx_selector.reject_selection(tx.id());
-                        has_rejections = true;
-                    }
                     Ok(fee) => {
+                        if tx.is_ai_opening() {
+                            if has_opening {
+                                tx_selector.reject_selection(tx.id());
+                                has_rejections = true;
+                                continue;
+                            }
+                            has_opening = true;
+                        }
                         txs.push(tx);
                         calculated_fees.push(fee);
                     }

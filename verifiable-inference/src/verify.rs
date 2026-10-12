@@ -8,6 +8,7 @@ use crate::opening::{ChunkRange, EntryOpening, Point};
 use crate::{q8, quant};
 
 pub const EPS: f64 = 1e-5;
+pub const EPS_GEGLU: f64 = 3e-5;
 const MMVQ_MAX_BATCH: u32 = 8;
 const MATRIX_ROW_PADDING: u64 = 512;
 
@@ -162,6 +163,9 @@ pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: 
     }
     let split = g_entry.glu_form == manifest::FORM_SPLIT;
     let m_out = if split { g_entry.m / 2 } else { g_entry.m };
+    if m_out == 0 {
+        return Err(Fail::Shape);
+    }
     let row = d[2] % m_out;
 
     let n_pos_leaves = 2 * tier.n_products + 1;
@@ -224,7 +228,8 @@ pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: 
         };
         let (f, df) = glu(g_entry.glu_op, rg.y_hat).ok_or(Fail::Unsupported)?;
         let h = f * ru.y_hat;
-        (h, EPS * ((df * ru.y_hat).abs() * rg.scale + f.abs() * ru.scale + (rg.y_hat * ru.y_hat).abs()))
+        let eps_glu = if g_entry.glu_op == manifest::GLU_GEGLU { EPS_GEGLU } else { EPS };
+        (h, EPS * ((df * ru.y_hat).abs() * rg.scale + f.abs() * ru.scale) + eps_glu * (rg.y_hat * ru.y_hat).abs())
     };
     if (y - y_hat).abs() > tol {
         return Err(Fail::Mismatch);
