@@ -813,15 +813,17 @@ pub const TRACE_PREFIXES: [Option<TracePrefix>; 5] = [
     None,
 ];
 
-/// Audit rules of a tier: the verifier context and, under the prefix rule, the prefix context.
+/// Audit rules of a tier: the verifier context, the prefix context under the prefix rule, and
+/// whether every traced response is audited.
 #[derive(Clone, Debug)]
 pub struct TraceRules {
     pub ctx: keryx_verifiable_inference::verify::TierCtx,
     pub prefix: Option<TracePrefix>,
+    pub audit_all: bool,
 }
 
 /// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests.
-pub fn trace_rules(tier: u8, prefix: bool) -> Option<TraceRules> {
+pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool) -> Option<TraceRules> {
     let manifests = if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 };
     let m = (*manifests.get(tier as usize)?)?;
     let t = POM_TIERS_H14.get(tier as usize)?;
@@ -833,7 +835,7 @@ pub fn trace_rules(tier: u8, prefix: bool) -> Option<TraceRules> {
         n_products: m.n_products,
     };
     let prefix = if prefix { Some(TRACE_PREFIXES.get(tier as usize)?.clone()?) } else { None };
-    Some(TraceRules { ctx, prefix })
+    Some(TraceRules { ctx, prefix, audit_all })
 }
 
 /// Tier lineup of the service ledger and the provider queries: the H14 set once
@@ -1564,6 +1566,9 @@ pub struct Params {
     /// against the model embedding (`keryx_verifiable_inference::prefix`); implies the shape
     /// rule. Changes the audit fold. `never()` = dormant.
     pub trace_prefix_activation: ForkActivation,
+    /// Every traced response is audited, and a trace root is admitted once within the ledger
+    /// memory. Changes the audit fold. `never()` = dormant.
+    pub trace_audit_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1838,6 +1843,7 @@ impl Params {
             verifiable_inference_activation: self.verifiable_inference_activation,
             trace_shape_activation: self.trace_shape_activation,
             trace_prefix_activation: self.trace_prefix_activation,
+            trace_audit_activation: self.trace_audit_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2053,6 +2059,7 @@ pub const MAINNET_PARAMS: Params = Params {
     verifiable_inference_activation: ForkActivation::never(),
     trace_shape_activation: ForkActivation::never(),
     trace_prefix_activation: ForkActivation::never(),
+    trace_audit_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2188,6 +2195,7 @@ pub const TESTNET_PARAMS: Params = Params {
     verifiable_inference_activation: ForkActivation::new(200_000),
     trace_shape_activation: ForkActivation::new(215_000),
     trace_prefix_activation: ForkActivation::new(215_000),
+    trace_audit_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2285,6 +2293,7 @@ pub const SIMNET_PARAMS: Params = Params {
     verifiable_inference_activation: ForkActivation::never(),
     trace_shape_activation: ForkActivation::never(),
     trace_prefix_activation: ForkActivation::never(),
+    trace_audit_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2376,6 +2385,7 @@ pub const DEVNET_PARAMS: Params = Params {
     verifiable_inference_activation: ForkActivation::never(),
     trace_shape_activation: ForkActivation::never(),
     trace_prefix_activation: ForkActivation::never(),
+    trace_audit_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),

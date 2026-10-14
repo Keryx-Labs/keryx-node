@@ -657,7 +657,8 @@ impl VirtualStateProcessor {
             let (trace_responses, trace_openings) = self.trace_events_of_chain_block(hash);
             let h14 = self.private_inference_activation.is_active(daa);
             let prefix_at = |at: u64| self.trace_prefix_activation.is_active(at);
-            let tier = |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at)) } else { None };
+            let audit_at = |at: u64| self.trace_audit_activation.is_active(at);
+            let tier = |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at)) } else { None };
             let traces = TraceInputs {
                 chain_hash: hash,
                 responses: &trace_responses,
@@ -665,6 +666,7 @@ impl VirtualStateProcessor {
                 tier: &tier,
                 prompt_lens: &request_prompt_lens,
                 shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa),
+                unique_root: audit_at(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();
@@ -694,6 +696,25 @@ impl VirtualStateProcessor {
                 |id| self.service_standing_at(id, daa),
                 cohort,
             );
+            if live {
+                for v in outcome.verdicts.iter() {
+                    match v.cause {
+                        None => info!(
+                            "service-bond: opening of response {} by miner {} accepted (request {})",
+                            hex::encode(v.response_txid),
+                            v.responder,
+                            hex::encode(v.request_hash)
+                        ),
+                        Some(cause) => info!(
+                            "service-bond: opening of response {} by miner {} rejected: {} (request {})",
+                            hex::encode(v.response_txid),
+                            v.responder,
+                            cause,
+                            hex::encode(v.request_hash)
+                        ),
+                    }
+                }
+            }
             return (outcome, escrows);
         }
         if warmup {

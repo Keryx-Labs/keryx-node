@@ -183,6 +183,8 @@ pub struct TraceInputs<'a> {
     pub prompt_lens: &'a [([u8; 32], u32)],
     /// Whether the shape rule is active at this block.
     pub shape: bool,
+    /// Whether a trace root is admitted once at this block.
+    pub unique_root: bool,
 }
 
 const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
@@ -227,28 +229,35 @@ pub fn trace_seed(chain_hash: &Hash, response_txid: &[u8; 32]) -> [u8; 32] {
     seed
 }
 
-/// Whether an opening body proves every drawn point of `audit` under `seed`, the prefix point
-/// included when the rules carry a prefix context.
+/// Checks that an opening body proves every drawn point of `audit` under `seed`, the prefix
+/// point included when the rules carry a prefix context; `Err` names the failing check.
 fn trace_opening_valid(
     rules: &crate::config::params::TraceRules,
     audit: &TraceAudit,
     seed: &[u8; 32],
     txid: &[u8; 32],
     body: &[u8],
-) -> bool {
+) -> Result<(), &'static str> {
     use keryx_verifiable_inference::{draw::POINTS, opening::Opening, prefix, verify};
-    let Some(opening) = Opening::decode(body) else { return false };
-    if &opening.response_txid != txid || opening.points.len() != POINTS as usize {
-        return false;
+    let Some(opening) = Opening::decode(body) else { return Err("malformed body") };
+    if &opening.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    if opening.points.len() != POINTS as usize {
+        return Err("point count");
     }
     let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
-    if !opening.points.iter().enumerate().all(|(i, p)| verify::verify_point(&rules.ctx, &resp, seed, i as u32, p).is_ok()) {
-        return false;
+    for (i, p) in opening.points.iter().enumerate() {
+        if verify::verify_point(&rules.ctx, &resp, seed, i as u32, p).is_err() {
+            return Err(if i == 0 { "point 0" } else { "point 1" });
+        }
     }
     match (&rules.prefix, &opening.prefix) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(pc), Some(p)) => prefix::verify_prefix_point(&rules.ctx, pc, &resp, seed, &audit.request_hash, p).is_ok(),
+        (None, _) => Ok(()),
+        (Some(_), None) => Err("prefix point missing"),
+        (Some(pc), Some(p)) => {
+            prefix::verify_prefix_point(&rules.ctx, pc, &resp, seed, &audit.request_hash, p).map(|_| ()).map_err(|_| "prefix point")
+        }
     }
 }
 
@@ -647,6 +656,8 @@ pub struct ServiceReward {
 #[derive(Clone, Debug, Default)]
 pub struct FoldOutcome {
     pub misses: Vec<ServiceMiss>,
+    /// Openings judged by this fold.
+    pub verdicts: Vec<TraceVerdict>,
     /// Inference rewards decided by this fold (first accepted response of a routed request).
     pub rewards: Vec<ServiceReward>,
     /// Served-response streak resets as (identity, preserved last-strike daa). The preserved daa
@@ -657,6 +668,15 @@ pub struct FoldOutcome {
     /// Claims dropped by the burnable-window purge in this fold, in pop order — the undo log
     /// needs them to reverse the block.
     pub expired: Vec<(Hash, EscrowClaim)>,
+}
+
+/// The judgement of one opening: `cause` is `None` when it closed the audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceVerdict {
+    pub response_txid: [u8; 32],
+    pub request_hash: [u8; 32],
+    pub responder: Hash,
+    pub cause: Option<&'static str>,
 }
 
 /// Reorg-restore state of everything but the vault (see [`ServiceLedger::light_snapshot`]).
@@ -672,6 +692,7 @@ pub struct LightSnapshot {
     audited: std::collections::BTreeMap<[u8; 32], u64>,
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
+    trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -717,6 +738,9 @@ pub struct ServiceLedger {
     /// Shapes of traced responses whose request was not pending yet, by `(request hash,
     /// responder)`; judged when the request is admitted, dropped with `early_responses`.
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
+    /// Trace roots admitted under the root rule, with the daa of their response; a repeat
+    /// within [`SERVICE_AUDITED_MEMORY_DAA`] is not an answer.
+    trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
 }
 
 impl ServiceLedger {
@@ -986,6 +1010,20 @@ impl ServiceLedger {
             }
         }
 
+        if let Some(tr) = traces.filter(|tr| tr.unique_root) {
+            self.trace_roots.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
+            for ev in tr.responses {
+                if misshaped.contains(&(ev.request_hash, ev.responder)) {
+                    continue;
+                }
+                if self.trace_roots.contains_key(&ev.trace_root) {
+                    misshaped.push((ev.request_hash, ev.responder));
+                } else {
+                    self.trace_roots.insert(ev.trace_root, daa);
+                }
+            }
+        }
+
         // An authenticated response (signed by a delegated escrow key) marks every cohort
         // identity that delegated to it as having served this audit and resets their streak.
         // Anyone else's response is ignored by the ledger. A response landing before the audit
@@ -1206,8 +1244,8 @@ impl ServiceLedger {
             let mut a = self.trace_audits.remove(&txid).unwrap();
             self.resolve_trace_audit(&mut a);
             let seed = trace_seed(&tr.chain_hash, &txid);
-            let auditable = a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() && (tr.tier)(a.tier, a.accepted_daa).is_some();
-            if auditable && keryx_verifiable_inference::draw::audited(&seed) {
+            let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
+            if rules.is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
                 a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa));
                 a.seed = Some(seed);
                 self.trace_audits.insert(txid, a);
@@ -1221,9 +1259,17 @@ impl ServiceLedger {
                 continue;
             }
             let a = self.trace_audits.remove(&op.response_txid).unwrap();
-            let valid =
-                (tr.tier)(a.tier, a.accepted_daa).is_some_and(|rules| trace_opening_valid(&rules, &a, &seed, &op.response_txid, &op.body));
-            if !valid {
+            let verdict = match (tr.tier)(a.tier, a.accepted_daa) {
+                Some(rules) => trace_opening_valid(&rules, &a, &seed, &op.response_txid, &op.body),
+                None => Err("no rules"),
+            };
+            outcome.verdicts.push(TraceVerdict {
+                response_txid: op.response_txid,
+                request_hash: a.request_hash,
+                responder: a.responder,
+                cause: verdict.err(),
+            });
+            if verdict.is_err() {
                 for miner in a.identities.iter() {
                     if warmup {
                         continue;
@@ -1392,6 +1438,7 @@ impl ServiceLedger {
             audited: self.audited.clone(),
             trace_audits: self.trace_audits.clone(),
             early_shapes: self.early_shapes.clone(),
+            trace_roots: self.trace_roots.clone(),
         }
     }
 
@@ -1407,6 +1454,7 @@ impl ServiceLedger {
         self.audited = snap.audited.clone();
         self.trace_audits = snap.trace_audits.clone();
         self.early_shapes = snap.early_shapes.clone();
+        self.trace_roots = snap.trace_roots.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -1476,6 +1524,7 @@ pub struct ServiceLedgerSnapshot {
     pub recent_producers: Vec<(u64, Hash, u8, Hash)>,
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
+    trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
@@ -1491,6 +1540,9 @@ const SNAPSHOT_ENCODING_VERSION_TRACE: u8 = 3;
 /// and the early shapes (`[n: u32] n × [request_hash: 32] [responder: 32] [n_prompt: u32]
 /// [n_pos: u32] [answer_len: u32]`, key order).
 const SNAPSHOT_ENCODING_VERSION_SHAPE: u8 = 4;
+/// Private, trace and shape sections (possibly empty) followed by the admitted trace roots
+/// (`[n: u32] n × [root: 32] [daa: u64]`, key order).
+const SNAPSHOT_ENCODING_VERSION_ROOT: u8 = 5;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1569,7 +1621,9 @@ impl ServiceLedgerSnapshot {
             .map(|(rh, r)| (rh, &r.cohort_seed, &r.recipients))
             .collect();
         let shaped = self.pending.values().any(|r| r.prompt_len > 0) || !self.early_shapes.is_empty();
-        out.push(if shaped {
+        let version = if !self.trace_roots.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_ROOT
+        } else if shaped {
             SNAPSHOT_ENCODING_VERSION_SHAPE
         } else if !self.trace_audits.is_empty() {
             SNAPSHOT_ENCODING_VERSION_TRACE
@@ -1577,7 +1631,8 @@ impl ServiceLedgerSnapshot {
             SNAPSHOT_ENCODING_VERSION
         } else {
             SNAPSHOT_ENCODING_VERSION_PRIVATE
-        });
+        };
+        out.push(version);
         out.extend_from_slice(&(self.vault.len() as u32).to_le_bytes());
         for (miner, claims) in self.vault.iter() {
             out.extend_from_slice(&miner.as_bytes());
@@ -1655,7 +1710,7 @@ impl ServiceLedgerSnapshot {
             out.push(*tier);
             out.extend_from_slice(&escrow.as_bytes());
         }
-        if !private.is_empty() || !self.trace_audits.is_empty() || shaped {
+        if version >= SNAPSHOT_ENCODING_VERSION_PRIVATE {
             out.extend_from_slice(&(private.len() as u32).to_le_bytes());
             for (rh, seed, recipients) in private {
                 out.extend_from_slice(rh);
@@ -1663,7 +1718,7 @@ impl ServiceLedgerSnapshot {
                 put_hashes(&mut out, recipients);
             }
         }
-        if !self.trace_audits.is_empty() || shaped {
+        if version >= SNAPSHOT_ENCODING_VERSION_TRACE {
             out.extend_from_slice(&(self.trace_audits.len() as u32).to_le_bytes());
             for (txid, a) in self.trace_audits.iter() {
                 out.extend_from_slice(txid);
@@ -1687,7 +1742,7 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
-        if shaped {
+        if version >= SNAPSHOT_ENCODING_VERSION_SHAPE {
             let lens: Vec<(&[u8; 32], u32)> = self.pending.iter().filter(|(_, r)| r.prompt_len > 0).map(|(rh, r)| (rh, r.prompt_len)).collect();
             out.extend_from_slice(&(lens.len() as u32).to_le_bytes());
             for (rh, len) in lens {
@@ -1703,6 +1758,13 @@ impl ServiceLedgerSnapshot {
                 out.extend_from_slice(&shape.answer_len.to_le_bytes());
             }
         }
+        if version >= SNAPSHOT_ENCODING_VERSION_ROOT {
+            out.extend_from_slice(&(self.trace_roots.len() as u32).to_le_bytes());
+            for (root, daa) in self.trace_roots.iter() {
+                out.extend_from_slice(root);
+                out.extend_from_slice(&daa.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -1712,7 +1774,11 @@ impl ServiceLedgerSnapshot {
         let version = r.u8()?;
         if !matches!(
             version,
-            SNAPSHOT_ENCODING_VERSION | SNAPSHOT_ENCODING_VERSION_PRIVATE | SNAPSHOT_ENCODING_VERSION_TRACE | SNAPSHOT_ENCODING_VERSION_SHAPE
+            SNAPSHOT_ENCODING_VERSION
+                | SNAPSHOT_ENCODING_VERSION_PRIVATE
+                | SNAPSHOT_ENCODING_VERSION_TRACE
+                | SNAPSHOT_ENCODING_VERSION_SHAPE
+                | SNAPSHOT_ENCODING_VERSION_ROOT
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -1886,7 +1952,7 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
-        if version == SNAPSHOT_ENCODING_VERSION_SHAPE {
+        if version >= SNAPSHOT_ENCODING_VERSION_SHAPE {
             let n = r.u32()?;
             for _ in 0..n {
                 let rh = r.key()?;
@@ -1903,6 +1969,19 @@ impl ServiceLedgerSnapshot {
                 let shape = TraceShape { n_prompt: r.u32()?, n_pos: r.u32()?, answer_len: r.u32()? };
                 if snap.early_shapes.insert((rh, key), shape).is_some() {
                     return Err("malformed early shapes".into());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ROOT {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty root section".into());
+            }
+            for _ in 0..n {
+                let root = r.key()?;
+                let daa = r.u64()?;
+                if snap.trace_roots.insert(root, daa).is_some() {
+                    return Err("malformed trace roots".into());
                 }
             }
         }
@@ -2168,6 +2247,7 @@ impl ServiceLedger {
             recent_producers: Vec::new(),
             trace_audits: self.trace_audits.clone(),
             early_shapes: self.early_shapes.clone(),
+            trace_roots: self.trace_roots.clone(),
         }
     }
 
@@ -2184,6 +2264,7 @@ impl ServiceLedger {
         self.producer_spk = snap.producer_spk.clone();
         self.trace_audits = snap.trace_audits.clone();
         self.early_shapes = snap.early_shapes.clone();
+        self.trace_roots = snap.trace_roots.clone();
     }
 }
 
@@ -3440,6 +3521,9 @@ mod tests {
 
         const RH: [u8; 32] = [7u8; 32];
         const TXID: [u8; 32] = [0x51u8; 32];
+        /// Second request and response of the root rule runs.
+        const RH2: [u8; 32] = [8u8; 32];
+        const TXID2: [u8; 32] = [0x52u8; 32];
         const ESCROW_PK: [u8; 32] = [0xA5u8; 32];
 
         fn miner() -> Hash {
@@ -3465,11 +3549,18 @@ mod tests {
             shape: Option<(u32, u32)>,
             /// Prefix rule: the prefix offset, and the request id the traced prompt carries.
             prefix: Option<(u32, [u8; 32])>,
+            /// Audit rule: every traced response is audited, and the root rule admits a second
+            /// request `RH2` at 100.
+            audit_all: bool,
         }
 
         impl Run {
             fn new(auditable: bool) -> Self {
-                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable, shape: None, prefix: None }
+                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable, shape: None, prefix: None, audit_all: false }
+            }
+
+            fn audited_all() -> Self {
+                Self { audit_all: true, ..Self::new(true) }
             }
 
             fn shaped(prompt_len: u32, answer_len: u32) -> Self {
@@ -3482,21 +3573,56 @@ mod tests {
             }
 
             fn fold(&mut self, daa: u64, chain: Hash, responses: &[TraceResponseEvent], openings: &[TraceOpeningEvent]) -> Vec<(Hash, u32)> {
+                self.fold_with_verdicts(daa, chain, responses, openings, &mut Vec::new())
+            }
+
+            /// [`Self::fold`] that also reports the causes of the openings it judged.
+            fn fold_with_verdicts(
+                &mut self,
+                daa: u64,
+                chain: Hash,
+                responses: &[TraceResponseEvent],
+                openings: &[TraceOpeningEvent],
+                verdicts: &mut Vec<Option<&'static str>>,
+            ) -> Vec<(Hash, u32)> {
                 let tier = |t: u8, _at: u64| -> Option<TraceRules> {
-                    (self.auditable && t == 0)
-                        .then(|| TraceRules { ctx: self.model.tier(), prefix: self.prefix.map(|(o, _)| self.model.prefix_ctx(o)) })
+                    (self.auditable && t == 0).then(|| TraceRules {
+                        ctx: self.model.tier(),
+                        prefix: self.prefix.map(|(o, _)| self.model.prefix_ctx(o)),
+                        audit_all: self.audit_all,
+                    })
                 };
                 let lens = [(RH, self.shape.map_or(0, |(p, _)| p))];
-                let tr = TraceInputs { chain_hash: chain, responses, openings, tier: &tier, prompt_lens: &lens, shape: self.shape.is_some() };
+                let tr = TraceInputs {
+                    chain_hash: chain,
+                    responses,
+                    openings,
+                    tier: &tier,
+                    prompt_lens: &lens,
+                    shape: self.shape.is_some(),
+                    unique_root: self.audit_all,
+                };
                 let set = [miner()];
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
-                let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
-                self.ledger
-                    .on_chain_block_with_traces(daa, &req, &[], &[], &resp, &[], &[], &tr, |_| true, |_| set.iter().map(|m| (*m, *m)).collect())
-                    .misses
-                    .iter()
-                    .map(|m| (m.miner, m.consecutive_misses))
-                    .collect()
+                let req: Vec<([u8; 32], u8, u32)> = match (daa, self.audit_all) {
+                    (100, false) => vec![(RH, 0, 256)],
+                    (100, true) => vec![(RH, 0, 256), (RH2, 0, 256)],
+                    _ => vec![],
+                };
+                let outcome = self.ledger.on_chain_block_with_traces(
+                    daa,
+                    &req,
+                    &[],
+                    &[],
+                    &resp,
+                    &[],
+                    &[],
+                    &tr,
+                    |_| true,
+                    |_| set.iter().map(|m| (*m, *m)).collect(),
+                );
+                verdicts.extend(outcome.verdicts.iter().map(|v| v.cause));
+                outcome.misses.iter().map(|m| (m.miner, m.consecutive_misses)).collect()
             }
 
             /// The traced response of this run: 3 prompt positions, 9 in total (40 and 48 under
@@ -3611,6 +3737,75 @@ mod tests {
             assert_eq!(deadline, 0);
             assert!(run.ledger.trace_audits.is_empty());
             assert!(run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]).is_empty());
+        }
+
+        #[test]
+        fn every_trace_is_audited_under_the_audit_rule() {
+            let mut run = Run::audited_all();
+            let (deadline, body) = run.until_draw(true, false);
+            assert!(deadline > 203);
+            assert_eq!(run.ledger.trace_audits.len(), 1);
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut verdicts = Vec::new();
+            assert!(run.fold_with_verdicts(203, h, &[], &[opening(ESCROW_PK, body)], &mut verdicts).is_empty());
+            assert_eq!(verdicts, vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+            // The second request of the run was never answered.
+            assert_eq!(run.fold(run.window_end() + 1, h, &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn fraud_verdict_names_the_failing_check() {
+            let mut run = Run::prefixed(8, RH);
+            let (r, seed) = run.drawn(true, true);
+            let body = run.model.open(&r, TXID, &seed).encode();
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)], &mut verdicts);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert_eq!(verdicts, vec![Some("prefix point missing")]);
+        }
+
+        #[test]
+        fn reused_trace_root_is_not_an_answer_under_the_root_rule() {
+            let mut run = Run::audited_all();
+            let (_, ev) = run.event(true);
+            let ev2 = TraceResponseEvent { response_txid: TXID2, request_hash: RH2, ..ev.clone() };
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 1);
+            assert!(run.ledger.trace_audits.contains_key(&TXID));
+            assert_eq!(run.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
+            assert!(run.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().responded.is_empty());
+            assert_eq!(run.ledger.trace_roots.len(), 1);
+
+            let snap = run.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], 5);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+            let mut restored = Run::audited_all();
+            restored.ledger.restore_snapshot(&parsed);
+            assert_eq!(restored.ledger.trace_roots.len(), 1);
+            // The unanswered second request strikes at its deadline; the served one does not.
+            let end = restored.window_end();
+            assert_eq!(restored.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn root_memory_expires() {
+            let mut run = Run::audited_all();
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert_eq!(run.ledger.trace_roots.len(), 1);
+            let later = 102 + super::super::SERVICE_AUDITED_MEMORY_DAA;
+            run.fold(later - 1, h0, &[], &[]);
+            assert_eq!(run.ledger.trace_roots.len(), 1);
+            run.fold(later, h0, &[], &[]);
+            assert!(run.ledger.trace_roots.is_empty());
         }
 
         #[test]
