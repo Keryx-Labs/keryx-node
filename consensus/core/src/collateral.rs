@@ -160,6 +160,8 @@ pub struct TraceResponseEvent {
     pub trace_root: [u8; 32],
     pub n_prompt: u32,
     pub n_pos: u32,
+    /// Plaintext length of the sealed answer.
+    pub answer_len: u32,
 }
 
 /// An opening accepted in a chain block whose signature verifies under `escrow_pubkey`.
@@ -176,9 +178,25 @@ pub struct TraceInputs<'a> {
     pub responses: &'a [TraceResponseEvent],
     pub openings: &'a [TraceOpeningEvent],
     pub tier: &'a dyn Fn(u8) -> Option<keryx_verifiable_inference::verify::TierCtx>,
+    /// Plaintext prompt length of the block's accepted requests, by request hash.
+    pub prompt_lens: &'a [([u8; 32], u32)],
+    /// Whether the shape rule is active at this block.
+    pub shape: bool,
 }
 
 const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
+
+/// The committed shape of a traced response whose request is not pending yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TraceShape {
+    n_prompt: u32,
+    n_pos: u32,
+    answer_len: u32,
+}
+
+fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape) -> bool {
+    keryx_verifiable_inference::shape::shape_ok(req.prompt_len, shape.answer_len, req.max_tokens, shape.n_prompt, shape.n_pos)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TraceAudit {
@@ -555,6 +573,8 @@ struct PendingRequest {
     /// Private inference: the seed of the target cohort the recipients must cover; zero for a
     /// public request.
     cohort_seed: PrivateCohortSeed,
+    /// Plaintext prompt length; zero before the shape rule.
+    prompt_len: u32,
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
@@ -641,6 +661,7 @@ pub struct LightSnapshot {
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
     audited: std::collections::BTreeMap<[u8; 32], u64>,
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
+    early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -683,6 +704,9 @@ pub struct ServiceLedger {
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
     /// Traced responses awaiting their draw or their opening, by response transaction id.
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
+    /// Shapes of traced responses whose request was not pending yet, by `(request hash,
+    /// responder)`; judged when the request is admitted, dropped with `early_responses`.
+    early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
 }
 
 impl ServiceLedger {
@@ -874,6 +898,8 @@ impl ServiceLedger {
 
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
         self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
+        let early_hashes: std::collections::BTreeSet<[u8; 32]> = self.early_responses.keys().copied().collect();
+        self.early_shapes.retain(|(rh, _), _| early_hashes.contains(rh));
 
         // This block's own requests are admitted before its responses are folded: a response
         // accepted in the same chain block as its request must find the request pending, or it is
@@ -893,7 +919,9 @@ impl ServiceLedger {
             if gated {
                 self.audited.insert(*rh, daa);
             }
-            let early = self.early_responses.remove(rh).map(|(_, keys)| keys).unwrap_or_default();
+            let mut early = self.early_responses.remove(rh).map(|(_, keys)| keys).unwrap_or_default();
+            let prompt_len =
+                traces.filter(|tr| tr.shape).and_then(|tr| tr.prompt_lens.iter().find(|(h, _)| h == rh).map(|(_, l)| *l)).unwrap_or(0);
             // A re-accepted hash (identical payload resubmitted) must not reset the running
             // audit: overwriting would re-arm the window and push the miss out forever.
             let entry = self.pending.entry(*rh).or_insert(PendingRequest {
@@ -906,12 +934,41 @@ impl ServiceLedger {
                 early_responders: Vec::new(),
                 recipients: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, _, r)| r.clone()).unwrap_or_default(),
                 cohort_seed: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, s, _)| *s).unwrap_or([0u8; 36]),
+                prompt_len,
             });
+            if traces.is_some_and(|tr| tr.shape) {
+                let shapes: Vec<(Hash, TraceShape)> = self
+                    .early_shapes
+                    .range((*rh, Hash::from_bytes([0u8; 32]))..=(*rh, Hash::from_bytes([0xffu8; 32])))
+                    .map(|((_, key), shape)| (*key, *shape))
+                    .collect();
+                self.early_shapes.retain(|(h, _), _| h != rh);
+                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape)));
+            }
             // Answers that beat their own request to acceptance.
             if entry.audit.is_none() {
                 for key in early {
                     if !entry.early_responders.contains(&key) {
                         entry.early_responders.push(key);
+                    }
+                }
+            }
+        }
+
+        // A traced response whose commitment does not fit the sealed sizes of its request and
+        // answer is not an answer: neither credited nor audited.
+        let mut misshaped: Vec<([u8; 32], Hash)> = Vec::new();
+        if let Some(tr) = traces.filter(|tr| tr.shape) {
+            for ev in tr.responses {
+                let shape = TraceShape { n_prompt: ev.n_prompt, n_pos: ev.n_pos, answer_len: ev.answer_len };
+                match self.pending.get(&ev.request_hash) {
+                    Some(req) => {
+                        if !trace_shape_ok(req, &shape) {
+                            misshaped.push((ev.request_hash, ev.responder));
+                        }
+                    }
+                    None => {
+                        self.early_shapes.insert((ev.request_hash, ev.responder), shape);
                     }
                 }
             }
@@ -923,6 +980,9 @@ impl ServiceLedger {
         // arms is parked on the request and credited when it does.
         for (rh, responder) in responses {
             let Some(r) = responder else { continue };
+            if misshaped.contains(&(*rh, *r)) {
+                continue;
+            }
             let mut served: Vec<Hash> = Vec::new();
             {
                 let Some(req) = self.pending.get_mut(rh) else {
@@ -963,10 +1023,11 @@ impl ServiceLedger {
             let victim =
                 self.early_responses.iter().min_by_key(|(hash, (seen, _))| (*seen, **hash)).map(|(hash, _)| *hash).unwrap();
             self.early_responses.remove(&victim);
+            self.early_shapes.retain(|(rh, _), _| *rh != victim);
         }
 
         if let Some(tr) = traces {
-            self.fold_traces(daa, tr, warmup, &is_established, &mut outcome);
+            self.fold_traces(daa, tr, &misshaped, warmup, &is_established, &mut outcome);
         }
 
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
@@ -1092,9 +1153,17 @@ impl ServiceLedger {
 
     /// Records the block's traced responses, draws the ripe ones, judges the openings and closes
     /// the audits whose deadline passed.
-    fn fold_traces(&mut self, daa: u64, tr: &TraceInputs, warmup: bool, is_established: &dyn Fn(&Hash) -> bool, outcome: &mut FoldOutcome) {
+    fn fold_traces(
+        &mut self,
+        daa: u64,
+        tr: &TraceInputs,
+        misshaped: &[([u8; 32], Hash)],
+        warmup: bool,
+        is_established: &dyn Fn(&Hash) -> bool,
+        outcome: &mut FoldOutcome,
+    ) {
         for ev in tr.responses {
-            if self.trace_audits.contains_key(&ev.response_txid) {
+            if self.trace_audits.contains_key(&ev.response_txid) || misshaped.contains(&(ev.request_hash, ev.responder)) {
                 continue;
             }
             let mut a = TraceAudit {
@@ -1309,6 +1378,7 @@ impl ServiceLedger {
             producer_spk: self.producer_spk.clone(),
             audited: self.audited.clone(),
             trace_audits: self.trace_audits.clone(),
+            early_shapes: self.early_shapes.clone(),
         }
     }
 
@@ -1323,6 +1393,7 @@ impl ServiceLedger {
         self.producer_spk = snap.producer_spk.clone();
         self.audited = snap.audited.clone();
         self.trace_audits = snap.trace_audits.clone();
+        self.early_shapes = snap.early_shapes.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -1391,6 +1462,7 @@ pub struct ServiceLedgerSnapshot {
     /// below the pruning point reads.
     pub recent_producers: Vec<(u64, Hash, u8, Hash)>,
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
+    early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
@@ -1401,6 +1473,11 @@ const SNAPSHOT_ENCODING_VERSION: u8 = 1;
 const SNAPSHOT_ENCODING_VERSION_PRIVATE: u8 = 2;
 /// Private section (possibly empty) followed by the trace audits.
 const SNAPSHOT_ENCODING_VERSION_TRACE: u8 = 3;
+/// Private and trace sections (possibly empty) followed by the prompt lengths of the pending
+/// requests that carry one (`[n: u32] n × [request_hash: 32] [prompt_len: u32]`, pending order)
+/// and the early shapes (`[n: u32] n × [request_hash: 32] [responder: 32] [n_prompt: u32]
+/// [n_pos: u32] [answer_len: u32]`, key order).
+const SNAPSHOT_ENCODING_VERSION_SHAPE: u8 = 4;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1478,7 +1555,10 @@ impl ServiceLedgerSnapshot {
             .filter(|(_, r)| !r.recipients.is_empty())
             .map(|(rh, r)| (rh, &r.cohort_seed, &r.recipients))
             .collect();
-        out.push(if !self.trace_audits.is_empty() {
+        let shaped = self.pending.values().any(|r| r.prompt_len > 0) || !self.early_shapes.is_empty();
+        out.push(if shaped {
+            SNAPSHOT_ENCODING_VERSION_SHAPE
+        } else if !self.trace_audits.is_empty() {
             SNAPSHOT_ENCODING_VERSION_TRACE
         } else if private.is_empty() {
             SNAPSHOT_ENCODING_VERSION
@@ -1562,7 +1642,7 @@ impl ServiceLedgerSnapshot {
             out.push(*tier);
             out.extend_from_slice(&escrow.as_bytes());
         }
-        if !private.is_empty() || !self.trace_audits.is_empty() {
+        if !private.is_empty() || !self.trace_audits.is_empty() || shaped {
             out.extend_from_slice(&(private.len() as u32).to_le_bytes());
             for (rh, seed, recipients) in private {
                 out.extend_from_slice(rh);
@@ -1570,7 +1650,7 @@ impl ServiceLedgerSnapshot {
                 put_hashes(&mut out, recipients);
             }
         }
-        if !self.trace_audits.is_empty() {
+        if !self.trace_audits.is_empty() || shaped {
             out.extend_from_slice(&(self.trace_audits.len() as u32).to_le_bytes());
             for (txid, a) in self.trace_audits.iter() {
                 out.extend_from_slice(txid);
@@ -1594,6 +1674,22 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
+        if shaped {
+            let lens: Vec<(&[u8; 32], u32)> = self.pending.iter().filter(|(_, r)| r.prompt_len > 0).map(|(rh, r)| (rh, r.prompt_len)).collect();
+            out.extend_from_slice(&(lens.len() as u32).to_le_bytes());
+            for (rh, len) in lens {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&len.to_le_bytes());
+            }
+            out.extend_from_slice(&(self.early_shapes.len() as u32).to_le_bytes());
+            for ((rh, key), shape) in self.early_shapes.iter() {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&key.as_bytes());
+                out.extend_from_slice(&shape.n_prompt.to_le_bytes());
+                out.extend_from_slice(&shape.n_pos.to_le_bytes());
+                out.extend_from_slice(&shape.answer_len.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -1601,7 +1697,10 @@ impl ServiceLedgerSnapshot {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { bytes, pos: 0 };
         let version = r.u8()?;
-        if version != SNAPSHOT_ENCODING_VERSION && version != SNAPSHOT_ENCODING_VERSION_PRIVATE && version != SNAPSHOT_ENCODING_VERSION_TRACE {
+        if !matches!(
+            version,
+            SNAPSHOT_ENCODING_VERSION | SNAPSHOT_ENCODING_VERSION_PRIVATE | SNAPSHOT_ENCODING_VERSION_TRACE | SNAPSHOT_ENCODING_VERSION_SHAPE
+        ) {
             return Err("unsupported snapshot encoding".into());
         }
         let mut snap = Self::default();
@@ -1651,7 +1750,18 @@ impl ServiceLedgerSnapshot {
                 _ => return Err("malformed audit".into()),
             };
             let early_responders = r.hashes()?;
-            let req = PendingRequest { tier, max_tokens, accepted_daa, reward, winner, audit, early_responders, recipients: Vec::new(), cohort_seed: [0u8; 36] };
+            let req = PendingRequest {
+                tier,
+                max_tokens,
+                accepted_daa,
+                reward,
+                winner,
+                audit,
+                early_responders,
+                recipients: Vec::new(),
+                cohort_seed: [0u8; 36],
+                prompt_len: 0,
+            };
             if snap.pending.insert(rh, req).is_some() {
                 return Err("malformed pending".into());
             }
@@ -1708,7 +1818,7 @@ impl ServiceLedgerSnapshot {
             let escrow = r.hash()?;
             snap.recent_producers.push((daa, id, tier, escrow));
         }
-        if version == SNAPSHOT_ENCODING_VERSION_PRIVATE || version == SNAPSHOT_ENCODING_VERSION_TRACE {
+        if version >= SNAPSHOT_ENCODING_VERSION_PRIVATE {
             let n = r.u32()?;
             if n == 0 && version == SNAPSHOT_ENCODING_VERSION_PRIVATE {
                 return Err("empty private section".into());
@@ -1729,9 +1839,9 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
-        if version == SNAPSHOT_ENCODING_VERSION_TRACE {
+        if version >= SNAPSHOT_ENCODING_VERSION_TRACE {
             let n = r.u32()?;
-            if n == 0 {
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_TRACE {
                 return Err("empty trace section".into());
             }
             for _ in 0..n {
@@ -1760,6 +1870,26 @@ impl ServiceLedgerSnapshot {
                 }
                 if snap.trace_audits.insert(txid, a).is_some() {
                     return Err("malformed trace section".into());
+                }
+            }
+        }
+        if version == SNAPSHOT_ENCODING_VERSION_SHAPE {
+            let n = r.u32()?;
+            for _ in 0..n {
+                let rh = r.key()?;
+                let len = r.u32()?;
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if req.prompt_len == 0 && len > 0 => req.prompt_len = len,
+                    _ => return Err("malformed prompt lengths".into()),
+                }
+            }
+            let n = r.u32()?;
+            for _ in 0..n {
+                let rh = r.key()?;
+                let key = r.hash()?;
+                let shape = TraceShape { n_prompt: r.u32()?, n_pos: r.u32()?, answer_len: r.u32()? };
+                if snap.early_shapes.insert((rh, key), shape).is_some() {
+                    return Err("malformed early shapes".into());
                 }
             }
         }
@@ -2024,6 +2154,7 @@ impl ServiceLedger {
             producer_spk: self.producer_spk.clone(),
             recent_producers: Vec::new(),
             trace_audits: self.trace_audits.clone(),
+            early_shapes: self.early_shapes.clone(),
         }
     }
 
@@ -2039,6 +2170,7 @@ impl ServiceLedger {
         self.audited = snap.audited.clone();
         self.producer_spk = snap.producer_spk.clone();
         self.trace_audits = snap.trace_audits.clone();
+        self.early_shapes = snap.early_shapes.clone();
     }
 }
 
@@ -3315,16 +3447,23 @@ mod tests {
             ledger: ServiceLedger,
             model: Model,
             auditable: bool,
+            /// Shape rule: `(prompt length, answer length)` of the request and its response.
+            shape: Option<(u32, u32)>,
         }
 
         impl Run {
             fn new(auditable: bool) -> Self {
-                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable }
+                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable, shape: None }
+            }
+
+            fn shaped(prompt_len: u32, answer_len: u32) -> Self {
+                Self { shape: Some((prompt_len, answer_len)), ..Self::new(true) }
             }
 
             fn fold(&mut self, daa: u64, chain: Hash, responses: &[TraceResponseEvent], openings: &[TraceOpeningEvent]) -> Vec<(Hash, u32)> {
                 let tier = |t: u8| -> Option<TierCtx> { (self.auditable && t == 0).then(|| self.model.tier()) };
-                let tr = TraceInputs { chain_hash: chain, responses, openings, tier: &tier };
+                let lens = [(RH, self.shape.map_or(0, |(p, _)| p))];
+                let tr = TraceInputs { chain_hash: chain, responses, openings, tier: &tier, prompt_lens: &lens, shape: self.shape.is_some() };
                 let set = [miner()];
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
                 let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
@@ -3336,8 +3475,8 @@ mod tests {
                     .collect()
             }
 
-            /// Request at 100, traced response at 102, draw at 202. Returns the opening deadline.
-            fn until_draw(&mut self, honest: bool, drawn: bool) -> (u64, Vec<u8>) {
+            /// The traced response of this run: 3 prompt positions, 9 in total.
+            fn event(&mut self, honest: bool) -> (keryx_verifiable_inference::testkit::Response, TraceResponseEvent) {
                 let r = self.model.response(3, 9, honest);
                 let ev = TraceResponseEvent {
                     response_txid: TXID,
@@ -3347,7 +3486,18 @@ mod tests {
                     trace_root: r.trace_root,
                     n_prompt: r.n_prompt,
                     n_pos: r.n_pos,
+                    answer_len: self.shape.map_or(0, |(_, a)| a),
                 };
+                (r, ev)
+            }
+
+            fn window_end(&self) -> u64 {
+                self.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().window_end_daa
+            }
+
+            /// Request at 100, traced response at 102, draw at 202. Returns the opening deadline.
+            fn until_draw(&mut self, honest: bool, drawn: bool) -> (u64, Vec<u8>) {
+                let (r, ev) = self.event(honest);
                 let h0 = Hash::from_bytes([0u8; 32]);
                 assert!(self.fold(100, h0, &[], &[]).is_empty());
                 assert!(self.fold(102, h0, &[ev], &[]).is_empty());
@@ -3427,6 +3577,93 @@ mod tests {
             let (deadline, _) = run.until_draw(false, true);
             assert_eq!(deadline, 0);
             assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn misshaped_trace_is_neither_credited_nor_audited() {
+            // 64 prompt bytes need 4 prompt positions; the trace commits 3.
+            let mut run = Run::shaped(64, 8);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn well_shaped_trace_is_credited_and_audited() {
+            // 48 prompt bytes need 3 prompt positions, 60 answer bytes need 6 generated ones.
+            let mut run = Run::shaped(48, 60);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 1);
+            let end = run.window_end();
+            assert!(run.fold(end + 1, chain_hash(false), &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn answer_over_the_token_budget_is_misshaped() {
+            // max_tokens 256 allows 8 192 answer bytes.
+            let mut run = Run::shaped(0, 8_193);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn early_misshaped_trace_is_dropped_when_its_request_arrives() {
+            let mut run = Run::shaped(64, 8);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(98, h0, &[ev], &[]).is_empty());
+            assert_eq!(run.ledger.early_shapes.len(), 1);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.ledger.early_shapes.is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+
+            let mut run = Run::shaped(48, 60);
+            let (_, ev) = run.event(true);
+            assert!(run.fold(98, h0, &[ev], &[]).is_empty());
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            let end = run.window_end();
+            assert!(run.fold(end + 1, chain_hash(false), &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn shapes_round_trip_through_the_snapshot() {
+            let mut run = Run::shaped(48, 60);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(98, h0, &[ev], &[]).is_empty());
+            let bytes = run.ledger.snapshot().to_bytes();
+            assert_eq!(bytes[0], 4);
+            assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), run.ledger.snapshot());
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            let snap = run.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], 4);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+            let mut restored = Run::shaped(48, 60);
+            restored.ledger.restore_snapshot(&parsed);
+            assert_eq!(restored.ledger.pending.get(&RH).unwrap().prompt_len, 48);
+            assert!(restored.fold(101, h0, &[], &[]).is_empty());
+            let end = restored.window_end();
+            assert!(restored.fold(end + 1, chain_hash(false), &[], &[]).is_empty());
         }
 
         #[test]

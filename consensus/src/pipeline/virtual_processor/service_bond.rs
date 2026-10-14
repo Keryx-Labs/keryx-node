@@ -19,7 +19,8 @@ use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
+use keryx_inference::private::PRIVATE_TAG_LEN;
+use keryx_inference::{AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope, PrivateResponseEnvelope};
 use keryx_txscript::script_class::ScriptClass;
 
 const _: () = assert!(keryx_consensus_core::collateral::PRIVATE_COHORT_TARGET == keryx_inference::private::MAX_PRIVATE_RECIPIENTS);
@@ -320,10 +321,11 @@ impl VirtualStateProcessor {
         hash: Hash,
         txid_identity: bool,
         private: bool,
-    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>, Vec<([u8; 32], Option<Hash>)>) {
+    ) -> ServiceEvents {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
         let mut request_recipients = Vec::new();
+        let mut request_prompt_lens = Vec::new();
         let mut responses = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
         for mbad in acceptance.iter() {
@@ -346,6 +348,7 @@ impl VirtualStateProcessor {
                             }
                             requests.push((request_hash, tier as u8, req.max_tokens));
                             request_rewards.push((request_hash, req.inference_reward));
+                            request_prompt_lens.push((request_hash, plaintext_prompt_len(&req.prompt)));
                             // Past the private-inference gate the envelope names the responders
                             // obligated for (and paid by) this request. A plaintext request from a
                             // block below the gate, merged past it, folds as a public request.
@@ -368,7 +371,7 @@ impl VirtualStateProcessor {
                 }
             }
         }
-        (requests, request_rewards, request_recipients, responses)
+        ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses }
     }
 
     /// Traced responses with a verified responder, and correctly signed openings, accepted by
@@ -397,6 +400,7 @@ impl VirtualStateProcessor {
                         trace_root: trace.trace_root,
                         n_prompt: trace.n_prompt,
                         n_pos: trace.n_pos,
+                        answer_len: resp.private_body.as_deref().map_or(0, plaintext_answer_len),
                     });
                 } else if tx.is_ai_opening() {
                     let Some(signed) = SignedPayload::split(&tx.payload) else { continue };
@@ -610,11 +614,12 @@ impl VirtualStateProcessor {
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, request_recipients, responses) = self.service_events_of_chain_block(
-            hash,
-            self.reward_routing_activation.is_active(daa),
-            self.private_inference_activation.is_active(daa),
-        );
+        let ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses } = self
+            .service_events_of_chain_block(
+                hash,
+                self.reward_routing_activation.is_active(daa),
+                self.private_inference_activation.is_active(daa),
+            );
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -652,7 +657,14 @@ impl VirtualStateProcessor {
             let (trace_responses, trace_openings) = self.trace_events_of_chain_block(hash);
             let h14 = self.private_inference_activation.is_active(daa);
             let tier = |t: u8| if h14 { trace_tier_ctx(t) } else { None };
-            let traces = TraceInputs { chain_hash: hash, responses: &trace_responses, openings: &trace_openings, tier: &tier };
+            let traces = TraceInputs {
+                chain_hash: hash,
+                responses: &trace_responses,
+                openings: &trace_openings,
+                tier: &tier,
+                prompt_lens: &request_prompt_lens,
+                shape: self.trace_shape_activation.is_active(daa),
+            };
             if warmup {
                 let burned = self.service_burned.read();
                 ledger.on_chain_block_warmup_with_traces(
@@ -1615,5 +1627,30 @@ mod tests {
         script.push(keryx_txscript::opcodes::codes::OpCheckSig);
         assert_eq!(csv_escrow_pubkey(&script), Some([0x11u8; 32]));
         assert_eq!(csv_escrow_pubkey(&[0u8; 10]), None);
+    }
+}
+
+/// The service-ledger inputs of one chain block.
+struct ServiceEvents {
+    requests: Vec<([u8; 32], u8, u32)>,
+    request_rewards: Vec<([u8; 32], u64)>,
+    request_recipients: Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>,
+    request_prompt_lens: Vec<([u8; 32], u32)>,
+    responses: Vec<([u8; 32], Option<Hash>)>,
+}
+
+/// Plaintext length of a request prompt: the sealed length without the envelope, else the bytes.
+fn plaintext_prompt_len(prompt: &[u8]) -> u32 {
+    match PrivateRequestEnvelope::parse(prompt) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => prompt.len().min(u32::MAX as usize) as u32,
+    }
+}
+
+/// Plaintext length of a sealed answer body.
+fn plaintext_answer_len(body: &[u8]) -> u32 {
+    match PrivateResponseEnvelope::parse(body) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => 0,
     }
 }

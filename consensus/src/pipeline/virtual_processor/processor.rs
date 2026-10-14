@@ -181,6 +181,8 @@ pub struct VirtualStateProcessor {
     pub(super) private_inference_activation: ForkActivation,
     /// Verifiable-inference activation (see `params.verifiable_inference_activation`).
     pub(super) verifiable_inference_activation: ForkActivation,
+    /// Trace shape rule activation (see `params.trace_shape_activation`).
+    pub(super) trace_shape_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -409,6 +411,7 @@ impl VirtualStateProcessor {
             reward_routing_activation: params.reward_routing_activation,
             private_inference_activation: params.private_inference_activation,
             verifiable_inference_activation: params.verifiable_inference_activation,
+            trace_shape_activation: params.trace_shape_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
