@@ -13,7 +13,7 @@ use keryx_consensus_core::collateral::{
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
     TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
 };
-use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_tier_ctx};
+use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
@@ -656,14 +656,15 @@ impl VirtualStateProcessor {
         if self.verifiable_inference_activation.is_active(daa) {
             let (trace_responses, trace_openings) = self.trace_events_of_chain_block(hash);
             let h14 = self.private_inference_activation.is_active(daa);
-            let tier = |t: u8| if h14 { trace_tier_ctx(t) } else { None };
+            let prefix_at = |at: u64| self.trace_prefix_activation.is_active(at);
+            let tier = |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at)) } else { None };
             let traces = TraceInputs {
                 chain_hash: hash,
                 responses: &trace_responses,
                 openings: &trace_openings,
                 tier: &tier,
                 prompt_lens: &request_prompt_lens,
-                shape: self.trace_shape_activation.is_active(daa),
+                shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();

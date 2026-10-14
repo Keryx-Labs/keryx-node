@@ -6,7 +6,7 @@ pub const VERSION: u8 = 1;
 /// Version 1 plus a prefix point after the points.
 pub const VERSION_PREFIX: u8 = 2;
 /// Largest opening body.
-pub const MAX_BODY_LEN: usize = 80 * 1024;
+pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
 pub const SIGNATURE_LEN: usize = 32 + 64;
 /// Smallest opening payload: version, response id, point count and the signature.

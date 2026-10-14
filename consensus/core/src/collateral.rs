@@ -177,7 +177,8 @@ pub struct TraceInputs<'a> {
     pub chain_hash: Hash,
     pub responses: &'a [TraceResponseEvent],
     pub openings: &'a [TraceOpeningEvent],
-    pub tier: &'a dyn Fn(u8) -> Option<keryx_verifiable_inference::verify::TierCtx>,
+    /// Audit rules of a tier for a response accepted at a DAA score.
+    pub tier: &'a dyn Fn(u8, u64) -> Option<crate::config::params::TraceRules>,
     /// Plaintext prompt length of the block's accepted requests, by request hash.
     pub prompt_lens: &'a [([u8; 32], u32)],
     /// Whether the shape rule is active at this block.
@@ -194,8 +195,9 @@ struct TraceShape {
     answer_len: u32,
 }
 
-fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape) -> bool {
+fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, prefix_offset: Option<u32>) -> bool {
     keryx_verifiable_inference::shape::shape_ok(req.prompt_len, shape.answer_len, req.max_tokens, shape.n_prompt, shape.n_pos)
+        && prefix_offset.is_none_or(|o| keryx_verifiable_inference::prefix::fits(shape.n_prompt, o))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,21 +227,29 @@ pub fn trace_seed(chain_hash: &Hash, response_txid: &[u8; 32]) -> [u8; 32] {
     seed
 }
 
-/// Whether an opening body proves every drawn point of `audit` under `seed`.
+/// Whether an opening body proves every drawn point of `audit` under `seed`, the prefix point
+/// included when the rules carry a prefix context.
 fn trace_opening_valid(
-    ctx: &keryx_verifiable_inference::verify::TierCtx,
+    rules: &crate::config::params::TraceRules,
     audit: &TraceAudit,
     seed: &[u8; 32],
     txid: &[u8; 32],
     body: &[u8],
 ) -> bool {
-    use keryx_verifiable_inference::{draw::POINTS, opening::Opening, verify};
+    use keryx_verifiable_inference::{draw::POINTS, opening::Opening, prefix, verify};
     let Some(opening) = Opening::decode(body) else { return false };
     if &opening.response_txid != txid || opening.points.len() != POINTS as usize {
         return false;
     }
     let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
-    opening.points.iter().enumerate().all(|(i, p)| verify::verify_point(ctx, &resp, seed, i as u32, p).is_ok())
+    if !opening.points.iter().enumerate().all(|(i, p)| verify::verify_point(&rules.ctx, &resp, seed, i as u32, p).is_ok()) {
+        return false;
+    }
+    match (&rules.prefix, &opening.prefix) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(pc), Some(p)) => prefix::verify_prefix_point(&rules.ctx, pc, &resp, seed, &audit.request_hash, p).is_ok(),
+    }
 }
 
 /// Domain separator of the trace opening signature.
@@ -936,14 +946,15 @@ impl ServiceLedger {
                 cohort_seed: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, s, _)| *s).unwrap_or([0u8; 36]),
                 prompt_len,
             });
-            if traces.is_some_and(|tr| tr.shape) {
+            if let Some(tr) = traces.filter(|tr| tr.shape) {
+                let prefix_offset = (tr.tier)(entry.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
                 let shapes: Vec<(Hash, TraceShape)> = self
                     .early_shapes
                     .range((*rh, Hash::from_bytes([0u8; 32]))..=(*rh, Hash::from_bytes([0xffu8; 32])))
                     .map(|((_, key), shape)| (*key, *shape))
                     .collect();
                 self.early_shapes.retain(|(h, _), _| h != rh);
-                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape)));
+                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset)));
             }
             // Answers that beat their own request to acceptance.
             if entry.audit.is_none() {
@@ -963,7 +974,8 @@ impl ServiceLedger {
                 let shape = TraceShape { n_prompt: ev.n_prompt, n_pos: ev.n_pos, answer_len: ev.answer_len };
                 match self.pending.get(&ev.request_hash) {
                     Some(req) => {
-                        if !trace_shape_ok(req, &shape) {
+                        let prefix_offset = (tr.tier)(req.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
+                        if !trace_shape_ok(req, &shape, prefix_offset) {
                             misshaped.push((ev.request_hash, ev.responder));
                         }
                     }
@@ -1194,7 +1206,7 @@ impl ServiceLedger {
             let mut a = self.trace_audits.remove(&txid).unwrap();
             self.resolve_trace_audit(&mut a);
             let seed = trace_seed(&tr.chain_hash, &txid);
-            let auditable = a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() && (tr.tier)(a.tier).is_some();
+            let auditable = a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() && (tr.tier)(a.tier, a.accepted_daa).is_some();
             if auditable && keryx_verifiable_inference::draw::audited(&seed) {
                 a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa));
                 a.seed = Some(seed);
@@ -1209,7 +1221,8 @@ impl ServiceLedger {
                 continue;
             }
             let a = self.trace_audits.remove(&op.response_txid).unwrap();
-            let valid = (tr.tier)(a.tier).is_some_and(|ctx| trace_opening_valid(&ctx, &a, &seed, &op.response_txid, &op.body));
+            let valid =
+                (tr.tier)(a.tier, a.accepted_daa).is_some_and(|rules| trace_opening_valid(&rules, &a, &seed, &op.response_txid, &op.body));
             if !valid {
                 for miner in a.identities.iter() {
                     if warmup {
@@ -3422,7 +3435,8 @@ mod tests {
     mod traces {
         use super::super::{ServiceLedger, ServiceLedgerSnapshot, TraceInputs, TraceOpeningEvent, TraceResponseEvent, trace_seed};
         use keryx_hashes::Hash;
-        use keryx_verifiable_inference::{draw, testkit::Model, verify::TierCtx};
+        use crate::config::params::TraceRules;
+        use keryx_verifiable_inference::{draw, testkit::Model};
 
         const RH: [u8; 32] = [7u8; 32];
         const TXID: [u8; 32] = [0x51u8; 32];
@@ -3449,19 +3463,29 @@ mod tests {
             auditable: bool,
             /// Shape rule: `(prompt length, answer length)` of the request and its response.
             shape: Option<(u32, u32)>,
+            /// Prefix rule: the prefix offset, and the request id the traced prompt carries.
+            prefix: Option<(u32, [u8; 32])>,
         }
 
         impl Run {
             fn new(auditable: bool) -> Self {
-                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable, shape: None }
+                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable, shape: None, prefix: None }
             }
 
             fn shaped(prompt_len: u32, answer_len: u32) -> Self {
                 Self { shape: Some((prompt_len, answer_len)), ..Self::new(true) }
             }
 
+            /// Prefix rule at `offset`, traced prompt carrying `carried` as the request id.
+            fn prefixed(offset: u32, carried: [u8; 32]) -> Self {
+                Self { prefix: Some((offset, carried)), ..Self::shaped(64, 10) }
+            }
+
             fn fold(&mut self, daa: u64, chain: Hash, responses: &[TraceResponseEvent], openings: &[TraceOpeningEvent]) -> Vec<(Hash, u32)> {
-                let tier = |t: u8| -> Option<TierCtx> { (self.auditable && t == 0).then(|| self.model.tier()) };
+                let tier = |t: u8, _at: u64| -> Option<TraceRules> {
+                    (self.auditable && t == 0)
+                        .then(|| TraceRules { ctx: self.model.tier(), prefix: self.prefix.map(|(o, _)| self.model.prefix_ctx(o)) })
+                };
                 let lens = [(RH, self.shape.map_or(0, |(p, _)| p))];
                 let tr = TraceInputs { chain_hash: chain, responses, openings, tier: &tier, prompt_lens: &lens, shape: self.shape.is_some() };
                 let set = [miner()];
@@ -3475,9 +3499,13 @@ mod tests {
                     .collect()
             }
 
-            /// The traced response of this run: 3 prompt positions, 9 in total.
+            /// The traced response of this run: 3 prompt positions, 9 in total (40 and 48 under
+            /// the prefix rule).
             fn event(&mut self, honest: bool) -> (keryx_verifiable_inference::testkit::Response, TraceResponseEvent) {
-                let r = self.model.response(3, 9, honest);
+                let r = match &self.prefix {
+                    Some((offset, carried)) => self.model.response_with_prefix(40, 48, honest, Some((carried, *offset))),
+                    None => self.model.response(3, 9, honest),
+                };
                 let ev = TraceResponseEvent {
                     response_txid: TXID,
                     request_hash: RH,
@@ -3495,16 +3523,30 @@ mod tests {
                 self.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().window_end_daa
             }
 
-            /// Request at 100, traced response at 102, draw at 202. Returns the opening deadline.
-            fn until_draw(&mut self, honest: bool, drawn: bool) -> (u64, Vec<u8>) {
+            /// Request at 100, traced response at 102, draw at 202: the response and its seed.
+            fn drawn(&mut self, honest: bool, drawn: bool) -> (keryx_verifiable_inference::testkit::Response, [u8; 32]) {
                 let (r, ev) = self.event(honest);
                 let h0 = Hash::from_bytes([0u8; 32]);
                 assert!(self.fold(100, h0, &[], &[]).is_empty());
                 assert!(self.fold(102, h0, &[ev], &[]).is_empty());
                 let ch = chain_hash(drawn);
                 assert!(self.fold(202, ch, &[], &[]).is_empty());
-                let body = self.model.open(&r, TXID, &trace_seed(&ch, &TXID)).encode();
-                (self.ledger.trace_audits.get(&TXID).map(|a| a.deadline_daa).unwrap_or(0), body)
+                (r, trace_seed(&ch, &TXID))
+            }
+
+            fn deadline(&self) -> u64 {
+                self.ledger.trace_audits.get(&TXID).map(|a| a.deadline_daa).unwrap_or(0)
+            }
+
+            /// [`Self::drawn`] then the opening of this run. Returns the opening deadline.
+            fn until_draw(&mut self, honest: bool, drawn: bool) -> (u64, Vec<u8>) {
+                let (r, seed) = self.drawn(honest, drawn);
+                let body = match &self.prefix {
+                    Some((offset, carried)) => self.model.open_with_prefix(&r, TXID, &seed, carried, *offset),
+                    None => self.model.open(&r, TXID, &seed),
+                }
+                .encode();
+                (self.deadline(), body)
             }
         }
 
@@ -3577,6 +3619,50 @@ mod tests {
             let (deadline, _) = run.until_draw(false, true);
             assert_eq!(deadline, 0);
             assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn prefix_opening_closes_the_audit() {
+            let mut run = Run::prefixed(8, RH);
+            let (deadline, body) = run.until_draw(true, true);
+            assert!(deadline > 203);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn opening_without_the_prefix_point_is_fraud_under_the_prefix_rule() {
+            let mut run = Run::prefixed(8, RH);
+            let (r, seed) = run.drawn(true, true);
+            let body = run.model.open(&r, TXID, &seed).encode();
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn trace_of_another_request_is_fraud_under_the_prefix_rule() {
+            let mut run = Run::prefixed(8, [0x99u8; 32]);
+            let (_, body) = run.until_draw(true, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn prompt_too_short_for_the_prefix_is_misshaped() {
+            // 40 prompt positions hold a prefix at offset 8, not at offset 9.
+            let mut run = Run::prefixed(9, RH);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
         }
 
         #[test]

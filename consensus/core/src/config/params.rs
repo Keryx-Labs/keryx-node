@@ -668,17 +668,172 @@ pub const TRACE_MANIFESTS_H14: [Option<TraceManifest>; 5] = [
     None,
 ];
 
-/// Verifier context of `tier` in the H14 lineup.
-pub fn trace_tier_ctx(tier: u8) -> Option<keryx_verifiable_inference::verify::TierCtx> {
-    let m = (*TRACE_MANIFESTS_H14.get(tier as usize)?)?;
+/// Trace manifests of the H14 lineup with the embedding and layer-0 norm entries, by tier.
+pub const TRACE_MANIFESTS_PREFIX: [Option<TraceManifest>; 5] = [
+    Some(TraceManifest {
+        m_t: [
+            0x9b, 0x80, 0x2a, 0xe5, 0xf4, 0xca, 0xfe, 0x07, 0x3b, 0xd9, 0x7b, 0x72, 0x22, 0x2a, 0x77, 0xf4,
+            0x4e, 0xb5, 0x97, 0x49, 0x1a, 0xb0, 0x72, 0x35, 0x18, 0x0c, 0x5e, 0xf8, 0x78, 0x3f, 0x62, 0xbc,
+        ],
+        n_entries: 251,
+        n_products: 249,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x5d, 0x67, 0x8f, 0xfb, 0xd6, 0xc4, 0x16, 0x4c, 0xc8, 0xd4, 0x00, 0x61, 0x68, 0xad, 0xc2, 0x76,
+            0x54, 0x1f, 0xdf, 0x3f, 0x18, 0x1e, 0xa8, 0xa8, 0x9c, 0xac, 0x70, 0x23, 0x1e, 0x7d, 0x7d, 0x1a,
+        ],
+        n_entries: 363,
+        n_products: 241,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0xc0, 0x9c, 0x80, 0xb1, 0x81, 0x5b, 0x93, 0xdb, 0xa8, 0xb4, 0x30, 0xf2, 0x64, 0x8e, 0x50, 0xbe,
+            0x87, 0x13, 0x7d, 0xe9, 0x45, 0xf9, 0x6c, 0xa8, 0x2e, 0x4c, 0xfa, 0x20, 0x84, 0xb2, 0xa8, 0x08,
+        ],
+        n_entries: 331,
+        n_products: 329,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x98, 0xdc, 0x87, 0xdc, 0x3c, 0xf1, 0x29, 0x72, 0x32, 0xe8, 0x9e, 0x58, 0xbf, 0xae, 0x50, 0x1c,
+            0x11, 0x72, 0xba, 0x05, 0x62, 0x68, 0x07, 0xa0, 0x86, 0xca, 0x38, 0xcd, 0xaf, 0xfb, 0x4c, 0x47,
+        ],
+        n_entries: 499,
+        n_products: 497,
+    }),
+    None,
+];
+
+/// Prefix context of a tier (`keryx_verifiable_inference::prefix::PrefixCtx`).
+pub type TracePrefix = keryx_verifiable_inference::prefix::PrefixCtx;
+
+/// Prefix contexts of the H14 lineup, by tier. `None`: the tier is not audited.
+pub const TRACE_PREFIXES: [Option<TracePrefix>; 5] = [
+    Some(TracePrefix {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 6,
+        embd_entry: 249,
+        norm_entry: 250,
+        eps: 9.999999974752427e-07,
+        embd_scale: 1.0,
+    }),
+    Some(TracePrefix {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 7,
+        embd_entry: 361,
+        norm_entry: 362,
+        eps: 9.999999747378752e-06,
+        embd_scale: 1.0,
+    }),
+    Some(TracePrefix {
+        table: [
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 107, 249, 250, 251, 252, 253,
+            254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
+            270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285,
+            286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301,
+            302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+            318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
+            334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349,
+            350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365,
+            366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381,
+            382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397,
+            398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
+            414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429,
+            430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445,
+            446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461,
+            462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
+            478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493,
+        ],
+        offset: 7,
+        embd_entry: 329,
+        norm_entry: 330,
+        eps: 9.999999974752427e-07,
+        embd_scale: 61.967735290527344,
+    }),
+    Some(TracePrefix {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 6,
+        embd_entry: 497,
+        norm_entry: 498,
+        eps: 9.999999974752427e-07,
+        embd_scale: 1.0,
+    }),
+    None,
+];
+
+/// Audit rules of a tier: the verifier context and, under the prefix rule, the prefix context.
+#[derive(Clone, Debug)]
+pub struct TraceRules {
+    pub ctx: keryx_verifiable_inference::verify::TierCtx,
+    pub prefix: Option<TracePrefix>,
+}
+
+/// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests.
+pub fn trace_rules(tier: u8, prefix: bool) -> Option<TraceRules> {
+    let manifests = if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 };
+    let m = (*manifests.get(tier as usize)?)?;
     let t = POM_TIERS_H14.get(tier as usize)?;
-    Some(keryx_verifiable_inference::verify::TierCtx {
+    let ctx = keryx_verifiable_inference::verify::TierCtx {
         r_t: t.root,
         n_chunks: t.chunks,
         m_t: m.m_t,
         n_entries: m.n_entries,
         n_products: m.n_products,
-    })
+    };
+    let prefix = if prefix { Some(TRACE_PREFIXES.get(tier as usize)?.clone()?) } else { None };
+    Some(TraceRules { ctx, prefix })
 }
 
 /// Tier lineup of the service ledger and the provider queries: the H14 set once
@@ -1405,6 +1560,10 @@ pub struct Params {
     /// (`keryx_verifiable_inference::shape`), or the response is neither credited nor audited.
     /// Changes the audit fold. `never()` = dormant.
     pub trace_shape_activation: ForkActivation,
+    /// A traced prompt carries the request id and the audit opens one of those positions
+    /// against the model embedding (`keryx_verifiable_inference::prefix`); implies the shape
+    /// rule. Changes the audit fold. `never()` = dormant.
+    pub trace_prefix_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1678,6 +1837,7 @@ impl Params {
             private_inference_activation: self.private_inference_activation,
             verifiable_inference_activation: self.verifiable_inference_activation,
             trace_shape_activation: self.trace_shape_activation,
+            trace_prefix_activation: self.trace_prefix_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -1892,6 +2052,7 @@ pub const MAINNET_PARAMS: Params = Params {
     private_inference_activation: ForkActivation::new(H14_ACTIVATION_DAA),
     verifiable_inference_activation: ForkActivation::never(),
     trace_shape_activation: ForkActivation::never(),
+    trace_prefix_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2026,6 +2187,7 @@ pub const TESTNET_PARAMS: Params = Params {
     private_inference_activation: ForkActivation::new(6_000),
     verifiable_inference_activation: ForkActivation::new(200_000),
     trace_shape_activation: ForkActivation::never(),
+    trace_prefix_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2122,6 +2284,7 @@ pub const SIMNET_PARAMS: Params = Params {
     private_inference_activation: ForkActivation::never(),
     verifiable_inference_activation: ForkActivation::never(),
     trace_shape_activation: ForkActivation::never(),
+    trace_prefix_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2212,6 +2375,7 @@ pub const DEVNET_PARAMS: Params = Params {
     private_inference_activation: ForkActivation::never(),
     verifiable_inference_activation: ForkActivation::never(),
     trace_shape_activation: ForkActivation::never(),
+    trace_prefix_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),

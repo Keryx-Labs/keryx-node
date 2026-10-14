@@ -15,6 +15,7 @@ pub const PREFIX_POINT: u32 = draw::POINTS;
 pub const THRESHOLD: f64 = 1.0;
 
 /// Consensus data of a tier's prefix.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PrefixCtx {
     /// Token id of each byte value.
     pub table: [u32; 256],

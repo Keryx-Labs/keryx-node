@@ -43,9 +43,11 @@ const MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
 const MAXIMUM_STANDARD_AI_REQUEST_TRANSIENT_MASS: u64 =
     (keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
 
+/// Maximum standard compute mass of an opening: the largest payload plus the transaction header.
+const MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS: u64 = keryx_verifiable_inference::opening::MAX_PAYLOAD_LEN as u64 + 4_096;
+
 /// Maximum standard transient mass of an opening: the largest payload plus the transaction header.
-const MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS: u64 =
-    (keryx_verifiable_inference::opening::MAX_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
+const MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS: u64 = MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS * TRANSIENT_BYTE_TO_MASS_FACTOR;
 
 impl Mempool {
     pub(crate) fn check_transaction_standard_in_isolation(&self, transaction: &MutableTransaction) -> NonStandardResult<()> {
@@ -72,8 +74,10 @@ impl Mempool {
         // size of a transaction. This also helps mitigate CPU exhaustion
         // attacks.
         let NonContextualMasses { compute_mass, transient_mass } = transaction.calculated_non_contextual_masses.unwrap();
-        if compute_mass > MAXIMUM_STANDARD_TRANSACTION_MASS {
-            return Err(NonStandardError::RejectComputeMass(transaction_id, compute_mass, MAXIMUM_STANDARD_TRANSACTION_MASS));
+        let max_compute_mass =
+            if transaction.tx.is_ai_opening() { MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS } else { MAXIMUM_STANDARD_TRANSACTION_MASS };
+        if compute_mass > max_compute_mass {
+            return Err(NonStandardError::RejectComputeMass(transaction_id, compute_mass, max_compute_mass));
         }
         let max_transient_mass = if transaction.tx.is_ai_request() {
             MAXIMUM_STANDARD_AI_REQUEST_TRANSIENT_MASS

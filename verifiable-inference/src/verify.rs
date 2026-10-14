@@ -13,6 +13,7 @@ const MMVQ_MAX_BATCH: u32 = 8;
 const MATRIX_ROW_PADDING: u64 = 512;
 
 /// Consensus data of a tier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierCtx {
     pub r_t: Hash,
     pub n_chunks: u64,
