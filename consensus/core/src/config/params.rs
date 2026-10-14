@@ -2186,8 +2186,8 @@ pub const TESTNET_PARAMS: Params = Params {
     // flipping it below already-folded history splits the testnet.
     private_inference_activation: ForkActivation::new(6_000),
     verifiable_inference_activation: ForkActivation::new(200_000),
-    trace_shape_activation: ForkActivation::never(),
-    trace_prefix_activation: ForkActivation::never(),
+    trace_shape_activation: ForkActivation::new(215_000),
+    trace_prefix_activation: ForkActivation::new(215_000),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
