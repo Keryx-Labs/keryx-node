@@ -48,7 +48,7 @@ pub struct Report {
     pub tol: f64,
 }
 
-fn open_entry(tier: &TierCtx, e: &EntryOpening, expected_index: u64) -> Result<Entry, Fail> {
+pub(crate) fn open_entry(tier: &TierCtx, e: &EntryOpening, expected_index: u64) -> Result<Entry, Fail> {
     if e.index as u64 != expected_index || !manifest::verify_entry(&tier.m_t, tier.n_entries, expected_index, &e.bytes, &e.path) {
         return Err(Fail::Manifest);
     }
@@ -57,7 +57,7 @@ fn open_entry(tier: &TierCtx, e: &EntryOpening, expected_index: u64) -> Result<E
 }
 
 /// Tensor bytes proven against the model root.
-fn open_bytes(tier: &TierCtx, entry: &Entry, r: &ChunkRange, offset: u64, len: u64) -> Result<Vec<u8>, Fail> {
+pub(crate) fn open_bytes(tier: &TierCtx, entry: &Entry, r: &ChunkRange, offset: u64, len: u64) -> Result<Vec<u8>, Fail> {
     let end = offset + len;
     if len == 0 || end > entry.n_bytes / 32 * 32 {
         return Err(Fail::Shape);
@@ -75,7 +75,7 @@ fn open_bytes(tier: &TierCtx, entry: &Entry, r: &ChunkRange, offset: u64, len: u
     Ok(r.chunks[o..o + len as usize].to_vec())
 }
 
-fn open_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, row: u64) -> Result<Vec<u8>, Fail> {
+pub(crate) fn open_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, row: u64) -> Result<Vec<u8>, Fail> {
     if row >= entry.m || entry.n_exp != 1 {
         return Err(Fail::Shape);
     }
@@ -83,7 +83,7 @@ fn open_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, row: u64) -> Result<V
     open_bytes(tier, entry, r, row * rb, rb)
 }
 
-fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
+pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
     if n_ubatch <= MMVQ_MAX_BATCH {
         q8::MMVQ
     } else if matches!(wtype, 2 | 3 | 7 | quant::Q4_K | quant::Q5_K) {
@@ -93,7 +93,7 @@ fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
     }
 }
 
-fn x_len(k: u64, layout: u8) -> u64 {
+pub(crate) fn x_len(k: u64, layout: u8) -> u64 {
     let kp = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     if layout == q8::MMVQ { kp / 32 * 36 } else { kp / 128 * 144 }
 }

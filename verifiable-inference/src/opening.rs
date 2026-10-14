@@ -3,6 +3,8 @@
 use crate::merkle::Hash;
 
 pub const VERSION: u8 = 1;
+/// Version 1 plus a prefix point after the points.
+pub const VERSION_PREFIX: u8 = 2;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 80 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -60,10 +62,25 @@ pub struct Point {
     pub y_path: Vec<Hash>,
 }
 
+/// The layer-0 check of one prefix position: the input of the first product against the
+/// embedding of the token the request id puts there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrefixPoint {
+    pub n_ubatch: u32,
+    pub pos_path: Vec<Hash>,
+    pub meta_path: Vec<Hash>,
+    pub entry: EntryOpening,
+    pub x: Vec<u8>,
+    pub x_path: Vec<Hash>,
+    pub embd: (EntryOpening, ChunkRange),
+    pub norm: (EntryOpening, ChunkRange),
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Opening {
     pub response_txid: Hash,
     pub points: Vec<Point>,
+    pub prefix: Option<PrefixPoint>,
 }
 
 struct W(Vec<u8>);
@@ -153,7 +170,7 @@ impl R<'_> {
 impl Opening {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u8(VERSION);
+        w.u8(if self.prefix.is_some() { VERSION_PREFIX } else { VERSION });
         w.0.extend_from_slice(&self.response_txid);
         w.u8(self.points.len() as u8);
         for p in &self.points {
@@ -188,12 +205,25 @@ impl Opening {
             w.hashes(&p.y_chunk_path);
             w.hashes(&p.y_path);
         }
+        if let Some(p) = &self.prefix {
+            w.u32(p.n_ubatch);
+            w.hashes(&p.pos_path);
+            w.hashes(&p.meta_path);
+            w.entry(&p.entry);
+            w.bytes32(&p.x);
+            w.hashes(&p.x_path);
+            w.entry(&p.embd.0);
+            w.range(&p.embd.1);
+            w.entry(&p.norm.0);
+            w.range(&p.norm.1);
+        }
         w.0
     }
 
     pub fn decode(b: &[u8]) -> Option<Opening> {
         let mut r = R { b, o: 0 };
-        if r.u8()? != VERSION {
+        let version = r.u8()?;
+        if version != VERSION && version != VERSION_PREFIX {
             return None;
         }
         let response_txid: Hash = r.take(32)?.try_into().ok()?;
@@ -225,6 +255,20 @@ impl Opening {
                 y_path: r.hashes()?,
             });
         }
-        (r.o == b.len()).then_some(Opening { response_txid, points })
+        let prefix = if version == VERSION_PREFIX {
+            Some(PrefixPoint {
+                n_ubatch: r.u32()?,
+                pos_path: r.hashes()?,
+                meta_path: r.hashes()?,
+                entry: r.entry()?,
+                x: r.bytes32()?,
+                x_path: r.hashes()?,
+                embd: (r.entry()?, r.range()?),
+                norm: (r.entry()?, r.range()?),
+            })
+        } else {
+            None
+        };
+        (r.o == b.len()).then_some(Opening { response_txid, points, prefix })
     }
 }

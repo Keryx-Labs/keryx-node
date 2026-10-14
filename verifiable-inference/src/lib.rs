@@ -6,6 +6,7 @@ pub mod f16;
 pub mod manifest;
 pub mod merkle;
 pub mod opening;
+pub mod prefix;
 pub mod q8;
 pub mod quant;
 pub mod shape;

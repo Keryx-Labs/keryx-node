@@ -2,6 +2,39 @@
 
 use crate::f16;
 
+/// Scale and quantized values of each 32-value block of a row.
+pub fn blocks(leaf: &[u8], layout: u8, k: usize) -> Option<Vec<(f32, [i8; 32])>> {
+    let mut out = Vec::with_capacity(k.div_ceil(32));
+    match layout {
+        MMVQ => {
+            if leaf.len() < k.div_ceil(32) * 36 {
+                return None;
+            }
+            for blk in leaf.chunks_exact(36).take(k.div_ceil(32)) {
+                out.push((f16::read(blk, 0), std::array::from_fn(|j| blk[4 + j] as i8)));
+            }
+        }
+        MMQ_D4 | MMQ_DS4 | MMQ_D2S6 => {
+            if leaf.len() < k.div_ceil(128) * 144 {
+                return None;
+            }
+            for blk in leaf.chunks_exact(144).take(k.div_ceil(128)) {
+                for sb in 0..4 {
+                    let d = match layout {
+                        MMQ_D4 => f32::from_le_bytes([blk[4 * sb], blk[4 * sb + 1], blk[4 * sb + 2], blk[4 * sb + 3]]),
+                        MMQ_DS4 => f16::read(blk, 4 * sb),
+                        _ => f16::read(blk, 2 * (sb / 2)),
+                    };
+                    out.push((d, std::array::from_fn(|j| blk[16 + 32 * sb + j] as i8)));
+                }
+            }
+        }
+        _ => return None,
+    }
+    out.truncate(k.div_ceil(32));
+    Some(out)
+}
+
 pub const MMVQ: u8 = 0;
 pub const MMQ_D4: u8 = 1;
 pub const MMQ_DS4: u8 = 2;
