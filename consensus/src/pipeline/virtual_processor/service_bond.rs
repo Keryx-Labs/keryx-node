@@ -180,10 +180,11 @@ fn log_new_service_misses(
         }
         let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
         info!(
-            "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (awaiting finality)",
+            "service-bond: miss #{} by miner {} on request {}{} → {:?}, {} claims / {} sompi (awaiting finality)",
             miss.consecutive_misses,
             miss.miner,
             hex::encode(miss.request_hash),
+            if miss.opening_missing { " (opening missing)" } else { "" },
             miss.penalty,
             miss.burned.len(),
             burned_total
@@ -667,6 +668,7 @@ impl VirtualStateProcessor {
                 prompt_lens: &request_prompt_lens,
                 shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa),
                 unique_root: audit_at(daa),
+                sanction: self.trace_sanction_activation.is_active(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();

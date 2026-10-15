@@ -1569,6 +1569,10 @@ pub struct Params {
     /// Every traced response is audited, and a trace root is admitted once within the ledger
     /// memory. Changes the audit fold. `never()` = dormant.
     pub trace_audit_activation: ForkActivation,
+    /// A missing opening strikes without the strike interval guard, and a traced response under
+    /// the audit rule resets the streak at its accepted opening instead of at the response.
+    /// `never()` = dormant.
+    pub trace_sanction_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1844,6 +1848,7 @@ impl Params {
             trace_shape_activation: self.trace_shape_activation,
             trace_prefix_activation: self.trace_prefix_activation,
             trace_audit_activation: self.trace_audit_activation,
+            trace_sanction_activation: self.trace_sanction_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2060,6 +2065,7 @@ pub const MAINNET_PARAMS: Params = Params {
     trace_shape_activation: ForkActivation::never(),
     trace_prefix_activation: ForkActivation::never(),
     trace_audit_activation: ForkActivation::never(),
+    trace_sanction_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2196,6 +2202,7 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_shape_activation: ForkActivation::new(215_000),
     trace_prefix_activation: ForkActivation::new(215_000),
     trace_audit_activation: ForkActivation::new(240_000),
+    trace_sanction_activation: ForkActivation::new(280_000),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2294,6 +2301,7 @@ pub const SIMNET_PARAMS: Params = Params {
     trace_shape_activation: ForkActivation::never(),
     trace_prefix_activation: ForkActivation::never(),
     trace_audit_activation: ForkActivation::never(),
+    trace_sanction_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2386,6 +2394,7 @@ pub const DEVNET_PARAMS: Params = Params {
     trace_shape_activation: ForkActivation::never(),
     trace_prefix_activation: ForkActivation::never(),
     trace_audit_activation: ForkActivation::never(),
+    trace_sanction_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),

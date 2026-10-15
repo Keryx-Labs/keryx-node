@@ -187,6 +187,8 @@ pub struct VirtualStateProcessor {
     pub(super) trace_prefix_activation: ForkActivation,
     /// Trace audit rule activation (see `params.trace_audit_activation`).
     pub(super) trace_audit_activation: ForkActivation,
+    /// Trace sanction rule activation (see `params.trace_sanction_activation`).
+    pub(super) trace_sanction_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -418,6 +420,7 @@ impl VirtualStateProcessor {
             trace_shape_activation: params.trace_shape_activation,
             trace_prefix_activation: params.trace_prefix_activation,
             trace_audit_activation: params.trace_audit_activation,
+            trace_sanction_activation: params.trace_sanction_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),

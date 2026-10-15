@@ -185,6 +185,9 @@ pub struct TraceInputs<'a> {
     pub shape: bool,
     /// Whether a trace root is admitted once at this block.
     pub unique_root: bool,
+    /// Whether the sanction rule is active at this block: a missing opening strikes without the
+    /// interval guard, and a response under the audit rule resets the streak at its opening.
+    pub sanction: bool,
 }
 
 const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
@@ -567,6 +570,8 @@ pub struct ServiceMiss {
     /// finality-deep, reorg-immune deadline from the miss's own daa.
     pub penalty: ServicePenalty,
     pub burned: Vec<EscrowClaim>,
+    /// The miss is an audited response left unopened, not a silent cohort member.
+    pub opening_missing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1034,6 +1039,7 @@ impl ServiceLedger {
                 continue;
             }
             let mut served: Vec<Hash> = Vec::new();
+            let req_tier: u8;
             {
                 let Some(req) = self.pending.get_mut(rh) else {
                     let entry = self.early_responses.entry(*rh).or_insert((daa, Vec::new()));
@@ -1042,6 +1048,7 @@ impl ServiceLedger {
                     }
                     continue;
                 };
+                req_tier = req.tier;
                 let Some(audit) = req.audit.as_mut() else {
                     if !req.early_responders.contains(r) {
                         req.early_responders.push(*r);
@@ -1059,9 +1066,12 @@ impl ServiceLedger {
             if let Some(first) = served.first().copied() {
                 self.maybe_award(rh, first, warmup, &mut outcome);
             }
+            // Under the sanction rule a traced response that will be audited resets the streak at
+            // its accepted opening, not here.
+            let reset_at_opening = self.reset_waits_for_opening(traces, rh, r, req_tier, daa);
             for identity in served {
                 // A warmup fold leaves strikes alone: the baseline already carries this reset.
-                if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
+                if !warmup && !reset_at_opening && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
                     let preserved = self.reset_preserved_last_daa(&identity, daa);
                     self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: preserved });
                     outcome.resets.push((identity, preserved));
@@ -1115,6 +1125,7 @@ impl ServiceLedger {
                             consecutive_misses: count,
                             penalty,
                             burned,
+                            opening_missing: false,
                         });
                     }
                     self.pending.remove(&rh);
@@ -1149,13 +1160,17 @@ impl ServiceLedger {
                             service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa));
                         // Credit whoever answered before the audit existed: same membership test
                         // as the live path, so an early answer and a late one are worth the same.
+                        let req_tier = req.tier;
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
                         let mut responded: Vec<Hash> = Vec::new();
                         for key in early.iter() {
+                            let waits = self.reset_waits_for_opening(traces, &rh, key, req_tier, daa);
                             for identity in delegations.iter().filter(|(e, _)| e == key).map(|(_, id)| id) {
                                 if ids.binary_search(identity).is_ok() && !responded.contains(identity) {
                                     responded.push(*identity);
-                                    served_at_arm.push(*identity);
+                                    if !waits {
+                                        served_at_arm.push(*identity);
+                                    }
                                 }
                             }
                         }
@@ -1269,6 +1284,15 @@ impl ServiceLedger {
                 responder: a.responder,
                 cause: verdict.err(),
             });
+            if verdict.is_ok() && tr.sanction && !warmup {
+                for miner in a.identities.iter() {
+                    if self.strike_state(miner).is_some_and(|e| e.count > 0) {
+                        let preserved = self.reset_preserved_last_daa(miner, daa);
+                        self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: preserved });
+                        outcome.resets.push((*miner, preserved));
+                    }
+                }
+            }
             if verdict.is_err() {
                 for miner in a.identities.iter() {
                     if warmup {
@@ -1281,7 +1305,14 @@ impl ServiceLedger {
                     if penalty == ServicePenalty::Suspend {
                         self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: daa });
                     }
-                    outcome.misses.push(ServiceMiss { request_hash: a.request_hash, miner: *miner, consecutive_misses: count, penalty, burned });
+                    outcome.misses.push(ServiceMiss {
+                        request_hash: a.request_hash,
+                        miner: *miner,
+                        consecutive_misses: count,
+                        penalty,
+                        burned,
+                        opening_missing: false,
+                    });
                 }
             }
         }
@@ -1294,7 +1325,9 @@ impl ServiceLedger {
                 if warmup {
                     continue;
                 }
-                if self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA) {
+                if !tr.sanction
+                    && self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
+                {
                     continue;
                 }
                 let count = self.consecutive_misses(miner) + 1;
@@ -1304,7 +1337,14 @@ impl ServiceLedger {
                 if penalty == ServicePenalty::Suspend {
                     self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: daa });
                 }
-                outcome.misses.push(ServiceMiss { request_hash: a.request_hash, miner: *miner, consecutive_misses: count, penalty, burned });
+                outcome.misses.push(ServiceMiss {
+                    request_hash: a.request_hash,
+                    miner: *miner,
+                    consecutive_misses: count,
+                    penalty,
+                    burned,
+                    opening_missing: true,
+                });
             }
         }
 
@@ -1387,6 +1427,15 @@ impl ServiceLedger {
     }
 
     /// Whether `service_bond_v2_activation` is live at `daa`.
+    /// Under the sanction rule a traced response headed for an audit resets the streak at its
+    /// accepted opening, not when it is credited.
+    fn reset_waits_for_opening(&self, traces: Option<&TraceInputs>, request_hash: &[u8; 32], responder: &Hash, tier: u8, daa: u64) -> bool {
+        let Some(tr) = traces.filter(|tr| tr.sanction) else { return false };
+        let audited = |at: u64| (tr.tier)(tier, at).is_some_and(|rules| rules.audit_all);
+        tr.responses.iter().any(|ev| ev.request_hash == *request_hash && ev.responder == *responder) && audited(daa)
+            || self.trace_audits.values().any(|a| a.request_hash == *request_hash && a.responder == *responder && audited(a.accepted_daa))
+    }
+
     fn v2_at(&self, daa: u64) -> bool {
         self.window_v2_activation_daa.is_some_and(|a| daa >= a)
     }
@@ -3552,15 +3601,30 @@ mod tests {
             /// Audit rule: every traced response is audited, and the root rule admits a second
             /// request `RH2` at 100.
             audit_all: bool,
+            /// Sanction rule: a missing opening strikes without the interval guard, the streak
+            /// resets at the accepted opening.
+            sanction: bool,
         }
 
         impl Run {
             fn new(auditable: bool) -> Self {
-                Self { ledger: ServiceLedger::default(), model: Model::new(), auditable, shape: None, prefix: None, audit_all: false }
+                Self {
+                    ledger: ServiceLedger::default(),
+                    model: Model::new(),
+                    auditable,
+                    shape: None,
+                    prefix: None,
+                    audit_all: false,
+                    sanction: false,
+                }
             }
 
             fn audited_all() -> Self {
                 Self { audit_all: true, ..Self::new(true) }
+            }
+
+            fn sanctioned() -> Self {
+                Self { sanction: true, ..Self::audited_all() }
             }
 
             fn shaped(prompt_len: u32, answer_len: u32) -> Self {
@@ -3601,6 +3665,7 @@ mod tests {
                     prompt_lens: &lens,
                     shape: self.shape.is_some(),
                     unique_root: self.audit_all,
+                    sanction: self.sanction,
                 };
                 let set = [miner()];
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -3718,6 +3783,83 @@ mod tests {
             assert!(run.fold(deadline, h, &[], &[]).is_empty());
             assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
             assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn missing_opening_is_rate_limited_under_the_audit_rule_alone() {
+            let mut run = Run::audited_all();
+            run.ledger.strikes.insert(miner(), crate::collateral::StrikeEntry { count: 1, last_daa: 99 });
+            let (deadline, _) = run.until_draw(true, false);
+            // The served response resets the streak at once.
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            let h = Hash::from_bytes([3u8; 32]);
+            // The unanswered second request strikes at its window end.
+            assert_eq!(run.fold(run.window_end() + 1, h, &[], &[]), vec![(miner(), 1)]);
+            // The unopened audit falls inside the interval guard of that strike.
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn missing_opening_ignores_the_interval_guard_under_the_sanction_rule() {
+            let mut run = Run::sanctioned();
+            run.ledger.strikes.insert(miner(), crate::collateral::StrikeEntry { count: 1, last_daa: 99 });
+            let (deadline, _) = run.until_draw(true, false);
+            // Served, credited, but the streak waits for the opening.
+            assert_eq!(run.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 1);
+            let h = Hash::from_bytes([3u8; 32]);
+            // Cohort silence on the second request keeps the interval guard.
+            assert!(run.fold(run.window_end() + 1, h, &[], &[]).is_empty());
+            // The unopened audit strikes anyway and escalates.
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn accepted_opening_resets_the_streak_under_the_sanction_rule() {
+            let mut run = Run::sanctioned();
+            run.ledger.strikes.insert(miner(), crate::collateral::StrikeEntry { count: 1, last_daa: 99 });
+            let (deadline, body) = run.until_draw(true, false);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 1);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            assert!(run.ledger.trace_audits.is_empty());
+            // The unanswered second request strikes at its window end; the closed audit does not.
+            assert_eq!(run.fold(run.window_end() + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+        }
+
+        #[test]
+        fn two_missing_openings_escalate_in_one_fold_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let mut run = Run::audited_all();
+                run.sanction = sanction;
+                let (_, ev) = run.event(true);
+                let r2 = run.model.response(3, 10, true);
+                let ev2 = TraceResponseEvent {
+                    response_txid: TXID2,
+                    request_hash: RH2,
+                    trace_root: r2.trace_root,
+                    n_prompt: r2.n_prompt,
+                    n_pos: r2.n_pos,
+                    ..ev.clone()
+                };
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(run.fold(100, h0, &[], &[]).is_empty());
+                assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
+                assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
+                assert_eq!(run.ledger.trace_audits.len(), 2);
+                let deadline = run.deadline();
+                let misses = run.fold(deadline + 1, Hash::from_bytes([3u8; 32]), &[], &[]);
+                if sanction {
+                    assert_eq!(misses, vec![(miner(), 1), (miner(), 2)]);
+                } else {
+                    assert_eq!(misses, vec![(miner(), 1)]);
+                }
+                assert!(run.ledger.trace_audits.is_empty());
+            }
         }
 
         #[test]
