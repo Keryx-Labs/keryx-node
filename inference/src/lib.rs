@@ -27,7 +27,7 @@ pub use ai_payload::{
 pub use fraud_proof::{verify_fraud_proof, compute_ai_commitment, FraudProofResult, FRAUD_PROOF_LEN};
 pub use private::{
     escrow_pubkey_of, max_private_prompt_len, open_request, open_response, seal_request, seal_request_with_rng, seal_response,
-    seal_response_with_rng, OpenedRequest, PrivateError, PrivateRecipient, PrivateRequestEnvelope, PrivateRequestSecret,
+    seal_response_with_rng, OpenedRequest, PrivateError, PrivateRecipient, PrivateRequestEnvelope, PrivateRequestSecret, ResponseKey,
     PrivateResponseEnvelope, MAX_PRIVATE_RECIPIENTS, PRIVATE_MAGIC, PRIVATE_VERSION,
 };
 
