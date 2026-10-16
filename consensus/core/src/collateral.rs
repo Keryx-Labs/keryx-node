@@ -188,6 +188,10 @@ pub struct TraceInputs<'a> {
     /// Whether the sanction rule is active at this block: a missing opening strikes without the
     /// interval guard, and a response under the audit rule resets the streak at its opening.
     pub sanction: bool,
+    /// Whether the context rule is active at this block: a silent cohort member is excused on a
+    /// prompt that may exceed the tier context floor unless a member's traced response proved
+    /// it fit.
+    pub context: bool,
 }
 
 const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
@@ -599,6 +603,8 @@ struct PendingRequest {
     cohort_seed: PrivateCohortSeed,
     /// Plaintext prompt length; zero before the shape rule.
     prompt_len: u32,
+    /// A cohort member's well-formed traced response proved the prompt fits the tier context floor.
+    fit_proven: bool,
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
@@ -673,6 +679,8 @@ pub struct FoldOutcome {
     /// Claims dropped by the burnable-window purge in this fold, in pop order — the undo log
     /// needs them to reverse the block.
     pub expired: Vec<(Hash, EscrowClaim)>,
+    /// Silent cohort members left unstruck under the context rule, as (request hash, identity).
+    pub excused: Vec<([u8; 32], Hash)>,
 }
 
 /// The judgement of one opening: `cause` is `None` when it closed the audit.
@@ -938,7 +946,9 @@ impl ServiceLedger {
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
         self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
         let early_hashes: std::collections::BTreeSet<[u8; 32]> = self.early_responses.keys().copied().collect();
-        self.early_shapes.retain(|(rh, _), _| early_hashes.contains(rh));
+        let context = traces.is_some_and(|tr| tr.context);
+        let pending = &self.pending;
+        self.early_shapes.retain(|(rh, _), _| early_hashes.contains(rh) || (context && pending.get(rh).is_some_and(|r| r.audit.is_none())));
 
         // This block's own requests are admitted before its responses are folded: a response
         // accepted in the same chain block as its request must find the request pending, or it is
@@ -974,6 +984,7 @@ impl ServiceLedger {
                 recipients: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, _, r)| r.clone()).unwrap_or_default(),
                 cohort_seed: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, s, _)| *s).unwrap_or([0u8; 36]),
                 prompt_len,
+                fit_proven: false,
             });
             if let Some(tr) = traces.filter(|tr| tr.shape) {
                 let prefix_offset = (tr.tier)(entry.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
@@ -982,8 +993,11 @@ impl ServiceLedger {
                     .range((*rh, Hash::from_bytes([0u8; 32]))..=(*rh, Hash::from_bytes([0xffu8; 32])))
                     .map(|((_, key), shape)| (*key, *shape))
                     .collect();
-                self.early_shapes.retain(|(h, _), _| h != rh);
                 early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset)));
+                // Under the context rule the well-formed early shapes wait for the arming,
+                // where cohort membership is known.
+                let keep = tr.context;
+                self.early_shapes.retain(|(h, key), _| h != rh || (keep && early.contains(key)));
             }
             // Answers that beat their own request to acceptance.
             if entry.audit.is_none() {
@@ -1006,6 +1020,8 @@ impl ServiceLedger {
                         let prefix_offset = (tr.tier)(req.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
                         if !trace_shape_ok(req, &shape, prefix_offset) {
                             misshaped.push((ev.request_hash, ev.responder));
+                        } else if tr.context && req.audit.is_none() {
+                            self.early_shapes.insert((ev.request_hash, ev.responder), shape);
                         }
                     }
                     None => {
@@ -1049,6 +1065,7 @@ impl ServiceLedger {
                     continue;
                 };
                 req_tier = req.tier;
+                let req_max_tokens = req.max_tokens;
                 let Some(audit) = req.audit.as_mut() else {
                     if !req.early_responders.contains(r) {
                         req.early_responders.push(*r);
@@ -1061,6 +1078,16 @@ impl ServiceLedger {
                         audit.responded.push(identity);
                         served.push(identity);
                     }
+                }
+                if !served.is_empty()
+                    && traces.is_some_and(|tr| {
+                        tr.context
+                            && tr.responses.iter().any(|ev| {
+                                ev.request_hash == *rh && ev.responder == *r && crate::config::params::prompt_fits_floor(req_tier, ev.n_prompt, req_max_tokens)
+                            })
+                    })
+                {
+                    req.fit_proven = true;
                 }
             }
             if let Some(first) = served.first().copied() {
@@ -1097,10 +1124,17 @@ impl ServiceLedger {
             match &req.audit {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
+                    let excused = traces.is_some_and(|tr| tr.context)
+                        && !req.fit_proven
+                        && crate::config::params::safe_prompt_len(req.tier, req.max_tokens).is_some_and(|safe| req.prompt_len > safe);
                     for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m)) {
                         if warmup {
                             // The miss is already persisted: its burns came in through `is_burned`
                             // and its strike lives in the baseline.
+                            continue;
+                        }
+                        if excused {
+                            outcome.excused.push((rh, *miner));
                             continue;
                         }
                         // Rate-limit: a strike lands at most once per interval. A miss inside the
@@ -1149,6 +1183,7 @@ impl ServiceLedger {
                     }
                     if set.is_empty() {
                         self.pending.remove(&rh);
+                        self.early_shapes.retain(|(h, _), _| *h != rh);
                     } else {
                         let mut ids: Vec<Hash> = set.iter().map(|(id, _)| *id).collect();
                         ids.sort_unstable();
@@ -1161,22 +1196,33 @@ impl ServiceLedger {
                         // Credit whoever answered before the audit existed: same membership test
                         // as the live path, so an early answer and a late one are worth the same.
                         let req_tier = req.tier;
+                        let req_max_tokens = req.max_tokens;
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
                         let mut responded: Vec<Hash> = Vec::new();
+                        let mut fit = false;
                         for key in early.iter() {
                             let waits = self.reset_waits_for_opening(traces, &rh, key, req_tier, daa);
+                            let mut member = false;
                             for identity in delegations.iter().filter(|(e, _)| e == key).map(|(_, id)| id) {
                                 if ids.binary_search(identity).is_ok() && !responded.contains(identity) {
                                     responded.push(*identity);
+                                    member = true;
                                     if !waits {
                                         served_at_arm.push(*identity);
                                     }
                                 }
                             }
+                            if member && self.early_shapes.get(&(rh, *key)).is_some_and(|s| crate::config::params::prompt_fits_floor(req_tier, s.n_prompt, req_max_tokens)) {
+                                fit = true;
+                            }
                         }
+                        self.early_shapes.retain(|(h, _), _| *h != rh);
                         let first_credit = responded.first().copied();
-                        self.pending.get_mut(&rh).unwrap().audit =
-                            Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window });
+                        let req = self.pending.get_mut(&rh).unwrap();
+                        if fit && traces.is_some_and(|tr| tr.context) {
+                            req.fit_proven = true;
+                        }
+                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window });
                         if let Some(first) = first_credit {
                             self.maybe_award(&rh, first, warmup, &mut outcome);
                         }
@@ -1592,6 +1638,10 @@ const SNAPSHOT_ENCODING_VERSION_SHAPE: u8 = 4;
 /// Private, trace and shape sections (possibly empty) followed by the admitted trace roots
 /// (`[n: u32] n × [root: 32] [daa: u64]`, key order).
 const SNAPSHOT_ENCODING_VERSION_ROOT: u8 = 5;
+/// Private, trace, shape and root sections (possibly empty) followed by the pending requests
+/// whose prompt was proven to fit the tier context floor (`[n: u32] n × [request_hash: 32]`,
+/// pending order).
+const SNAPSHOT_ENCODING_VERSION_CONTEXT: u8 = 6;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1670,7 +1720,10 @@ impl ServiceLedgerSnapshot {
             .map(|(rh, r)| (rh, &r.cohort_seed, &r.recipients))
             .collect();
         let shaped = self.pending.values().any(|r| r.prompt_len > 0) || !self.early_shapes.is_empty();
-        let version = if !self.trace_roots.is_empty() {
+        let fit: Vec<&[u8; 32]> = self.pending.iter().filter(|(_, r)| r.fit_proven).map(|(rh, _)| rh).collect();
+        let version = if !fit.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_CONTEXT
+        } else if !self.trace_roots.is_empty() {
             SNAPSHOT_ENCODING_VERSION_ROOT
         } else if shaped {
             SNAPSHOT_ENCODING_VERSION_SHAPE
@@ -1814,6 +1867,12 @@ impl ServiceLedgerSnapshot {
                 out.extend_from_slice(&daa.to_le_bytes());
             }
         }
+        if version >= SNAPSHOT_ENCODING_VERSION_CONTEXT {
+            out.extend_from_slice(&(fit.len() as u32).to_le_bytes());
+            for rh in fit {
+                out.extend_from_slice(rh);
+            }
+        }
         out
     }
 
@@ -1828,6 +1887,7 @@ impl ServiceLedgerSnapshot {
                 | SNAPSHOT_ENCODING_VERSION_TRACE
                 | SNAPSHOT_ENCODING_VERSION_SHAPE
                 | SNAPSHOT_ENCODING_VERSION_ROOT
+                | SNAPSHOT_ENCODING_VERSION_CONTEXT
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -1889,6 +1949,7 @@ impl ServiceLedgerSnapshot {
                 recipients: Vec::new(),
                 cohort_seed: [0u8; 36],
                 prompt_len: 0,
+                fit_proven: false,
             };
             if snap.pending.insert(rh, req).is_some() {
                 return Err("malformed pending".into());
@@ -2023,7 +2084,7 @@ impl ServiceLedgerSnapshot {
         }
         if version >= SNAPSHOT_ENCODING_VERSION_ROOT {
             let n = r.u32()?;
-            if n == 0 {
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_ROOT {
                 return Err("empty root section".into());
             }
             for _ in 0..n {
@@ -2031,6 +2092,19 @@ impl ServiceLedgerSnapshot {
                 let daa = r.u64()?;
                 if snap.trace_roots.insert(root, daa).is_some() {
                     return Err("malformed trace roots".into());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_CONTEXT {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty context section".into());
+            }
+            for _ in 0..n {
+                let rh = r.key()?;
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if !req.fit_proven => req.fit_proven = true,
+                    _ => return Err("malformed context section".into()),
                 }
             }
         }
@@ -3604,6 +3678,15 @@ mod tests {
             /// Sanction rule: a missing opening strikes without the interval guard, the streak
             /// resets at the accepted opening.
             sanction: bool,
+            /// Context rule: silence on a prompt that may exceed the tier floor is excused unless
+            /// a member's traced response proved it fit.
+            context: bool,
+            /// Token budget of the request `RH`.
+            max_tokens: u32,
+            /// Cohort of tier 0.
+            cohort: Vec<Hash>,
+            /// `(n_prompt, n_pos)` of the traced response when set.
+            positions: Option<(u32, u32)>,
         }
 
         impl Run {
@@ -3616,7 +3699,17 @@ mod tests {
                     prefix: None,
                     audit_all: false,
                     sanction: false,
+                    context: false,
+                    max_tokens: 256,
+                    cohort: vec![miner()],
+                    positions: None,
                 }
+            }
+
+            /// Context rule over the shape rule: tier 0 floor 8 192, budget 256, so a prompt over
+            /// 7 424 bytes is grey.
+            fn context(prompt_len: u32) -> Self {
+                Self { context: true, ..Self::shaped(prompt_len, 10) }
             }
 
             fn audited_all() -> Self {
@@ -3666,12 +3759,13 @@ mod tests {
                     shape: self.shape.is_some(),
                     unique_root: self.audit_all,
                     sanction: self.sanction,
+                    context: self.context,
                 };
-                let set = [miner()];
+                let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
                 let req: Vec<([u8; 32], u8, u32)> = match (daa, self.audit_all) {
-                    (100, false) => vec![(RH, 0, 256)],
-                    (100, true) => vec![(RH, 0, 256), (RH2, 0, 256)],
+                    (100, false) => vec![(RH, 0, self.max_tokens)],
+                    (100, true) => vec![(RH, 0, self.max_tokens), (RH2, 0, 256)],
                     _ => vec![],
                 };
                 let outcome = self.ledger.on_chain_block_with_traces(
@@ -3693,9 +3787,10 @@ mod tests {
             /// The traced response of this run: 3 prompt positions, 9 in total (40 and 48 under
             /// the prefix rule).
             fn event(&mut self, honest: bool) -> (keryx_verifiable_inference::testkit::Response, TraceResponseEvent) {
-                let r = match &self.prefix {
-                    Some((offset, carried)) => self.model.response_with_prefix(40, 48, honest, Some((carried, *offset))),
-                    None => self.model.response(3, 9, honest),
+                let r = match (&self.prefix, self.positions) {
+                    (Some((offset, carried)), _) => self.model.response_with_prefix(40, 48, honest, Some((carried, *offset))),
+                    (None, Some((n_prompt, n_pos))) => self.model.response(n_prompt, n_pos, honest),
+                    (None, None) => self.model.response(3, 9, honest),
                 };
                 let ev = TraceResponseEvent {
                     response_txid: TXID,
@@ -3743,6 +3838,108 @@ mod tests {
 
         fn opening(pk: [u8; 32], body: Vec<u8>) -> TraceOpeningEvent {
             TraceOpeningEvent { response_txid: TXID, escrow_pubkey: pk, body }
+        }
+
+        /// Request at 100, audit armed at 101, then the window expires with nobody answering.
+        fn silent_window(run: &mut Run) -> Vec<(Hash, u32)> {
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            let end = run.window_end();
+            run.fold(end + 1, h0, &[], &[])
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_excused_when_nobody_answers() {
+            let mut run = Run::context(8_000);
+            assert!(silent_window(&mut run).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            assert!(run.ledger.pending.is_empty());
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_struck_without_the_rule() {
+            let mut run = Run::shaped(8_000, 10);
+            assert_eq!(silent_window(&mut run), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn safe_prompt_silence_is_struck() {
+            let mut run = Run::context(64);
+            assert_eq!(silent_window(&mut run), vec![(miner(), 1)]);
+        }
+
+        /// Request at 100, audit armed at 101, the traced response of `miner()` at 102, then the
+        /// window expires on the silent second member `b`.
+        fn answered_window(run: &mut Run, b: Hash) -> Vec<(Hash, u32)> {
+            run.cohort.push(b);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            let end = run.window_end();
+            run.fold(end + 1, h0, &[], &[])
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_struck_once_a_member_proved_the_fit() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            run.positions = Some((500, 510));
+            assert_eq!(answered_window(&mut run, b), vec![(b, 1)]);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_excused_when_the_answer_exceeded_the_floor() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            run.max_tokens = 8_000;
+            run.positions = Some((500, 510));
+            assert!(answered_window(&mut run, b).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&b), 0);
+        }
+
+        #[test]
+        fn a_misshaped_answer_proves_nothing() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            // 3 prompt positions for an 8 000-byte prompt: not an answer.
+            assert!(answered_window(&mut run, b).is_empty());
+        }
+
+        #[test]
+        fn an_early_member_answer_proves_the_fit() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            run.cohort.push(b);
+            run.positions = Some((500, 510));
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            // the answer lands in the request's own block, before the audit arms
+            assert!(run.fold(100, h0, &[ev], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.ledger.early_shapes.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, h0, &[], &[]), vec![(b, 1)]);
+        }
+
+        #[test]
+        fn a_proven_fit_survives_the_snapshot() {
+            let mut run = Run::context(8_000);
+            run.positions = Some((500, 510));
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.pending.get(&RH).unwrap().fit_proven);
+            let bytes = run.ledger.snapshot().to_bytes();
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_CONTEXT);
+            let back = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert!(back.pending.get(&RH).unwrap().fit_proven);
+            assert_eq!(back.to_bytes(), bytes);
         }
 
         #[test]

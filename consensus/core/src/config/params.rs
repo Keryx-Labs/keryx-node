@@ -838,6 +838,30 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool) -> Option<TraceRules
     Some(TraceRules { ctx, prefix, audit_all })
 }
 
+/// Context floor of each tier of the H14 lineup, in tokens: the context a responder is held to.
+/// Must equal the miner's `ctx_floor` per model.
+pub const CONTEXT_FLOORS_H14: [u32; 5] = [8_192, 32_768, 32_768, 32_768, 32_768];
+
+/// Positions the chat template and the request prefix add to a prompt, at most.
+pub const CONTEXT_OVERHEAD_TOKENS: u32 = 512;
+
+/// Context floor of `tier`, in tokens.
+pub fn context_floor(tier: u8) -> Option<u32> {
+    CONTEXT_FLOORS_H14.get(tier as usize).copied()
+}
+
+/// Longest prompt, in bytes, sure to fit the context floor of `tier` under `max_tokens`: a
+/// token spans at least one byte.
+pub fn safe_prompt_len(tier: u8, max_tokens: u32) -> Option<u32> {
+    Some(context_floor(tier)?.saturating_sub(max_tokens.saturating_add(CONTEXT_OVERHEAD_TOKENS)))
+}
+
+/// Whether a traced prompt of `n_prompt` positions fits the context floor of `tier` with its
+/// `max_tokens` budget.
+pub fn prompt_fits_floor(tier: u8, n_prompt: u32, max_tokens: u32) -> bool {
+    context_floor(tier).is_some_and(|floor| n_prompt.saturating_add(max_tokens) <= floor)
+}
+
 /// Tier lineup of the service ledger and the provider queries: the H14 set once
 /// `private_inference_activation` is live, else the H6 set.
 pub fn service_tiers(private_inference_active: bool) -> &'static [crate::pom::PomTier] {
@@ -1573,6 +1597,10 @@ pub struct Params {
     /// the audit rule resets the streak at its accepted opening instead of at the response.
     /// `never()` = dormant.
     pub trace_sanction_activation: ForkActivation,
+    /// A cohort member silent on a request whose prompt may exceed the tier context floor is
+    /// not struck unless a traced response of a cohort member proved the prompt fit. Changes
+    /// the audit fold. `never()` = dormant.
+    pub trace_context_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1849,6 +1877,7 @@ impl Params {
             trace_prefix_activation: self.trace_prefix_activation,
             trace_audit_activation: self.trace_audit_activation,
             trace_sanction_activation: self.trace_sanction_activation,
+            trace_context_activation: self.trace_context_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2066,6 +2095,7 @@ pub const MAINNET_PARAMS: Params = Params {
     trace_prefix_activation: ForkActivation::never(),
     trace_audit_activation: ForkActivation::never(),
     trace_sanction_activation: ForkActivation::never(),
+    trace_context_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2203,6 +2233,7 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_prefix_activation: ForkActivation::new(215_000),
     trace_audit_activation: ForkActivation::new(240_000),
     trace_sanction_activation: ForkActivation::new(280_000),
+    trace_context_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2302,6 +2333,7 @@ pub const SIMNET_PARAMS: Params = Params {
     trace_prefix_activation: ForkActivation::never(),
     trace_audit_activation: ForkActivation::never(),
     trace_sanction_activation: ForkActivation::never(),
+    trace_context_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2395,6 +2427,7 @@ pub const DEVNET_PARAMS: Params = Params {
     trace_prefix_activation: ForkActivation::never(),
     trace_audit_activation: ForkActivation::never(),
     trace_sanction_activation: ForkActivation::never(),
+    trace_context_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
