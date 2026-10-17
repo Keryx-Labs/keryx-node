@@ -192,6 +192,12 @@ pub struct TraceInputs<'a> {
     /// prompt that may exceed the tier context floor unless a member's traced response proved
     /// it fit.
     pub context: bool,
+    /// Whether the draw rule is active at this block: the reward of a routed request goes to a
+    /// draw among the members credited within its draw window.
+    pub draw: bool,
+    /// Whether the v3 window is active at this block: an audit armed here is judged on the
+    /// measured work of the request and the queue of each member.
+    pub window_v3: bool,
 }
 
 const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
@@ -420,6 +426,52 @@ pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
     base + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
+/// Window base once `service_window_v3_activation` is live.
+pub const SERVICE_WINDOW_BASE_DAA_V3: u64 = 150;
+
+/// Per-tier generation allowance of the v3 window, in hundredths of a DAA per generated token.
+pub const SERVICE_WINDOW_RATE_V3: [u64; 5] = [90, 180, 85, 70, 35];
+
+/// Requests queued ahead of a request at one responder beyond which no lateness is imputed to
+/// it on that request. Must equal the miner's request queue size.
+pub const SERVICE_QUEUE_CAP: usize = 64;
+
+/// Serving work of one request under the v3 window, in DAA: `n_prompt` prompt tokens (or
+/// sealed bytes, which bound them) and `generated` generated tokens.
+pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32) -> u64 {
+    let rate = SERVICE_WINDOW_RATE_V3[(tier as usize).min(SERVICE_WINDOW_RATE_V3.len() - 1)];
+    2 * (n_prompt as u64).div_ceil(100) + (rate * generated.min(AI_REQUEST_MAX_TOKENS_CAP) as u64).div_ceil(100)
+}
+
+/// Service window of one request under `service_window_v3_activation`, queue excluded.
+pub fn service_window_daa_v3(tier: u8, n_prompt: u32, generated: u32) -> u64 {
+    SERVICE_WINDOW_BASE_DAA_V3 + service_work_daa(tier, n_prompt, generated)
+}
+
+/// Length of the reward draw of a request: half its v3 window at full budget.
+pub fn reward_draw_window_daa(tier: u8, prompt_len: u32, max_tokens: u32) -> u64 {
+    service_window_daa_v3(tier, prompt_len, max_tokens).div_ceil(2)
+}
+
+/// Domain separator of the reward draw seed.
+pub const REWARD_DRAW_DOMAIN: &[u8] = b"KeryxRewardDrawV1";
+
+/// Seed of the reward draw of `request_hash` closed by the chain block `chain_hash`.
+pub fn reward_draw_seed(chain_hash: &Hash, request_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(REWARD_DRAW_DOMAIN);
+    hasher.update(&chain_hash.as_bytes());
+    hasher.update(request_hash);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(hasher.finalize().as_bytes());
+    seed
+}
+
+fn upper_median(mut values: Vec<u32>) -> Option<u32> {
+    values.sort_unstable();
+    values.get(values.len() / 2).copied()
+}
+
 /// DAA horizon beyond which per-request ledger state is forgotten: pending requests expire and
 /// vault claims drop out. This bounds the request/vault memory a fold must warm up; strike
 /// counts are NOT horizon-bound — they persist in the strike log and only reset on a served
@@ -605,6 +657,34 @@ struct PendingRequest {
     prompt_len: u32,
     /// A cohort member's well-formed traced response proved the prompt fits the tier context floor.
     fit_proven: bool,
+    /// Open reward draw under the draw rule.
+    draw: Option<RewardDraw>,
+}
+
+impl PendingRequest {
+    /// `(prompt tokens, generated tokens)` the request is judged on: the upper medians of its
+    /// traced member answers, else the sealed prompt length and the full budget.
+    fn reference_shape(&self) -> (u32, u32) {
+        let shapes: Vec<(u32, u32)> =
+            self.audit.as_ref().and_then(|a| a.v3.as_ref()).map(|w| w.answers.iter().filter_map(|(_, _, s)| *s).collect()).unwrap_or_default();
+        let p = upper_median(shapes.iter().map(|(p, _)| *p).collect()).unwrap_or(self.prompt_len);
+        let g = upper_median(shapes.iter().map(|(_, g)| *g).collect()).unwrap_or(self.max_tokens);
+        (p, g)
+    }
+
+    fn reference_work(&self) -> u64 {
+        let (p, g) = self.reference_shape();
+        service_work_daa(self.tier, p, g)
+    }
+}
+
+/// A reward draw: opened by the first credited response, closed `W` DAA later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RewardDraw {
+    open_daa: u64,
+    close_daa: u64,
+    /// Credited identities and the daa they were credited at, credit order.
+    candidates: Vec<(Hash, u64)>,
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
@@ -617,6 +697,19 @@ struct Audit {
     delegations: Vec<(Hash, Hash)>,
     responded: Vec<Hash>,
     window_end_daa: u64,
+    /// Present when armed under the v3 window.
+    v3: Option<QueuedWindow>,
+}
+
+/// Per-member state of an audit armed under the v3 window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueuedWindow {
+    arm_daa: u64,
+    /// Cohort order: work queued ahead of the request (DAA), and whether the queue exceeded
+    /// [`SERVICE_QUEUE_CAP`].
+    queue: Vec<(u64, bool)>,
+    /// Credited members: identity, credit daa, traced `(n_prompt, generated)`.
+    answers: Vec<(Hash, u64, Option<(u32, u32)>)>,
 }
 
 /// One miner's strike state: consecutive-miss count and the daa of the last actual strike.
@@ -681,6 +774,8 @@ pub struct FoldOutcome {
     pub expired: Vec<(Hash, EscrowClaim)>,
     /// Silent cohort members left unstruck under the context rule, as (request hash, identity).
     pub excused: Vec<([u8; 32], Hash)>,
+    /// Members whose answer came past their v3 deadline, as (request hash, identity).
+    pub late: Vec<([u8; 32], Hash)>,
 }
 
 /// The judgement of one opening: `cause` is `None` when it closed the audit.
@@ -946,15 +1041,18 @@ impl ServiceLedger {
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
         self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
         let early_hashes: std::collections::BTreeSet<[u8; 32]> = self.early_responses.keys().copied().collect();
-        let context = traces.is_some_and(|tr| tr.context);
+        let keep_shapes = traces.is_some_and(|tr| tr.context || tr.window_v3);
         let pending = &self.pending;
-        self.early_shapes.retain(|(rh, _), _| early_hashes.contains(rh) || (context && pending.get(rh).is_some_and(|r| r.audit.is_none())));
+        self.early_shapes
+            .retain(|(rh, _), _| early_hashes.contains(rh) || (keep_shapes && pending.get(rh).is_some_and(|r| r.audit.is_none())));
 
         // This block's own requests are admitted before its responses are folded: a response
         // accepted in the same chain block as its request must find the request pending, or it is
         // dropped and its author struck for an answer he did give. Arming still waits for the next
         // block (`daa > accepted_daa` below), so the cohort is unchanged.
         let gated = self.reward_routing_daa.is_some_and(|a| daa >= a);
+        let draw_rule = traces.is_some_and(|tr| tr.draw);
+        let window_v3 = traces.is_some_and(|tr| tr.window_v3);
         if gated {
             self.audited.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
         }
@@ -985,6 +1083,7 @@ impl ServiceLedger {
                 cohort_seed: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, s, _)| *s).unwrap_or([0u8; 36]),
                 prompt_len,
                 fit_proven: false,
+                draw: None,
             });
             if let Some(tr) = traces.filter(|tr| tr.shape) {
                 let prefix_offset = (tr.tier)(entry.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
@@ -994,9 +1093,9 @@ impl ServiceLedger {
                     .map(|((_, key), shape)| (*key, *shape))
                     .collect();
                 early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset)));
-                // Under the context rule the well-formed early shapes wait for the arming,
-                // where cohort membership is known.
-                let keep = tr.context;
+                // Under the context rule and the v3 window the well-formed early shapes wait for
+                // the arming, where cohort membership is known.
+                let keep = tr.context || tr.window_v3;
                 self.early_shapes.retain(|(h, key), _| h != rh || (keep && early.contains(key)));
             }
             // Answers that beat their own request to acceptance.
@@ -1020,7 +1119,7 @@ impl ServiceLedger {
                         let prefix_offset = (tr.tier)(req.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
                         if !trace_shape_ok(req, &shape, prefix_offset) {
                             misshaped.push((ev.request_hash, ev.responder));
-                        } else if tr.context && req.audit.is_none() {
+                        } else if (tr.context || tr.window_v3) && req.audit.is_none() {
                             self.early_shapes.insert((ev.request_hash, ev.responder), shape);
                         }
                     }
@@ -1079,6 +1178,14 @@ impl ServiceLedger {
                         served.push(identity);
                     }
                 }
+                if let Some(w) = audit.v3.as_mut() {
+                    let shape = traces
+                        .and_then(|tr| tr.responses.iter().find(|ev| ev.request_hash == *rh && ev.responder == *r))
+                        .map(|ev| (ev.n_prompt, ev.n_pos.saturating_sub(ev.n_prompt)));
+                    for identity in served.iter() {
+                        w.answers.push((*identity, daa, shape));
+                    }
+                }
                 if !served.is_empty()
                     && traces.is_some_and(|tr| {
                         tr.context
@@ -1090,9 +1197,7 @@ impl ServiceLedger {
                     req.fit_proven = true;
                 }
             }
-            if let Some(first) = served.first().copied() {
-                self.maybe_award(rh, first, warmup, &mut outcome);
-            }
+            self.credit_reward(rh, &served, daa, draw_rule, warmup, &mut outcome);
             // Under the sanction rule a traced response that will be audited resets the streak at
             // its accepted opening, not here.
             let reset_at_opening = self.reset_waits_for_opening(traces, rh, r, req_tier, daa);
@@ -1115,27 +1220,60 @@ impl ServiceLedger {
 
         if let Some(tr) = traces {
             self.fold_traces(daa, tr, &misshaped, warmup, &is_established, &mut outcome);
+            let closing: Vec<[u8; 32]> =
+                self.pending.iter().filter(|(_, r)| r.draw.as_ref().is_some_and(|d| daa >= d.close_daa)).map(|(h, _)| *h).collect();
+            for rh in closing {
+                self.close_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
+            }
         }
 
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
         let mut served_at_arm: Vec<Hash> = Vec::new();
+        let mut armed_v3: Vec<[u8; 32]> = Vec::new();
         for rh in hashes {
             let req = self.pending.get(&rh).unwrap();
             match &req.audit {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
+                    let late: Vec<Hash> = match &audit.v3 {
+                        Some(w) => {
+                            let (p, g) = req.reference_shape();
+                            let allowed = w.arm_daa + service_window_daa_v3(req.tier, p, g);
+                            w.answers
+                                .iter()
+                                .filter(|(id, at, _)| {
+                                    audit
+                                        .cohort
+                                        .binary_search(id)
+                                        .ok()
+                                        .and_then(|i| w.queue.get(i))
+                                        .is_some_and(|(queued, capped)| !capped && *at > allowed + queued)
+                                })
+                                .map(|(id, _, _)| *id)
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
                     let excused = traces.is_some_and(|tr| tr.context)
                         && !req.fit_proven
                         && crate::config::params::safe_prompt_len(req.tier, req.max_tokens).is_some_and(|safe| req.prompt_len > safe);
-                    for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m)) {
+                    self.drop_draw_candidates(&rh, &late);
+                    if let Some(tr) = traces {
+                        self.close_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
+                    }
+                    for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)) {
                         if warmup {
                             // The miss is already persisted: its burns came in through `is_burned`
                             // and its strike lives in the baseline.
                             continue;
                         }
-                        if excused {
+                        let is_late = late.contains(miner);
+                        if excused && !is_late {
                             outcome.excused.push((rh, *miner));
                             continue;
+                        }
+                        if is_late {
+                            outcome.late.push((rh, *miner));
                         }
                         // Rate-limit: a strike lands at most once per interval. A miss inside the
                         // interval of the miner's last strike is a no-op — no escalation, no burn.
@@ -1199,13 +1337,16 @@ impl ServiceLedger {
                         let req_max_tokens = req.max_tokens;
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
                         let mut responded: Vec<Hash> = Vec::new();
+                        let mut answers: Vec<(Hash, u64, Option<(u32, u32)>)> = Vec::new();
                         let mut fit = false;
                         for key in early.iter() {
                             let waits = self.reset_waits_for_opening(traces, &rh, key, req_tier, daa);
+                            let shape = self.early_shapes.get(&(rh, *key)).map(|s| (s.n_prompt, s.n_pos.saturating_sub(s.n_prompt)));
                             let mut member = false;
                             for identity in delegations.iter().filter(|(e, _)| e == key).map(|(_, id)| id) {
                                 if ids.binary_search(identity).is_ok() && !responded.contains(identity) {
                                     responded.push(*identity);
+                                    answers.push((*identity, daa, shape));
                                     member = true;
                                     if !waits {
                                         served_at_arm.push(*identity);
@@ -1217,19 +1358,25 @@ impl ServiceLedger {
                             }
                         }
                         self.early_shapes.retain(|(h, _), _| *h != rh);
-                        let first_credit = responded.first().copied();
+                        let credited = responded.clone();
                         let req = self.pending.get_mut(&rh).unwrap();
                         if fit && traces.is_some_and(|tr| tr.context) {
                             req.fit_proven = true;
                         }
-                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window });
-                        if let Some(first) = first_credit {
-                            self.maybe_award(&rh, first, warmup, &mut outcome);
-                        }
+                        let v3 = window_v3.then(|| {
+                            armed_v3.push(rh);
+                            QueuedWindow { arm_daa: daa, queue: Vec::new(), answers }
+                        });
+                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window, v3 });
+                        self.credit_reward(&rh, &credited, daa, draw_rule, warmup, &mut outcome);
                     }
                 }
                 None => {}
             }
+        }
+
+        for rh in armed_v3 {
+            self.set_queued_window(&rh, daa);
         }
 
         for identity in served_at_arm {
@@ -1340,6 +1487,7 @@ impl ServiceLedger {
                 }
             }
             if verdict.is_err() {
+                self.drop_draw_candidates(&a.request_hash, &a.identities);
                 for miner in a.identities.iter() {
                     if warmup {
                         continue;
@@ -1367,6 +1515,7 @@ impl ServiceLedger {
             self.trace_audits.iter().filter(|(_, a)| a.seed.is_some() && daa > a.deadline_daa).map(|(k, _)| *k).collect();
         for txid in late {
             let a = self.trace_audits.remove(&txid).unwrap();
+            self.drop_draw_candidates(&a.request_hash, &a.identities);
             for miner in a.identities.iter() {
                 if warmup {
                     continue;
@@ -1519,6 +1668,93 @@ impl ServiceLedger {
         }
     }
 
+    /// Credits `served` on the reward of `rh`. An open draw takes them as candidates until it
+    /// closes; otherwise the first credit opens a draw under the draw rule, or wins outright.
+    fn credit_reward(&mut self, rh: &[u8; 32], served: &[Hash], daa: u64, draw_rule: bool, warmup: bool, outcome: &mut FoldOutcome) {
+        let Some(&first) = served.first() else { return };
+        let Some(routed_from) = self.reward_routing_daa else { return };
+        let Some(req) = self.pending.get_mut(rh) else { return };
+        if let Some(draw) = req.draw.as_mut() {
+            if daa <= draw.close_daa {
+                for identity in served {
+                    if !draw.candidates.iter().any(|(c, _)| c == identity) {
+                        draw.candidates.push((*identity, daa));
+                    }
+                }
+            }
+            return;
+        }
+        if req.accepted_daa < routed_from || req.winner.is_some() || req.reward == 0 {
+            return;
+        }
+        if draw_rule {
+            let close_daa = daa + reward_draw_window_daa(req.tier, req.prompt_len, req.max_tokens);
+            req.draw = Some(RewardDraw { open_daa: daa, close_daa, candidates: served.iter().map(|id| (*id, daa)).collect() });
+            return;
+        }
+        self.maybe_award(rh, first, warmup, outcome);
+    }
+
+    /// Removes identities the audit sanctioned on `rh` from its open draw.
+    fn drop_draw_candidates(&mut self, rh: &[u8; 32], identities: &[Hash]) {
+        if identities.is_empty() {
+            return;
+        }
+        if let Some(draw) = self.pending.get_mut(rh).and_then(|r| r.draw.as_mut()) {
+            draw.candidates.retain(|(id, _)| !identities.contains(id));
+        }
+    }
+
+    /// Draws the winner of `rh` among its remaining candidates, seeded by the closing chain
+    /// block; with none left the reward stays burned.
+    fn close_draw(&mut self, rh: &[u8; 32], chain_hash: &Hash, warmup: bool, outcome: &mut FoldOutcome) {
+        let Some(req) = self.pending.get_mut(rh) else { return };
+        let Some(draw) = req.draw.take() else { return };
+        let mut candidates: Vec<Hash> = draw.candidates.iter().map(|(id, _)| *id).collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let Some(i) = assign_index(&reward_draw_seed(chain_hash, rh), candidates.len()) else {
+            req.reward = 0;
+            return;
+        };
+        let winner = candidates[i];
+        req.winner = Some(winner);
+        if !warmup {
+            let spk = self.producer_spk.get(&winner).cloned();
+            outcome.rewards.push(ServiceReward { request_hash: *rh, winner, amount: req.reward, spk });
+        }
+    }
+
+    /// Sets the per-member queue and the deadline of an audit just armed under the v3 window:
+    /// each member's queue is the work of the other armed requests it has not answered yet.
+    fn set_queued_window(&mut self, rh: &[u8; 32], daa: u64) {
+        let Some(req) = self.pending.get(rh) else { return };
+        let Some(audit) = req.audit.as_ref() else { return };
+        let queue: Vec<(u64, bool)> = audit
+            .cohort
+            .iter()
+            .map(|m| {
+                let ahead: Vec<u64> = self
+                    .pending
+                    .iter()
+                    .filter(|(h, j)| {
+                        *h != rh && j.audit.as_ref().is_some_and(|ja| ja.cohort.binary_search(m).is_ok() && !ja.responded.contains(m))
+                    })
+                    .map(|(_, j)| j.reference_work())
+                    .collect();
+                (ahead.iter().sum(), ahead.len() > SERVICE_QUEUE_CAP)
+            })
+            .collect();
+        let own = service_window_daa_v3(req.tier, req.prompt_len, req.max_tokens);
+        let horizon_end = req.accepted_daa + SERVICE_LEDGER_HORIZON_DAA - 2;
+        let end = (daa + own + queue.iter().map(|(q, _)| *q).max().unwrap_or(0)).min(horizon_end);
+        let audit = self.pending.get_mut(rh).unwrap().audit.as_mut().unwrap();
+        audit.window_end_daa = end;
+        if let Some(w) = audit.v3.as_mut() {
+            w.queue = queue;
+        }
+    }
+
     /// The small reorg-restore state: everything but the vault (whose restore goes through the
     /// per-block undo log — cloning a full burnable window per chain block does not scale).
     pub fn light_snapshot(&self) -> LightSnapshot {
@@ -1642,6 +1878,12 @@ const SNAPSHOT_ENCODING_VERSION_ROOT: u8 = 5;
 /// whose prompt was proven to fit the tier context floor (`[n: u32] n × [request_hash: 32]`,
 /// pending order).
 const SNAPSHOT_ENCODING_VERSION_CONTEXT: u8 = 6;
+/// Sections of version 6 (possibly empty) followed by the open reward draws (`[n: u32] n ×
+/// [request_hash: 32] [open_daa: u64] [close_daa: u64] [k: u32] k × [identity: 32] [daa: u64]`,
+/// pending order) and the v3 windows (`[n: u32] n × [request_hash: 32] [arm_daa: u64] [q: u32]
+/// q × [queued: u64] [capped: u8] [a: u32] a × [identity: 32] [daa: u64] [traced: u8]
+/// ([n_prompt: u32] [generated: u32] when traced)`, pending order, queue in cohort order).
+const SNAPSHOT_ENCODING_VERSION_QUEUE: u8 = 7;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1721,7 +1963,12 @@ impl ServiceLedgerSnapshot {
             .collect();
         let shaped = self.pending.values().any(|r| r.prompt_len > 0) || !self.early_shapes.is_empty();
         let fit: Vec<&[u8; 32]> = self.pending.iter().filter(|(_, r)| r.fit_proven).map(|(rh, _)| rh).collect();
-        let version = if !fit.is_empty() {
+        let drawn: Vec<(&[u8; 32], &RewardDraw)> = self.pending.iter().filter_map(|(rh, r)| r.draw.as_ref().map(|d| (rh, d))).collect();
+        let windowed: Vec<(&[u8; 32], &QueuedWindow)> =
+            self.pending.iter().filter_map(|(rh, r)| r.audit.as_ref().and_then(|a| a.v3.as_ref()).map(|w| (rh, w))).collect();
+        let version = if !drawn.is_empty() || !windowed.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_QUEUE
+        } else if !fit.is_empty() {
             SNAPSHOT_ENCODING_VERSION_CONTEXT
         } else if !self.trace_roots.is_empty() {
             SNAPSHOT_ENCODING_VERSION_ROOT
@@ -1873,6 +2120,42 @@ impl ServiceLedgerSnapshot {
                 out.extend_from_slice(rh);
             }
         }
+        if version >= SNAPSHOT_ENCODING_VERSION_QUEUE {
+            out.extend_from_slice(&(drawn.len() as u32).to_le_bytes());
+            for (rh, d) in drawn {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&d.open_daa.to_le_bytes());
+                out.extend_from_slice(&d.close_daa.to_le_bytes());
+                out.extend_from_slice(&(d.candidates.len() as u32).to_le_bytes());
+                for (id, at) in d.candidates.iter() {
+                    out.extend_from_slice(&id.as_bytes());
+                    out.extend_from_slice(&at.to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&(windowed.len() as u32).to_le_bytes());
+            for (rh, w) in windowed {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&w.arm_daa.to_le_bytes());
+                out.extend_from_slice(&(w.queue.len() as u32).to_le_bytes());
+                for (queued, capped) in w.queue.iter() {
+                    out.extend_from_slice(&queued.to_le_bytes());
+                    out.push(*capped as u8);
+                }
+                out.extend_from_slice(&(w.answers.len() as u32).to_le_bytes());
+                for (id, at, shape) in w.answers.iter() {
+                    out.extend_from_slice(&id.as_bytes());
+                    out.extend_from_slice(&at.to_le_bytes());
+                    match shape {
+                        Some((n_prompt, generated)) => {
+                            out.push(1);
+                            out.extend_from_slice(&n_prompt.to_le_bytes());
+                            out.extend_from_slice(&generated.to_le_bytes());
+                        }
+                        None => out.push(0),
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -1888,6 +2171,7 @@ impl ServiceLedgerSnapshot {
                 | SNAPSHOT_ENCODING_VERSION_SHAPE
                 | SNAPSHOT_ENCODING_VERSION_ROOT
                 | SNAPSHOT_ENCODING_VERSION_CONTEXT
+                | SNAPSHOT_ENCODING_VERSION_QUEUE
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -1933,7 +2217,7 @@ impl ServiceLedgerSnapshot {
                     }
                     let responded = r.hashes()?;
                     let window_end_daa = r.u64()?;
-                    Some(Audit { cohort, delegations, responded, window_end_daa })
+                    Some(Audit { cohort, delegations, responded, window_end_daa, v3: None })
                 }
                 _ => return Err("malformed audit".into()),
             };
@@ -1950,6 +2234,7 @@ impl ServiceLedgerSnapshot {
                 cohort_seed: [0u8; 36],
                 prompt_len: 0,
                 fit_proven: false,
+                draw: None,
             };
             if snap.pending.insert(rh, req).is_some() {
                 return Err("malformed pending".into());
@@ -2097,7 +2382,7 @@ impl ServiceLedgerSnapshot {
         }
         if version >= SNAPSHOT_ENCODING_VERSION_CONTEXT {
             let n = r.u32()?;
-            if n == 0 {
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_CONTEXT {
                 return Err("empty context section".into());
             }
             for _ in 0..n {
@@ -2105,6 +2390,60 @@ impl ServiceLedgerSnapshot {
                 match snap.pending.get_mut(&rh) {
                     Some(req) if !req.fit_proven => req.fit_proven = true,
                     _ => return Err("malformed context section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_QUEUE {
+            let n_draws = r.u32()?;
+            for _ in 0..n_draws {
+                let rh = r.key()?;
+                let open_daa = r.u64()?;
+                let close_daa = r.u64()?;
+                let k = r.u32()? as usize;
+                let mut candidates = Vec::with_capacity(k.min(1 << 16));
+                for _ in 0..k {
+                    let id = r.hash()?;
+                    let at = r.u64()?;
+                    candidates.push((id, at));
+                }
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if req.draw.is_none() => req.draw = Some(RewardDraw { open_daa, close_daa, candidates }),
+                    _ => return Err("malformed draw section".into()),
+                }
+            }
+            let n_windows = r.u32()?;
+            if n_draws == 0 && n_windows == 0 {
+                return Err("empty queue section".into());
+            }
+            for _ in 0..n_windows {
+                let rh = r.key()?;
+                let arm_daa = r.u64()?;
+                let q = r.u32()? as usize;
+                let mut queue = Vec::with_capacity(q.min(1 << 16));
+                for _ in 0..q {
+                    let queued = r.u64()?;
+                    let capped = match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err("malformed queue".into()),
+                    };
+                    queue.push((queued, capped));
+                }
+                let k = r.u32()? as usize;
+                let mut answers = Vec::with_capacity(k.min(1 << 16));
+                for _ in 0..k {
+                    let id = r.hash()?;
+                    let at = r.u64()?;
+                    let shape = match r.u8()? {
+                        0 => None,
+                        1 => Some((r.u32()?, r.u32()?)),
+                        _ => return Err("malformed answer".into()),
+                    };
+                    answers.push((id, at, shape));
+                }
+                match snap.pending.get_mut(&rh).and_then(|req| req.audit.as_mut()) {
+                    Some(a) if a.v3.is_none() && a.cohort.len() == queue.len() => a.v3 = Some(QueuedWindow { arm_daa, queue, answers }),
+                    _ => return Err("malformed window section".into()),
                 }
             }
         }
@@ -3760,6 +4099,8 @@ mod tests {
                     unique_root: self.audit_all,
                     sanction: self.sanction,
                     context: self.context,
+                    draw: false,
+                    window_v3: false,
                 };
                 let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -4304,6 +4645,331 @@ mod tests {
             let h = Hash::from_bytes([3u8; 32]);
             assert!(restored.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
             assert_eq!(restored.ledger.snapshot().to_bytes()[0], 1);
+        }
+    }
+
+    mod draw_and_window {
+        use super::super::*;
+        use keryx_hashes::Hash;
+
+        const RH: [u8; 32] = [7u8; 32];
+        const RH2: [u8; 32] = [8u8; 32];
+        const REWARD: u64 = 1_000;
+
+        fn id(b: u8) -> Hash {
+            Hash::from_bytes([b; 32])
+        }
+
+        fn chain(b: u8) -> Hash {
+            Hash::from_bytes([b; 32])
+        }
+
+        /// One answer: request, responder, traced `(n_prompt, n_pos)`.
+        type Answer = ([u8; 32], Hash, Option<(u32, u32)>);
+
+        struct Net {
+            ledger: ServiceLedger,
+            cohort: Vec<Hash>,
+            draw: bool,
+            window_v3: bool,
+        }
+
+        impl Net {
+            fn new(draw: bool, window_v3: bool, cohort: Vec<Hash>) -> Self {
+                let mut ledger = ServiceLedger::default();
+                ledger.set_window_v2_activation(0);
+                ledger.set_reward_routing_activation(0);
+                Self { ledger, cohort, draw, window_v3 }
+            }
+
+            /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
+            /// `answers`.
+            fn fold(&mut self, daa: u64, chain: Hash, requests: &[([u8; 32], u32)], answers: &[Answer]) -> FoldOutcome {
+                let tier = |_: u8, _: u64| -> Option<crate::config::params::TraceRules> { None };
+                let events: Vec<TraceResponseEvent> = answers
+                    .iter()
+                    .filter_map(|(rh, r, s)| {
+                        s.map(|(n_prompt, n_pos)| {
+                            let mut txid = r.as_bytes();
+                            txid[0] ^= rh[0];
+                            TraceResponseEvent {
+                                response_txid: txid,
+                                request_hash: *rh,
+                                responder: *r,
+                                escrow_pubkey: [0u8; 32],
+                                trace_root: txid,
+                                n_prompt,
+                                n_pos,
+                                answer_len: 0,
+                            }
+                        })
+                    })
+                    .collect();
+                let tr = TraceInputs {
+                    chain_hash: chain,
+                    responses: &events,
+                    openings: &[],
+                    tier: &tier,
+                    prompt_lens: &[],
+                    shape: false,
+                    unique_root: false,
+                    sanction: false,
+                    context: false,
+                    draw: self.draw,
+                    window_v3: self.window_v3,
+                };
+                let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
+                let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
+                let resp: Vec<([u8; 32], Option<Hash>)> = answers.iter().map(|(rh, r, _)| (*rh, Some(*r))).collect();
+                let set = self.cohort.clone();
+                self.ledger.on_chain_block_with_traces(
+                    daa,
+                    &reqs,
+                    &rewards,
+                    &[],
+                    &resp,
+                    &[],
+                    &[],
+                    &tr,
+                    |_| true,
+                    |_| set.iter().map(|m| (*m, *m)).collect(),
+                )
+            }
+
+            fn window_end(&self, rh: &[u8; 32]) -> u64 {
+                self.ledger.pending.get(rh).unwrap().audit.as_ref().unwrap().window_end_daa
+            }
+
+            fn struck(outcome: &FoldOutcome) -> Vec<Hash> {
+                let mut v: Vec<Hash> = outcome.misses.iter().map(|m| m.miner).collect();
+                v.sort_unstable();
+                v
+            }
+        }
+
+        #[test]
+        fn v3_work_matches_the_measured_coefficients() {
+            assert_eq!(service_work_daa(2, 5_000, 2_048), 100 + 1_741);
+            assert_eq!(service_window_daa_v3(2, 5_000, 2_048), 1_991);
+            assert_eq!(reward_draw_window_daa(2, 5_000, 2_048), 996);
+            assert_eq!(service_window_daa_v3(4, 5_000, 2_048), 150 + 100 + 717);
+            assert_eq!(reward_draw_window_daa(4, 5_000, 2_048), 484);
+            assert_eq!(service_work_daa(1, 0, 4_096), service_work_daa(1, 0, 10_000));
+        }
+
+        #[test]
+        fn without_the_draw_the_first_credit_wins() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let out = net.fold(102, chain(0), &[], &[(RH, b, None)]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![b]);
+        }
+
+        #[test]
+        fn the_draw_picks_among_members_credited_within_its_window() {
+            let (a, b, c) = (id(1), id(2), id(3));
+            let mut net = Net::new(true, false, vec![a, b, c]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            assert!(net.fold(102, chain(0), &[], &[(RH, b, None)]).rewards.is_empty());
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            assert_eq!(close, 102 + 191);
+            assert!(net.fold(close - 1, chain(0), &[], &[(RH, a, None)]).rewards.is_empty());
+            let closing = chain(9);
+            let out = net.fold(close, closing, &[], &[(RH, c, None)]);
+            let winner = [a, b, c][assign_index(&reward_draw_seed(&closing, &RH), 3).unwrap()];
+            assert_eq!(out.rewards.len(), 1);
+            assert_eq!(out.rewards[0].winner, winner);
+            assert_eq!(out.rewards[0].amount, REWARD);
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().winner, Some(winner));
+            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_none());
+        }
+
+        #[test]
+        fn a_member_credited_after_the_close_is_not_a_candidate() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            let out = net.fold(close, chain(9), &[], &[]);
+            assert_eq!(out.rewards[0].winner, a);
+            assert!(net.fold(close + 1, chain(9), &[], &[(RH, b, None)]).rewards.is_empty());
+        }
+
+        #[test]
+        fn early_answers_open_the_draw_at_the_arming() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[(RH, a, None), (RH, b, None)]);
+            assert!(net.fold(101, chain(0), &[], &[]).rewards.is_empty());
+            let draw = net.ledger.pending.get(&RH).unwrap().draw.clone().unwrap();
+            assert_eq!(draw.open_daa, 101);
+            assert_eq!(draw.candidates.len(), 2);
+        }
+
+        #[test]
+        fn a_draw_with_no_candidate_left_burns_the_reward() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            net.ledger.drop_draw_candidates(&RH, &[a]);
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            assert!(net.fold(close, chain(9), &[], &[]).rewards.is_empty());
+            let req = net.ledger.pending.get(&RH).unwrap();
+            assert_eq!((req.winner, req.reward), (None, 0));
+            assert!(net.fold(close + 1, chain(9), &[], &[(RH, b, None)]).rewards.is_empty());
+        }
+
+        #[test]
+        fn an_open_draw_closes_before_its_request_is_judged() {
+            let a = id(1);
+            let mut net = Net::new(true, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            net.fold(end, chain(0), &[], &[(RH, a, Some((0, 256)))]);
+            let out = net.fold(end + 1, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
+            assert!(net.ledger.pending.is_empty());
+        }
+
+        #[test]
+        fn an_open_draw_survives_the_snapshot() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, b, None)]);
+            let snap = net.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], SNAPSHOT_ENCODING_VERSION_QUEUE);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+            let mut restored = Net::new(true, false, vec![a, b]);
+            restored.ledger.restore_snapshot(&parsed);
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            assert_eq!(restored.fold(close, chain(9), &[], &[]).rewards, net.fold(close, chain(9), &[], &[]).rewards);
+        }
+
+        #[test]
+        fn the_v3_deadline_is_judged_on_the_median_answer() {
+            let (a, b, c, d) = (id(1), id(2), id(3), id(4));
+            let mut net = Net::new(false, true, vec![a, b, c, d]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            // full budget, no prompt bytes: 150 + 231
+            assert_eq!(net.window_end(&RH), 101 + 381);
+            // 200 generated tokens on 100 prompt tokens: allowed until 101 + 150 + 2 + 180
+            let allowed = 101 + service_window_daa_v3(0, 100, 200);
+            assert_eq!(allowed, 433);
+            net.fold(150, chain(0), &[], &[(RH, a, Some((100, 300)))]);
+            net.fold(allowed, chain(0), &[], &[(RH, b, Some((100, 300)))]);
+            // a padded answer does not move the median nor buy its author time
+            net.fold(allowed + 1, chain(0), &[], &[(RH, c, Some((100, 356)))]);
+            let out = net.fold(net.window_end(&RH) + 1, chain(0), &[], &[]);
+            assert_eq!(Net::struck(&out), vec![c, d]);
+            assert_eq!(out.late, vec![(RH, c)]);
+            assert_eq!(net.ledger.consecutive_misses(&a), 0);
+            assert_eq!(net.ledger.consecutive_misses(&b), 0);
+        }
+
+        #[test]
+        fn without_any_answer_the_v3_window_runs_the_full_budget() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end, chain(0), &[], &[]).misses.is_empty());
+            assert_eq!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])), vec![a]);
+        }
+
+        #[test]
+        fn an_untraced_answer_is_judged_on_the_full_budget() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            net.fold(end, chain(0), &[], &[(RH, a, None)]);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn the_queue_ahead_extends_the_deadline() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let first_end = net.window_end(&RH);
+            // b already served the first request: only a has it queued
+            net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, Some((0, 256)))]);
+            net.fold(103, chain(0), &[], &[]);
+            let queued = service_work_daa(0, 0, 256);
+            assert_eq!(net.window_end(&RH2), 103 + 381 + queued);
+            assert_eq!(net.window_end(&RH), first_end);
+            let w = net.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
+            assert_eq!(w.queue, vec![(queued, false), (0, false)]);
+            net.fold(300, chain(0), &[], &[(RH, a, Some((0, 256)))]);
+            // past its own work, inside its own work plus the queue
+            net.fold(103 + 381 + queued, chain(0), &[], &[(RH2, a, Some((0, 256))), (RH2, b, Some((0, 256)))]);
+            assert!(net.ledger.pending.get(&RH).is_none());
+            let out = net.fold(net.window_end(&RH2) + 1, chain(0), &[], &[]);
+            assert_eq!(Net::struck(&out), vec![b]);
+            assert_eq!(out.late, vec![(RH2, b)]);
+        }
+
+        #[test]
+        fn no_lateness_past_the_queue_cap() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            let requests: Vec<([u8; 32], u32)> =
+                (0..SERVICE_QUEUE_CAP as u8 + 2).map(|i| ([i + 10; 32], 256)).collect();
+            net.fold(100, chain(0), &requests, &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let rh = requests[0].0;
+            let w = net.ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
+            assert_eq!(w.queue, vec![(service_work_daa(0, 0, 256) * (SERVICE_QUEUE_CAP as u64 + 1), true)]);
+            let end = net.window_end(&rh);
+            let answers: Vec<Answer> = requests.iter().map(|(h, _)| (*h, a, Some((0, 1)))).collect();
+            net.fold(end, chain(0), &[], &answers);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn the_v3_deadline_stays_under_the_ledger_horizon() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            let requests: Vec<([u8; 32], u32)> = (0..40u8).map(|i| ([i + 10; 32], 4_096)).collect();
+            net.fold(100, chain(0), &requests, &[]);
+            net.fold(101, chain(0), &[], &[]);
+            assert_eq!(net.window_end(&requests[0].0), 100 + SERVICE_LEDGER_HORIZON_DAA - 2);
+            let out = net.fold(100 + SERVICE_LEDGER_HORIZON_DAA - 1, chain(0), &[], &[]);
+            assert_eq!(out.misses.len(), 1);
+        }
+
+        #[test]
+        fn a_v3_window_survives_the_snapshot() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(150, chain(0), &[], &[(RH, a, Some((100, 300))), (RH, b, None)]);
+            let snap = net.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], SNAPSHOT_ENCODING_VERSION_QUEUE);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            let mut restored = Net::new(false, true, vec![a, b]);
+            restored.ledger.restore_snapshot(&parsed);
+            assert_eq!(restored.ledger.snapshot().to_bytes(), bytes);
         }
     }
 }

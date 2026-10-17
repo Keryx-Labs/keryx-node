@@ -670,6 +670,8 @@ impl VirtualStateProcessor {
                 unique_root: audit_at(daa),
                 sanction: self.trace_sanction_activation.is_active(daa),
                 context: self.trace_context_activation.is_active(daa),
+                draw: self.reward_draw_activation.is_active(daa),
+                window_v3: self.service_window_v3_activation.is_active(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();
@@ -700,6 +702,9 @@ impl VirtualStateProcessor {
                 cohort,
             );
             if live {
+                for (rh, miner) in outcome.late.iter() {
+                    info!("service-bond: answer of miner {} on request {} past its deadline", miner, hex::encode(rh));
+                }
                 for (rh, miner) in outcome.excused.iter() {
                     info!(
                         "service-bond: silence of miner {} on request {} excused (prompt may exceed the tier context floor)",
