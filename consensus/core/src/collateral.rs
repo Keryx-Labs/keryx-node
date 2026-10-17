@@ -198,6 +198,9 @@ pub struct TraceInputs<'a> {
     /// Whether the v3 window is active at this block: an audit armed here is judged on the
     /// measured work of the request and the queue of each member.
     pub window_v3: bool,
+    /// Whether a response accepted more than once by this block is judged once by the shape
+    /// and root rules.
+    pub dedup: bool,
 }
 
 const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
@@ -1111,8 +1114,13 @@ impl ServiceLedger {
         // A traced response whose commitment does not fit the sealed sizes of its request and
         // answer is not an answer: neither credited nor audited.
         let mut misshaped: Vec<([u8; 32], Hash)> = Vec::new();
+        // An input-less response can be accepted more than once by one chain block.
+        let mut seen_txids = std::collections::BTreeSet::new();
+        let trace_responses: Vec<&TraceResponseEvent> = traces
+            .map(|tr| tr.responses.iter().filter(|ev| !tr.dedup || seen_txids.insert(ev.response_txid)).collect())
+            .unwrap_or_default();
         if let Some(tr) = traces.filter(|tr| tr.shape) {
-            for ev in tr.responses {
+            for ev in trace_responses.iter() {
                 let shape = TraceShape { n_prompt: ev.n_prompt, n_pos: ev.n_pos, answer_len: ev.answer_len };
                 match self.pending.get(&ev.request_hash) {
                     Some(req) => {
@@ -1130,9 +1138,9 @@ impl ServiceLedger {
             }
         }
 
-        if let Some(tr) = traces.filter(|tr| tr.unique_root) {
+        if traces.is_some_and(|tr| tr.unique_root) {
             self.trace_roots.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
-            for ev in tr.responses {
+            for ev in trace_responses.iter() {
                 if misshaped.contains(&(ev.request_hash, ev.responder)) {
                     continue;
                 }
@@ -4101,6 +4109,7 @@ mod tests {
                     context: self.context,
                     draw: false,
                     window_v3: false,
+                    dedup: false,
                 };
                 let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -4672,6 +4681,12 @@ mod tests {
             cohort: Vec<Hash>,
             draw: bool,
             window_v3: bool,
+            /// Root rule: a trace root is admitted once.
+            unique_root: bool,
+            /// Every traced answer carries the same trace root.
+            same_root: bool,
+            /// Dedup rule: a response accepted twice by one block is judged once.
+            dedup: bool,
         }
 
         impl Net {
@@ -4679,7 +4694,7 @@ mod tests {
                 let mut ledger = ServiceLedger::default();
                 ledger.set_window_v2_activation(0);
                 ledger.set_reward_routing_activation(0);
-                Self { ledger, cohort, draw, window_v3 }
+                Self { ledger, cohort, draw, window_v3, unique_root: false, same_root: false, dedup: false }
             }
 
             /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
@@ -4697,7 +4712,7 @@ mod tests {
                                 request_hash: *rh,
                                 responder: *r,
                                 escrow_pubkey: [0u8; 32],
-                                trace_root: txid,
+                                trace_root: if self.same_root { [0xEEu8; 32] } else { txid },
                                 n_prompt,
                                 n_pos,
                                 answer_len: 0,
@@ -4712,11 +4727,12 @@ mod tests {
                     tier: &tier,
                     prompt_lens: &[],
                     shape: false,
-                    unique_root: false,
+                    unique_root: self.unique_root,
                     sanction: false,
                     context: false,
                     draw: self.draw,
                     window_v3: self.window_v3,
+                    dedup: self.dedup,
                 };
                 let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
                 let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
@@ -4745,6 +4761,66 @@ mod tests {
                 v.sort_unstable();
                 v
             }
+        }
+
+        /// The same traced response accepted twice by one chain block, as an input-less
+        /// transaction merged from two blocks of the mergeset.
+        fn twice(a: Hash) -> Vec<Answer> {
+            vec![(RH, a, Some((100, 300))), (RH, a, Some((100, 300)))]
+        }
+
+        #[test]
+        fn a_response_accepted_twice_after_the_arming_is_credited_once() {
+            let a = id(1);
+            let mut net = Net::new(false, false, vec![a]);
+            net.unique_root = true;
+            net.dedup = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &twice(a));
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![a]);
+            assert_eq!(net.ledger.trace_audits.len(), 1);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn a_response_accepted_twice_with_its_request_is_credited_at_the_arming() {
+            let a = id(1);
+            let mut net = Net::new(false, false, vec![a]);
+            net.unique_root = true;
+            net.dedup = true;
+            net.fold(100, chain(0), &[(RH, 256)], &twice(a));
+            net.fold(101, chain(0), &[], &[]);
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![a]);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn before_the_dedup_rule_a_response_accepted_twice_is_not_credited() {
+            let a = id(1);
+            let mut net = Net::new(false, false, vec![a]);
+            net.unique_root = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &twice(a));
+            let end = net.window_end(&RH);
+            assert_eq!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])), vec![a]);
+        }
+
+        #[test]
+        fn a_repeated_root_from_another_response_is_still_refused() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, false, vec![a, b]);
+            net.unique_root = true;
+            net.same_root = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((100, 300)))]);
+            net.fold(103, chain(0), &[], &[(RH, b, Some((100, 300)))]);
+            let end = net.window_end(&RH);
+            assert_eq!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])), vec![b]);
         }
 
         #[test]

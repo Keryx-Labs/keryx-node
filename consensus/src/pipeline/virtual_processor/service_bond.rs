@@ -672,6 +672,7 @@ impl VirtualStateProcessor {
                 context: self.trace_context_activation.is_active(daa),
                 draw: self.reward_draw_activation.is_active(daa),
                 window_v3: self.service_window_v3_activation.is_active(daa),
+                dedup: self.trace_dedup_activation.is_active(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();

@@ -1609,6 +1609,9 @@ pub struct Params {
     /// queue of each member; an answer past its deadline is struck as a silence. Changes the
     /// audit fold. `never()` = dormant.
     pub service_window_v3_activation: ForkActivation,
+    /// A traced response accepted more than once by one chain block is judged once by the shape
+    /// and root rules. Changes the audit fold. `never()` = dormant.
+    pub trace_dedup_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1888,6 +1891,7 @@ impl Params {
             trace_context_activation: self.trace_context_activation,
             reward_draw_activation: self.reward_draw_activation,
             service_window_v3_activation: self.service_window_v3_activation,
+            trace_dedup_activation: self.trace_dedup_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2108,6 +2112,7 @@ pub const MAINNET_PARAMS: Params = Params {
     trace_context_activation: ForkActivation::never(),
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
+    trace_dedup_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2248,6 +2253,7 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_context_activation: ForkActivation::never(),
     reward_draw_activation: ForkActivation::new(300_000),
     service_window_v3_activation: ForkActivation::new(300_000),
+    trace_dedup_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2350,6 +2356,7 @@ pub const SIMNET_PARAMS: Params = Params {
     trace_context_activation: ForkActivation::never(),
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
+    trace_dedup_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2446,6 +2453,7 @@ pub const DEVNET_PARAMS: Params = Params {
     trace_context_activation: ForkActivation::never(),
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
+    trace_dedup_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
