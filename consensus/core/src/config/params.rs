@@ -2253,7 +2253,7 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_context_activation: ForkActivation::never(),
     reward_draw_activation: ForkActivation::new(300_000),
     service_window_v3_activation: ForkActivation::new(300_000),
-    trace_dedup_activation: ForkActivation::never(),
+    trace_dedup_activation: ForkActivation::new(365_000),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
