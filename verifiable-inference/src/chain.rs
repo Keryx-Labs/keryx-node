@@ -70,6 +70,9 @@ pub fn block_deviation(x: &[u8], layout: u8, k: usize, first_block: usize, v: &[
     let mut worst = 0f64;
     for (b, (d, q)) in blocks.get(first_block..first_block.checked_add(n)?)?.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
+        if !d.is_finite() || vals.iter().any(|a| !a.is_finite()) {
+            return None;
+        }
         if *d == 0.0 {
             if vals.iter().any(|a| a.abs() > 1e-6 * vmax) {
                 return None;
@@ -116,7 +119,7 @@ pub fn residual_link(dst: &[f32], add: &[f64], src: &[f32], scale: f64) -> Resul
     for ((&d, &a), &s) in dst.iter().zip(add).zip(src) {
         let s = s as f64;
         let tol = EPS_RESID * scale.abs() * (a.abs() + s.abs()) + f32::MIN_POSITIVE as f64;
-        if (d as f64 - scale * (a + s)).abs() > tol {
+        if !((d as f64 - scale * (a + s)).abs() <= tol) {
             return Err(Fail::Mismatch);
         }
     }
@@ -369,6 +372,19 @@ mod tests {
         assert_eq!(glu_link(&x, q8::MMVQ, D, 4, &h[128..256]), Ok(()));
         assert_eq!(glu_link(&x, q8::MMVQ, D, 5, &h[128..256]), Err(Fail::Mismatch));
         assert_eq!(glu_link(&x, q8::MMVQ, D, 15, &h[128..256]), Err(Fail::Mismatch));
+    }
+
+    #[test]
+    fn non_finite_values_fail() {
+        let h = vec_of(1, 3.0);
+        let mut v: Vec<f64> = rms_norm(&h, &norm_w(), EPS);
+        let x = q8_1_row(&v);
+        v[3] = f64::NAN;
+        assert_eq!(block_deviation(&x, q8::MMVQ, D, 0, &v), None);
+        let add: Vec<f64> = h.iter().map(|&a| a as f64).collect();
+        let mut dst: Vec<f32> = h.iter().map(|a| 2.0 * a).collect();
+        dst[0] = f32::NAN;
+        assert_eq!(residual_link(&dst, &add, &h, 1.0), Err(Fail::Mismatch));
     }
 
     #[test]

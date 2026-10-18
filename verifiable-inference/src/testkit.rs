@@ -29,7 +29,7 @@ pub struct Model {
     m_t: Hash,
 }
 
-fn serialize(entry: &Entry) -> Vec<u8> {
+pub(crate) fn serialize(entry: &Entry) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
     b.extend_from_slice(entry.name.as_bytes());

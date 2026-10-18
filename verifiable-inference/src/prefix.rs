@@ -63,6 +63,9 @@ pub fn deviation(x: &[u8], layout: u8, v: &[f64]) -> Option<f64> {
     let mut worst = 0f64;
     for (b, (d, q)) in blocks.iter().enumerate() {
         let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
+        if !d.is_finite() || vals.iter().any(|a| !a.is_finite()) {
+            return None;
+        }
         if *d == 0.0 {
             if vals.iter().any(|a| a.abs() > 1e-6 * vmax) {
                 return None;
@@ -192,6 +195,9 @@ mod tests {
         assert!(dev <= 0.5 + 0.2, "{dev}");
         let shifted: Vec<f64> = v.iter().map(|a| a + 0.05).collect();
         assert!(deviation(&leaf, q8::MMVQ, &shifted).unwrap() > 1.0);
+        let mut nan = v.clone();
+        nan[5] = f64::NAN;
+        assert_eq!(deviation(&leaf, q8::MMVQ, &nan), None);
         let zero = vec![0u8; 72];
         assert_eq!(deviation(&zero, q8::MMVQ, &vec![0.0; 64]), Some(0.0));
         assert_eq!(deviation(&zero, q8::MMVQ, &v), None);

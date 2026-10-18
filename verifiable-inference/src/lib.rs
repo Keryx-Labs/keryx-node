@@ -1,6 +1,8 @@
 //! Verification of inference trace openings.
 
 pub mod chain;
+#[cfg(test)]
+pub mod chainkit;
 pub mod dot;
 pub mod draw;
 pub mod f16;
