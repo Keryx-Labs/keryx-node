@@ -163,6 +163,7 @@ pub struct TraceResponseEvent {
     /// Plaintext length of the sealed answer.
     pub answer_len: u32,
     pub stage: u8,
+    pub tokens: bool,
 }
 
 /// An opening accepted in a chain block whose signature verifies under `escrow_pubkey`.
@@ -266,11 +267,12 @@ fn trace_opening_valid(
     let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     if let Some(cc) = &rules.chain {
         let (Some(pc), Some(pp), Some(rp)) = (&rules.prefix, &opening.prefix, &opening.resid) else { return Err("stage-2 part missing") };
-        if opening.links.len() != opening.points.len() {
+        if opening.links.len() != opening.points.len() || opening.experts.len() != opening.points.len() {
             return Err("link count");
         }
         for (i, (p, (tok, link))) in opening.points.iter().zip(&opening.links).enumerate() {
-            if chain::verify_chain_point(&rules.ctx, cc, &resp, seed, i as u32, p, *tok, link).is_err() {
+            let ids = opening.experts.get(i).and_then(Option::as_ref);
+            if chain::verify_chain_point(&rules.ctx, cc, &resp, seed, i as u32, p, *tok, link, ids).is_err() {
                 return Err(if i == 0 { "point 0" } else { "point 1" });
             }
         }
@@ -1143,7 +1145,7 @@ impl ServiceLedger {
                     Some(req) => {
                         let rules = (tr.tier)(req.tier, daa);
                         let prefix_offset = rules.as_ref().and_then(|r| r.prefix.as_ref().map(|p| p.offset));
-                        let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || ev.stage == keryx_verifiable_inference::chain::STAGE_CHAIN);
+                        let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || (ev.stage == keryx_verifiable_inference::chain::STAGE_CHAIN && ev.tokens));
                         if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset) {
                             misshaped.push((ev.request_hash, ev.responder));
                         } else if (tr.context || tr.window_v3) && req.audit.is_none() {
@@ -4172,6 +4174,7 @@ mod tests {
                     n_pos: r.n_pos,
                     answer_len: self.shape.map_or(0, |(_, a)| a),
                     stage: 1,
+                    tokens: false,
                 };
                 (r, ev)
             }
@@ -4738,6 +4741,7 @@ mod tests {
                                 n_pos,
                                 answer_len: 0,
                                 stage: 1,
+                                tokens: false,
                             }
                         })
                     })

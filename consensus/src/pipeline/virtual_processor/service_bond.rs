@@ -403,6 +403,7 @@ impl VirtualStateProcessor {
                         n_pos: trace.n_pos,
                         answer_len: resp.private_body.as_deref().map_or(0, plaintext_answer_len),
                         stage: trace.stage,
+                        tokens: trace.tokens_root.is_some(),
                     });
                 } else if tx.is_ai_opening() {
                     let Some(signed) = SignedPayload::split(&tx.payload) else { continue };

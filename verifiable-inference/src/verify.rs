@@ -4,7 +4,7 @@ use crate::dot::{self, Recomputed};
 use crate::draw;
 use crate::manifest::{self, Entry};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify, rt_verify_range};
-use crate::opening::{ChunkRange, EntryOpening, Point};
+use crate::opening::{ChunkRange, EntryOpening, ExpertIds, Point};
 use crate::{q8, quant};
 
 pub const EPS: f64 = 1e-5;
@@ -46,11 +46,13 @@ pub struct PosShape {
     pub meta_index: u64,
     /// Token in the meta leaf (stage 2).
     pub tok: Option<u32>,
+    /// Active experts per position of an expert product; 0 = none.
+    pub n_used: u32,
 }
 
 impl PosShape {
     pub fn stage1(n_products: u64) -> Self {
-        Self { n_leaves: 2 * n_products + 1, meta_index: 2 * n_products, tok: None }
+        Self { n_leaves: 2 * n_products + 1, meta_index: 2 * n_products, tok: None, n_used: 0 }
     }
 
     pub(crate) fn meta_hash(&self, t: u64, n_ubatch: u32) -> Hash {
@@ -72,6 +74,8 @@ pub(crate) struct Opened {
     pub pos_root: Hash,
     pub input: Entry,
     pub layout: u8,
+    pub slot: u64,
+    pub expert: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +113,14 @@ pub(crate) fn open_bytes(tier: &TierCtx, entry: &Entry, r: &ChunkRange, offset: 
     }
     let o = (offset % 32) as usize;
     Ok(r.chunks[o..o + len as usize].to_vec())
+}
+
+pub(crate) fn open_expert_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, exp: u64, row: u64) -> Result<Vec<u8>, Fail> {
+    if row >= entry.m || exp >= entry.n_exp as u64 {
+        return Err(Fail::Shape);
+    }
+    let rb = entry.row_bytes as u64;
+    open_bytes(tier, entry, r, (exp * entry.m + row) * rb, rb)
 }
 
 pub(crate) fn open_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, row: u64) -> Result<Vec<u8>, Fail> {
@@ -151,10 +163,18 @@ fn glu(op: u8, g: f64) -> Option<(f64, f64)> {
 
 /// Verify point `i` of an opening.
 pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: &Point) -> Result<Report, Fail> {
-    verify_point_at(tier, resp, seed, i, p, &PosShape::stage1(tier.n_products)).map(|(r, _)| r)
+    verify_point_at(tier, resp, seed, i, p, &PosShape::stage1(tier.n_products), None).map(|(r, _)| r)
 }
 
-pub(crate) fn verify_point_at(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: &Point, shape: &PosShape) -> Result<(Report, Opened), Fail> {
+pub(crate) fn verify_point_at(
+    tier: &TierCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    i: u32,
+    p: &Point,
+    shape: &PosShape,
+    ids: Option<&ExpertIds>,
+) -> Result<(Report, Opened), Fail> {
     let n_traced = resp.n_pos as u64;
     if n_traced == 0 || resp.n_prompt == 0 || resp.n_prompt > resp.n_pos {
         return Err(Fail::Shape);
@@ -167,7 +187,8 @@ pub(crate) fn verify_point_at(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i
 
     let first = open_entry(tier, &p.entry, rank)?;
     let output_only = first.role == manifest::ROLE_OUTPUT;
-    if first.role != manifest::ROLE_PRODUCT && !output_only {
+    let heads = first.role == manifest::ROLE_HEADS;
+    if first.role != manifest::ROLE_PRODUCT && !output_only && !heads {
         return Err(Fail::Manifest);
     }
     let t = if output_only {
@@ -198,9 +219,21 @@ pub(crate) fn verify_point_at(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i
         _ => return Err(Fail::Unsupported),
     };
     let (g_entry, g_rank) = gate;
-    if g_entry.n_exp != 1 {
-        return Err(Fail::Unsupported);
+    let experts = g_entry.n_exp > 1 && !heads;
+    if experts != ids.is_some() || (experts && shape.n_used == 0) || (heads && (g_entry.n_exp < 2 || up.is_some())) {
+        return Err(Fail::Shape);
     }
+    if up.as_ref().is_some_and(|u| u.n_exp != g_entry.n_exp) {
+        return Err(Fail::Manifest);
+    }
+    let n_used = if experts {
+        shape.n_used as u64
+    } else if heads {
+        g_entry.n_exp as u64
+    } else {
+        1
+    };
+    let slot = if n_used > 1 { (d[3] >> 32) % n_used } else { 0 };
     let split = g_entry.glu_form == manifest::FORM_SPLIT;
     let m_out = if split { g_entry.m / 2 } else { g_entry.m };
     if m_out == 0 {
@@ -210,9 +243,12 @@ pub(crate) fn verify_point_at(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i
 
     let n_pos_leaves = shape.n_leaves;
     let layout = if output_only { q8::MMVQ } else { layout_for(p.n_ubatch, g_entry.wtype) };
-    if p.x.len() as u64 != x_len(g_entry.k, layout) {
-        return Err(Fail::Shape);
-    }
+    let x_one = x_len(g_entry.k, layout);
+    let x = match p.x.len() as u64 {
+        n if n == x_one => &p.x[..],
+        n if n_used > 1 && n == n_used * x_one => &p.x[(slot * x_one) as usize..((slot + 1) * x_one) as usize],
+        _ => return Err(Fail::Shape),
+    };
     let pos_root = b3_fold(n_pos_leaves, 2 * g_rank, blake3::hash(&p.x).as_bytes(), &p.x_path).ok_or(Fail::Trace)?;
     if !b3_verify(&resp.trace_root, n_traced, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
@@ -220,20 +256,41 @@ pub(crate) fn verify_point_at(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i
     if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);
     }
-    if p.y_total_len as u64 != m_out * 4 || p.y_chunk_index as u64 != row * 4 / B3_CHUNK as u64 {
+    let body = n_used * m_out * 4;
+    if experts && body % B3_CHUNK as u64 != 0 {
+        return Err(Fail::Shape);
+    }
+    let y_off = (slot * m_out + row) * 4;
+    let y_total = body + if experts { 4 * n_used } else { 0 };
+    if p.y_total_len as u64 != y_total || p.y_chunk_index as u64 != y_off / B3_CHUNK as u64 {
         return Err(Fail::Shape);
     }
     let y_leaf = b3_leaf_from_chunk(p.y_total_len as u64, p.y_chunk_index as u64, &p.y_chunk, &p.y_chunk_path).ok_or(Fail::Trace)?;
     if !b3_verify(&pos_root, n_pos_leaves, 2 * g_rank + 1, &y_leaf, &p.y_path) {
         return Err(Fail::Trace);
     }
-    let o = (row * 4 % B3_CHUNK as u64) as usize;
+    let o = (y_off % B3_CHUNK as u64) as usize;
     let y = f32::from_le_bytes(p.y_chunk[o..o + 4].try_into().unwrap()) as f64;
+    let exp = match ids {
+        Some(e) => {
+            let last = body / B3_CHUNK as u64;
+            if b3_leaf_from_chunk(y_total, last, &e.chunk, &e.chunk_path) != Some(y_leaf) {
+                return Err(Fail::Trace);
+            }
+            let s = 4 * slot as usize;
+            let id = u32::from_le_bytes(e.chunk[s..s + 4].try_into().unwrap()) as u64;
+            if id >= g_entry.n_exp as u64 {
+                return Err(Fail::Mismatch);
+            }
+            id
+        }
+        None => slot,
+    };
 
     let k = g_entry.k as usize;
     let dot_row = |entry: &Entry, r: &ChunkRange, rr: u64| -> Result<Recomputed, Fail> {
-        let bytes = open_row(tier, entry, r, rr)?;
-        dot::canonical_dot(entry.wtype, &bytes, k, &p.x, layout).ok_or(Fail::Unsupported)
+        let bytes = open_expert_row(tier, entry, r, exp, rr)?;
+        dot::canonical_dot(entry.wtype, &bytes, k, x, layout).ok_or(Fail::Unsupported)
     };
 
     let (y_hat, tol) = if g_entry.glu_form == manifest::FORM_NONE {
@@ -271,5 +328,5 @@ pub(crate) fn verify_point_at(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i
     if !((y - y_hat).abs() <= tol) {
         return Err(Fail::Mismatch);
     }
-    Ok((Report { t, rank, row, y, y_hat, tol }, Opened { pos_root, input: g_entry, layout }))
+    Ok((Report { t, rank, row, y, y_hat, tol }, Opened { pos_root, input: g_entry, layout, slot, expert: exp }))
 }

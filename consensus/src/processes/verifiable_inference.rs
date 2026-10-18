@@ -71,12 +71,12 @@ mod tests {
     fn response(trace: bool) -> Vec<u8> {
         let r = AiResponsePayload::new_v2([7u8; 32], 1, [0u8; 34], 1, AiResponder { escrow_pubkey: [1; 32], signature: [2; 64] })
             .with_private_body(vec![3u8; 40]);
-        let r = if trace { r.with_trace(TraceCommitment { trace_root: [4; 32], n_prompt: 3, n_pos: 9, stage: 1 }) } else { r };
+        let r = if trace { r.with_trace(TraceCommitment { trace_root: [4; 32], n_prompt: 3, n_pos: 9, stage: 1, tokens_root: None }) } else { r };
         r.serialize()
     }
 
     fn opening() -> Vec<u8> {
-        let mut p = Opening { response_txid: [5; 32], points: vec![], prefix: None, links: vec![], resid: None }.encode();
+        let mut p = Opening { response_txid: [5; 32], points: vec![], prefix: None, links: vec![], experts: vec![], resid: None }.encode();
         p.extend_from_slice(&[6u8; 96]);
         p
     }

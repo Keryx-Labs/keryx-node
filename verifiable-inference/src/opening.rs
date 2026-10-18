@@ -78,6 +78,13 @@ pub struct PrefixPoint {
     pub norm: (EntryOpening, ChunkRange),
 }
 
+/// Last chunk of an expert product's `Y` leaf, which ends with the slot expert ids.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExpertIds {
+    pub chunk: Vec<u8>,
+    pub chunk_path: Vec<Hash>,
+}
+
 /// One 1 KiB chunk of a committed leaf.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LeafChunk {
@@ -100,7 +107,7 @@ pub enum LinkOpening {
     None,
     Norm { src: LeafBytes, norm: (EntryOpening, ChunkRange) },
     Token { embd: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
-    Glu { src: EntryOpening, y: LeafChunk },
+    Source { src: EntryOpening, y: LeafChunk, ids: Option<ExpertIds> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +120,19 @@ pub enum ResidSrc {
 pub enum ResidAdd {
     Chunk(LeafChunk),
     Normed { y: LeafBytes, norm: (EntryOpening, ChunkRange) },
+    Moe(Box<MoeAdd>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoeAdd {
+    pub scores: LeafBytes,
+    pub bias: (EntryOpening, ChunkRange),
+    pub ids: ExpertIds,
+    pub slots: Vec<LeafChunk>,
+    pub shexp: LeafChunk,
+    pub router_row: (EntryOpening, ChunkRange),
+    pub src_full: LeafBytes,
+    pub norm: (EntryOpening, ChunkRange),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +146,6 @@ pub struct ResidPoint {
     pub dst: LeafChunk,
     pub src: ResidSrc,
     pub add: ResidAdd,
-    pub scale: Option<(EntryOpening, ChunkRange)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -136,6 +155,8 @@ pub struct Opening {
     pub prefix: Option<PrefixPoint>,
     /// Stage 2: `(token, link)` of each point.
     pub links: Vec<(u32, LinkOpening)>,
+    /// Stage 2: expert ids of each point drawn on an expert product.
+    pub experts: Vec<Option<ExpertIds>>,
     pub resid: Option<ResidPoint>,
 }
 
@@ -204,10 +225,18 @@ impl W {
                 self.weights(embd);
                 self.weights(norm);
             }
-            LinkOpening::Glu { src, y } => {
+            LinkOpening::Source { src, y, ids } => {
                 self.u8(3);
                 self.entry(src);
                 self.leaf_chunk(y);
+                match ids {
+                    Some(e) => {
+                        self.u8(1);
+                        self.bytes32(&e.chunk);
+                        self.hashes(&e.chunk_path);
+                    }
+                    None => self.u8(0),
+                }
             }
         }
     }
@@ -240,13 +269,21 @@ impl W {
                 self.leaf_bytes(y);
                 self.weights(norm);
             }
-        }
-        match &p.scale {
-            Some(w) => {
-                self.u8(1);
-                self.weights(w);
+            ResidAdd::Moe(m) => {
+                self.u8(2);
+                self.leaf_bytes(&m.scores);
+                self.weights(&m.bias);
+                self.bytes32(&m.ids.chunk);
+                self.hashes(&m.ids.chunk_path);
+                self.u8(m.slots.len() as u8);
+                for c in &m.slots {
+                    self.leaf_chunk(c);
+                }
+                self.leaf_chunk(&m.shexp);
+                self.weights(&m.router_row);
+                self.leaf_bytes(&m.src_full);
+                self.weights(&m.norm);
             }
-            None => self.u8(0),
         }
     }
 }
@@ -314,7 +351,15 @@ impl R<'_> {
             0 => LinkOpening::None,
             1 => LinkOpening::Norm { src: self.leaf_bytes()?, norm: self.weights()? },
             2 => LinkOpening::Token { embd: self.weights()?, norm: self.weights()? },
-            3 => LinkOpening::Glu { src: self.entry()?, y: self.leaf_chunk()? },
+            3 => LinkOpening::Source {
+                src: self.entry()?,
+                y: self.leaf_chunk()?,
+                ids: match self.u8()? {
+                    0 => None,
+                    1 => Some(ExpertIds { chunk: self.bytes32()?, chunk_path: self.hashes()? }),
+                    _ => return None,
+                },
+            },
             _ => return None,
         })
     }
@@ -334,14 +379,26 @@ impl R<'_> {
         let add = match self.u8()? {
             0 => ResidAdd::Chunk(self.leaf_chunk()?),
             1 => ResidAdd::Normed { y: self.leaf_bytes()?, norm: self.weights()? },
+            2 => {
+                let scores = self.leaf_bytes()?;
+                let bias = self.weights()?;
+                let ids = ExpertIds { chunk: self.bytes32()?, chunk_path: self.hashes()? };
+                let n = self.u8()? as usize;
+                let slots = (0..n).map(|_| self.leaf_chunk()).collect::<Option<Vec<_>>>()?;
+                ResidAdd::Moe(Box::new(MoeAdd {
+                    scores,
+                    bias,
+                    ids,
+                    slots,
+                    shexp: self.leaf_chunk()?,
+                    router_row: self.weights()?,
+                    src_full: self.leaf_bytes()?,
+                    norm: self.weights()?,
+                }))
+            }
             _ => return None,
         };
-        let scale = match self.u8()? {
-            0 => None,
-            1 => Some(self.weights()?),
-            _ => return None,
-        };
-        Some(ResidPoint { n_ubatch, tok, pos_path, meta_path, layer, product, dst, src, add, scale })
+        Some(ResidPoint { n_ubatch, tok, pos_path, meta_path, layer, product, dst, src, add })
     }
 }
 
@@ -391,9 +448,17 @@ impl Opening {
             w.hashes(&p.y_path);
         }
         if chain {
-            for (tok, link) in &self.links {
+            for (i, (tok, link)) in self.links.iter().enumerate() {
                 w.u32(*tok);
                 w.link(link);
+                match self.experts.get(i).cloned().flatten() {
+                    Some(e) => {
+                        w.u8(1);
+                        w.bytes32(&e.chunk);
+                        w.hashes(&e.chunk_path);
+                    }
+                    None => w.u8(0),
+                }
             }
         }
         if let Some(p) = &self.prefix {
@@ -449,8 +514,18 @@ impl Opening {
                 y_path: r.hashes()?,
             });
         }
+        let mut experts = Vec::new();
         let links = if version == VERSION_CHAIN {
-            (0..n).map(|_| Some((r.u32()?, r.link()?))).collect::<Option<Vec<_>>>()?
+            let mut links = Vec::with_capacity(n);
+            for _ in 0..n {
+                links.push((r.u32()?, r.link()?));
+                experts.push(match r.u8()? {
+                    0 => None,
+                    1 => Some(ExpertIds { chunk: r.bytes32()?, chunk_path: r.hashes()? }),
+                    _ => return None,
+                });
+            }
+            links
         } else {
             Vec::new()
         };
@@ -469,6 +544,6 @@ impl Opening {
             None
         };
         let resid = if version == VERSION_CHAIN { Some(r.resid()?) } else { None };
-        (r.o == b.len()).then_some(Opening { response_txid, points, prefix, links, resid })
+        (r.o == b.len()).then_some(Opening { response_txid, points, prefix, links, experts, resid })
     }
 }

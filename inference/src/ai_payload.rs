@@ -51,6 +51,8 @@ pub const AI_RESPONSE_EXT_PRIVATE_BODY: u8 = 0x80;
 pub const AI_RESPONSE_EXT_TRACE: u8 = 0x81;
 /// `[trace_root: 32] [n_prompt: 4 LE] [n_pos: 4 LE] [stage: 1]`.
 pub const AI_RESPONSE_TRACE_LEN: usize = 32 + 4 + 4 + 1;
+/// The trace commitment followed by `[tokens_root: 32]`.
+pub const AI_RESPONSE_TRACE_TOKENS_LEN: usize = AI_RESPONSE_TRACE_LEN + 32;
 /// `[ext_kind: 1] [ext_len: 4 LE]`.
 pub const AI_RESPONSE_EXT_HEADER_LEN: usize = 1 + 4;
 /// Largest inline body: a 4 096-token answer with envelope overhead fits comfortably.
@@ -60,7 +62,7 @@ pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN
     + AI_RESPONSE_EXT_HEADER_LEN
     + MAX_AI_RESPONSE_PRIVATE_BODY_LEN
     + AI_RESPONSE_EXT_HEADER_LEN
-    + AI_RESPONSE_TRACE_LEN;
+    + AI_RESPONSE_TRACE_TOKENS_LEN;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
 /// `[response_hash: 32] [challenger_deposit: 8 LE] [challenger_spk_version: 2 LE] [challenger_spk: 32] [proof_data…]`
@@ -167,20 +169,33 @@ pub struct TraceCommitment {
     pub n_prompt: u32,
     pub n_pos: u32,
     pub stage: u8,
+    /// BLAKE3 of the generated token ids (u32 LE, in order).
+    pub tokens_root: Option<[u8; 32]>,
 }
 
 impl TraceCommitment {
-    pub fn to_bytes(&self) -> [u8; AI_RESPONSE_TRACE_LEN] {
-        let mut out = [0u8; AI_RESPONSE_TRACE_LEN];
-        out[..32].copy_from_slice(&self.trace_root);
-        out[32..36].copy_from_slice(&self.n_prompt.to_le_bytes());
-        out[36..40].copy_from_slice(&self.n_pos.to_le_bytes());
-        out[40] = self.stage;
+    pub fn len(&self) -> usize {
+        if self.tokens_root.is_some() { AI_RESPONSE_TRACE_TOKENS_LEN } else { AI_RESPONSE_TRACE_LEN }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len());
+        out.extend_from_slice(&self.trace_root);
+        out.extend_from_slice(&self.n_prompt.to_le_bytes());
+        out.extend_from_slice(&self.n_pos.to_le_bytes());
+        out.push(self.stage);
+        if let Some(t) = &self.tokens_root {
+            out.extend_from_slice(t);
+        }
         out
     }
 
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() != AI_RESPONSE_TRACE_LEN {
+        if b.len() != AI_RESPONSE_TRACE_LEN && b.len() != AI_RESPONSE_TRACE_TOKENS_LEN {
             return None;
         }
         Some(Self {
@@ -188,6 +203,7 @@ impl TraceCommitment {
             n_prompt: u32::from_le_bytes(b[32..36].try_into().ok()?),
             n_pos: u32::from_le_bytes(b[36..40].try_into().ok()?),
             stage: b[40],
+            tokens_root: if b.len() == AI_RESPONSE_TRACE_TOKENS_LEN { Some(b[41..73].try_into().ok()?) } else { None },
         })
     }
 }
@@ -264,13 +280,13 @@ impl AiResponsePayload {
     pub fn extension_bytes(&self) -> Vec<u8> {
         match &self.private_body {
             Some(body) => {
-                let mut out = Vec::with_capacity(2 * AI_RESPONSE_EXT_HEADER_LEN + body.len() + AI_RESPONSE_TRACE_LEN);
+                let mut out = Vec::with_capacity(2 * AI_RESPONSE_EXT_HEADER_LEN + body.len() + AI_RESPONSE_TRACE_TOKENS_LEN);
                 out.push(AI_RESPONSE_EXT_PRIVATE_BODY);
                 out.extend_from_slice(&(body.len() as u32).to_le_bytes());
                 out.extend_from_slice(body);
                 if let Some(trace) = &self.trace {
                     out.push(AI_RESPONSE_EXT_TRACE);
-                    out.extend_from_slice(&(AI_RESPONSE_TRACE_LEN as u32).to_le_bytes());
+                    out.extend_from_slice(&(trace.len() as u32).to_le_bytes());
                     out.extend_from_slice(&trace.to_bytes());
                 }
                 out
@@ -330,9 +346,10 @@ impl AiResponsePayload {
             let trace = if rest.is_empty() {
                 None
             } else {
-                if rest.len() != AI_RESPONSE_EXT_HEADER_LEN + AI_RESPONSE_TRACE_LEN
+                let n = rest.len().checked_sub(AI_RESPONSE_EXT_HEADER_LEN)?;
+                if (n != AI_RESPONSE_TRACE_LEN && n != AI_RESPONSE_TRACE_TOKENS_LEN)
                     || rest[0] != AI_RESPONSE_EXT_TRACE
-                    || u32::from_le_bytes(rest[1..5].try_into().ok()?) as usize != AI_RESPONSE_TRACE_LEN
+                    || u32::from_le_bytes(rest[1..5].try_into().ok()?) as usize != n
                 {
                     return None;
                 }
@@ -511,7 +528,7 @@ mod tests {
 
         // The largest body is accepted, one byte more is not.
         let max = v2_with_body(vec![1u8; MAX_AI_RESPONSE_PRIVATE_BODY_LEN]).serialize();
-        assert_eq!(max.len() + AI_RESPONSE_EXT_HEADER_LEN + AI_RESPONSE_TRACE_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN);
+        assert_eq!(max.len() + AI_RESPONSE_EXT_HEADER_LEN + AI_RESPONSE_TRACE_TOKENS_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN);
         assert!(AiResponsePayload::deserialize(&max).is_some());
         let over = v2_with_body(vec![1u8; MAX_AI_RESPONSE_PRIVATE_BODY_LEN + 1]).serialize();
         assert!(AiResponsePayload::deserialize(&over).is_none());
@@ -540,7 +557,25 @@ mod tests {
     }
 
     fn trace() -> TraceCommitment {
-        TraceCommitment { trace_root: [0x5Au8; 32], n_prompt: 47, n_pos: 95, stage: 1 }
+        TraceCommitment { trace_root: [0x5Au8; 32], n_prompt: 47, n_pos: 95, stage: 1, tokens_root: None }
+    }
+
+    #[test]
+    fn ai_response_trace_with_tokens_roundtrip() {
+        let body = vec![9u8; 40];
+        let t = TraceCommitment { stage: 2, tokens_root: Some([0x33u8; 32]), ..trace() };
+        let resp = v2_with_body(body.clone()).with_trace(t);
+        let bytes = resp.serialize();
+        assert_eq!(bytes.len(), AI_RESPONSE_PAYLOAD_V2_LEN + 2 * AI_RESPONSE_EXT_HEADER_LEN + body.len() + AI_RESPONSE_TRACE_TOKENS_LEN);
+        let parsed = AiResponsePayload::deserialize(&bytes).unwrap();
+        assert_eq!(parsed.trace, Some(t));
+        let max = v2_with_body(vec![1u8; MAX_AI_RESPONSE_PRIVATE_BODY_LEN]).with_trace(t).serialize();
+        assert_eq!(max.len(), MAX_AI_RESPONSE_PAYLOAD_LEN);
+        assert!(AiResponsePayload::deserialize(&max).is_some());
+        let mut bad = bytes.clone();
+        let at = bytes.len() - AI_RESPONSE_TRACE_TOKENS_LEN - 4;
+        bad[at..at + 4].copy_from_slice(&(AI_RESPONSE_TRACE_LEN as u32).to_le_bytes());
+        assert!(AiResponsePayload::deserialize(&bad).is_none());
     }
 
     #[test]
@@ -557,9 +592,8 @@ mod tests {
         let signed = resp.signed_bytes();
         assert_eq!(&signed[AI_RESPONSE_PAYLOAD_LEN..], &bytes[AI_RESPONSE_PAYLOAD_V2_LEN..]);
         assert_ne!(signed, v2_with_body(body).signed_bytes());
-        // The largest body with a trace is the largest payload.
         let max = v2_with_body(vec![1u8; MAX_AI_RESPONSE_PRIVATE_BODY_LEN]).with_trace(trace()).serialize();
-        assert_eq!(max.len(), MAX_AI_RESPONSE_PAYLOAD_LEN);
+        assert_eq!(max.len() + AI_RESPONSE_TRACE_TOKENS_LEN - AI_RESPONSE_TRACE_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN);
         assert!(AiResponsePayload::deserialize(&max).is_some());
         // Without a body the trace is not encoded.
         let plain = AiResponsePayload::new_v2([7u8; 32], 1, [0u8; 34], 1, AiResponder { escrow_pubkey: [1; 32], signature: [2; 64] })

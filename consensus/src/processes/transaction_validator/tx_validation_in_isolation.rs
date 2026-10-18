@@ -260,7 +260,7 @@ mod tests {
         tv.validate_tx_in_isolation(&response(head.serialize())).unwrap();
         let with_body = head.clone().with_private_body(vec![0xAB; 1_000]).serialize();
         tv.validate_tx_in_isolation(&response(with_body)).unwrap();
-        let trace = keryx_inference::TraceCommitment { trace_root: [5u8; 32], n_prompt: 3, n_pos: 9, stage: 1 };
+        let trace = keryx_inference::TraceCommitment { trace_root: [5u8; 32], n_prompt: 3, n_pos: 9, stage: 1, tokens_root: None };
         let max_body = head.clone().with_private_body(vec![0xAB; MAX_AI_RESPONSE_PRIVATE_BODY_LEN]).with_trace(trace).serialize();
         assert_eq!(max_body.len(), MAX_AI_RESPONSE_PAYLOAD_LEN);
         tv.validate_tx_in_isolation(&response(max_body)).unwrap();

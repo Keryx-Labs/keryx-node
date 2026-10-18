@@ -3,7 +3,7 @@
 use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
-use crate::opening::{ChunkRange, EntryOpening, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
 use crate::opening::PrefixPoint;
 use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
 use crate::verify::{Fail, PosShape, Report, ResponseCtx, TierCtx, open_bytes, open_entry, open_row, verify_point_at};
@@ -23,6 +23,10 @@ pub struct ChainCtx {
     pub embd_entry: u32,
     pub eps: f64,
     pub embd_scale: f64,
+    /// The last layer keeps only the output positions.
+    pub trim_last: bool,
+    /// Active experts per position of an expert product; 0 = no expert products.
+    pub n_used: u32,
 }
 /// Relative tolerance of a residual addition, per element.
 pub const EPS_RESID: f64 = 1e-6;
@@ -34,9 +38,15 @@ pub enum Resid {
     Out,
 }
 
-/// Leaves of a stage-2 position: `X`/`Y` per product, two residuals per layer, then the meta leaf.
-pub fn n_pos_leaves(n_products: u64, n_layers: u64) -> u64 {
-    2 * n_products + 2 * n_layers + 1
+/// Leaves of a stage-2 position: `X`/`Y` per product, two residuals per layer, `n_router` router
+/// leaves, then the meta leaf.
+pub fn n_pos_leaves(n_products: u64, n_layers: u64, n_router: u64) -> u64 {
+    2 * n_products + 2 * n_layers + n_router + 1
+}
+
+/// Leaf index of the router scores of `layer`.
+pub fn router_leaf(n_products: u64, n_layers: u64, layer: u64) -> u64 {
+    2 * n_products + 2 * n_layers + layer
 }
 
 /// Leaf index of a residual of `layer`.
@@ -45,8 +55,12 @@ pub fn resid_leaf(n_products: u64, layer: u64, kind: Resid) -> u64 {
 }
 
 /// Leaf index of the meta leaf.
-pub fn meta_leaf(n_products: u64, n_layers: u64) -> u64 {
-    2 * n_products + 2 * n_layers
+pub fn meta_leaf(n_products: u64, n_layers: u64, n_router: u64) -> u64 {
+    2 * n_products + 2 * n_layers + n_router
+}
+
+fn n_router(ctx: &ChainCtx) -> u64 {
+    if ctx.n_used > 0 { ctx.n_layers as u64 } else { 0 }
 }
 
 /// Meta leaf bytes: position, batch size, token consumed at the position.
@@ -130,7 +144,12 @@ pub fn residual_link(dst: &[f32], add: &[f64], src: &[f32], scale: f64) -> Resul
 /// Leaf layout of a stage-2 position consuming `tok`.
 pub fn shape(tier: &TierCtx, ctx: &ChainCtx, tok: u32) -> PosShape {
     let n_layers = ctx.n_layers as u64;
-    PosShape { n_leaves: n_pos_leaves(tier.n_products, n_layers), meta_index: meta_leaf(tier.n_products, n_layers), tok: Some(tok) }
+    PosShape {
+        n_leaves: n_pos_leaves(tier.n_products, n_layers, n_router(ctx)),
+        meta_index: meta_leaf(tier.n_products, n_layers, n_router(ctx)),
+        tok: Some(tok),
+        n_used: ctx.n_used,
+    }
 }
 
 fn f32s(b: &[u8]) -> Vec<f32> {
@@ -164,6 +183,10 @@ fn whole_leaf(pos_root: &Hash, shape: &PosShape, index: u64, l: &LeafBytes, len:
     Ok(f32s(&l.bytes))
 }
 
+fn chunk_leaf_raw(c: &ExpertIds, total_len: u64, index: u64) -> Result<Hash, Fail> {
+    b3_leaf_from_chunk(total_len, index, &c.chunk, &c.chunk_path).ok_or(Fail::Trace)
+}
+
 fn chunk_leaf(c: &LeafChunk, total_len: u64, index: u64) -> Result<Hash, Fail> {
     if c.total_len as u64 != total_len || c.index as u64 != index {
         return Err(Fail::Shape);
@@ -194,9 +217,10 @@ pub fn verify_chain_point(
     p: &Point,
     tok: u32,
     link: &LinkOpening,
+    ids: Option<&ExpertIds>,
 ) -> Result<Report, Fail> {
     let shape = shape(tier, ctx, tok);
-    let (report, o) = verify_point_at(tier, resp, seed, i, p, &shape)?;
+    let (report, o) = verify_point_at(tier, resp, seed, i, p, &shape, ids)?;
     let Chain::Product(pl) = o.input.chain else {
         return Err(Fail::Manifest);
     };
@@ -222,14 +246,42 @@ pub fn verify_chain_point(
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
             norm_link(&p.x, o.layout, &h, &f32_weights(tier, norm, pl.norm, k, 0, k)?, ctx.eps)?;
         }
-        (manifest::LINK_GLU, LinkOpening::Glu { src, y }) => {
+        (manifest::LINK_GLU, LinkOpening::Source { src, y, ids: Some(ids) }) if o.input.n_exp > 1 => {
             let se = open_entry(tier, src, pl.src as u64)?;
-            let m_out = match se.glu_form {
-                manifest::FORM_PAIR_GATE => se.m,
-                manifest::FORM_SPLIT => se.m / 2,
+            if se.glu_form != manifest::FORM_PAIR_GATE || se.n_exp != o.input.n_exp || se.m != k {
+                return Err(Fail::Manifest);
+            }
+            let n_used = ctx.n_used as u64;
+            let body = n_used * k * 4;
+            let per_slot = k * 4 / B3_CHUNK as u64;
+            if per_slot == 0 || (k * 4) % B3_CHUNK as u64 != 0 {
+                return Err(Fail::Shape);
+            }
+            let total = body + 4 * n_used;
+            let gate_y = 2 * pl.src as u64 + 1;
+            let ids_leaf = chunk_leaf_raw(ids, total, body / B3_CHUNK as u64)?;
+            if !b3_verify(&o.pos_root, shape.n_leaves, gate_y, &ids_leaf, &y.leaf_path) {
+                return Err(Fail::Trace);
+            }
+            let s = 4 * o.slot as usize;
+            if u32::from_le_bytes(ids.chunk[s..s + 4].try_into().unwrap()) as u64 != o.expert {
+                return Err(Fail::Mismatch);
+            }
+            let c = o.slot * per_slot + draw::point(seed, i)[3] % per_slot;
+            let h = leaf_chunk(&o.pos_root, &shape, gate_y, y, total, c)?;
+            let x_one = crate::verify::x_len(k, o.layout) as usize;
+            let xs = p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)?;
+            glu_link(xs, o.layout, k as usize, ((c - o.slot * per_slot) * B3_CHUNK as u64 / 128) as usize, &h)?;
+        }
+        (manifest::LINK_GLU | manifest::LINK_DIRECT, LinkOpening::Source { src, y, ids: None }) if o.input.n_exp == 1 => {
+            let se = open_entry(tier, src, pl.src as u64)?;
+            let m_out = match (pl.link, se.glu_form) {
+                (manifest::LINK_GLU, manifest::FORM_PAIR_GATE) => se.m,
+                (manifest::LINK_GLU, manifest::FORM_SPLIT) => se.m / 2,
+                (manifest::LINK_DIRECT, manifest::FORM_NONE) if se.role == manifest::ROLE_PRODUCT => se.m,
                 _ => return Err(Fail::Manifest),
             };
-            if m_out != k {
+            if m_out != k || se.n_exp != 1 {
                 return Err(Fail::Manifest);
             }
             let total = 4 * m_out;
@@ -255,6 +307,124 @@ pub fn verify_chain_prefix_point(
     verify_prefix_point_at(tier, prefix, resp, seed, request_txid, p, |tok| shape(tier, ctx, tok))
 }
 
+/// Tolerance on router probabilities.
+pub const EPS_ROUTE: f64 = 1e-5;
+/// Smallest weight sum of the routed experts.
+const ROUTE_SUM_FLOOR: f64 = 6.103515625e-5;
+
+/// Mixing weights of the committed experts `ids` from the committed router scores, or `None` when
+/// `ids` is not the top `ids.len()` of `sigmoid(scores) + bias`.
+pub fn route_weights(scores: &[f32], bias: &[f32], ids: &[u32], w_scale: f64) -> Option<Vec<f64>> {
+    if scores.len() != bias.len() || ids.is_empty() || ids.len() > scores.len() {
+        return None;
+    }
+    let p: Vec<f64> = scores.iter().map(|&x| 1.0 / (1.0 + libm::exp(-(x as f64)))).collect();
+    if p.iter().any(|v| !v.is_finite()) || bias.iter().any(|b| !b.is_finite()) {
+        return None;
+    }
+    let sel: Vec<f64> = p.iter().zip(bias).map(|(a, &b)| a + b as f64).collect();
+    let mut chosen = vec![false; p.len()];
+    let mut prev = f64::INFINITY;
+    for &id in ids {
+        let i = id as usize;
+        if i >= p.len() || chosen[i] || sel[i] > prev + EPS_ROUTE {
+            return None;
+        }
+        chosen[i] = true;
+        prev = sel[i];
+    }
+    let floor = ids.iter().map(|&i| sel[i as usize]).fold(f64::INFINITY, f64::min);
+    if sel.iter().enumerate().any(|(i, &v)| !chosen[i] && v > floor + EPS_ROUTE) {
+        return None;
+    }
+    let sum = ids.iter().map(|&i| p[i as usize]).sum::<f64>().max(ROUTE_SUM_FLOOR);
+    Some(ids.iter().map(|&i| p[i as usize] / sum * w_scale).collect())
+}
+
+/// Relative tolerance of the router scores and of the routed sum.
+pub const EPS_MOE: f64 = 1e-5;
+
+struct MoeCheck<'a> {
+    tier: &'a TierCtx,
+    ctx: &'a ChainCtx,
+    shape: &'a PosShape,
+    pos_root: &'a Hash,
+    layer: u64,
+    down: u64,
+    dim: u64,
+    c: u64,
+    seed: &'a Hash,
+}
+
+impl MoeCheck<'_> {
+    fn verify(&self, moe: &manifest::MoeLinks, m: &crate::opening::MoeAdd, dst: &[f32], src: &[f32], off: usize, n: usize) -> Result<(), Fail> {
+        let (tier, ctx, np) = (self.tier, self.ctx, self.tier.n_products);
+        let n_used = ctx.n_used as u64;
+        if n_used == 0 || m.slots.len() as u64 != n_used {
+            return Err(Fail::Shape);
+        }
+        let re = open_entry(tier, &m.router_row.0, moe.router as u64)?;
+        if re.role != manifest::ROLE_ROUTER || re.wtype != 0 || re.k != self.dim {
+            return Err(Fail::Manifest);
+        }
+        let n_exp = re.m;
+        let scores = whole_leaf(self.pos_root, self.shape, router_leaf(np, ctx.n_layers as u64, self.layer), &m.scores, 4 * n_exp)?;
+        let bias = f32_weights(tier, &m.bias, moe.probs_bias, n_exp, 0, n_exp)?;
+
+        let body = n_used * self.dim * 4;
+        let per_slot = self.dim * 4 / B3_CHUNK as u64;
+        if body % B3_CHUNK as u64 != 0 || (self.dim * 4) % B3_CHUNK as u64 != 0 {
+            return Err(Fail::Shape);
+        }
+        let total = body + 4 * n_used;
+        let y_leaf = 2 * moe.down_exps as u64 + 1;
+        let ids_leaf = chunk_leaf_raw(&m.ids, total, body / B3_CHUNK as u64)?;
+        if !b3_verify(self.pos_root, self.shape.n_leaves, y_leaf, &ids_leaf, &m.slots[0].leaf_path) {
+            return Err(Fail::Trace);
+        }
+        let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let w = route_weights(&scores, &bias, &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
+
+        let r_full = whole_leaf(self.pos_root, self.shape, resid_leaf(np, self.layer, Resid::Attn), &m.src_full, 4 * self.dim)?;
+        let x = rms_norm(&r_full, &f32_weights(tier, &m.norm, moe.ffn_norm, self.dim, 0, self.dim)?, ctx.eps);
+        let row = draw::point(self.seed, RESID_POINT)[3] % n_exp;
+        let wr = f32s(&open_bytes(tier, &re, &m.router_row.1, row * 4 * self.dim, 4 * self.dim)?);
+        let (dot, mag) = wr.iter().zip(&x).fold((0f64, 0f64), |(d, a), (&wi, &xi)| (d + wi as f64 * xi, a + (wi as f64 * xi).abs()));
+        if !((scores[row as usize] as f64 - dot).abs() <= EPS_MOE * mag + f32::MIN_POSITIVE as f64) {
+            return Err(Fail::Mismatch);
+        }
+
+        let ys = (0..n_used)
+            .map(|s| leaf_chunk(self.pos_root, self.shape, y_leaf, &m.slots[s as usize], total, s * per_slot + self.c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sh = leaf_chunk(self.pos_root, self.shape, 2 * self.down + 1, &m.shexp, 4 * self.dim, self.c)?;
+        if ys.iter().any(|y| y.len() != n) || sh.len() != n || dst.len() != n || src.len() != n || off + n > self.dim as usize {
+            return Err(Fail::Shape);
+        }
+        for j in 0..n {
+            let (mut sum, mut mag) = (sh[j] as f64 + src[j] as f64, (sh[j] as f64).abs() + (src[j] as f64).abs());
+            for (ws, y) in w.iter().zip(&ys) {
+                sum += ws * y[j] as f64;
+                mag += (ws * y[j] as f64).abs();
+            }
+            if !((dst[j] as f64 - sum).abs() <= EPS_MOE * mag + f32::MIN_POSITIVE as f64) {
+                return Err(Fail::Mismatch);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Position of a residual point of `layer`.
+pub fn resid_position(ctx: &ChainCtx, resp: &ResponseCtx, layer: u64, d0: u64) -> Result<u64, Fail> {
+    let n_pos = resp.n_pos as u64;
+    if ctx.trim_last && layer + 1 == ctx.n_layers as u64 {
+        let first = (resp.n_prompt as u64).checked_sub(1).filter(|&f| f < n_pos).ok_or(Fail::Shape)?;
+        return Ok(first + d0 % (n_pos - first));
+    }
+    Ok(d0 % n_pos)
+}
+
 /// Verify the residual point of a stage-2 opening.
 pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, p: &ResidPoint) -> Result<(), Fail> {
     let (np, n_layers) = (tier.n_products, ctx.n_layers as u64);
@@ -262,9 +432,9 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         return Err(Fail::Shape);
     }
     let d = draw::point(seed, RESID_POINT);
-    let t = d[0] % resp.n_pos as u64;
     let sel = d[1] % (2 * n_layers);
     let (layer, kind) = (sel / 2, if sel % 2 == 0 { Resid::Attn } else { Resid::Out });
+    let t = resid_position(ctx, resp, layer, d[0])?;
     let shape = shape(tier, ctx, p.tok);
 
     let le = open_entry(tier, &p.layer, ctx.layer_base as u64 + layer)?;
@@ -301,6 +471,11 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         _ => return Err(Fail::Shape),
     };
     let post = if kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
+    if let ResidAdd::Moe(m) = &p.add {
+        let moe = ll.moe.filter(|_| kind == Resid::Out && post == manifest::NONE).ok_or(Fail::Shape)?;
+        let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed };
+        return ctx2.verify(&moe, m, &dst, &src, off, n);
+    }
     let add: Vec<f64> = match (post, &p.add) {
         (manifest::NONE, ResidAdd::Chunk(ac)) => leaf_chunk(&pos_root, &shape, 2 * rank + 1, ac, total, c)?.iter().map(|&v| v as f64).collect(),
         (pn, ResidAdd::Normed { y, norm }) if pn != manifest::NONE => {
@@ -309,11 +484,14 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         }
         _ => return Err(Fail::Shape),
     };
-    let scale = match (kind, ll.scale, &p.scale) {
-        (Resid::Out, sc, Some(w)) if sc != manifest::NONE => f32_weights(tier, w, sc, 1, 0, 1)?[0] as f64,
-        (_, sc, None) if kind == Resid::Attn || sc == manifest::NONE => 1.0,
-        _ => return Err(Fail::Shape),
+    let scale = match ll.scale {
+        manifest::NONE => 1.0,
+        _ if kind == Resid::Attn => 1.0,
+        bits => f32::from_bits(bits) as f64,
     };
+    if !scale.is_finite() {
+        return Err(Fail::Manifest);
+    }
     residual_link(&dst, &add, &src, scale)
 }
 
@@ -339,10 +517,13 @@ mod tests {
 
     #[test]
     fn layout_of_a_stage2_position() {
-        assert_eq!(n_pos_leaves(3, 2), 11);
+        assert_eq!(n_pos_leaves(3, 2, 0), 11);
+        assert_eq!(n_pos_leaves(3, 2, 2), 13);
+        assert_eq!(router_leaf(3, 2, 1), 11);
+        assert_eq!(meta_leaf(3, 2, 2), 12);
         assert_eq!(resid_leaf(3, 0, Resid::Attn), 6);
         assert_eq!(resid_leaf(3, 1, Resid::Out), 9);
-        assert_eq!(meta_leaf(3, 2), 10);
+        assert_eq!(meta_leaf(3, 2, 0), 10);
         assert_eq!(&meta(7, 512, 42)[8..], &42u32.to_le_bytes());
     }
 
@@ -399,6 +580,24 @@ mod tests {
         let mut dst: Vec<f32> = h.iter().map(|a| 2.0 * a).collect();
         dst[0] = f32::NAN;
         assert_eq!(residual_link(&dst, &add, &h, 1.0), Err(Fail::Mismatch));
+    }
+
+    #[test]
+    fn routing_follows_the_top_scores() {
+        let scores: Vec<f32> = (0..16).map(|i| ((i * 7) % 16) as f32 * 0.25 - 2.0).collect();
+        let bias = vec![0.0f32; 16];
+        let mut order: Vec<u32> = (0..16).collect();
+        order.sort_by(|&a, &b| scores[b as usize].total_cmp(&scores[a as usize]));
+        let top = &order[..4];
+        let w = route_weights(&scores, &bias, top, 2.0).unwrap();
+        assert!((w.iter().sum::<f64>() - 2.0).abs() < 1e-12);
+        assert!(route_weights(&scores, &bias, &order[1..5], 2.0).is_none());
+        assert!(route_weights(&scores, &bias, &[top[1], top[0], top[2], top[3]], 2.0).is_none());
+        assert!(route_weights(&scores, &bias, &[top[0], top[0], top[2], top[3]], 2.0).is_none());
+        let mut biased = bias.clone();
+        biased[order[10] as usize] = 5.0;
+        let w2 = route_weights(&scores, &biased, &[order[10], top[0], top[1], top[2]], 2.0).unwrap();
+        assert!((w2.iter().sum::<f64>() - 2.0).abs() < 1e-12);
     }
 
     #[test]
