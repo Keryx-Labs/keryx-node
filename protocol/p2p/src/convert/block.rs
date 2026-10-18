@@ -41,6 +41,8 @@ pub struct EncodedPomProof {
     pub legacy: Option<Vec<u8>>,
     /// Compact multiproof form, for `pom_proof_deduped`.
     pub deduped: Option<Vec<u8>>,
+    /// Block task opening, sent with the compact form.
+    pub task: Option<Vec<u8>>,
 }
 
 /// Encode a proof for one peer, preferring the compact form when the peer speaks it.
@@ -55,11 +57,11 @@ pub fn encode_pom_proof(format: PomWireFormat, header: &Header, proof: Option<&s
         && let Ok(compact) = pom_v4_wire::v4_wire_context(header, proof.tier)
             .and_then(|(seed, n_chunks)| pom_v4_wire::encode_v4_deduped(proof, seed, n_chunks))
     {
-        return EncodedPomProof { legacy: None, deduped: Some(compact) };
+        return EncodedPomProof { legacy: None, deduped: Some(compact), task: proof.task.clone() };
     }
     // `to_wire_bytes` keeps a pre-H4 proof (steps_v2 == None) byte-identical to the legacy
     // layout, so not-yet-updated peers still decode re-served pre-H4 blocks.
-    EncodedPomProof { legacy: Some(proof.to_wire_bytes()), deduped: None }
+    EncodedPomProof { legacy: Some(proof.to_wire_bytes()), deduped: None, task: None }
 }
 
 /// Decode whichever proof encoding a peer sent. `header` is needed for the compact form only, to
@@ -68,11 +70,13 @@ pub fn decode_pom_proof(
     header: &Header,
     pom_proof: Option<Vec<u8>>,
     pom_proof_deduped: Option<Vec<u8>>,
+    block_task: Option<Vec<u8>>,
 ) -> Result<Option<PomProof>, ConversionError> {
     if let Some(bytes) = pom_proof_deduped {
         let tier = pom_v4_wire::deduped_tier(&bytes).ok_or(ConversionError::PomProofDecode)?;
         let (seed, n_chunks) = pom_v4_wire::v4_wire_context(header, tier).map_err(|_| ConversionError::PomProofDecode)?;
-        let proof = pom_v4_wire::decode_v4_deduped(&bytes, seed, n_chunks).map_err(|_| ConversionError::PomProofDecode)?;
+        let mut proof = pom_v4_wire::decode_v4_deduped(&bytes, seed, n_chunks).map_err(|_| ConversionError::PomProofDecode)?;
+        proof.task = block_task;
         return Ok(Some(proof));
     }
     if let Some(bytes) = pom_proof {
@@ -92,6 +96,7 @@ impl From<(HeaderFormat, EncodedPomProof, &Block)> for protowire::BlockMessage {
             transactions: block.transactions.iter().map(|tx| tx.into()).collect(),
             pom_proof: pom.legacy,
             pom_proof_deduped: pom.deduped,
+            block_task: pom.task,
             // Carry the tier explicitly (falls back to the proof's tier) so it survives IBD even
             // when the full proof is absent (legacy blocks).
             pom_tier: block.pom_tier.or_else(|| block.pom_proof.as_ref().map(|p| p.tier)).map(|t| t as u32),
@@ -107,6 +112,7 @@ impl From<&BlockBody> for protowire::BlockBodyMessage {
             pom_tier: None,
             pom_proof: None,
             pom_proof_deduped: None,
+            block_task: None,
         }
     }
 }
@@ -125,7 +131,7 @@ impl TryFrom<Versioned<protowire::BlockMessage>> for Block {
         let hdr: Header = Versioned(header_format, header).try_into()?;
         // Decode the proof against the header: the compact encoding omits the walk seed and tree
         // shape precisely because both are derivable from it.
-        let proof = decode_pom_proof(&hdr, block.pom_proof, block.pom_proof_deduped)?;
+        let proof = decode_pom_proof(&hdr, block.pom_proof, block.pom_proof_deduped, block.block_task)?;
         let mut blk = Block::new(hdr, txs);
         if let Some(proof) = proof {
             blk = blk.with_pom_proof(proof);
@@ -168,6 +174,7 @@ mod tests {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 
@@ -187,6 +194,7 @@ mod tests {
             ]),
             v3: None,
             v4: None,
+            task: None,
         }
     }
 
@@ -221,6 +229,23 @@ mod tests {
                 (HeaderFormat::Legacy, encode_pom_proof(format, block.header.as_ref(), block.pom_proof.as_ref()), &block).into();
             assert_eq!(msg.pom_proof.is_some() as u8 + msg.pom_proof_deduped.is_some() as u8, 1, "{format:?}");
         }
+    }
+
+    /// A proof carrying a block task opening keeps it through the legacy wire.
+    #[test]
+    fn task_opening_survives_the_legacy_wire() {
+        let mut proof = dummy_proof_v2();
+        proof.task = Some(vec![0xAB; 300]);
+        let block = Block::from_precomputed_hash(Hash::from_bytes([4u8; 32]), vec![]).with_pom_proof(proof);
+        for format in [PomWireFormat::Legacy, PomWireFormat::Deduped] {
+            let msg: protowire::BlockMessage =
+                (HeaderFormat::Legacy, encode_pom_proof(format, block.header.as_ref(), block.pom_proof.as_ref()), &block).into();
+            let back: Block = Versioned(HeaderFormat::Legacy, msg).try_into().unwrap();
+            assert_eq!(back.pom_proof.unwrap().task.as_deref(), Some(&[0xABu8; 300][..]), "{format:?}");
+        }
+        let plain = PomProof::from_wire_bytes(&dummy_proof_v2().to_wire_bytes()).unwrap();
+        assert!(plain.task.is_none());
+        assert_eq!(dummy_proof_v2().to_wire_bytes(), borsh::to_vec(&keryx_consensus_core::pom::PomProofPreV3::from(&dummy_proof_v2())).unwrap());
     }
 
     /// A block with no proof stays with no proof, in either format.

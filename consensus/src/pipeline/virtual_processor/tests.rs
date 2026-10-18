@@ -531,6 +531,7 @@ async fn tier_reward_e2e_scales_merged_block_miner_cut() {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 
@@ -589,6 +590,7 @@ async fn ibd_body_without_proof_is_paid_by_its_header_tier() {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 
@@ -748,6 +750,7 @@ async fn service_cohort_from_recent_tier_producers() {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 

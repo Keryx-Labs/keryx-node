@@ -678,6 +678,7 @@ mod tests {
             steps_v2: None,
             v3: None,
             v4: Some(v4),
+            task: None,
         }
     }
 
