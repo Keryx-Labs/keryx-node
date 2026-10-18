@@ -464,9 +464,16 @@ impl Tier {
 
     /// Residual point drawn by `seed`.
     pub fn open_resid(&self, trace: &Trace, seed: &Hash) -> ResidPoint {
+        self.open_resid_with(&self.chain_ctx(), trace, seed)
+    }
+
+    /// Residual point drawn by `seed` under `ctx`.
+    pub fn open_resid_with(&self, ctx: &ChainCtx, trace: &Trace, seed: &Hash) -> ResidPoint {
         let d = draw::point(seed, chain::RESID_POINT);
         let np = N_PRODUCTS as u64;
-        let t = d[0] % trace.positions.len() as u64;
+        let resp = crate::verify::ResponseCtx { trace_root: trace.trace_root, n_prompt: trace.n_prompt, n_pos: trace.positions.len() as u32 };
+        let sel = d[1] % (2 * N_LAYERS as u64);
+        let t = chain::resid_position(ctx, &resp, sel / 2, d[0]).expect("residual position");
         let sel = d[1] % (2 * N_LAYERS as u64);
         let (layer, kind) = (sel / 2, if sel % 2 == 0 { Resid::Attn } else { Resid::Out });
         let pos = &trace.positions[t as usize];
@@ -621,6 +628,36 @@ mod tests {
             }
         }
         assert!(refused > 0);
+    }
+
+    #[test]
+    fn a_trimmed_last_layer_adds_its_output_only_product() {
+        let (mut tier, trace) = honest();
+        let down = rank(N_LAYERS - 1, FFN_DOWN);
+        let (e, bytes) = &mut tier.entries[down];
+        e.role = manifest::ROLE_OUTPUT;
+        let nl = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        bytes[2 + nl + 44] = manifest::ROLE_OUTPUT;
+        tier.entry_leaves = tier.entries.iter().map(|(_, b)| Entry::leaf(b)).collect();
+        tier.m_t = rt_range_proof(&tier.entry_leaves, 0, 1).0;
+        let (tc, rc) = (tier.tier(), resp(&trace));
+        let trimmed = ChainCtx { trim_last: true, ..tier.chain_ctx() };
+        let (mut ok, mut refused) = (0, 0);
+        for s in 0..256u32 {
+            let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+            let sel = draw::point(&seed, chain::RESID_POINT)[1] % (2 * N_LAYERS as u64);
+            if sel != 2 * N_LAYERS as u64 - 1 {
+                continue;
+            }
+            let r = verify_resid_point(&tc, &trimmed, &rc, &seed, &tier.open_resid_with(&trimmed, &trace, &seed));
+            assert_eq!(r, Ok(()), "seed {s}");
+            ok += 1;
+            let untrimmed = tier.chain_ctx();
+            let r = verify_resid_point(&tc, &untrimmed, &rc, &seed, &tier.open_resid_with(&untrimmed, &trace, &seed));
+            assert_eq!(r, Err(crate::verify::Fail::Manifest), "seed {s}");
+            refused += 1;
+        }
+        assert!(ok > 0 && refused > 0);
     }
 }
 

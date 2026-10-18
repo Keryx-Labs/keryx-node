@@ -389,6 +389,7 @@ struct MoeCheck<'a> {
     c: u64,
     seed: &'a Hash,
     n_ubatch: u32,
+    trimmed: bool,
 }
 
 impl MoeCheck<'_> {
@@ -421,7 +422,7 @@ impl MoeCheck<'_> {
         let w = route_weights(&scores, &bias, &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
 
         let ge = open_entry(tier, &m.gate, moe.gate_exps as u64)?;
-        if ge.role != manifest::ROLE_PRODUCT || ge.k != self.dim || ge.n_exp as u64 != n_exp {
+        if !layer_role(ge.role, self.trimmed) || ge.k != self.dim || ge.n_exp as u64 != n_exp {
             return Err(Fail::Manifest);
         }
         let layout = crate::verify::layout_for(self.n_ubatch, ge.wtype);
@@ -470,6 +471,12 @@ impl MoeCheck<'_> {
     }
 }
 
+/// Whether a product of role `role` may feed a residual of a layer, `trimmed` = the last layer
+/// kept only at the output positions.
+fn layer_role(role: u8, trimmed: bool) -> bool {
+    role == manifest::ROLE_PRODUCT || (trimmed && role == manifest::ROLE_OUTPUT)
+}
+
 /// Position of a residual point of `layer`.
 pub fn resid_position(ctx: &ChainCtx, resp: &ResponseCtx, layer: u64, d0: u64) -> Result<u64, Fail> {
     let n_pos = resp.n_pos as u64;
@@ -499,7 +506,8 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     };
     let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
     let pe = open_entry(tier, &p.product, rank)?;
-    if pe.role != manifest::ROLE_PRODUCT || pe.glu_form != manifest::FORM_NONE || pe.n_exp != 1 {
+    let trimmed = ctx.trim_last && layer + 1 == n_layers;
+    if !layer_role(pe.role, trimmed) || pe.glu_form != manifest::FORM_NONE || pe.n_exp != 1 {
         return Err(Fail::Manifest);
     }
     let dim = pe.m;
@@ -528,7 +536,7 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     let post = if kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
     if let ResidAdd::Moe(m) = &p.add {
         let moe = ll.moe.filter(|_| kind == Resid::Out && post == manifest::NONE).ok_or(Fail::Shape)?;
-        let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed, n_ubatch: p.n_ubatch };
+        let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed, n_ubatch: p.n_ubatch, trimmed };
         return ctx2.verify(&moe, m, &dst, &src, off, n);
     }
     let add: Vec<f64> = match (post, &p.add) {
