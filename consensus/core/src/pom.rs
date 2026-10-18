@@ -67,6 +67,21 @@ pub fn pom_seed_h10_active(daa_score: u64) -> bool {
     daa_score >= POM_SEED_H10_ACTIVATION_DAA.load(Ordering::Relaxed)
 }
 
+/// DAA score at which headers carry the block task root. u64::MAX means "never" — initialised at
+/// startup from `Params::block_task_activation`.
+static BLOCK_TASK_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::block_task_activation`.
+pub fn init_block_task_activation(daa_score: u64) {
+    BLOCK_TASK_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Whether a header at `daa_score` carries the block task root.
+#[inline(always)]
+pub fn block_task_active(daa_score: u64) -> bool {
+    daa_score >= BLOCK_TASK_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
+
 /// DAA score at which the H14 tier lineup applies. u64::MAX means "never" — initialised at startup
 /// from `Params::private_inference_activation`, for the paths that only hold a header.
 static PRIVATE_INFERENCE_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);

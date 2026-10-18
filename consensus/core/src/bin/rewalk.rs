@@ -44,6 +44,7 @@ fn check(path: &str, blob: &[u8]) {
         pfs,
         h(&hd, "serviceStateHash").parse().unwrap_or_default(),
         tier,
+        Default::default(),
     );
     let pre: [u8; 32] = hash_override_nonce_time(&header, 0, 0).as_bytes();
     let seed = pom_block_seed_h5_2(&pre, timestamp, nonce);

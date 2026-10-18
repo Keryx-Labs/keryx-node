@@ -46,6 +46,7 @@ from!(item: &keryx_rpc_core::RpcOptionalHeader, protowire::RpcOptionalHeader, {
         pom_final_state: item.pom_final_state,
         service_state_hash: item.service_state_hash.map(|x| x.to_string()),
         pom_tier: item.pom_tier.map(|x| x as u32),
+        task_root: item.task_root.map(|x| x.to_string()),
     }
 });
 
@@ -71,5 +72,6 @@ try_from!(item: &protowire::RpcOptionalHeader, keryx_rpc_core::RpcOptionalHeader
         pom_final_state: item.pom_final_state,
         service_state_hash: item.service_state_hash.as_ref().map(|x| RpcHash::from_str(x)).transpose()?,
         pom_tier: item.pom_tier.map(|x| x as u8),
+        task_root: item.task_root.as_ref().map(|x| RpcHash::from_str(x)).transpose()?,
     }
 });

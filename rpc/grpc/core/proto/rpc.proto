@@ -48,6 +48,8 @@ message RpcBlockHeader {
   string serviceStateHash = 17;
   // H6: the winning walk's proven PoM tier, committed into the block hash.
   uint32 pomTier = 18;
+  // Block task root of the block's window (hex); empty before the block task gate.
+  string taskRoot = 19;
 }
 
 message RpcBlockLevelParents {
@@ -1043,6 +1045,8 @@ message RpcOptionalHeader {
   optional string serviceStateHash = 16;
   // H6: the winning walk's proven PoM tier.
   optional uint32 pomTier = 17;
+  // Block task root of the block's window (hex).
+  optional string taskRoot = 18;
 }
 
 message RpcOptionalTransactionOutpoint {

@@ -171,6 +171,10 @@ pub struct Header {
     /// proofless historical bodies. Zero before the fork.
     #[serde(default)]
     pub pom_tier: u8,
+    /// Root of the block task trace of this block's window. Consensus at/after the block task
+    /// gate: hashed into both the block hash and `pre_pow_hash`. Zero before the fork.
+    #[serde(default)]
+    pub task_root: Hash,
 }
 
 impl Header {
@@ -191,6 +195,7 @@ impl Header {
         pom_final_state: u64,
         service_state_hash: Hash,
         pom_tier: u8,
+        task_root: Hash,
     ) -> Self {
         let mut header = Self {
             hash: Default::default(), // Temp init before the finalize below
@@ -209,6 +214,7 @@ impl Header {
             pom_final_state,
             service_state_hash,
             pom_tier,
+            task_root,
         };
         header.finalize();
         header
@@ -245,6 +251,7 @@ impl Header {
             pom_final_state: 0,
             service_state_hash: Default::default(),
             pom_tier: 0,
+            task_root: Default::default(),
         }
     }
 }
@@ -305,6 +312,7 @@ mod tests {
             0,
             Default::default(),
             0,
+            Default::default(),
         );
         let json = serde_json::to_string(&header).unwrap();
         println!("{}", json);

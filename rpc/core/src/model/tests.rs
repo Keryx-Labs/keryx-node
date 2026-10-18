@@ -156,6 +156,7 @@ mod mockery {
                 pom_final_state: mock(),
                 service_state_hash: mock(),
                 pom_tier: mock(),
+                task_root: Default::default(),
             }
         }
     }
@@ -178,6 +179,7 @@ mod mockery {
                 pom_final_state: mock(),
                 service_state_hash: mock(),
                 pom_tier: mock(),
+                task_root: Default::default(),
             }
         }
     }
@@ -431,6 +433,7 @@ mod mockery {
                 pom_final_state: mock(),
                 service_state_hash: mock(),
                 pom_tier: mock(),
+                task_root: Default::default(),
             }
         }
     }
