@@ -5,7 +5,8 @@ use crate::dot;
 use crate::manifest::{self, Chain, Entry, LayerLinks, ProductLink};
 use crate::draw;
 use crate::merkle::{B3_CHUNK, Hash, b3_chunk_cv, b3_path, b3_root, rt_range_proof};
-use crate::opening::{ChunkRange, EntryOpening, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, LeafBytes, LeafChunk, LinkOpening, Point, PrefixPoint, ResidAdd, ResidPoint, ResidSrc};
+use crate::prefix::{self, PrefixCtx};
 use crate::prefix::expected_input;
 use crate::q8;
 use crate::quant;
@@ -21,8 +22,8 @@ pub const VOCAB: usize = 256;
 pub const EPS: f64 = 1e-6;
 
 const PER_LAYER: usize = 7;
-const ATTN_OUTPUT: usize = 0;
-const ATTN_Q: usize = 1;
+const ATTN_Q: usize = 0;
+const ATTN_OUTPUT: usize = 1;
 const FFN_DOWN: usize = 2;
 const FFN_GATE: usize = 3;
 const FFN_UP: usize = 4;
@@ -118,7 +119,7 @@ impl Tier {
             for p in 0..PER_LAYER {
                 let (name, m) = match p {
                     ATTN_OUTPUT => ("attn_output", D),
-                    ATTN_Q => ("attn_q", Q_M),
+                    ATTN_Q => ("attn_k", Q_M),
                     FFN_DOWN => ("ffn_down", D),
                     FFN_GATE => ("ffn_gate", D),
                     FFN_UP => ("ffn_up", D),
@@ -430,6 +431,37 @@ impl Tier {
 }
 
 impl Tier {
+    /// Prefix context of the synthetic tier: identity byte table.
+    pub fn prefix_ctx(&self, offset: u32) -> PrefixCtx {
+        PrefixCtx {
+            table: std::array::from_fn(|b| b as u32),
+            offset,
+            embd_entry: EMBD as u32,
+            norm_entry: attn_norm(0) as u32,
+            eps: EPS,
+            embd_scale: 1.0,
+        }
+    }
+
+    /// Stage-2 prefix point drawn by `seed` at `offset`.
+    pub fn open_prefix(&self, trace: &Trace, seed: &Hash, offset: u32) -> PrefixPoint {
+        let np = N_PRODUCTS as u64;
+        let t = prefix::position(seed, offset) as usize;
+        let pos = &trace.positions[t];
+        let k = self.entry(attn_norm(0)).k;
+        let (b0, n) = chain::norm_fragment(seed, prefix::PREFIX_POINT, k);
+        PrefixPoint {
+            n_ubatch: 1,
+            pos_path: b3_path(&trace.pos_roots, t),
+            meta_path: b3_path(&pos.hashes, chain::meta_leaf(np, N_LAYERS as u64, 0) as usize),
+            entry: self.entry_opening(0),
+            x: pos.leaves[0].clone(),
+            x_path: b3_path(&pos.hashes, 0),
+            embd: self.row_of(EMBD, pos.tok as u64),
+            norm: (self.entry_opening(attn_norm(0)), self.bytes_range(attn_norm(0), 4 * b0 * 32, 4 * (n * 32).min(k - b0 * 32))),
+        }
+    }
+
     /// Residual point drawn by `seed`.
     pub fn open_resid(&self, trace: &Trace, seed: &Hash) -> ResidPoint {
         let d = draw::point(seed, chain::RESID_POINT);
@@ -993,3 +1025,54 @@ mod head_tests {
         assert!(seen.iter().all(|&b| b));
     }
 }
+
+#[cfg(test)]
+mod block_task_tests {
+    use super::*;
+    use crate::block_task::{TASK_LEN, draw_seed, task_tokens, verify_block_task};
+    use crate::opening::Opening;
+
+    fn opening(tier: &Tier, trace: &Trace, block_hash: &Hash) -> Opening {
+        let seed = draw_seed(block_hash);
+        let (points, links): (Vec<_>, Vec<_>) = (0..draw::POINTS)
+            .map(|i| {
+                let (p, tok, link) = tier.open_point(trace, &seed, i);
+                (p, (tok, link))
+            })
+            .unzip();
+        Opening {
+            response_txid: *block_hash,
+            experts: vec![None; points.len()],
+            points,
+            prefix: Some(tier.open_prefix(trace, &seed, 0)),
+            links,
+            resid: Some(tier.open_resid(trace, &seed)),
+        }
+    }
+
+    #[test]
+    fn honest_block_task_passes() {
+        let tier = Tier::new();
+        let window_seed = [0x5Au8; 32];
+        let pc = tier.prefix_ctx(0);
+        let trace = tier.trace(&task_tokens(&pc.table, &window_seed), TASK_LEN);
+        for s in 0..48u32 {
+            let block = *blake3::hash(&s.to_le_bytes()).as_bytes();
+            verify_block_task(&tier.tier(), &tier.chain_ctx(), &pc, &trace.trace_root, &window_seed, &block, &opening(&tier, &trace, &block))
+                .unwrap_or_else(|e| panic!("block {s}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn a_task_of_another_window_is_refused() {
+        let tier = Tier::new();
+        let pc = tier.prefix_ctx(0);
+        let trace = tier.trace(&task_tokens(&pc.table, &[0x11u8; 32]), TASK_LEN);
+        for s in 0..48u32 {
+            let block = *blake3::hash(&s.to_le_bytes()).as_bytes();
+            let r = verify_block_task(&tier.tier(), &tier.chain_ctx(), &pc, &trace.trace_root, &[0x22u8; 32], &block, &opening(&tier, &trace, &block));
+            assert!(r.is_err(), "block {s}");
+        }
+    }
+}
+
