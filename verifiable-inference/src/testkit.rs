@@ -61,7 +61,7 @@ fn q8_0_rows(seed: u64, rows: usize, scale: f32) -> Vec<u8> {
 }
 
 /// Q8_1 row (`mmvq` layout) of `v`, rounded the way the kernel does.
-fn q8_1_row(v: &[f64]) -> Vec<u8> {
+pub(crate) fn q8_1_row(v: &[f64]) -> Vec<u8> {
     let mut leaf = Vec::with_capacity(v.len() / 32 * 36);
     for blk in v.chunks(32) {
         let amax = blk.iter().fold(0f64, |m, a| m.max(a.abs()));
@@ -116,6 +116,7 @@ impl Model {
             glu_form: manifest::FORM_NONE,
             partner: manifest::NONE,
             bias: manifest::NONE,
+            chain: manifest::Chain::None,
         };
         let entries: Vec<Entry> = vec![
             base("blk.0.ffn_down.weight", manifest::ROLE_PRODUCT, quant::Q8_0, M, 0, product.len(), row_bytes),

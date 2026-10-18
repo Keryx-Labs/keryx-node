@@ -1,5 +1,6 @@
 //! Verification of inference trace openings.
 
+pub mod chain;
 pub mod dot;
 pub mod draw;
 pub mod f16;
