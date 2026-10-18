@@ -110,6 +110,31 @@ mod tests {
         assert_ne!(blockhash::NONE, header.hash);
     }
 
+    /// Shared with the miner's `block_task_header_vector`: both MUST hash these fields alike.
+    #[test]
+    fn block_task_header_vector() {
+        let mut h = Header::from_precomputed_hash(1.into(), vec![Hash::from_bytes([0x11; 32])]);
+        h.version = 1;
+        h.hash_merkle_root = Hash::from_bytes([0x22; 32]);
+        h.accepted_id_merkle_root = Hash::from_bytes([0x23; 32]);
+        h.utxo_commitment = Hash::from_bytes([0x24; 32]);
+        h.timestamp = 1_700_000_000_000;
+        h.bits = 0x1e7f_ffff;
+        h.nonce = 0x0102_0304_0506_0708;
+        h.daa_score = u64::MAX;
+        h.blue_score = 98_765;
+        h.blue_work = BlueWorkType::from_u64(0x0123_4567_89ab_cdef);
+        h.pruning_point = Hash::from_bytes([0x33; 32]);
+        h.task_root = Hash::from_bytes([0x44; 32]);
+        h.pom_final_state = 0xdead_beef;
+        h.service_state_hash = Hash::from_bytes([0x55; 32]);
+        h.pom_tier = 3;
+        let pre = hash_internal(&h, 0, 0, Some(h.task_root), None, None, None);
+        let full = hash_internal(&h, h.nonce, h.timestamp, Some(h.task_root), Some(h.pom_final_state), Some(h.service_state_hash), Some(h.pom_tier));
+        assert_eq!(pre.to_string(), "c850d9d429ed501ce0016297999282297079f3d70c317b9b3aaf933a7868211f");
+        assert_eq!(full.to_string(), "346345442413f856f84442a2866100362d52f7e8426d1e19c9af5c8bae988e3a");
+    }
+
     #[test]
     fn task_root_is_hashed_only_when_present() {
         let mut header = Header::from_precomputed_hash(1.into(), vec![2.into()]);
