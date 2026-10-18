@@ -64,6 +64,8 @@ pub struct MoeLinks {
     /// f32 bits.
     pub w_scale: u32,
     pub ffn_norm: u32,
+    /// Rank of the gate product of the routed experts, whose input is the router input.
+    pub gate_exps: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +104,7 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
         }
         Some(&tag @ (TAG_LAYER | TAG_MOE_LAYER)) => {
             let moe = if tag == TAG_MOE_LAYER {
-                Some(MoeLinks { down_exps: u32a(25)?, router: u32a(29)?, probs_bias: u32a(33)?, w_scale: u32a(37)?, ffn_norm: u32a(41)? })
+                Some(MoeLinks { down_exps: u32a(25)?, router: u32a(29)?, probs_bias: u32a(33)?, w_scale: u32a(37)?, ffn_norm: u32a(41)?, gate_exps: u32a(45)? })
             } else {
                 None
             };
@@ -116,7 +118,7 @@ fn parse_chain(b: &[u8]) -> Option<(Chain, usize)> {
                     scale: u32a(21)?,
                     moe,
                 }),
-                if moe.is_some() { 45 } else { 25 },
+                if moe.is_some() { 49 } else { 25 },
             ))
         }
         _ => None,
@@ -141,7 +143,7 @@ pub fn chain_bytes(c: &Chain) -> Vec<u8> {
                 b.extend_from_slice(&v.to_le_bytes());
             }
             if let Some(m) = l.moe {
-                for v in [m.down_exps, m.router, m.probs_bias, m.w_scale, m.ffn_norm] {
+                for v in [m.down_exps, m.router, m.probs_bias, m.w_scale, m.ffn_norm, m.gate_exps] {
                     b.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -272,7 +274,7 @@ mod tests {
     fn chain_extensions_round_trip() {
         let p = Chain::Product(ProductLink { layer: 3, link: LINK_FFN_IN, norm: 17, src: NONE });
         let l = Chain::Layer(LayerLinks { layer: 3, proj: 4, down: 9, post_attn: 20, post_ffn: 21, scale: NONE, moe: None });
-        let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29 };
+        let moe = MoeLinks { down_exps: 12, router: 30, probs_bias: 31, w_scale: 2.446f32.to_bits(), ffn_norm: 29, gate_exps: 13 };
         let lm = Chain::Layer(LayerLinks { layer: 4, proj: 5, down: 11, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: Some(moe) });
         for c in [Chain::None, p, l, lm] {
             let mut b = base_bytes("x", ROLE_PRODUCT);

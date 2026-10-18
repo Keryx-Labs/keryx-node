@@ -88,7 +88,7 @@ pub fn verify_prefix_point(
     request_txid: &Hash,
     p: &PrefixPoint,
 ) -> Result<u64, Fail> {
-    verify_prefix_point_at(tier, ctx, resp, seed, request_txid, p, |_| PosShape::stage1(tier.n_products))
+    verify_prefix_point_at(tier, ctx, resp, seed, request_txid, p, |_| PosShape::stage1(tier.n_products), false)
 }
 
 pub(crate) fn verify_prefix_point_at(
@@ -99,6 +99,7 @@ pub(crate) fn verify_prefix_point_at(
     request_txid: &Hash,
     p: &PrefixPoint,
     shape_for: impl Fn(u32) -> PosShape,
+    fragment: bool,
 ) -> Result<u64, Fail> {
     if resp.n_pos == 0 || resp.n_prompt == 0 || resp.n_prompt > resp.n_pos || !fits(resp.n_prompt, ctx.offset) {
         return Err(Fail::Shape);
@@ -139,10 +140,18 @@ pub(crate) fn verify_prefix_point_at(
     let k = first.k as usize;
     let row = open_row(tier, &embd, &p.embd.1, tok as u64)?;
     let e = quant::dequant_row(embd.wtype, &row, k).ok_or(Fail::Unsupported)?;
-    let w_bytes = open_bytes(tier, &norm, &p.norm.1, 0, 4 * k as u64)?;
+    let (b0, nb) = if fragment { crate::chain::norm_fragment(seed, PREFIX_POINT, k as u64) } else { (0, (k as u64).div_ceil(32)) };
+    let (lo, len) = (b0 * 32, (nb * 32).min(k as u64 - b0 * 32));
+    let w_bytes = open_bytes(tier, &norm, &p.norm.1, 4 * lo, 4 * len)?;
     let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-    let v = expected_input(&e, &w, ctx.eps, ctx.embd_scale);
-    match deviation(&p.x, layout, &v) {
+    let dev = if fragment {
+        let s = crate::chain::rms_scaled(&e, ctx.eps, ctx.embd_scale);
+        let v: Vec<f64> = s[lo as usize..(lo + len) as usize].iter().zip(&w).map(|(a, &b)| a * b as f64).collect();
+        crate::chain::block_deviation(&p.x, layout, k, b0 as usize, &v)
+    } else {
+        deviation(&p.x, layout, &expected_input(&e, &w, ctx.eps, ctx.embd_scale))
+    };
+    match dev {
         Some(dev) if dev <= THRESHOLD => Ok(t),
         _ => Err(Fail::Mismatch),
     }

@@ -326,8 +326,12 @@ impl Tier {
         self.range(base + offset / 32, base + (offset + len - 1) / 32)
     }
 
-    fn weights_of(&self, i: usize) -> (EntryOpening, ChunkRange) {
-        (self.entry_opening(i), self.bytes_range(i, 0, self.entry(i).n_bytes))
+
+    fn norm_fragment_of(&self, i: usize, seed: &Hash, point: u32) -> (EntryOpening, ChunkRange) {
+        let k = self.entry(i).k;
+        let (b0, n) = chain::norm_fragment(seed, point, k);
+        let len = (n * 32).min(k - b0 * 32);
+        (self.entry_opening(i), self.bytes_range(i, 4 * b0 * 32, 4 * len))
     }
 
     fn row_of(&self, i: usize, r: u64) -> (EntryOpening, ChunkRange) {
@@ -405,7 +409,7 @@ impl Tier {
         let link = match pl.link {
             manifest::LINK_NONE => LinkOpening::None,
             manifest::LINK_ATTN_IN if layer == 0 => {
-                LinkOpening::Token { embd: self.row_of(EMBD, pos.tok as u64), norm: self.weights_of(pl.norm as usize) }
+                LinkOpening::Token { embd: self.row_of(EMBD, pos.tok as u64), norm: self.norm_fragment_of(pl.norm as usize, seed, i) }
             }
             manifest::LINK_GLU | manifest::LINK_DIRECT => {
                 let src = pl.src as u64;
@@ -418,7 +422,7 @@ impl Tier {
                     manifest::LINK_FFN_IN => chain::resid_leaf(np, layer, Resid::Attn),
                     _ => chain::resid_leaf(np, N_LAYERS as u64 - 1, Resid::Out),
                 };
-                LinkOpening::Norm { src: leaf_bytes(pos, leaf), norm: self.weights_of(pl.norm as usize) }
+                LinkOpening::Norm { src: leaf_bytes(pos, leaf), norm: self.norm_fragment_of(pl.norm as usize, seed, i) }
             }
         };
         (point, pos.tok, link)
@@ -748,11 +752,12 @@ mod moe_tests {
         let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
 
         let none = manifest::NONE;
-        let moe = manifest::MoeLinks { down_exps: 1, router: 3, probs_bias: 4, w_scale: SCALE.to_bits(), ffn_norm: 5 };
+        let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3 };
         let entries = vec![
             entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_down_exps.weight", manifest::ROLE_PRODUCT, D, D, E as u32, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_down_shexp.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
+            entry("blk.0.ffn_gate_exps.weight", manifest::ROLE_PRODUCT, D, D, E as u32, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_gate_inp.weight", manifest::ROLE_ROUTER, D, E, 1, 0, 4 * E * D, 4 * D, Chain::None),
             entry("blk.0.exp_probs_b.bias", manifest::ROLE_NORM, E, 1, 1, bias_off, 4 * E, 4 * E, Chain::None),
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
@@ -766,9 +771,9 @@ mod moe_tests {
             n_chunks: chunk_leaves.len() as u64,
             m_t: rt_range_proof(&entry_leaves, 0, 1).0,
             n_entries: entries.len() as u64,
-            n_products: 3,
+            n_products: 4,
         };
-        let ctx = ChainCtx { n_layers: 1, layer_base: 6, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: U as u32 };
+        let ctx = ChainCtx { n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: U as u32 };
 
         let r = vecf(3, D, 2.0);
         let x = chain::rms_norm(&r, &norm, EPS);
@@ -793,9 +798,10 @@ mod moe_tests {
         for id in &committed {
             y_exps.extend_from_slice(&id.to_le_bytes());
         }
-        let np = 3u64;
+        let np = 4u64;
         let n_leaves = chain::n_pos_leaves(np, 1, 1) as usize;
         let mut leaves = vec![Vec::new(); n_leaves];
+        leaves[6] = q8_1_row(&x);
         leaves[3] = y_exps;
         leaves[5] = bytes(&sh);
         leaves[chain::resid_leaf(np, 0, Resid::Attn) as usize] = bytes(&r);
@@ -826,7 +832,7 @@ mod moe_tests {
             if d[1] % 2 != 1 {
                 return None;
             }
-            let np = 3u64;
+            let np = 4u64;
             let c = d[2] % (D as u64 * 4 / B3_CHUNK as u64);
             let per = (D * 4 / B3_CHUNK) as u64;
             let row = d[3] % E as u64;
@@ -836,19 +842,19 @@ mod moe_tests {
                 tok: 7,
                 pos_path: Vec::new(),
                 meta_path: b3_path(&self.pos.hashes, chain::meta_leaf(np, 1, 1) as usize),
-                layer: self.eo(6),
+                layer: self.eo(7),
                 product: self.eo(2),
                 dst: leaf_chunk(&self.pos, chain::resid_leaf(np, 0, Resid::Out), c),
                 src: ResidSrc::Chunk(leaf_chunk(&self.pos, chain::resid_leaf(np, 0, Resid::Attn), c)),
                 add: ResidAdd::Moe(Box::new(MoeAdd {
                     scores: leaf_bytes(&self.pos, chain::router_leaf(np, 1, 0)),
-                    bias: (self.eo(4), self.range(4 * E * D, 4 * E)),
+                    bias: (self.eo(5), self.range(4 * E * D, 4 * E)),
                     ids: ExpertIds { chunk: ids_chunk.chunk, chunk_path: ids_chunk.chunk_path },
                     slots: (0..U as u64).map(|s| leaf_chunk(&self.pos, 3, s * per + c)).collect(),
                     shexp: leaf_chunk(&self.pos, 5, c),
-                    router_row: (self.eo(3), self.range(row as usize * 4 * D, 4 * D)),
-                    src_full: leaf_bytes(&self.pos, chain::resid_leaf(np, 0, Resid::Attn)),
-                    norm: (self.eo(5), self.range(4 * E * D + 4 * E, 4 * D)),
+                    router_row: (self.eo(4), self.range(row as usize * 4 * D, 4 * D)),
+                    gate: self.eo(3),
+                    gate_x: leaf_bytes(&self.pos, 6),
                 })),
             })
         }

@@ -131,8 +131,8 @@ pub struct MoeAdd {
     pub slots: Vec<LeafChunk>,
     pub shexp: LeafChunk,
     pub router_row: (EntryOpening, ChunkRange),
-    pub src_full: LeafBytes,
-    pub norm: (EntryOpening, ChunkRange),
+    pub gate: EntryOpening,
+    pub gate_x: LeafBytes,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -281,8 +281,8 @@ impl W {
                 }
                 self.leaf_chunk(&m.shexp);
                 self.weights(&m.router_row);
-                self.leaf_bytes(&m.src_full);
-                self.weights(&m.norm);
+                self.entry(&m.gate);
+                self.leaf_bytes(&m.gate_x);
             }
         }
     }
@@ -392,8 +392,8 @@ impl R<'_> {
                     slots,
                     shexp: self.leaf_chunk()?,
                     router_row: self.weights()?,
-                    src_full: self.leaf_bytes()?,
-                    norm: self.weights()?,
+                    gate: self.entry()?,
+                    gate_x: self.leaf_bytes()?,
                 }))
             }
             _ => return None,

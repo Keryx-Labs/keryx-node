@@ -72,6 +72,34 @@ pub fn meta(t: u32, n_ubatch: u32, tok: u32) -> [u8; 12] {
     m
 }
 
+/// Blocks of 32 values covered by a norm weight fragment.
+pub const NORM_FRAGMENT_BLOCKS: u64 = 8;
+const FRAGMENT_DRAW: u32 = 64;
+
+/// First block and block count of the norm weight fragment drawn for point `i` over `k` values.
+pub fn norm_fragment(seed: &Hash, i: u32, k: u64) -> (u64, u64) {
+    let blocks = k.div_ceil(32);
+    let n = NORM_FRAGMENT_BLOCKS.min(blocks);
+    (draw::point(seed, FRAGMENT_DRAW + i)[0] % (blocks - n + 1), n)
+}
+
+/// `v / rms(v)` in f64.
+pub fn rms_scaled(v: &[f32], eps: f64, scale: f64) -> Vec<f64> {
+    let e: Vec<f64> = v.iter().map(|&a| a as f64 * scale).collect();
+    let inv = 1.0 / libm::sqrt(e.iter().map(|a| a * a).sum::<f64>() / e.len() as f64 + eps);
+    e.iter().map(|a| a * inv).collect()
+}
+
+/// Checks the input blocks `[b0, b0 + n)` against `rms_scaled(src)` times the weight fragment `w`.
+fn fragment_link(x: &[u8], layout: u8, k: usize, scaled: &[f64], w: &[f32], b0: u64, n: u64) -> Result<(), Fail> {
+    let (lo, hi) = ((b0 * 32) as usize, (((b0 + n) * 32) as usize).min(k));
+    if scaled.len() != k || w.len() != hi - lo {
+        return Err(Fail::Shape);
+    }
+    let v: Vec<f64> = scaled[lo..hi].iter().zip(w).map(|(a, &b)| a * b as f64).collect();
+    within(block_deviation(x, layout, k, b0 as usize, &v))
+}
+
 /// `v * w / rms(v)` in f64.
 pub fn rms_norm(v: &[f32], w: &[f32], eps: f64) -> Vec<f64> {
     expected_input(v, w, eps, 1.0)
@@ -232,9 +260,10 @@ pub fn verify_chain_point(
     match (pl.link, link) {
         (manifest::LINK_NONE, LinkOpening::None) => {}
         (manifest::LINK_ATTN_IN, LinkOpening::Token { embd, norm }) if layer == 0 => {
-            let w = f32_weights(tier, norm, pl.norm, k, 0, k)?;
-            let v = expected_input(&embedding(tier, ctx, embd, tok, k)?, &w, ctx.eps, ctx.embd_scale);
-            within(block_deviation(&p.x, o.layout, k as usize, 0, &v))?;
+            let (b0, n) = norm_fragment(seed, i, k);
+            let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
+            let scaled = rms_scaled(&embedding(tier, ctx, embd, tok, k)?, ctx.eps, ctx.embd_scale);
+            fragment_link(&p.x, o.layout, k as usize, &scaled, &w, b0, n)?;
         }
         (manifest::LINK_ATTN_IN | manifest::LINK_FFN_IN | manifest::LINK_HEAD, LinkOpening::Norm { src, norm }) => {
             let leaf = match pl.link {
@@ -244,7 +273,9 @@ pub fn verify_chain_point(
                 _ => return Err(Fail::Shape),
             };
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
-            norm_link(&p.x, o.layout, &h, &f32_weights(tier, norm, pl.norm, k, 0, k)?, ctx.eps)?;
+            let (b0, n) = norm_fragment(seed, i, k);
+            let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
+            fragment_link(&p.x, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
         }
         (manifest::LINK_GLU, LinkOpening::Source { src, y, ids: Some(ids) }) if o.input.n_exp > 1 => {
             let se = open_entry(tier, src, pl.src as u64)?;
@@ -304,7 +335,7 @@ pub fn verify_chain_prefix_point(
     request_txid: &Hash,
     p: &PrefixPoint,
 ) -> Result<u64, Fail> {
-    verify_prefix_point_at(tier, prefix, resp, seed, request_txid, p, |tok| shape(tier, ctx, tok))
+    verify_prefix_point_at(tier, prefix, resp, seed, request_txid, p, |tok| shape(tier, ctx, tok), true)
 }
 
 /// Tolerance on router probabilities.
@@ -343,6 +374,8 @@ pub fn route_weights(scores: &[f32], bias: &[f32], ids: &[u32], w_scale: f64) ->
 
 /// Relative tolerance of the router scores and of the routed sum.
 pub const EPS_MOE: f64 = 1e-5;
+/// Largest quantization error of a committed Q8_1 value, in units of its block scale.
+const ROUTER_Q8_SLACK: f64 = 0.7;
 
 struct MoeCheck<'a> {
     tier: &'a TierCtx,
@@ -354,6 +387,7 @@ struct MoeCheck<'a> {
     dim: u64,
     c: u64,
     seed: &'a Hash,
+    n_ubatch: u32,
 }
 
 impl MoeCheck<'_> {
@@ -385,12 +419,32 @@ impl MoeCheck<'_> {
         let ids: Vec<u32> = m.ids.chunk.get(..4 * n_used as usize).ok_or(Fail::Shape)?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         let w = route_weights(&scores, &bias, &ids, f32::from_bits(moe.w_scale) as f64).ok_or(Fail::Mismatch)?;
 
-        let r_full = whole_leaf(self.pos_root, self.shape, resid_leaf(np, self.layer, Resid::Attn), &m.src_full, 4 * self.dim)?;
-        let x = rms_norm(&r_full, &f32_weights(tier, &m.norm, moe.ffn_norm, self.dim, 0, self.dim)?, ctx.eps);
+        let ge = open_entry(tier, &m.gate, moe.gate_exps as u64)?;
+        if ge.role != manifest::ROLE_PRODUCT || ge.k != self.dim || ge.n_exp as u64 != n_exp {
+            return Err(Fail::Manifest);
+        }
+        let layout = crate::verify::layout_for(self.n_ubatch, ge.wtype);
+        if m.gate_x.bytes.len() as u64 != crate::verify::x_len(self.dim, layout) {
+            return Err(Fail::Shape);
+        }
+        if !b3_verify(self.pos_root, self.shape.n_leaves, 2 * moe.gate_exps as u64, blake3::hash(&m.gate_x.bytes).as_bytes(), &m.gate_x.leaf_path) {
+            return Err(Fail::Trace);
+        }
+        let blocks = q8::blocks(&m.gate_x.bytes, layout, self.dim as usize).ok_or(Fail::Shape)?;
         let row = draw::point(self.seed, RESID_POINT)[3] % n_exp;
         let wr = f32s(&open_bytes(tier, &re, &m.router_row.1, row * 4 * self.dim, 4 * self.dim)?);
-        let (dot, mag) = wr.iter().zip(&x).fold((0f64, 0f64), |(d, a), (&wi, &xi)| (d + wi as f64 * xi, a + (wi as f64 * xi).abs()));
-        if !((scores[row as usize] as f64 - dot).abs() <= EPS_MOE * mag + f32::MIN_POSITIVE as f64) {
+        let (mut dot, mut mag, mut slack) = (0f64, 0f64, 0f64);
+        for (j, &wj) in wr.iter().enumerate() {
+            let (d, q) = &blocks[j / 32];
+            if !d.is_finite() {
+                return Err(Fail::Mismatch);
+            }
+            let xj = q[j % 32] as f64 * *d as f64;
+            dot += wj as f64 * xj;
+            mag += (wj as f64 * xj).abs();
+            slack += (wj as f64).abs() * ROUTER_Q8_SLACK * (*d as f64).abs();
+        }
+        if !((scores[row as usize] as f64 - dot).abs() <= slack + EPS_MOE * mag + f32::MIN_POSITIVE as f64) {
             return Err(Fail::Mismatch);
         }
 
@@ -473,14 +527,15 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     let post = if kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
     if let ResidAdd::Moe(m) = &p.add {
         let moe = ll.moe.filter(|_| kind == Resid::Out && post == manifest::NONE).ok_or(Fail::Shape)?;
-        let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed };
+        let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed, n_ubatch: p.n_ubatch };
         return ctx2.verify(&moe, m, &dst, &src, off, n);
     }
     let add: Vec<f64> = match (post, &p.add) {
         (manifest::NONE, ResidAdd::Chunk(ac)) => leaf_chunk(&pos_root, &shape, 2 * rank + 1, ac, total, c)?.iter().map(|&v| v as f64).collect(),
         (pn, ResidAdd::Normed { y, norm }) if pn != manifest::NONE => {
             let yv = whole_leaf(&pos_root, &shape, 2 * rank + 1, y, total)?;
-            rms_norm(&yv, &f32_weights(tier, norm, pn, dim, 0, dim)?, ctx.eps)[off..off + n].to_vec()
+            let w = f32_weights(tier, norm, pn, dim, off as u64, n as u64)?;
+            rms_scaled(&yv, ctx.eps, 1.0)[off..off + n].iter().zip(&w).map(|(a, &b)| a * b as f64).collect()
         }
         _ => return Err(Fail::Shape),
     };
