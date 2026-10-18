@@ -39,6 +39,41 @@ pub enum Fail {
     Mismatch,
 }
 
+/// Leaf layout of a traced position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PosShape {
+    pub n_leaves: u64,
+    pub meta_index: u64,
+    /// Token in the meta leaf (stage 2).
+    pub tok: Option<u32>,
+}
+
+impl PosShape {
+    pub fn stage1(n_products: u64) -> Self {
+        Self { n_leaves: 2 * n_products + 1, meta_index: 2 * n_products, tok: None }
+    }
+
+    pub(crate) fn meta_hash(&self, t: u64, n_ubatch: u32) -> Hash {
+        match self.tok {
+            Some(tok) => *blake3::hash(&crate::chain::meta(t as u32, n_ubatch, tok)).as_bytes(),
+            None => {
+                let mut m = [0u8; 8];
+                m[..4].copy_from_slice(&(t as u32).to_le_bytes());
+                m[4..].copy_from_slice(&n_ubatch.to_le_bytes());
+                *blake3::hash(&m).as_bytes()
+            }
+        }
+    }
+}
+
+/// What a verified point leaves for further checks at its position.
+#[derive(Debug, Clone)]
+pub(crate) struct Opened {
+    pub pos_root: Hash,
+    pub input: Entry,
+    pub layout: u8,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Report {
     pub t: u64,
@@ -116,6 +151,10 @@ fn glu(op: u8, g: f64) -> Option<(f64, f64)> {
 
 /// Verify point `i` of an opening.
 pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: &Point) -> Result<Report, Fail> {
+    verify_point_at(tier, resp, seed, i, p, &PosShape::stage1(tier.n_products)).map(|(r, _)| r)
+}
+
+pub(crate) fn verify_point_at(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: &Point, shape: &PosShape) -> Result<(Report, Opened), Fail> {
     let n_traced = resp.n_pos as u64;
     if n_traced == 0 || resp.n_prompt == 0 || resp.n_prompt > resp.n_pos {
         return Err(Fail::Shape);
@@ -169,7 +208,7 @@ pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: 
     }
     let row = d[2] % m_out;
 
-    let n_pos_leaves = 2 * tier.n_products + 1;
+    let n_pos_leaves = shape.n_leaves;
     let layout = if output_only { q8::MMVQ } else { layout_for(p.n_ubatch, g_entry.wtype) };
     if p.x.len() as u64 != x_len(g_entry.k, layout) {
         return Err(Fail::Shape);
@@ -178,10 +217,7 @@ pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: 
     if !b3_verify(&resp.trace_root, n_traced, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
     }
-    let mut meta = [0u8; 8];
-    meta[..4].copy_from_slice(&(t as u32).to_le_bytes());
-    meta[4..].copy_from_slice(&p.n_ubatch.to_le_bytes());
-    if !b3_verify(&pos_root, n_pos_leaves, 2 * tier.n_products, blake3::hash(&meta).as_bytes(), &p.meta_path) {
+    if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);
     }
     if p.y_total_len as u64 != m_out * 4 || p.y_chunk_index as u64 != row * 4 / B3_CHUNK as u64 {
@@ -235,5 +271,5 @@ pub fn verify_point(tier: &TierCtx, resp: &ResponseCtx, seed: &Hash, i: u32, p: 
     if (y - y_hat).abs() > tol {
         return Err(Fail::Mismatch);
     }
-    Ok(Report { t, rank, row, y, y_hat, tol })
+    Ok((Report { t, rank, row, y, y_hat, tol }, Opened { pos_root, input: g_entry, layout }))
 }

@@ -76,7 +76,7 @@ mod tests {
     }
 
     fn opening() -> Vec<u8> {
-        let mut p = Opening { response_txid: [5; 32], points: vec![], prefix: None }.encode();
+        let mut p = Opening { response_txid: [5; 32], points: vec![], prefix: None, links: vec![], resid: None }.encode();
         p.extend_from_slice(&[6u8; 96]);
         p
     }

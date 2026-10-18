@@ -4,7 +4,7 @@ use crate::draw;
 use crate::manifest;
 use crate::merkle::{Hash, b3_fold, b3_verify};
 use crate::opening::PrefixPoint;
-use crate::verify::{Fail, ResponseCtx, TierCtx, layout_for, open_bytes, open_entry, open_row, x_len};
+use crate::verify::{Fail, PosShape, ResponseCtx, TierCtx, layout_for, open_bytes, open_entry, open_row, x_len};
 use crate::{q8, quant};
 
 /// Prefix tokens, one per byte of the request id.
@@ -85,6 +85,18 @@ pub fn verify_prefix_point(
     request_txid: &Hash,
     p: &PrefixPoint,
 ) -> Result<u64, Fail> {
+    verify_prefix_point_at(tier, ctx, resp, seed, request_txid, p, |_| PosShape::stage1(tier.n_products))
+}
+
+pub(crate) fn verify_prefix_point_at(
+    tier: &TierCtx,
+    ctx: &PrefixCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    request_txid: &Hash,
+    p: &PrefixPoint,
+    shape_for: impl Fn(u32) -> PosShape,
+) -> Result<u64, Fail> {
     if resp.n_pos == 0 || resp.n_prompt == 0 || resp.n_prompt > resp.n_pos || !fits(resp.n_prompt, ctx.offset) {
         return Err(Fail::Shape);
     }
@@ -107,7 +119,8 @@ pub fn verify_prefix_point(
         return Err(Fail::Manifest);
     }
 
-    let n_pos_leaves = 2 * tier.n_products + 1;
+    let shape = shape_for(tok);
+    let n_pos_leaves = shape.n_leaves;
     let layout = layout_for(p.n_ubatch, first.wtype);
     if p.x.len() as u64 != x_len(first.k, layout) {
         return Err(Fail::Shape);
@@ -116,10 +129,7 @@ pub fn verify_prefix_point(
     if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
     }
-    let mut meta = [0u8; 8];
-    meta[..4].copy_from_slice(&(t as u32).to_le_bytes());
-    meta[4..].copy_from_slice(&p.n_ubatch.to_le_bytes());
-    if !b3_verify(&pos_root, n_pos_leaves, 2 * tier.n_products, blake3::hash(&meta).as_bytes(), &p.meta_path) {
+    if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);
     }
 

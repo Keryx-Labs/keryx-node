@@ -5,6 +5,8 @@ use crate::merkle::Hash;
 pub const VERSION: u8 = 1;
 /// Version 1 plus a prefix point after the points.
 pub const VERSION_PREFIX: u8 = 2;
+/// Stage-2 opening: each point carries its token and input link, then the prefix and residual points.
+pub const VERSION_CHAIN: u8 = 3;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -76,11 +78,65 @@ pub struct PrefixPoint {
     pub norm: (EntryOpening, ChunkRange),
 }
 
+/// One 1 KiB chunk of a committed leaf.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LeafChunk {
+    pub total_len: u32,
+    pub index: u32,
+    pub chunk: Vec<u8>,
+    pub chunk_path: Vec<Hash>,
+    pub leaf_path: Vec<Hash>,
+}
+
+/// A whole committed leaf.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LeafBytes {
+    pub bytes: Vec<u8>,
+    pub leaf_path: Vec<Hash>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkOpening {
+    None,
+    Norm { src: LeafBytes, norm: (EntryOpening, ChunkRange) },
+    Token { embd: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
+    Glu { src: EntryOpening, y: LeafChunk },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResidSrc {
+    Chunk(LeafChunk),
+    Token(EntryOpening, ChunkRange),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResidAdd {
+    Chunk(LeafChunk),
+    Normed { y: LeafBytes, norm: (EntryOpening, ChunkRange) },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidPoint {
+    pub n_ubatch: u32,
+    pub tok: u32,
+    pub pos_path: Vec<Hash>,
+    pub meta_path: Vec<Hash>,
+    pub layer: EntryOpening,
+    pub product: EntryOpening,
+    pub dst: LeafChunk,
+    pub src: ResidSrc,
+    pub add: ResidAdd,
+    pub scale: Option<(EntryOpening, ChunkRange)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Opening {
     pub response_txid: Hash,
     pub points: Vec<Point>,
     pub prefix: Option<PrefixPoint>,
+    /// Stage 2: `(token, link)` of each point.
+    pub links: Vec<(u32, LinkOpening)>,
+    pub resid: Option<ResidPoint>,
 }
 
 struct W(Vec<u8>);
@@ -119,6 +175,79 @@ impl W {
         self.u32((r.chunks.len() / 32) as u32);
         self.0.extend_from_slice(&r.chunks);
         self.hashes(&r.proof);
+    }
+    fn weights(&mut self, w: &(EntryOpening, ChunkRange)) {
+        self.entry(&w.0);
+        self.range(&w.1);
+    }
+    fn leaf_chunk(&mut self, c: &LeafChunk) {
+        self.u32(c.total_len);
+        self.u32(c.index);
+        self.bytes32(&c.chunk);
+        self.hashes(&c.chunk_path);
+        self.hashes(&c.leaf_path);
+    }
+    fn leaf_bytes(&mut self, l: &LeafBytes) {
+        self.bytes32(&l.bytes);
+        self.hashes(&l.leaf_path);
+    }
+    fn link(&mut self, l: &LinkOpening) {
+        match l {
+            LinkOpening::None => self.u8(0),
+            LinkOpening::Norm { src, norm } => {
+                self.u8(1);
+                self.leaf_bytes(src);
+                self.weights(norm);
+            }
+            LinkOpening::Token { embd, norm } => {
+                self.u8(2);
+                self.weights(embd);
+                self.weights(norm);
+            }
+            LinkOpening::Glu { src, y } => {
+                self.u8(3);
+                self.entry(src);
+                self.leaf_chunk(y);
+            }
+        }
+    }
+    fn resid(&mut self, p: &ResidPoint) {
+        self.u32(p.n_ubatch);
+        self.u32(p.tok);
+        self.hashes(&p.pos_path);
+        self.hashes(&p.meta_path);
+        self.entry(&p.layer);
+        self.entry(&p.product);
+        self.leaf_chunk(&p.dst);
+        match &p.src {
+            ResidSrc::Chunk(c) => {
+                self.u8(0);
+                self.leaf_chunk(c);
+            }
+            ResidSrc::Token(e, r) => {
+                self.u8(1);
+                self.entry(e);
+                self.range(r);
+            }
+        }
+        match &p.add {
+            ResidAdd::Chunk(c) => {
+                self.u8(0);
+                self.leaf_chunk(c);
+            }
+            ResidAdd::Normed { y, norm } => {
+                self.u8(1);
+                self.leaf_bytes(y);
+                self.weights(norm);
+            }
+        }
+        match &p.scale {
+            Some(w) => {
+                self.u8(1);
+                self.weights(w);
+            }
+            None => self.u8(0),
+        }
     }
 }
 
@@ -165,12 +294,68 @@ impl R<'_> {
         let chunks = self.take(n.checked_mul(32)?)?.to_vec();
         Some(ChunkRange { first_chunk, chunks, proof: self.hashes()? })
     }
+    fn weights(&mut self) -> Option<(EntryOpening, ChunkRange)> {
+        Some((self.entry()?, self.range()?))
+    }
+    fn leaf_chunk(&mut self) -> Option<LeafChunk> {
+        Some(LeafChunk {
+            total_len: self.u32()?,
+            index: self.u32()?,
+            chunk: self.bytes32()?,
+            chunk_path: self.hashes()?,
+            leaf_path: self.hashes()?,
+        })
+    }
+    fn leaf_bytes(&mut self) -> Option<LeafBytes> {
+        Some(LeafBytes { bytes: self.bytes32()?, leaf_path: self.hashes()? })
+    }
+    fn link(&mut self) -> Option<LinkOpening> {
+        Some(match self.u8()? {
+            0 => LinkOpening::None,
+            1 => LinkOpening::Norm { src: self.leaf_bytes()?, norm: self.weights()? },
+            2 => LinkOpening::Token { embd: self.weights()?, norm: self.weights()? },
+            3 => LinkOpening::Glu { src: self.entry()?, y: self.leaf_chunk()? },
+            _ => return None,
+        })
+    }
+    fn resid(&mut self) -> Option<ResidPoint> {
+        let n_ubatch = self.u32()?;
+        let tok = self.u32()?;
+        let pos_path = self.hashes()?;
+        let meta_path = self.hashes()?;
+        let layer = self.entry()?;
+        let product = self.entry()?;
+        let dst = self.leaf_chunk()?;
+        let src = match self.u8()? {
+            0 => ResidSrc::Chunk(self.leaf_chunk()?),
+            1 => ResidSrc::Token(self.entry()?, self.range()?),
+            _ => return None,
+        };
+        let add = match self.u8()? {
+            0 => ResidAdd::Chunk(self.leaf_chunk()?),
+            1 => ResidAdd::Normed { y: self.leaf_bytes()?, norm: self.weights()? },
+            _ => return None,
+        };
+        let scale = match self.u8()? {
+            0 => None,
+            1 => Some(self.weights()?),
+            _ => return None,
+        };
+        Some(ResidPoint { n_ubatch, tok, pos_path, meta_path, layer, product, dst, src, add, scale })
+    }
 }
 
 impl Opening {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        w.u8(if self.prefix.is_some() { VERSION_PREFIX } else { VERSION });
+        let chain = self.resid.is_some();
+        w.u8(if chain {
+            VERSION_CHAIN
+        } else if self.prefix.is_some() {
+            VERSION_PREFIX
+        } else {
+            VERSION
+        });
         w.0.extend_from_slice(&self.response_txid);
         w.u8(self.points.len() as u8);
         for p in &self.points {
@@ -205,6 +390,12 @@ impl Opening {
             w.hashes(&p.y_chunk_path);
             w.hashes(&p.y_path);
         }
+        if chain {
+            for (tok, link) in &self.links {
+                w.u32(*tok);
+                w.link(link);
+            }
+        }
         if let Some(p) = &self.prefix {
             w.u32(p.n_ubatch);
             w.hashes(&p.pos_path);
@@ -217,13 +408,16 @@ impl Opening {
             w.entry(&p.norm.0);
             w.range(&p.norm.1);
         }
+        if let Some(p) = &self.resid {
+            w.resid(p);
+        }
         w.0
     }
 
     pub fn decode(b: &[u8]) -> Option<Opening> {
         let mut r = R { b, o: 0 };
         let version = r.u8()?;
-        if version != VERSION && version != VERSION_PREFIX {
+        if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN) {
             return None;
         }
         let response_txid: Hash = r.take(32)?.try_into().ok()?;
@@ -255,7 +449,12 @@ impl Opening {
                 y_path: r.hashes()?,
             });
         }
-        let prefix = if version == VERSION_PREFIX {
+        let links = if version == VERSION_CHAIN {
+            (0..n).map(|_| Some((r.u32()?, r.link()?))).collect::<Option<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let prefix = if version >= VERSION_PREFIX {
             Some(PrefixPoint {
                 n_ubatch: r.u32()?,
                 pos_path: r.hashes()?,
@@ -269,6 +468,7 @@ impl Opening {
         } else {
             None
         };
-        (r.o == b.len()).then_some(Opening { response_txid, points, prefix })
+        let resid = if version == VERSION_CHAIN { Some(r.resid()?) } else { None };
+        (r.o == b.len()).then_some(Opening { response_txid, points, prefix, links, resid })
     }
 }
