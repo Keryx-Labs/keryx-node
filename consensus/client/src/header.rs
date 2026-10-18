@@ -237,7 +237,11 @@ impl Header {
 
     #[wasm_bindgen(setter = taskRoot)]
     pub fn set_task_root_from_js_value(&mut self, js_value: JsValue) {
-        self.inner_mut().task_root = Hash::from_slice(&js_value.try_as_vec_u8().expect("task root"));
+        if let Ok(bytes) = js_value.try_as_vec_u8()
+            && bytes.len() == 32
+        {
+            self.inner_mut().task_root = Hash::from_slice(&bytes);
+        }
     }
 
     #[wasm_bindgen(getter = hash)]

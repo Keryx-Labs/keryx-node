@@ -295,7 +295,8 @@ pub fn verify_chain_point(
                 return Err(Fail::Trace);
             }
             let s = 4 * o.slot as usize;
-            if u32::from_le_bytes(ids.chunk[s..s + 4].try_into().unwrap()) as u64 != o.expert {
+            let id = ids.chunk.get(s..s + 4).ok_or(Fail::Shape)?;
+            if u32::from_le_bytes(id.try_into().unwrap()) as u64 != o.expert {
                 return Err(Fail::Mismatch);
             }
             let c = o.slot * per_slot + draw::point(seed, i)[3] % per_slot;

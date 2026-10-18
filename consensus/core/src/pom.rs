@@ -67,6 +67,9 @@ pub fn pom_seed_h10_active(daa_score: u64) -> bool {
     daa_score >= POM_SEED_H10_ACTIVATION_DAA.load(Ordering::Relaxed)
 }
 
+/// Largest encoded block task opening.
+pub const BLOCK_TASK_MAX_LEN: usize = keryx_verifiable_inference::opening::MAX_BODY_LEN;
+
 /// DAA score at which headers carry the block task root. u64::MAX means "never" — initialised at
 /// startup from `Params::block_task_activation`.
 static BLOCK_TASK_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -445,6 +448,14 @@ impl PomProof {
     /// encoding. The witness travels outside the block hash, so a failed verification
     /// must be remembered per (block, witness) — never per block, or a single crafted
     /// witness would poison a valid hash permanently.
+    /// Drops the task extension when the block task rule is not active at `daa_score` or when it
+    /// exceeds the largest opening.
+    pub fn sanitize_task(&mut self, daa_score: u64) {
+        if !block_task_active(daa_score) || self.task.as_ref().is_some_and(|t| t.len() > BLOCK_TASK_MAX_LEN) {
+            self.task = None;
+        }
+    }
+
     pub fn wire_digest(&self) -> [u8; 32] {
         *blake3::hash(&self.to_wire_bytes()).as_bytes()
     }
@@ -939,6 +950,30 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
         return Err(PomVerifyError::TargetNotMet);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod task_sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn task_is_dropped_before_its_gate() {
+        let mut p = PomProof {
+            tier: 0,
+            trace_root: [0; 32],
+            pow_value: [0; 32],
+            final_state: 0,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: None,
+            v3: None,
+            v4: None,
+            task: Some(vec![1; 10]),
+        };
+        p.sanitize_task(1_000);
+        assert!(p.task.is_none());
+    }
 }
 
 #[cfg(test)]

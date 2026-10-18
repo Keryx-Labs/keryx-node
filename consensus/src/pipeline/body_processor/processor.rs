@@ -441,7 +441,7 @@ impl BlockBodyProcessor {
             // proof before its body reaches this commit.
             match self.pom_proof_store.insert_batch(&mut batch, hash, proof) {
                 Ok(()) | Err(StoreError::HashAlreadyExists(_)) => {}
-                Err(e) => panic!("PoM proof store error for {hash}: {e}"),
+                Err(e) => log::warn!("PoM proof for {hash} not stored: {e}"),
             }
             self.pom_tier_store.insert_batch(&mut batch, hash, proof.tier).unwrap();
         } else if let Some(tier) = pom_tier {

@@ -22,9 +22,16 @@ pub fn window(daa: u64) -> Option<u64> {
     daa.checked_sub(LAG_DAA).map(|d| d / WINDOW_DAA)
 }
 
-/// First DAA of window `w`: its seed is the first chain block at or after it.
+/// First DAA of window `w`.
 pub fn window_start(w: u64) -> u64 {
     w * WINDOW_DAA
+}
+
+/// Seed block of the window starting at `start`: the first block of `chain` (a selected-parent
+/// chain walked from the selected parent back, as `(hash, daa_score)`) whose DAA score is at
+/// most `start`.
+pub fn window_seed(start: u64, chain: impl IntoIterator<Item = (Hash, u64)>) -> Option<Hash> {
+    chain.into_iter().find(|&(_, daa)| daa <= start).map(|(h, _)| h)
 }
 
 /// The 32 bytes that select the task tokens of a window.
@@ -86,4 +93,21 @@ pub fn verify_block_task(
         return Err(Fail::Mismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_is_the_last_chain_block_not_after_the_window_start() {
+        let chain = [([1u8; 32], 300), ([2u8; 32], 250), ([3u8; 32], 190), ([4u8; 32], 120)];
+        assert_eq!(window_seed(192, chain), Some([3u8; 32]));
+        assert_eq!(window_seed(250, chain), Some([2u8; 32]));
+        assert_eq!(window_seed(300, chain), Some([1u8; 32]));
+        assert_eq!(window_seed(100, chain), None);
+        assert_eq!(window(15), None);
+        assert_eq!(window(16), Some(0));
+        assert_eq!(window(80), Some(1));
+    }
 }

@@ -77,10 +77,13 @@ pub fn decode_pom_proof(
         let (seed, n_chunks) = pom_v4_wire::v4_wire_context(header, tier).map_err(|_| ConversionError::PomProofDecode)?;
         let mut proof = pom_v4_wire::decode_v4_deduped(&bytes, seed, n_chunks).map_err(|_| ConversionError::PomProofDecode)?;
         proof.task = block_task;
+        proof.sanitize_task(header.daa_score);
         return Ok(Some(proof));
     }
     if let Some(bytes) = pom_proof {
-        return Ok(Some(PomProof::from_wire_bytes(&bytes).map_err(|_| ConversionError::PomProofDecode)?));
+        let mut proof = PomProof::from_wire_bytes(&bytes).map_err(|_| ConversionError::PomProofDecode)?;
+        proof.sanitize_task(header.daa_score);
+        return Ok(Some(proof));
     }
     Ok(None)
 }
@@ -231,9 +234,9 @@ mod tests {
         }
     }
 
-    /// A proof carrying a block task opening keeps it through the legacy wire.
+    /// Before the block task gate, an attached opening is dropped on decode.
     #[test]
-    fn task_opening_survives_the_legacy_wire() {
+    fn task_opening_is_dropped_before_its_gate() {
         let mut proof = dummy_proof_v2();
         proof.task = Some(vec![0xAB; 300]);
         let block = Block::from_precomputed_hash(Hash::from_bytes([4u8; 32]), vec![]).with_pom_proof(proof);
@@ -241,7 +244,7 @@ mod tests {
             let msg: protowire::BlockMessage =
                 (HeaderFormat::Legacy, encode_pom_proof(format, block.header.as_ref(), block.pom_proof.as_ref()), &block).into();
             let back: Block = Versioned(HeaderFormat::Legacy, msg).try_into().unwrap();
-            assert_eq!(back.pom_proof.unwrap().task.as_deref(), Some(&[0xABu8; 300][..]), "{format:?}");
+            assert!(back.pom_proof.unwrap().task.is_none(), "{format:?}");
         }
         let plain = PomProof::from_wire_bytes(&dummy_proof_v2().to_wire_bytes()).unwrap();
         assert!(plain.task.is_none());

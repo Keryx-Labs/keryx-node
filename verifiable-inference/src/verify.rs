@@ -278,7 +278,7 @@ pub(crate) fn verify_point_at(
                 return Err(Fail::Trace);
             }
             let s = 4 * slot as usize;
-            let id = u32::from_le_bytes(e.chunk[s..s + 4].try_into().unwrap()) as u64;
+            let id = u32::from_le_bytes(e.chunk.get(s..s + 4).ok_or(Fail::Shape)?.try_into().unwrap()) as u64;
             if id >= g_entry.n_exp as u64 {
                 return Err(Fail::Mismatch);
             }

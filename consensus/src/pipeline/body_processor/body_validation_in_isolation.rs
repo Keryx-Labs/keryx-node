@@ -54,32 +54,38 @@ impl BlockBodyProcessor {
         Ok(mass)
     }
 
-    /// First chain block at or after the start of the task window of `header`, along its
-    /// selected-parent chain.
+    /// Seed block of the task window of `header`, along its selected-parent chain.
     fn task_window_seed(&self, header: &keryx_consensus_core::header::Header) -> Option<Hash> {
         use crate::model::stores::ghostdag::GhostdagStoreReader;
-        use keryx_verifiable_inference::block_task::{window, window_start};
+        use keryx_verifiable_inference::block_task::{window, window_seed, window_start};
         let start = window_start(window(header.daa_score)?);
-        let mut seed = None;
-        let mut cur = self.ghostdag_store.get_selected_parent(header.hash).ok()?;
-        while self.headers_store.get_daa_score(cur).ok()? >= start {
-            seed = Some(cur);
-            if cur == self.genesis.hash {
-                break;
-            }
-            cur = self.ghostdag_store.get_selected_parent(cur).ok()?;
-        }
-        seed
+        let mut cur = Some(self.ghostdag_store.get_selected_parent(header.hash).ok()?);
+        let chain = std::iter::from_fn(|| {
+            let h = cur?;
+            let daa = self.headers_store.get_daa_score(h).ok()?;
+            cur = (h != self.genesis.hash).then(|| self.ghostdag_store.get_selected_parent(h).ok()).flatten();
+            Some((h.as_bytes(), daa))
+        });
+        window_seed(start, chain).map(Hash::from_bytes)
     }
 
     pub(super) fn check_block_task(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         use keryx_verifiable_inference::{block_task::verify_block_task, opening::Opening, verify::Fail};
         let header = &block.header;
-        if self.skip_opoi || !self.block_task_activation.is_active(header.daa_score) {
+        if self.skip_opoi {
             return Ok(());
+        }
+        if !self.block_task_activation.is_active(header.daa_score) {
+            return match block.pom_proof.as_ref().and_then(|p| p.task.as_ref()) {
+                Some(_) => Err(RuleError::BadBlockTask(Fail::Shape)),
+                None => Ok(()),
+            };
         }
         let proof = block.pom_proof.as_ref().ok_or(RuleError::PomProofMissing)?;
         let bytes = proof.task.as_ref().ok_or(RuleError::BlockTaskMissing)?;
+        if bytes.len() > keryx_consensus_core::pom::BLOCK_TASK_MAX_LEN {
+            return Err(RuleError::BadBlockTask(Fail::Shape));
+        }
         let opening = Opening::decode(bytes).ok_or(RuleError::BadBlockTask(Fail::Shape))?;
         let rules = keryx_consensus_core::config::params::trace_rules(proof.tier, true, false, true)
             .ok_or(RuleError::BadBlockTask(Fail::Manifest))?;
@@ -293,6 +299,8 @@ impl BlockBodyProcessor {
         };
         let candidate = Block::from_header_arc(header).with_pom_proof(proof.clone());
         self.check_pom_proof(&candidate)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("PoM proof adoption rejected for {}: {}", hash, e)))?;
+        self.check_block_task(&candidate)
             .map_err(|e| ConsensusError::GeneralOwned(format!("PoM proof adoption rejected for {}: {}", hash, e)))?;
         let mut batch = WriteBatch::default();
         match self.pom_proof_store.insert_batch(&mut batch, hash, &proof) {

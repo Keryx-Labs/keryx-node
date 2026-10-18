@@ -214,7 +214,7 @@ impl Header {
             pom_final_state,
             service_state_hash,
             pom_tier,
-            task_root,
+            task_root: if crate::pom::block_task_active(daa_score) { task_root } else { Default::default() },
         };
         header.finalize();
         header
@@ -292,6 +292,29 @@ mod tests {
     fn deserialize_parents(bytes: &[u8]) -> bincode::Result<Vec<Vec<Hash>>> {
         let parents: CompressedParents = bincode::deserialize(bytes)?;
         Ok(parents.into())
+    }
+
+    #[test]
+    fn task_root_is_zero_before_its_gate() {
+        let h = Header::new_finalized(
+            1,
+            vec![vec![1.into()]].try_into().unwrap(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            1,
+            2,
+            3,
+            4,
+            0.into(),
+            5,
+            Default::default(),
+            0,
+            Default::default(),
+            0,
+            7.into(),
+        );
+        assert_eq!(h.task_root, Hash::default());
     }
 
     #[test]
