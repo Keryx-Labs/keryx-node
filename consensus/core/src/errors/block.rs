@@ -96,6 +96,12 @@ pub enum RuleError {
     #[error("PoM possession proof missing")]
     PomProofMissing,
 
+    #[error("block task opening missing")]
+    BlockTaskMissing,
+
+    #[error("invalid block task opening: {0:?}")]
+    BadBlockTask(keryx_verifiable_inference::verify::Fail),
+
     #[error("PoM witness already failed verification for this block (negative cache)")]
     KnownBadPomWitness,
 

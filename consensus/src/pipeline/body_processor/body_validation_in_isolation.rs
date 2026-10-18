@@ -49,8 +49,46 @@ impl BlockBodyProcessor {
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
         if !skip_pom_proof {
             self.check_pom_proof(block)?;
+            self.check_block_task(block)?;
         }
         Ok(mass)
+    }
+
+    /// First chain block at or after the start of the task window of `header`, along its
+    /// selected-parent chain.
+    fn task_window_seed(&self, header: &keryx_consensus_core::header::Header) -> Option<Hash> {
+        use crate::model::stores::ghostdag::GhostdagStoreReader;
+        use keryx_verifiable_inference::block_task::{window, window_start};
+        let start = window_start(window(header.daa_score)?);
+        let mut seed = None;
+        let mut cur = self.ghostdag_store.get_selected_parent(header.hash).ok()?;
+        while self.headers_store.get_daa_score(cur).ok()? >= start {
+            seed = Some(cur);
+            if cur == self.genesis.hash {
+                break;
+            }
+            cur = self.ghostdag_store.get_selected_parent(cur).ok()?;
+        }
+        seed
+    }
+
+    pub(super) fn check_block_task(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        use keryx_verifiable_inference::{block_task::verify_block_task, opening::Opening, verify::Fail};
+        let header = &block.header;
+        if self.skip_opoi || !self.block_task_activation.is_active(header.daa_score) {
+            return Ok(());
+        }
+        let proof = block.pom_proof.as_ref().ok_or(RuleError::PomProofMissing)?;
+        let bytes = proof.task.as_ref().ok_or(RuleError::BlockTaskMissing)?;
+        let opening = Opening::decode(bytes).ok_or(RuleError::BadBlockTask(Fail::Shape))?;
+        let rules = keryx_consensus_core::config::params::trace_rules(proof.tier, true, false, true)
+            .ok_or(RuleError::BadBlockTask(Fail::Manifest))?;
+        let (Some(chain), Some(prefix)) = (rules.chain.as_ref(), rules.prefix.as_ref()) else {
+            return Err(RuleError::BadBlockTask(Fail::Manifest));
+        };
+        let seed = self.task_window_seed(header).ok_or(RuleError::BlockTaskMissing)?;
+        verify_block_task(&rules.ctx, chain, prefix, &header.task_root.as_bytes(), &seed.as_bytes(), &header.hash.as_bytes(), &opening)
+            .map_err(RuleError::BadBlockTask)
     }
 
     fn check_has_transactions(block: &Block) -> BlockProcessResult<()> {

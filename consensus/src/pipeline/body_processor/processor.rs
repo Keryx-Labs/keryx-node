@@ -93,13 +93,14 @@ pub struct BlockBodyProcessor {
     /// the v2 path; `header.pom_final_state` carries `pom_v3::fold64(roots[K])`.
     pub(super) pom_v3_activation: ForkActivation,
     pub(super) pom_v4_activation: ForkActivation,
+    pub(super) block_task_activation: ForkActivation,
     pub(super) h10_activation: ForkActivation,
     pub(super) private_inference_activation: ForkActivation,
     pub(super) verifiable_inference_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
-    pub(super) _ghostdag_store: Arc<DbGhostdagStore>,
+    pub(super) ghostdag_store: Arc<DbGhostdagStore>,
     pub(super) headers_store: Arc<DbHeadersStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, persisted at commit for the tier-reward coinbase split.
@@ -182,6 +183,7 @@ pub(super) fn witness_scoped_error(e: &RuleError) -> bool {
             | RuleError::PomFinalStateMismatch(_, _)
             | RuleError::PomUnknownTier(_)
             | RuleError::PomDeclaredTierMismatch(_, _)
+            | RuleError::BadBlockTask(_)
     )
 }
 
@@ -206,6 +208,7 @@ pub(super) fn marks_block_invalid(e: &RuleError, bad_witness_rejects_delivery: b
             | RuleError::MissingParents(_)
             | RuleError::PrunedBlock
             | RuleError::PomProofMissing
+            | RuleError::BlockTaskMissing
             | RuleError::KnownBadPomWitness
     ) {
         return false;
@@ -253,12 +256,13 @@ impl BlockBodyProcessor {
             h5_2_activation: params.h5_2_activation,
             pom_v3_activation: params.pom_v3_activation,
             pom_v4_activation: params.pom_v4_activation,
+            block_task_activation: params.block_task_activation,
             h10_activation: params.h10_activation,
             private_inference_activation: params.private_inference_activation,
             verifiable_inference_activation: params.verifiable_inference_activation,
 
             statuses_store: storage.statuses_store.clone(),
-            _ghostdag_store: storage.ghostdag_store.clone(),
+            ghostdag_store: storage.ghostdag_store.clone(),
             headers_store: storage.headers_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
