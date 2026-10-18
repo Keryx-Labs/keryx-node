@@ -532,6 +532,36 @@ mod tests {
     }
 
     #[test]
+    fn a_zeroed_input_is_refused() {
+        let (tier, mut trace) = honest();
+        let r = rank(1, ATTN_Q);
+        for pos in &mut trace.positions {
+            let x = vec![0u8; pos.leaves[2 * r].len()];
+            let y = vec![0u8; pos.leaves[2 * r + 1].len()];
+            pos.leaves[2 * r] = x;
+            pos.leaves[2 * r + 1] = y;
+            pos.hashes[2 * r] = *blake3::hash(&pos.leaves[2 * r]).as_bytes();
+            pos.hashes[2 * r + 1] = *blake3::hash(&pos.leaves[2 * r + 1]).as_bytes();
+        }
+        trace.pos_roots = trace.positions.iter().map(|p| b3_root(&p.hashes)).collect();
+        trace.trace_root = b3_root(&trace.pos_roots);
+        let (tc, cc, rc) = (tier.tier(), tier.chain_ctx(), resp(&trace));
+        let mut refused = 0;
+        for s in 0..256u32 {
+            let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+            for i in 0..draw::POINTS {
+                if draw::point(&seed, i)[1] % N_PRODUCTS as u64 != r as u64 {
+                    continue;
+                }
+                let (p, tok, link) = tier.open_point(&trace, &seed, i);
+                assert!(verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None).is_err(), "seed {s} point {i}");
+                refused += 1;
+            }
+        }
+        assert!(refused > 0);
+    }
+
+    #[test]
     fn a_changed_residual_is_refused() {
         let (tier, mut trace) = honest();
         let leaf = chain::resid_leaf(N_PRODUCTS as u64, 0, Resid::Attn) as usize;
