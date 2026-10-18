@@ -402,6 +402,7 @@ impl VirtualStateProcessor {
                         n_prompt: trace.n_prompt,
                         n_pos: trace.n_pos,
                         answer_len: resp.private_body.as_deref().map_or(0, plaintext_answer_len),
+                        stage: trace.stage,
                     });
                 } else if tx.is_ai_opening() {
                     let Some(signed) = SignedPayload::split(&tx.payload) else { continue };
@@ -659,14 +660,15 @@ impl VirtualStateProcessor {
             let h14 = self.private_inference_activation.is_active(daa);
             let prefix_at = |at: u64| self.trace_prefix_activation.is_active(at);
             let audit_at = |at: u64| self.trace_audit_activation.is_active(at);
-            let tier = |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at)) } else { None };
+            let chain_at = |at: u64| self.trace_chain_activation.is_active(at);
+            let tier = |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at)) } else { None };
             let traces = TraceInputs {
                 chain_hash: hash,
                 responses: &trace_responses,
                 openings: &trace_openings,
                 tier: &tier,
                 prompt_lens: &request_prompt_lens,
-                shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa),
+                shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa) || chain_at(daa),
                 unique_root: audit_at(daa),
                 sanction: self.trace_sanction_activation.is_active(daa),
                 context: self.trace_context_activation.is_active(daa),

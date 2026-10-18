@@ -162,6 +162,7 @@ pub struct TraceResponseEvent {
     pub n_pos: u32,
     /// Plaintext length of the sealed answer.
     pub answer_len: u32,
+    pub stage: u8,
 }
 
 /// An opening accepted in a chain block whose signature verifies under `escrow_pubkey`.
@@ -254,7 +255,7 @@ fn trace_opening_valid(
     txid: &[u8; 32],
     body: &[u8],
 ) -> Result<(), &'static str> {
-    use keryx_verifiable_inference::{draw::POINTS, opening::Opening, prefix, verify};
+    use keryx_verifiable_inference::{chain, draw::POINTS, opening::Opening, prefix, verify};
     let Some(opening) = Opening::decode(body) else { return Err("malformed body") };
     if &opening.response_txid != txid {
         return Err("response id mismatch");
@@ -263,6 +264,22 @@ fn trace_opening_valid(
         return Err("point count");
     }
     let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    if let Some(cc) = &rules.chain {
+        let (Some(pc), Some(pp), Some(rp)) = (&rules.prefix, &opening.prefix, &opening.resid) else { return Err("stage-2 part missing") };
+        if opening.links.len() != opening.points.len() {
+            return Err("link count");
+        }
+        for (i, (p, (tok, link))) in opening.points.iter().zip(&opening.links).enumerate() {
+            if chain::verify_chain_point(&rules.ctx, cc, &resp, seed, i as u32, p, *tok, link).is_err() {
+                return Err(if i == 0 { "point 0" } else { "point 1" });
+            }
+        }
+        chain::verify_chain_prefix_point(&rules.ctx, cc, pc, &resp, seed, &audit.request_hash, pp).map_err(|_| "prefix point")?;
+        return chain::verify_resid_point(&rules.ctx, cc, &resp, seed, rp).map_err(|_| "residual point");
+    }
+    if opening.resid.is_some() {
+        return Err("stage-2 opening before its rule");
+    }
     for (i, p) in opening.points.iter().enumerate() {
         if verify::verify_point(&rules.ctx, &resp, seed, i as u32, p).is_err() {
             return Err(if i == 0 { "point 0" } else { "point 1" });
@@ -1124,8 +1141,10 @@ impl ServiceLedger {
                 let shape = TraceShape { n_prompt: ev.n_prompt, n_pos: ev.n_pos, answer_len: ev.answer_len };
                 match self.pending.get(&ev.request_hash) {
                     Some(req) => {
-                        let prefix_offset = (tr.tier)(req.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
-                        if !trace_shape_ok(req, &shape, prefix_offset) {
+                        let rules = (tr.tier)(req.tier, daa);
+                        let prefix_offset = rules.as_ref().and_then(|r| r.prefix.as_ref().map(|p| p.offset));
+                        let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || ev.stage == keryx_verifiable_inference::chain::STAGE_CHAIN);
+                        if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset) {
                             misshaped.push((ev.request_hash, ev.responder));
                         } else if (tr.context || tr.window_v3) && req.audit.is_none() {
                             self.early_shapes.insert((ev.request_hash, ev.responder), shape);
@@ -4093,6 +4112,7 @@ mod tests {
                     (self.auditable && t == 0).then(|| TraceRules {
                         ctx: self.model.tier(),
                         prefix: self.prefix.map(|(o, _)| self.model.prefix_ctx(o)),
+                        chain: None,
                         audit_all: self.audit_all,
                     })
                 };
@@ -4151,6 +4171,7 @@ mod tests {
                     n_prompt: r.n_prompt,
                     n_pos: r.n_pos,
                     answer_len: self.shape.map_or(0, |(_, a)| a),
+                    stage: 1,
                 };
                 (r, ev)
             }
@@ -4716,6 +4737,7 @@ mod tests {
                                 n_prompt,
                                 n_pos,
                                 answer_len: 0,
+                                stage: 1,
                             }
                         })
                     })

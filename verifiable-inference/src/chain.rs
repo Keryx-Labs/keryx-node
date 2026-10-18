@@ -4,7 +4,8 @@ use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
 use crate::opening::{ChunkRange, EntryOpening, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
-use crate::prefix::{THRESHOLD, expected_input};
+use crate::opening::PrefixPoint;
+use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
 use crate::verify::{Fail, PosShape, Report, ResponseCtx, TierCtx, open_bytes, open_entry, open_row, verify_point_at};
 use crate::{q8, quant};
 
@@ -239,6 +240,19 @@ pub fn verify_chain_point(
         _ => return Err(Fail::Shape),
     }
     Ok(report)
+}
+
+/// Verify the prefix point of a stage-2 opening.
+pub fn verify_chain_prefix_point(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    prefix: &PrefixCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    request_txid: &Hash,
+    p: &PrefixPoint,
+) -> Result<u64, Fail> {
+    verify_prefix_point_at(tier, prefix, resp, seed, request_txid, p, |tok| shape(tier, ctx, tok))
 }
 
 /// Verify the residual point of a stage-2 opening.

@@ -813,17 +813,42 @@ pub const TRACE_PREFIXES: [Option<TracePrefix>; 5] = [
     None,
 ];
 
-/// Audit rules of a tier: the verifier context, the prefix context under the prefix rule, and
-/// whether every traced response is audited.
+/// Stage-2 data of a tier: its chain manifest, chain context and prefix context.
+#[derive(Clone, Debug)]
+pub struct TraceChain {
+    pub manifest: TraceManifest,
+    pub ctx: keryx_verifiable_inference::chain::ChainCtx,
+    pub prefix: TracePrefix,
+}
+
+/// Stage-2 data of the H14 lineup, by tier.
+pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [None, None, None, None, None];
+
+/// Audit rules of a tier: the verifier context, the prefix context under the prefix rule, the
+/// chain context under stage 2, and whether every traced response is audited.
 #[derive(Clone, Debug)]
 pub struct TraceRules {
     pub ctx: keryx_verifiable_inference::verify::TierCtx,
     pub prefix: Option<TracePrefix>,
+    pub chain: Option<keryx_verifiable_inference::chain::ChainCtx>,
     pub audit_all: bool,
 }
 
-/// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests.
-pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool) -> Option<TraceRules> {
+/// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests,
+/// `chain` stage 2 and its manifests.
+pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool) -> Option<TraceRules> {
+    if chain {
+        let c = TRACE_CHAINS_H15.get(tier as usize)?.clone()?;
+        let t = POM_TIERS_H14.get(tier as usize)?;
+        let ctx = keryx_verifiable_inference::verify::TierCtx {
+            r_t: t.root,
+            n_chunks: t.chunks,
+            m_t: c.manifest.m_t,
+            n_entries: c.manifest.n_entries,
+            n_products: c.manifest.n_products,
+        };
+        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all });
+    }
     let manifests = if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 };
     let m = (*manifests.get(tier as usize)?)?;
     let t = POM_TIERS_H14.get(tier as usize)?;
@@ -835,7 +860,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool) -> Option<TraceRules
         n_products: m.n_products,
     };
     let prefix = if prefix { Some(TRACE_PREFIXES.get(tier as usize)?.clone()?) } else { None };
-    Some(TraceRules { ctx, prefix, audit_all })
+    Some(TraceRules { ctx, prefix, chain: None, audit_all })
 }
 
 /// Context floor of each tier of the H14 lineup, in tokens: the context a responder is held to.
@@ -1612,6 +1637,9 @@ pub struct Params {
     /// A traced response accepted more than once by one chain block is judged once by the shape
     /// and root rules. Changes the audit fold. `never()` = dormant.
     pub trace_dedup_activation: ForkActivation,
+    /// Traced responses and their openings follow stage 2. Changes the audit fold.
+    /// `never()` = dormant.
+    pub trace_chain_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1892,6 +1920,7 @@ impl Params {
             reward_draw_activation: self.reward_draw_activation,
             service_window_v3_activation: self.service_window_v3_activation,
             trace_dedup_activation: self.trace_dedup_activation,
+            trace_chain_activation: self.trace_chain_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2113,6 +2142,7 @@ pub const MAINNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
     trace_dedup_activation: ForkActivation::never(),
+    trace_chain_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2254,6 +2284,7 @@ pub const TESTNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::new(300_000),
     service_window_v3_activation: ForkActivation::new(300_000),
     trace_dedup_activation: ForkActivation::new(365_000),
+    trace_chain_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(118_000),
@@ -2357,6 +2388,7 @@ pub const SIMNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
     trace_dedup_activation: ForkActivation::never(),
+    trace_chain_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2454,6 +2486,7 @@ pub const DEVNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
     trace_dedup_activation: ForkActivation::never(),
+    trace_chain_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2540,5 +2573,19 @@ mod h14_lineup_tests {
         assert!(INFERENCE_REWARD_MINIMUMS_FLAT.iter().all(|(id, _)| POM_TIERS_H14.iter().any(|t| t.model_id == *id)));
         let id: String = QWEN3_8_27B_MODEL_ID.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(id, "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3");
+    }
+}
+
+#[cfg(test)]
+mod trace_chain_tests {
+    use super::*;
+
+    #[test]
+    fn stage2_arms_only_with_every_tier_covered() {
+        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS, &SIMNET_PARAMS, &DEVNET_PARAMS] {
+            if p.trace_chain_activation != ForkActivation::never() {
+                assert!(TRACE_CHAINS_H15.iter().all(Option::is_some));
+            }
+        }
     }
 }

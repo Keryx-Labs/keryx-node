@@ -197,6 +197,8 @@ pub struct VirtualStateProcessor {
     pub(super) service_window_v3_activation: ForkActivation,
     /// Trace dedup rule activation (see `params.trace_dedup_activation`).
     pub(super) trace_dedup_activation: ForkActivation,
+    /// Stage-2 trace rule activation (see `params.trace_chain_activation`).
+    pub(super) trace_chain_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -433,6 +435,7 @@ impl VirtualStateProcessor {
             reward_draw_activation: params.reward_draw_activation,
             service_window_v3_activation: params.service_window_v3_activation,
             trace_dedup_activation: params.trace_dedup_activation,
+            trace_chain_activation: params.trace_chain_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
