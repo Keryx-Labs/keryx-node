@@ -83,6 +83,7 @@ static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H15_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -500,6 +501,25 @@ impl VirtualStateProcessor {
             info!("  Models        — tier 3: Qwen3.8-27B replaces Qwen3.6-27B");
             info!("  IBD           — recent blocks received during sync must carry a verified possession proof");
             info!("  Seed          — new PoM walk seed: miners must run the H14 release");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        if banner_should_fire(self.verifiable_inference_activation, header)
+            && H15_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H15 · DAA {} ════════════════", self.verifiable_inference_activation.daa_score());
+            info!("  Verifiable    — every AiResponse commits the trace of its inference; untraced answers are not credited");
+            info!("  Audit         — every traced response is audited: the responder opens the drawn points in an opening transaction");
+            info!("  Trace chain   — openings are chained layer to layer, from the request-bound prompt prefix to the generated tokens");
+            info!("  Sanctions     — a missing or failed opening is struck; a trace root is admitted only once");
+            info!("  Answers       — sealed answer bodies capped at {} KiB", keryx_inference::ai_payload::MAX_AI_RESPONSE_PRIVATE_BODY_LEN / 1024);
+            info!("  Service       — answer deadlines follow the measured work of each request and the queue of each miner");
+            info!("  Context       — a silent miner is not struck on a prompt beyond its tier context unless another proved it fit");
+            info!("  Reward        — the inference reward is drawn among the miners credited on the request");
+            info!("  Holder reward — new bracket table: 1% with nothing held, +5% per 10 days of production held, 100% at 200 days");
+            info!("  Block task    — each block commits and opens the task of its window; header format changes");
+            info!("  Miners        — MANDATORY update: miners must run the H15 release");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
