@@ -160,12 +160,13 @@ impl BlockBodyProcessor {
     fn check_verifiable_inference_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let mut openings = 0usize;
         for tx in block.transactions.iter().skip(1) {
-            if let Err(v) = check_verifiable_inference_era(tx, block.header.daa_score, self.verifiable_inference_activation) {
+            if let Err(v) = check_verifiable_inference_era(tx, block.header.daa_score, self.verifiable_inference_activation, self.trace_chain_activation) {
                 return Err(match v {
                     VerifiableEraViolation::OpeningBeforeActivation => RuleError::AiOpeningBeforeActivation(tx.id()),
                     VerifiableEraViolation::TraceBeforeActivation => RuleError::AiTraceBeforeActivation(tx.id()),
                     VerifiableEraViolation::ResponseWithoutTrace => RuleError::AiResponseWithoutTrace(tx.id()),
                     VerifiableEraViolation::MalformedOpening => RuleError::AiOpeningMalformed(tx.id()),
+                    VerifiableEraViolation::BodyTooLongBeforeChain(len) => RuleError::AiResponseBodyTooLong(tx.id(), len),
                 });
             }
             openings += tx.is_ai_opening() as usize;

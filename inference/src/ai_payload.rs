@@ -55,8 +55,10 @@ pub const AI_RESPONSE_TRACE_LEN: usize = 32 + 4 + 4 + 1;
 pub const AI_RESPONSE_TRACE_TOKENS_LEN: usize = AI_RESPONSE_TRACE_LEN + 32;
 /// `[ext_kind: 1] [ext_len: 4 LE]`.
 pub const AI_RESPONSE_EXT_HEADER_LEN: usize = 1 + 4;
-/// Largest inline body: a 4 096-token answer with envelope overhead fits comfortably.
-pub const MAX_AI_RESPONSE_PRIVATE_BODY_LEN: usize = 32 * 1024;
+/// Largest inline body: a 4 096-token answer with its token ids and envelope overhead.
+pub const MAX_AI_RESPONSE_PRIVATE_BODY_LEN: usize = 48 * 1024;
+/// Largest inline body before `trace_chain_activation`.
+pub const MAX_AI_RESPONSE_PRIVATE_BODY_LEN_H14: usize = 32 * 1024;
 pub const MIN_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_LEN;
 pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN
     + AI_RESPONSE_EXT_HEADER_LEN

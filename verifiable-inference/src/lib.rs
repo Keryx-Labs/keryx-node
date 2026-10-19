@@ -1,5 +1,6 @@
 //! Verification of inference trace openings.
 
+pub mod answer;
 pub mod block_task;
 pub mod chain;
 #[cfg(test)]

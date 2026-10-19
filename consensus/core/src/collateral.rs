@@ -212,6 +212,7 @@ const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
 struct TraceShape {
     n_prompt: u32,
     n_pos: u32,
+    /// Text length of the sealed answer.
     answer_len: u32,
 }
 
@@ -1140,7 +1141,12 @@ impl ServiceLedger {
             .unwrap_or_default();
         if let Some(tr) = traces.filter(|tr| tr.shape) {
             for ev in trace_responses.iter() {
-                let shape = TraceShape { n_prompt: ev.n_prompt, n_pos: ev.n_pos, answer_len: ev.answer_len };
+                let answer_len = if ev.tokens {
+                    keryx_verifiable_inference::answer::text_len(ev.answer_len, ev.n_pos.saturating_sub(ev.n_prompt)).unwrap_or(u32::MAX)
+                } else {
+                    ev.answer_len
+                };
+                let shape = TraceShape { n_prompt: ev.n_prompt, n_pos: ev.n_pos, answer_len };
                 match self.pending.get(&ev.request_hash) {
                     Some(req) => {
                         let rules = (tr.tier)(req.tier, daa);

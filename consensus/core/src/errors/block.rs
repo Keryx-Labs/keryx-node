@@ -219,6 +219,9 @@ pub enum RuleError {
     #[error("opening tx {0} does not decode")]
     AiOpeningMalformed(TransactionId),
 
+    #[error("AiResponse tx {0} carries a {1}-byte body above the pre-stage-2 maximum")]
+    AiResponseBodyTooLong(TransactionId, usize),
+
     #[error("block carries {0} opening transactions, at most one is allowed")]
     TooManyAiOpenings(usize),
 
