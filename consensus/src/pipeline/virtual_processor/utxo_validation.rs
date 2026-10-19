@@ -34,7 +34,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -876,7 +876,9 @@ impl VirtualStateProcessor {
                 };
                 let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
                 // Recalibrated bracket table ships bundled with H4 (one hardfork, one gate).
-                let bps = if self.coin_age_activation.is_active(pov_daa_score) {
+                let bps = if self.ratio_reward_v3_activation.is_active(pov_daa_score) {
+                    ratio_reward_bps_v3(balance, production)
+                } else if self.coin_age_activation.is_active(pov_daa_score) {
                     ratio_reward_bps_v2(balance, production)
                 } else {
                     ratio_reward_bps(balance, production)

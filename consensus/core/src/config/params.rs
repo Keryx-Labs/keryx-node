@@ -1234,6 +1234,17 @@ pub const RATIO_REWARD_BPS_V2: [u64; 9] = [5_000, 5_500, 6_000, 6_500, 7_000, 7_
 /// 0/3/7/15/30/45/60/75/90 days held.
 pub const RATIO_REWARD_THRESHOLDS_V2: [u64; 9] = [0, 3, 7, 15, 30, 45, 60, 75, 90];
 
+/// Ratio-reward v3 bracket table, gated by `ratio_reward_v3_activation`: 1 % with nothing held,
+/// then +5 % every 10 days of production held, 100 % at 200 days.
+pub const RATIO_REWARD_BPS_V3: [u64; 21] = [
+    100, 500, 1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500, 5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 8_500,
+    9_000, 9_500, 10_000,
+];
+
+/// Bracket entry thresholds for `RATIO_REWARD_BPS_V3`, same semantics as `RATIO_REWARD_THRESHOLDS_V2`.
+pub const RATIO_REWARD_THRESHOLDS_V3: [u64; 21] =
+    [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200];
+
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
 /// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
@@ -1272,6 +1283,11 @@ pub fn ratio_reward_bps(balance: u64, production: u64) -> u64 {
 /// `coin_age_activation` (bundled into H4).
 pub fn ratio_reward_bps_v2(balance: u64, production: u64) -> u64 {
     ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS_V2, &RATIO_REWARD_BPS_V2)
+}
+
+/// Same as `ratio_reward_bps`, against the `RATIO_REWARD_BPS_V3` table.
+pub fn ratio_reward_bps_v3(balance: u64, production: u64) -> u64 {
+    ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS_V3, &RATIO_REWARD_BPS_V3)
 }
 
 /// Division-free bracket scan shared by `ratio_reward_bps`/`ratio_reward_bps_v2`: bracket `i` is
@@ -1858,6 +1874,9 @@ pub struct Params {
     /// A traced response accepted more than once by one chain block is judged once by the shape
     /// and root rules. Changes the audit fold. `never()` = dormant.
     pub trace_dedup_activation: ForkActivation,
+    /// The holder ratio bracket follows `RATIO_REWARD_BPS_V3`. Changes the coinbase.
+    /// `never()` = dormant.
+    pub ratio_reward_v3_activation: ForkActivation,
     /// Traced responses and their openings follow stage 2. Changes the audit fold.
     /// `never()` = dormant.
     pub trace_chain_activation: ForkActivation,
@@ -2144,6 +2163,7 @@ impl Params {
             reward_draw_activation: self.reward_draw_activation,
             service_window_v3_activation: self.service_window_v3_activation,
             trace_dedup_activation: self.trace_dedup_activation,
+            ratio_reward_v3_activation: self.ratio_reward_v3_activation,
             trace_chain_activation: self.trace_chain_activation,
             block_task_activation: self.block_task_activation,
             service_ledger_activation: self.service_ledger_activation,
@@ -2367,6 +2387,7 @@ pub const MAINNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
     trace_dedup_activation: ForkActivation::never(),
+    ratio_reward_v3_activation: ForkActivation::never(),
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
@@ -2510,6 +2531,7 @@ pub const TESTNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::new(300_000),
     service_window_v3_activation: ForkActivation::new(300_000),
     trace_dedup_activation: ForkActivation::new(365_000),
+    ratio_reward_v3_activation: ForkActivation::never(),
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
@@ -2615,6 +2637,7 @@ pub const SIMNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
     trace_dedup_activation: ForkActivation::never(),
+    ratio_reward_v3_activation: ForkActivation::never(),
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
@@ -2714,6 +2737,7 @@ pub const DEVNET_PARAMS: Params = Params {
     reward_draw_activation: ForkActivation::never(),
     service_window_v3_activation: ForkActivation::never(),
     trace_dedup_activation: ForkActivation::never(),
+    ratio_reward_v3_activation: ForkActivation::never(),
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
@@ -2775,6 +2799,22 @@ mod ratio_reward_bps_tests {
         // Off-by-one just under each threshold must NOT round up to the next bracket.
         assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
         assert_eq!(ratio_reward_bps_v2(90 * P - 1, P), 9_000);
+    }
+
+    #[test]
+    fn v3_brackets() {
+        assert_eq!(ratio_reward_bps_v3(0, P), 100);
+        assert_eq!(ratio_reward_bps_v3(10 * P - 1, P), 100);
+        assert_eq!(ratio_reward_bps_v3(10 * P, P), 500);
+        assert_eq!(ratio_reward_bps_v3(22 * P, P), 1_000);
+        assert_eq!(ratio_reward_bps_v3(90 * P, P), 4_500);
+        assert_eq!(ratio_reward_bps_v3(200 * P - 1, P), 9_500);
+        assert_eq!(ratio_reward_bps_v3(200 * P, P), 10_000);
+        assert_eq!(ratio_reward_bps_v3(u64::MAX / 2, P), 10_000);
+        for i in 1..RATIO_REWARD_THRESHOLDS_V3.len() {
+            assert_eq!(RATIO_REWARD_THRESHOLDS_V3[i], 10 * i as u64);
+            assert_eq!(RATIO_REWARD_BPS_V3[i], 500 * i as u64);
+        }
     }
 }
 
