@@ -221,6 +221,9 @@ pub const H13_ACTIVATION_DAA: u64 = 93_550_000;
 /// Targets 2026-10-09 ~14:00 UTC (from daa 117_774_522 at 2026-10-04 18:37 UTC, ~10.13 daa/s).
 pub const H14_ACTIVATION_DAA: u64 = 121_985_000;
 
+/// Testnet H15 gate: every verifiable-inference, audit and holder-reward v3 rule. Node and miner.
+pub const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -2456,10 +2459,9 @@ pub const TESTNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // Testnet mirrors the current mainnet state from genesis: every shipped fork
-    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels,
-    // coin-age H4, H5/H5.1/H5.2) is active at DAA 0, so the only transition exercised
-    // on this testnet is the H6 crossing at DAA 108_000.
+    // Testnet mirrors the current mainnet state from genesis: every fork shipped on mainnet
+    // (up to H14) is active from the first blocks, so the only transition exercised on this
+    // testnet is the H15 crossing at `TESTNET_H15_ACTIVATION_DAA`.
     opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
@@ -2521,22 +2523,22 @@ pub const TESTNET_PARAMS: Params = Params {
     reward_routing_activation: ForkActivation::new(0),
     // Private inference — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
-    private_inference_activation: ForkActivation::new(6_000),
-    verifiable_inference_activation: ForkActivation::new(200_000),
-    trace_shape_activation: ForkActivation::new(215_000),
-    trace_prefix_activation: ForkActivation::new(215_000),
-    trace_audit_activation: ForkActivation::new(240_000),
-    trace_sanction_activation: ForkActivation::new(280_000),
-    trace_context_activation: ForkActivation::never(),
-    reward_draw_activation: ForkActivation::new(300_000),
-    service_window_v3_activation: ForkActivation::new(300_000),
-    trace_dedup_activation: ForkActivation::new(365_000),
-    ratio_reward_v3_activation: ForkActivation::never(),
-    trace_chain_activation: ForkActivation::never(),
-    block_task_activation: ForkActivation::never(),
+    private_inference_activation: ForkActivation::new(1),
+    verifiable_inference_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_shape_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_prefix_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_audit_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_sanction_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_context_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    reward_draw_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    service_window_v3_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_dedup_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    ratio_reward_v3_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_chain_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    block_task_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
-    exact_verification_activation: ForkActivation::new(118_000),
+    exact_verification_activation: ForkActivation::new(500),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
