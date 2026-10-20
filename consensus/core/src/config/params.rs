@@ -626,6 +626,9 @@ pub const POM_TIERS_H14: &[crate::pom::PomTier] = &[
     POM_TIERS_H6[4],
 ];
 
+/// Context pad entries of each `POM_TIERS_H14` tier under the v5 walk; 0 = no pad.
+pub const POM_V5_PAD_ENTRIES_H14: [u64; 5] = [22_511_616, 32_243_712, 34_570_240, 57_835_520, 0];
+
 /// Matmul manifest of a tier: root `M_T`, entry count and product count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TraceManifest {
@@ -1726,6 +1729,10 @@ pub struct Params {
     /// the v3 spot-check. Node+miner lockstep. `never()` to disable.
     pub pom_v4_activation: ForkActivation,
 
+    /// PoM v5: the re-walk also reads the tier's context pad. Node+miner lockstep.
+    /// `never()` = dormant.
+    pub pom_v5_activation: ForkActivation,
+
     /// H10 activation DAA score. At/after this score the re-walk seed is `pom_block_seed_h10`.
     /// Strictly later than `pom_v4_activation`. Node+miner lockstep. `never()` to disable.
     pub h10_activation: ForkActivation,
@@ -2140,6 +2147,7 @@ impl Params {
 
             pom_maxlevel_v4_activation: self.pom_maxlevel_v4_activation,
             pom_v4_activation: self.pom_v4_activation,
+            pom_v5_activation: self.pom_v5_activation,
             h10_activation: self.h10_activation,
 
             ratio_reward_activation: self.ratio_reward_activation,
@@ -2324,6 +2332,7 @@ pub const MAINNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
     pom_maxlevel_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
     pom_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
+    pom_v5_activation: ForkActivation::never(),
     h10_activation: ForkActivation::new(H10_ACTIVATION_DAA),
 
     // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
@@ -2492,6 +2501,7 @@ pub const TESTNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(0),
     pom_maxlevel_v4_activation: ForkActivation::new(1),
     pom_v4_activation: ForkActivation::new(1),
+    pom_v5_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     h10_activation: ForkActivation::new(TESTNET_H10_ACTIVATION_DAA),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
@@ -2617,6 +2627,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
     pom_v4_activation: ForkActivation::never(),
+    pom_v5_activation: ForkActivation::never(),
     h10_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
@@ -2718,6 +2729,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
     pom_v4_activation: ForkActivation::never(),
+    pom_v5_activation: ForkActivation::never(),
     h10_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)

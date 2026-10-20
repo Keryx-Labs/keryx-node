@@ -23,6 +23,7 @@ use keryx_consensus_core::{
     },
     pom_v3::verify_pom_proof_v3_container,
     pom_v4::verify_pom_proof_v4_container,
+    pom_v5::{v5_pad_seed, verify_pom_proof_v5_container},
     tx::TransactionOutpoint,
 };
 use keryx_database::prelude::StoreError;
@@ -399,6 +400,12 @@ impl BlockBodyProcessor {
         // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
         // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
         // later), so the pin check above already ran.
+        if self.pom_v5_activation.is_active(header.daa_score) {
+            let n_pad = keryx_consensus_core::config::params::POM_V5_PAD_ENTRIES_H14.get(proof.tier as usize).copied().unwrap_or(0);
+            let pad_seed = v5_pad_seed(proof.tier, &tier.model_id, &tier.root);
+            return verify_pom_proof_v5_container(seed, proof, tier.chunks, &tier.root, &pad_seed, n_pad, &target, final_hash)
+                .map_err(RuleError::BadPomProofV4);
+        }
         if pom_v4 {
             return verify_pom_proof_v4_container(seed, proof, tier.chunks, &tier.root, &target, final_hash)
                 .map_err(RuleError::BadPomProofV4);
