@@ -197,6 +197,8 @@ pub struct VirtualStateProcessor {
     pub(super) service_window_v3_activation: ForkActivation,
     /// Trace dedup rule activation (see `params.trace_dedup_activation`).
     pub(super) trace_dedup_activation: ForkActivation,
+    /// Seed-bound opening rule activation (see `params.trace_seed_bind_activation`).
+    pub(super) trace_seed_bind_activation: ForkActivation,
     /// Ratio-reward v3 table activation (see `params.ratio_reward_v3_activation`).
     pub(super) ratio_reward_v3_activation: ForkActivation,
     /// Stage-2 trace rule activation (see `params.trace_chain_activation`).
@@ -437,6 +439,7 @@ impl VirtualStateProcessor {
             reward_draw_activation: params.reward_draw_activation,
             service_window_v3_activation: params.service_window_v3_activation,
             trace_dedup_activation: params.trace_dedup_activation,
+            trace_seed_bind_activation: params.trace_seed_bind_activation,
             ratio_reward_v3_activation: params.ratio_reward_v3_activation,
             trace_chain_activation: params.trace_chain_activation,
             finality_depth: params.finality_depth(),
@@ -1581,7 +1584,7 @@ impl VirtualStateProcessor {
             }
             v => TxRuleError::AiRequestPayloadRule(v.to_string()),
         })?;
-        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation)
+        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation)
             .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())

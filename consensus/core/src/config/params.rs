@@ -1886,6 +1886,10 @@ pub struct Params {
     /// Blocks commit and open the task of their window. Header format and hashing change.
     /// `never()` = dormant.
     pub block_task_activation: ForkActivation,
+    /// An opening may name the seed block it was built for; one naming another seed than its
+    /// audit's is passed over and the audit keeps waiting. Changes the audit fold.
+    /// `never()` = dormant.
+    pub trace_seed_bind_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -2169,6 +2173,7 @@ impl Params {
             ratio_reward_v3_activation: self.ratio_reward_v3_activation,
             trace_chain_activation: self.trace_chain_activation,
             block_task_activation: self.block_task_activation,
+            trace_seed_bind_activation: self.trace_seed_bind_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2393,6 +2398,7 @@ pub const MAINNET_PARAMS: Params = Params {
     ratio_reward_v3_activation: ForkActivation::never(),
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
+    trace_seed_bind_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2536,6 +2542,7 @@ pub const TESTNET_PARAMS: Params = Params {
     ratio_reward_v3_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     trace_chain_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     block_task_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_seed_bind_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(500),
@@ -2642,6 +2649,7 @@ pub const SIMNET_PARAMS: Params = Params {
     ratio_reward_v3_activation: ForkActivation::never(),
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
+    trace_seed_bind_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2742,6 +2750,7 @@ pub const DEVNET_PARAMS: Params = Params {
     ratio_reward_v3_activation: ForkActivation::never(),
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
+    trace_seed_bind_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),

@@ -7,6 +7,9 @@ pub const VERSION: u8 = 1;
 pub const VERSION_PREFIX: u8 = 2;
 /// Stage-2 opening: each point carries its token and input link, then the prefix and residual points.
 pub const VERSION_CHAIN: u8 = 3;
+/// Envelope naming the seed block an opening was built for: `[4] [response id] [seed block]`, then
+/// the inner body's version and the rest of that body after its response id.
+pub const VERSION_SEEDED: u8 = 4;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -480,6 +483,17 @@ impl Opening {
     }
 
     pub fn decode(b: &[u8]) -> Option<Opening> {
+        if b.first() == Some(&VERSION_SEEDED) {
+            let inner = *b.get(65)?;
+            if inner == VERSION_SEEDED {
+                return None;
+            }
+            let mut v = Vec::with_capacity(b.len() - 32);
+            v.push(inner);
+            v.extend_from_slice(&b[1..33]);
+            v.extend_from_slice(&b[66..]);
+            return Self::decode(&v);
+        }
         let mut r = R { b, o: 0 };
         let version = r.u8()?;
         if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN) {
@@ -546,4 +560,27 @@ impl Opening {
         let resid = if version == VERSION_CHAIN { Some(r.resid()?) } else { None };
         (r.o == b.len()).then_some(Opening { response_txid, points, prefix, links, experts, resid })
     }
+}
+
+/// The seed block a seeded opening body names; `None` for an unseeded body.
+pub fn seed_block(body: &[u8]) -> Option<Hash> {
+    if body.first() != Some(&VERSION_SEEDED) {
+        return None;
+    }
+    body.get(33..65)?.try_into().ok()
+}
+
+/// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
+pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
+    let version = *body.first()?;
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN) || body.len() < 33 {
+        return None;
+    }
+    let mut v = Vec::with_capacity(body.len() + 33);
+    v.push(VERSION_SEEDED);
+    v.extend_from_slice(&body[1..33]);
+    v.extend_from_slice(seed_block);
+    v.push(version);
+    v.extend_from_slice(&body[33..]);
+    Some(v)
 }

@@ -490,6 +490,10 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_opening_key(response_txid)
     }
 
+    pub(crate) fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.service_ledger.lock().ledger.awaited_opening_seed(response_txid)
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
@@ -676,6 +680,7 @@ impl VirtualStateProcessor {
                 draw: self.reward_draw_activation.is_active(daa),
                 window_v3: self.service_window_v3_activation.is_active(daa),
                 dedup: self.trace_dedup_activation.is_active(daa),
+                seed_bind: self.trace_seed_bind_activation.is_active(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();

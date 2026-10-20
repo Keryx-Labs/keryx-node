@@ -338,6 +338,29 @@ mod tests {
     }
 
     #[test]
+    fn seeded_envelope_round_trips() {
+        use crate::opening::{VERSION_SEEDED, seed_block, seeded};
+        let m = Model::new();
+        let r = m.response(3, 9, true);
+        let req: Hash = [4; 32];
+        let rp = m.response_with_prefix(40, 48, true, Some((&req, 6)));
+        let block: Hash = [7; 32];
+        for body in [m.open(&r, [5; 32], &[1; 32]).encode(), m.open_with_prefix(&rp, [5; 32], &[1; 32], &req, 6).encode()] {
+            assert_eq!(seed_block(&body), None);
+            let s = seeded(&body, &block).unwrap();
+            assert_eq!(s[0], VERSION_SEEDED);
+            assert_eq!(&s[1..33], &[5u8; 32]);
+            assert_eq!(seed_block(&s), Some(block));
+            assert_eq!(Opening::decode(&s), Opening::decode(&body));
+            assert!(seeded(&s, &block).is_none());
+            assert!(Opening::decode(&s[..s.len() - 1]).is_none());
+        }
+        let mut nested = seeded(&m.open(&r, [5; 32], &[1; 32]).encode(), &block).unwrap();
+        nested[65] = VERSION_SEEDED;
+        assert!(Opening::decode(&nested).is_none());
+    }
+
+    #[test]
     fn synthetic_openings_verify() {
         let m = Model::new();
         let tier = m.tier();

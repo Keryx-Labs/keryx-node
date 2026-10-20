@@ -3,7 +3,7 @@
 
 use keryx_consensus_core::{collateral::SERVICE_LEDGER_HORIZON_DAA, config::params::ForkActivation, tx::Transaction};
 use keryx_inference::AiResponsePayload;
-use keryx_verifiable_inference::opening::{Opening, SignedPayload};
+use keryx_verifiable_inference::opening::{Opening, SignedPayload, seed_block};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifiableEraViolation {
@@ -13,7 +13,8 @@ pub enum VerifiableEraViolation {
     TraceBeforeActivation,
     /// An AiResponse with an inline body but no trace commitment once the transition window is over.
     ResponseWithoutTrace,
-    /// An opening whose payload does not decode.
+    /// An opening whose payload does not decode, or that names its seed block before
+    /// `trace_seed_bind_activation`.
     MalformedOpening,
     /// An AiResponse body longer than the pre-chain maximum before `trace_chain_activation`.
     BodyTooLongBeforeChain(usize),
@@ -37,6 +38,7 @@ pub fn check_verifiable_inference_era(
     daa_score: u64,
     activation: ForkActivation,
     chain_activation: ForkActivation,
+    seed_bind_activation: ForkActivation,
 ) -> Result<(), VerifiableEraViolation> {
     let response = if tx.is_ai_response() { AiResponsePayload::deserialize(&tx.payload) } else { None };
     if !chain_activation.is_active(daa_score) {
@@ -56,6 +58,9 @@ pub fn check_verifiable_inference_era(
     }
     if tx.is_ai_opening() {
         let signed = SignedPayload::split(&tx.payload).ok_or(VerifiableEraViolation::MalformedOpening)?;
+        if seed_block(signed.body).is_some() && !seed_bind_activation.is_active(daa_score) {
+            return Err(VerifiableEraViolation::MalformedOpening);
+        }
         Opening::decode(signed.body).ok_or(VerifiableEraViolation::MalformedOpening)?;
     }
     if daa_score >= activation.daa_score().saturating_add(SERVICE_LEDGER_HORIZON_DAA)
@@ -98,28 +103,28 @@ mod tests {
     #[test]
     fn dormant_gate_rejects_everything_new() {
         let gate = ForkActivation::never();
-        assert_eq!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, opening()), 5, gate, ForkActivation::never()), Err(VerifiableEraViolation::OpeningBeforeActivation));
-        assert_eq!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(true)), 5, gate, ForkActivation::never()), Err(VerifiableEraViolation::TraceBeforeActivation));
-        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(false)), u64::MAX - 1, gate, ForkActivation::never()).is_ok());
+        assert_eq!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, opening()), 5, gate, ForkActivation::never(), ForkActivation::never()), Err(VerifiableEraViolation::OpeningBeforeActivation));
+        assert_eq!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(true)), 5, gate, ForkActivation::never(), ForkActivation::never()), Err(VerifiableEraViolation::TraceBeforeActivation));
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(false)), u64::MAX - 1, gate, ForkActivation::never(), ForkActivation::never()).is_ok());
     }
 
     #[test]
     fn active_gate_rules() {
         let gate = ForkActivation::new(GATE);
-        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, opening()), GATE, gate, ForkActivation::never()).is_ok());
-        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(true)), GATE, gate, ForkActivation::never()).is_ok());
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, opening()), GATE, gate, ForkActivation::never(), ForkActivation::never()).is_ok());
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(true)), GATE, gate, ForkActivation::never(), ForkActivation::never()).is_ok());
         assert_eq!(
-            check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, vec![1u8; 200]), GATE, gate, ForkActivation::never()),
+            check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, vec![1u8; 200]), GATE, gate, ForkActivation::never(), ForkActivation::never()),
             Err(VerifiableEraViolation::MalformedOpening)
         );
         // Bodies without a trace stay valid during the transition window, not after it.
-        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(false)), GATE, gate, ForkActivation::never()).is_ok());
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(false)), GATE, gate, ForkActivation::never(), ForkActivation::never()).is_ok());
         let end = GATE + SERVICE_LEDGER_HORIZON_DAA;
         assert_eq!(
-            check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(false)), end, gate, ForkActivation::never()),
+            check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(false)), end, gate, ForkActivation::never(), ForkActivation::never()),
             Err(VerifiableEraViolation::ResponseWithoutTrace)
         );
-        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(true)), end, gate, ForkActivation::never()).is_ok());
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(true)), end, gate, ForkActivation::never(), ForkActivation::never()).is_ok());
     }
 
     #[test]
@@ -131,11 +136,24 @@ mod tests {
                 .serialize()
         };
         let (h14, max) = (keryx_inference::MAX_AI_RESPONSE_PRIVATE_BODY_LEN_H14, keryx_inference::MAX_AI_RESPONSE_PRIVATE_BODY_LEN);
-        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, body(h14)), GATE, gate, chain).is_ok());
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, body(h14)), GATE, gate, chain, ForkActivation::never()).is_ok());
         assert_eq!(
-            check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, body(h14 + 1)), 2 * GATE - 1, gate, chain),
+            check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, body(h14 + 1)), 2 * GATE - 1, gate, chain, ForkActivation::never()),
             Err(VerifiableEraViolation::BodyTooLongBeforeChain(h14 + 1))
         );
-        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, body(max)), 2 * GATE, gate, chain).is_ok());
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, body(max)), 2 * GATE, gate, chain, ForkActivation::never()).is_ok());
+    }
+
+    #[test]
+    fn seeded_opening_is_malformed_before_its_gate() {
+        let gate = ForkActivation::new(GATE);
+        let bind = ForkActivation::new(2 * GATE);
+        let body = Opening { response_txid: [5; 32], points: vec![], prefix: None, links: vec![], experts: vec![], resid: None }.encode();
+        let mut p = keryx_verifiable_inference::opening::seeded(&body, &[8; 32]).unwrap();
+        p.extend_from_slice(&[6u8; 96]);
+        let seeded = tx(SUBNETWORK_ID_AI_OPENING, p);
+        assert_eq!(check_verifiable_inference_era(&seeded, 2 * GATE - 1, gate, ForkActivation::never(), bind), Err(VerifiableEraViolation::MalformedOpening));
+        assert!(check_verifiable_inference_era(&seeded, 2 * GATE, gate, ForkActivation::never(), bind).is_ok());
+        assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, opening()), 2 * GATE - 1, gate, ForkActivation::never(), bind).is_ok());
     }
 }

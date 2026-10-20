@@ -188,6 +188,12 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// The draw seed of a response whose opening is awaited.
+    fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        let _ = response_txid;
+        None
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         unimplemented!()
     }

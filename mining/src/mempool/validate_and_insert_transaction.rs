@@ -11,13 +11,13 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::{private_cohort_seed, verify_opening_signature, verify_responder_signature},
+    collateral::{private_cohort_seed, trace_seed, verify_opening_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
 use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
-use keryx_verifiable_inference::opening::SignedPayload;
+use keryx_verifiable_inference::opening::{SignedPayload, seed_block};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -248,7 +248,7 @@ impl Mempool {
     }
 
     /// Admission policy for openings: signed by the escrow key of a drawn response that still
-    /// awaits its opening. Policy only.
+    /// awaits its opening, and naming, if any, the seed block of that draw. Policy only.
     fn validate_ai_opening(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
         if !transaction.tx.is_ai_opening() {
             return Ok(());
@@ -258,6 +258,9 @@ impl Mempool {
         let awaited = match (&signed, response_txid) {
             (Some(s), Some(txid)) => {
                 consensus.awaited_opening_key(&txid) == Some(s.escrow_pubkey)
+                    && seed_block(s.body).is_none_or(|b| {
+                        consensus.awaited_opening_seed(&txid) == Some(trace_seed(&keryx_hashes::Hash::from_bytes(b), &txid))
+                    })
                     && verify_opening_signature(&s.escrow_pubkey, &s.signature, s.body)
             }
             _ => false,

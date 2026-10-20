@@ -203,6 +203,9 @@ pub struct TraceInputs<'a> {
     /// Whether a response accepted more than once by this block is judged once by the shape
     /// and root rules.
     pub dedup: bool,
+    /// Whether an opening naming its seed block is judged only against an audit drawn from that
+    /// block, and passed over otherwise.
+    pub seed_bind: bool,
 }
 
 const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
@@ -1501,6 +1504,11 @@ impl ServiceLedger {
             if op.escrow_pubkey != a.escrow_pubkey {
                 continue;
             }
+            if let Some(block) = keryx_verifiable_inference::opening::seed_block(&op.body) {
+                if !tr.seed_bind || trace_seed(&Hash::from_bytes(block), &op.response_txid) != seed {
+                    continue;
+                }
+            }
             let a = self.trace_audits.remove(&op.response_txid).unwrap();
             let verdict = match (tr.tier)(a.tier, a.accepted_daa) {
                 Some(rules) => trace_opening_valid(&rules, &a, &seed, &op.response_txid, &op.body),
@@ -1622,6 +1630,11 @@ impl ServiceLedger {
     /// Escrow key expected to sign the opening of a drawn response still awaiting it.
     pub fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.escrow_pubkey)
+    }
+
+    /// Draw seed of a drawn response still awaiting its opening.
+    pub fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.trace_audits.get(response_txid).and_then(|a| a.seed)
     }
 
     pub fn private_recipients(&self, request_hash: &[u8; 32]) -> Option<&[Hash]> {
@@ -4014,7 +4027,10 @@ mod tests {
         use super::super::{ServiceLedger, ServiceLedgerSnapshot, TraceInputs, TraceOpeningEvent, TraceResponseEvent, trace_seed};
         use keryx_hashes::Hash;
         use crate::config::params::TraceRules;
-        use keryx_verifiable_inference::{draw, testkit::Model};
+        use keryx_verifiable_inference::{
+            draw,
+            testkit::{Model, Response},
+        };
 
         const RH: [u8; 32] = [7u8; 32];
         const TXID: [u8; 32] = [0x51u8; 32];
@@ -4055,6 +4071,8 @@ mod tests {
             /// Context rule: silence on a prompt that may exceed the tier floor is excused unless
             /// a member's traced response proved it fit.
             context: bool,
+            /// Seed-bound opening rule.
+            seed_bind: bool,
             /// Token budget of the request `RH`.
             max_tokens: u32,
             /// Cohort of tier 0.
@@ -4074,6 +4092,7 @@ mod tests {
                     audit_all: false,
                     sanction: false,
                     context: false,
+                    seed_bind: false,
                     max_tokens: 256,
                     cohort: vec![miner()],
                     positions: None,
@@ -4138,6 +4157,7 @@ mod tests {
                     draw: false,
                     window_v3: false,
                     dedup: false,
+                    seed_bind: self.seed_bind,
                 };
                 let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -4341,6 +4361,94 @@ mod tests {
             let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
             assert_eq!(misses, vec![(miner(), 2)]);
             assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        /// Two chain blocks that both draw `TXID`, an honest response, and the ledger before the
+        /// draw (accepted at 102, drawn at 202).
+        fn reorged_draw(run: &mut Run) -> (Response, Hash, Hash, ServiceLedger) {
+            let (r, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            let mut drawn = (0u64..)
+                .map(|i| {
+                    let mut b = [0u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    Hash::from_bytes(b)
+                })
+                .filter(|h| draw::audited(&trace_seed(h, &TXID)));
+            let (block_a, block_b) = (drawn.next().unwrap(), drawn.next().unwrap());
+            (r, block_a, block_b, run.ledger.clone())
+        }
+
+        fn seeded_body(run: &Run, r: &Response, built_for: &Hash, named: &Hash) -> Vec<u8> {
+            keryx_verifiable_inference::opening::seeded(&run.model.open(r, TXID, &trace_seed(built_for, &TXID)).encode(), &named.as_bytes())
+                .unwrap()
+        }
+
+        #[test]
+        fn unseeded_opening_judged_after_its_seed_block_left_the_chain_strikes() {
+            let mut run = Run::new(true);
+            let (r, block_a, block_b, fork) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_a, &[], &[]).is_empty());
+            let body = run.model.open(&r, TXID, &trace_seed(&block_a, &TXID)).encode();
+
+            run.ledger = fork;
+            assert!(run.fold(202, block_b, &[], &[]).is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), Some(ESCROW_PK));
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)], &mut verdicts);
+            assert!(matches!(verdicts[..], [Some(_)]), "{verdicts:?}");
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), None);
+        }
+
+        #[test]
+        fn seeded_opening_of_a_seed_block_that_left_the_chain_waits_for_the_one_of_the_chain() {
+            let mut run = Run { seed_bind: true, ..Run::new(true) };
+            let (r, block_a, block_b, fork) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_a, &[], &[]).is_empty());
+            let stale = seeded_body(&run, &r, &block_a, &block_a);
+
+            run.ledger = fork;
+            assert!(run.fold(202, block_b, &[], &[]).is_empty());
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, stale)], &mut verdicts);
+            assert!(verdicts.is_empty(), "{verdicts:?}");
+            assert!(misses.is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), Some(ESCROW_PK));
+
+            let fresh = seeded_body(&run, &r, &block_b, &block_b);
+            let misses = run.fold_with_verdicts(204, Hash::from_bytes([4u8; 32]), &[], &[opening(ESCROW_PK, fresh)], &mut verdicts);
+            assert_eq!(verdicts, vec![None]);
+            assert!(misses.is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), None);
+        }
+
+        #[test]
+        fn seeded_opening_before_its_rule_is_passed_over() {
+            let mut run = Run::new(true);
+            let (r, block_a, _, _) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_a, &[], &[]).is_empty());
+            let body = seeded_body(&run, &r, &block_a, &block_a);
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)], &mut verdicts);
+            assert!(verdicts.is_empty(), "{verdicts:?}");
+            assert!(misses.is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), Some(ESCROW_PK));
+        }
+
+        #[test]
+        fn seeded_opening_naming_the_seed_block_is_judged_on_its_points() {
+            let mut run = Run { seed_bind: true, ..Run::new(true) };
+            let (r, block_a, block_b, _) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_b, &[], &[]).is_empty());
+            let forged = seeded_body(&run, &r, &block_a, &block_b);
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, forged)], &mut verdicts);
+            assert!(matches!(verdicts[..], [Some(_)]), "{verdicts:?}");
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), None);
         }
 
         #[test]
@@ -4765,6 +4873,7 @@ mod tests {
                     draw: self.draw,
                     window_v3: self.window_v3,
                     dedup: self.dedup,
+                    seed_bind: false,
                 };
                 let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
                 let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
