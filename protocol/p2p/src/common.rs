@@ -93,6 +93,7 @@ impl ProtocolError {
     /// - a structurally invalid coinbase (missing/invalid OPoI tag),
     /// - a block failing difficulty validation or building on a known-invalid block
     ///   (the exact signature of the pre-relaunch branch),
+    /// - a block whose re-walked PoM proof does not verify,
     /// - a chain proven to exclude the configured chain anchor, i.e. a chain block shared with the
     ///   peer that sits below the anchor daa (see `Params::chain_anchor`). An inconclusive anchor
     ///   negotiation is an ambiguous ending and is deliberately not reported as `WrongChain`.
@@ -106,6 +107,7 @@ impl ProtocolError {
                     | RuleError::UnexpectedDifficulty(..)
                     | RuleError::InvalidParent(_)
                     | RuleError::KnownInvalid
+                    | RuleError::BadPomProofV4(_)
             ) | ProtocolError::WrongChain(_)
         )
     }
@@ -238,4 +240,16 @@ macro_rules! dequeue {
 #[macro_export]
 macro_rules! dequeue_with_request_id {
     ($receiver:expr, $pattern:path) => {{ $crate::unwrap_message_with_request_id!($receiver.recv().await, $pattern) }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keryx_consensus_core::pom_v4::PomV4VerifyError;
+
+    #[test]
+    fn a_failing_pom_proof_is_ban_worthy() {
+        assert!(ProtocolError::RuleError(RuleError::BadPomProofV4(PomV4VerifyError::FinalStateMismatch)).is_ban_worthy());
+        assert!(!ProtocolError::ConnectionClosed.is_ban_worthy());
+    }
 }
