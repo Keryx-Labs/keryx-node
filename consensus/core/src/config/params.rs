@@ -2502,7 +2502,7 @@ pub const TESTNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(0),
     pom_maxlevel_v4_activation: ForkActivation::new(1),
     pom_v4_activation: ForkActivation::new(1),
-    pom_v5_activation: ForkActivation::never(),
+    pom_v5_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     h10_activation: ForkActivation::new(TESTNET_H10_ACTIVATION_DAA),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
