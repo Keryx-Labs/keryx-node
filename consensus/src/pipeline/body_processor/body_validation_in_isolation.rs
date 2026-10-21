@@ -393,15 +393,8 @@ impl BlockBodyProcessor {
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
         let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
 
-        // H6: matrix-walk witness (pom_v3). The verifier NEVER re-walks (that would be
-        // K * D^3 = 4.3 GMACs per block — IBD in days, the H3 lesson): it re-derives the offset
-        // chain from the listed snippets, recomputes S_0 from the seed, and re-checks 32
-        // PRF-sampled single entries against the per-step state commitments and the UNCHANGED
-        // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
-        // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
-        // later), so the pin check above already ran.
         if self.pom_v5_activation.is_active(header.daa_score) {
-            let n_pad = keryx_consensus_core::config::params::POM_V5_PAD_ENTRIES_H14.get(proof.tier as usize).copied().unwrap_or(0);
+            let n_pad = keryx_consensus_core::config::params::POM_V5_PAD_TILES_H14.get(proof.tier as usize).copied().unwrap_or(0);
             let pad_seed = v5_pad_seed(proof.tier, &tier.model_id, &tier.root);
             return verify_pom_proof_v5_container(seed, proof, tier.chunks, &tier.root, &pad_seed, n_pad, &target, final_hash)
                 .map_err(RuleError::BadPomProofV4);
@@ -411,6 +404,13 @@ impl BlockBodyProcessor {
                 .map_err(RuleError::BadPomProofV4);
         }
 
+        // H6: matrix-walk witness (pom_v3). The verifier NEVER re-walks (that would be
+        // K * D^3 = 4.3 GMACs per block — IBD in days, the H3 lesson): it re-derives the offset
+        // chain from the listed snippets, recomputes S_0 from the seed, and re-checks 32
+        // PRF-sampled single entries against the per-step state commitments and the UNCHANGED
+        // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
+        // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
+        // later), so the pin check above already ran.
         if pom_v3 {
             return verify_pom_proof_v3_container(
                 &pre_pow_hash,

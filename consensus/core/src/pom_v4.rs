@@ -573,7 +573,7 @@ pub fn v4_walk(seed: u64, blob: &[u8]) -> Result<V4Walk, PomV4VerifyError> {
 }
 
 /// Merkle path from an aligned tile subtree (index = tile offset) up to `R_T`.
-fn v4_tile_path(leaf_hashes: &[[u8; 32]], tile_offset: u64) -> Vec<[u8; 32]> {
+pub(crate) fn v4_tile_path(leaf_hashes: &[[u8; 32]], tile_offset: u64) -> Vec<[u8; 32]> {
     let mut level: Vec<[u8; 32]> = leaf_hashes.to_vec();
     for _ in 0..TILE_SUBTREE_DEPTH {
         level = fold_level(&level);
