@@ -425,7 +425,7 @@ impl MoeCheck<'_> {
         if !layer_role(ge.role, self.trimmed) || ge.k != self.dim || ge.n_exp as u64 != n_exp {
             return Err(Fail::Manifest);
         }
-        let layout = crate::verify::layout_for(self.n_ubatch, ge.wtype);
+        let layout = if ge.role == manifest::ROLE_OUTPUT { q8::MMVQ } else { crate::verify::layout_for(self.n_ubatch, ge.wtype) };
         if m.gate_x.bytes.len() as u64 != crate::verify::x_len(self.dim, layout) {
             return Err(Fail::Shape);
         }

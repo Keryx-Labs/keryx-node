@@ -785,12 +785,13 @@ mod moe_tests {
         ctx: ChainCtx,
         pos: Position,
         trace_root: Hash,
+        n_ubatch: u32,
     }
 
     fn entry(name: &str, role: u8, k: usize, m: usize, n_exp: u32, off: usize, n: usize, rb: usize, chain: Chain) -> Vec<u8> {
         let e = Entry {
             name: name.into(),
-            wtype: if role == manifest::ROLE_PRODUCT { quant::Q8_0 } else { 0 },
+            wtype: if matches!(role, manifest::ROLE_PRODUCT | manifest::ROLE_OUTPUT) { quant::Q8_0 } else { 0 },
             k: k as u64,
             m: m as u64,
             n_exp,
@@ -809,7 +810,7 @@ mod moe_tests {
         b
     }
 
-    fn build(order_swap: bool, bump_slot: Option<usize>) -> Moe {
+    fn build(order_swap: bool, bump_slot: Option<usize>, batch: u32) -> Moe {
         let router = vecf(1, E * D, 0.05);
         let bias = vecf(2, E, 0.01);
         let norm: Vec<f32> = (0..D).map(|i| 1.0 + 0.001 * (i % 7) as f32).collect();
@@ -821,12 +822,13 @@ mod moe_tests {
         let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
 
         let none = manifest::NONE;
+        let last = if batch > 1 { manifest::ROLE_OUTPUT } else { manifest::ROLE_PRODUCT };
         let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3 };
         let entries = vec![
             entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_down_exps.weight", manifest::ROLE_PRODUCT, D, D, E as u32, 0, 0, 0, Chain::None),
-            entry("blk.0.ffn_down_shexp.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
-            entry("blk.0.ffn_gate_exps.weight", manifest::ROLE_PRODUCT, D, D, E as u32, 0, 0, 0, Chain::None),
+            entry("blk.0.ffn_down_shexp.weight", last, D, D, 1, 0, 0, 0, Chain::None),
+            entry("blk.0.ffn_gate_exps.weight", last, D, D, E as u32, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_gate_inp.weight", manifest::ROLE_ROUTER, D, E, 1, 0, 4 * E * D, 4 * D, Chain::None),
             entry("blk.0.exp_probs_b.bias", manifest::ROLE_NORM, E, 1, 1, bias_off, 4 * E, 4 * E, Chain::None),
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
@@ -842,7 +844,7 @@ mod moe_tests {
             n_entries: entries.len() as u64,
             n_products: 4,
         };
-        let ctx = ChainCtx { n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: U as u32 };
+        let ctx = ChainCtx { n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32 };
 
         let r = vecf(3, D, 2.0);
         let x = chain::rms_norm(&r, &norm, EPS);
@@ -876,10 +878,10 @@ mod moe_tests {
         leaves[chain::resid_leaf(np, 0, Resid::Attn) as usize] = bytes(&r);
         leaves[chain::resid_leaf(np, 0, Resid::Out) as usize] = bytes(&out);
         leaves[chain::router_leaf(np, 1, 0) as usize] = bytes(&scores);
-        leaves[chain::meta_leaf(np, 1, 1) as usize] = chain::meta(0, 1, 7).to_vec();
+        leaves[chain::meta_leaf(np, 1, 1) as usize] = chain::meta(0, batch, 7).to_vec();
         let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
         let trace_root = b3_root(&[b3_root(&hashes)]);
-        Moe { weights, chunk_leaves, entries, entry_leaves, tier, ctx, pos: Position { tok: 7, leaves, hashes }, trace_root }
+        Moe { weights, chunk_leaves, entries, entry_leaves, tier, ctx, pos: Position { tok: 7, leaves, hashes }, trace_root, n_ubatch: batch }
     }
 
     impl Moe {
@@ -907,7 +909,7 @@ mod moe_tests {
             let row = d[3] % E as u64;
             let ids_chunk = leaf_chunk(&self.pos, 3, (U * D * 4 / B3_CHUNK) as u64);
             Some(ResidPoint {
-                n_ubatch: 1,
+                n_ubatch: self.n_ubatch,
                 tok: 7,
                 pos_path: Vec::new(),
                 meta_path: b3_path(&self.pos.hashes, chain::meta_leaf(np, 1, 1) as usize),
@@ -941,21 +943,21 @@ mod moe_tests {
 
     #[test]
     fn honest_moe_layer_passes() {
-        let m = build(false, None);
+        let m = build(false, None, 1);
         let n = seeds().filter_map(|s| m.check(&s).map(|r| r.unwrap_or_else(|e| panic!("{e:?}")))).count();
         assert!(n > 0);
     }
 
     #[test]
     fn swapped_experts_are_refused() {
-        let m = build(true, None);
+        let m = build(true, None, 1);
         let results: Vec<_> = seeds().filter_map(|s| m.check(&s)).collect();
         assert!(!results.is_empty() && results.iter().all(|r| *r == Err(crate::verify::Fail::Mismatch)));
     }
 
     #[test]
     fn a_changed_expert_output_is_refused() {
-        let m = build(false, Some(1));
+        let m = build(false, Some(1), 1);
         let mut refused = 0;
         for s in seeds() {
             let d = draw::point(&s, chain::RESID_POINT);
@@ -967,6 +969,13 @@ mod moe_tests {
             }
         }
         assert!(refused > 0);
+    }
+
+    #[test]
+    fn a_trimmed_last_layer_reads_its_expert_input_as_one_row() {
+        let m = build(false, None, 32);
+        let n = seeds().filter_map(|s| m.check(&s).map(|r| r.unwrap_or_else(|e| panic!("{e:?}")))).count();
+        assert!(n > 0);
     }
 }
 
