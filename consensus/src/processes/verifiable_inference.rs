@@ -14,7 +14,7 @@ pub enum VerifiableEraViolation {
     /// An AiResponse with an inline body but no trace commitment once the transition window is over.
     ResponseWithoutTrace,
     /// An opening whose payload does not decode, or that names its seed block before
-    /// `trace_seed_bind_activation`.
+    /// `trace_seed_bind_activation` or does not name it after.
     MalformedOpening,
     /// An AiResponse body longer than the pre-chain maximum before `trace_chain_activation`.
     BodyTooLongBeforeChain(usize),
@@ -58,7 +58,7 @@ pub fn check_verifiable_inference_era(
     }
     if tx.is_ai_opening() {
         let signed = SignedPayload::split(&tx.payload).ok_or(VerifiableEraViolation::MalformedOpening)?;
-        if seed_block(signed.body).is_some() && !seed_bind_activation.is_active(daa_score) {
+        if seed_block(signed.body).is_some() != seed_bind_activation.is_active(daa_score) {
             return Err(VerifiableEraViolation::MalformedOpening);
         }
         Opening::decode(signed.body).ok_or(VerifiableEraViolation::MalformedOpening)?;
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn seeded_opening_is_malformed_before_its_gate() {
+    fn opening_names_its_seed_block_exactly_from_its_gate() {
         let gate = ForkActivation::new(GATE);
         let bind = ForkActivation::new(2 * GATE);
         let body = Opening { response_txid: [5; 32], points: vec![], prefix: None, links: vec![], experts: vec![], resid: None }.encode();
@@ -155,5 +155,9 @@ mod tests {
         assert_eq!(check_verifiable_inference_era(&seeded, 2 * GATE - 1, gate, ForkActivation::never(), bind), Err(VerifiableEraViolation::MalformedOpening));
         assert!(check_verifiable_inference_era(&seeded, 2 * GATE, gate, ForkActivation::never(), bind).is_ok());
         assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, opening()), 2 * GATE - 1, gate, ForkActivation::never(), bind).is_ok());
+        assert_eq!(
+            check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_OPENING, opening()), 2 * GATE, gate, ForkActivation::never(), bind),
+            Err(VerifiableEraViolation::MalformedOpening)
+        );
     }
 }
