@@ -49,8 +49,8 @@ impl BlockBodyProcessor {
         // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
         if !skip_pom_proof {
-            self.check_pom_proof(block)?;
             self.check_block_task(block)?;
+            self.check_pom_proof(block)?;
         }
         Ok(mass)
     }

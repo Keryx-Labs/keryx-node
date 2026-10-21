@@ -497,6 +497,7 @@ pub fn verify_pom_proof_v4_container<Hf: Fn(u64) -> [u8; 32]>(
     final_hash: Hf,
 ) -> Result<(), PomV4VerifyError> {
     let v4 = v4_container_witness(proof)?;
+    check_pow_pin(proof, target, &final_hash)?;
     let derived = verify_pom_proof_v4(seed, v4, r_t, n_chunks)?;
     finish_container(proof, derived, target, final_hash)
 }
@@ -517,6 +518,22 @@ pub(crate) fn v4_container_witness(proof: &crate::pom::PomProof) -> Result<&PomP
         return Err(PomV4VerifyError::TierMismatch);
     }
     Ok(v4)
+}
+
+/// `pow_value` of a container against its claimed `final_state` and the target.
+pub(crate) fn check_pow_pin<Hf: Fn(u64) -> [u8; 32]>(
+    proof: &crate::pom::PomProof,
+    target: &[u8; 32],
+    final_hash: &Hf,
+) -> Result<(), PomV4VerifyError> {
+    let pv = final_hash(proof.final_state);
+    if pv != proof.pow_value {
+        return Err(PomV4VerifyError::PowValueMismatch);
+    }
+    if !crate::pom::le_leq(&pv, target) {
+        return Err(PomV4VerifyError::TargetNotMet);
+    }
+    Ok(())
 }
 
 /// Header pins of a container against the verifier-derived `final_state`.

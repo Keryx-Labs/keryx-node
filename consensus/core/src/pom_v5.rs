@@ -4,9 +4,9 @@
 use crate::pom::{blake, mix64, verify_merkle};
 use crate::pom_v3::{fold64, snippet_fold};
 use crate::pom_v4::{
-    finish_container, v4_container_witness, v4_first_offset, v4_initial_state_into, v4_n_tiles, v4_state_root, v4_tile_subtree_root,
-    v4_transition_into, PomProofV4, PomV4VerifyError, POM_V4_D, POM_V4_K, POM_V4_OFFSET_STEP_SALT, POM_V4_SNIPPET_BYTES,
-    POM_V4_TILE_BYTES,
+    check_pow_pin, finish_container, v4_container_witness, v4_first_offset, v4_initial_state_into, v4_n_tiles, v4_state_root,
+    v4_tile_subtree_root, v4_transition_into, PomProofV4, PomV4VerifyError, POM_V4_D, POM_V4_K, POM_V4_OFFSET_STEP_SALT,
+    POM_V4_SNIPPET_BYTES, POM_V4_TILE_BYTES,
 };
 
 /// Bytes of one pad entry.
@@ -210,6 +210,7 @@ pub fn verify_pom_proof_v5_container<Hf: Fn(u64) -> [u8; 32]>(
     final_hash: Hf,
 ) -> Result<(), PomV4VerifyError> {
     let v4 = v4_container_witness(proof)?;
+    check_pow_pin(proof, target, &final_hash)?;
     let derived = verify_pom_proof_v5(seed, v4, r_t, n_chunks, pad_seed, n_pad_tiles)?;
     finish_container(proof, derived, target, final_hash)
 }
@@ -387,5 +388,10 @@ mod tests {
         };
         assert!(check(&container(fs)).is_ok());
         assert_eq!(check(&container(fs ^ 1)), Err(PomV4VerifyError::FinalStateMismatch));
+        let mut forged = container(fs);
+        forged.pow_value[0] ^= 1;
+        let mut gutted = forged.clone();
+        gutted.v4.as_mut().unwrap().tiles[0].clear();
+        assert_eq!(check(&gutted), Err(PomV4VerifyError::PowValueMismatch), "pow_value is checked before the walk");
     }
 }
