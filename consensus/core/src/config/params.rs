@@ -627,7 +627,7 @@ pub const POM_TIERS_H14: &[crate::pom::PomTier] = &[
 ];
 
 /// Context pad tiles of each `POM_TIERS_H14` tier under the v5 walk; 0 = no pad.
-pub const POM_V5_PAD_TILES_H14: [u64; 5] = [773_120, 1_146_880, 865_280, 3_105_792, 2_525_184];
+pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432];
 
 /// Matmul manifest of a tier: root `M_T`, entry count and product count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
