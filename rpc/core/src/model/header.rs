@@ -39,6 +39,8 @@ pub struct RpcRawHeader {
     pub service_state_hash: Hash,
     #[serde(default)]
     pub pom_tier: u8,
+    #[serde(default)]
+    pub task_root: Hash,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -69,6 +71,8 @@ pub struct RpcHeader {
     pub service_state_hash: Hash,
     #[serde(default)]
     pub pom_tier: u8,
+    #[serde(default)]
+    pub task_root: Hash,
 }
 
 impl RpcHeader {
@@ -102,6 +106,7 @@ impl From<Header> for RpcHeader {
             pom_final_state: header.pom_final_state,
             service_state_hash: header.service_state_hash,
             pom_tier: header.pom_tier,
+            task_root: header.task_root,
         }
     }
 }
@@ -125,6 +130,7 @@ impl From<&Header> for RpcHeader {
             pom_final_state: header.pom_final_state,
             service_state_hash: header.service_state_hash,
             pom_tier: header.pom_tier,
+            task_root: header.task_root,
         }
     }
 }
@@ -149,6 +155,7 @@ impl TryFrom<RpcHeader> for Header {
             pom_final_state: header.pom_final_state,
             service_state_hash: header.service_state_hash,
             pom_tier: header.pom_tier,
+            task_root: header.task_root,
         })
     }
 }
@@ -174,13 +181,14 @@ impl TryFrom<&RpcHeader> for Header {
             pom_final_state: header.pom_final_state,
             service_state_hash: header.service_state_hash,
             pom_tier: header.pom_tier,
+            task_root: header.task_root,
         })
     }
 }
 
 impl Serializer for RpcHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &4, writer)?;
+        store!(u16, &5, writer)?;
 
         store!(Hash, &self.hash, writer)?;
         store!(u16, &self.version, writer)?;
@@ -198,6 +206,7 @@ impl Serializer for RpcHeader {
         store!(u64, &self.pom_final_state, writer)?;
         store!(Hash, &self.service_state_hash, writer)?;
         store!(u8, &self.pom_tier, writer)?;
+        store!(Hash, &self.task_root, writer)?;
 
         Ok(())
     }
@@ -226,6 +235,7 @@ impl Deserializer for RpcHeader {
         let service_state_hash = if payload_version >= 3 { load!(Hash, reader)? } else { Hash::default() };
         // Struct-version 4 (H6): pom_tier. Older senders omit it.
         let pom_tier = if payload_version >= 4 { load!(u8, reader)? } else { 0u8 };
+        let task_root = if payload_version >= 5 { load!(Hash, reader)? } else { Hash::default() };
 
         Ok(Self {
             hash,
@@ -244,6 +254,7 @@ impl Deserializer for RpcHeader {
             pom_final_state,
             service_state_hash,
             pom_tier,
+            task_root,
         })
     }
 }
@@ -268,6 +279,7 @@ impl TryFrom<RpcRawHeader> for Header {
             header.pom_final_state,
             header.service_state_hash,
             header.pom_tier,
+            header.task_root,
         ))
     }
 }
@@ -292,6 +304,7 @@ impl TryFrom<&RpcRawHeader> for Header {
             header.pom_final_state,
             header.service_state_hash,
             header.pom_tier,
+            header.task_root,
         ))
     }
 }
@@ -314,6 +327,7 @@ impl From<&Header> for RpcRawHeader {
             pom_final_state: header.pom_final_state,
             service_state_hash: header.service_state_hash,
             pom_tier: header.pom_tier,
+            task_root: header.task_root,
         }
     }
 }
@@ -336,13 +350,14 @@ impl From<Header> for RpcRawHeader {
             pom_final_state: header.pom_final_state,
             service_state_hash: header.service_state_hash,
             pom_tier: header.pom_tier,
+            task_root: header.task_root,
         }
     }
 }
 
 impl Serializer for RpcRawHeader {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &4, writer)?;
+        store!(u16, &5, writer)?;
 
         store!(u16, &self.version, writer)?;
         store!(Vec<Vec<Hash>>, &self.parents_by_level, writer)?;
@@ -359,6 +374,7 @@ impl Serializer for RpcRawHeader {
         store!(u64, &self.pom_final_state, writer)?;
         store!(Hash, &self.service_state_hash, writer)?;
         store!(u8, &self.pom_tier, writer)?;
+        store!(Hash, &self.task_root, writer)?;
 
         Ok(())
     }
@@ -386,6 +402,7 @@ impl Deserializer for RpcRawHeader {
         let service_state_hash = if payload_version >= 3 { load!(Hash, reader)? } else { Hash::default() };
         // Struct-version 4 (H6): pom_tier. Older senders omit it.
         let pom_tier = if payload_version >= 4 { load!(u8, reader)? } else { 0u8 };
+        let task_root = if payload_version >= 5 { load!(Hash, reader)? } else { Hash::default() };
 
         Ok(Self {
             version,
@@ -403,6 +420,7 @@ impl Deserializer for RpcRawHeader {
             pom_final_state,
             service_state_hash,
             pom_tier,
+            task_root,
         })
     }
 }

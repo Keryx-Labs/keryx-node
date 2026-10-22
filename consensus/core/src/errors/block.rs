@@ -96,6 +96,12 @@ pub enum RuleError {
     #[error("PoM possession proof missing")]
     PomProofMissing,
 
+    #[error("block task opening missing")]
+    BlockTaskMissing,
+
+    #[error("invalid block task opening: {0:?}")]
+    BadBlockTask(keryx_verifiable_inference::verify::Fail),
+
     #[error("PoM witness already failed verification for this block (negative cache)")]
     KnownBadPomWitness,
 
@@ -200,6 +206,24 @@ pub enum RuleError {
 
     #[error("AiResponse tx {0} carries no inline private body")]
     AiResponseWithoutPrivateBody(TransactionId),
+
+    #[error("opening tx {0} before the verifiable-inference activation")]
+    AiOpeningBeforeActivation(TransactionId),
+
+    #[error("AiResponse tx {0} carries a trace commitment before the verifiable-inference activation")]
+    AiTraceBeforeActivation(TransactionId),
+
+    #[error("AiResponse tx {0} carries no trace commitment")]
+    AiResponseWithoutTrace(TransactionId),
+
+    #[error("opening tx {0} does not decode")]
+    AiOpeningMalformed(TransactionId),
+
+    #[error("AiResponse tx {0} carries a {1}-byte body above the pre-stage-2 maximum")]
+    AiResponseBodyTooLong(TransactionId, usize),
+
+    #[error("block carries {0} opening transactions, at most one is allowed")]
+    TooManyAiOpenings(usize),
 
     #[error("AiRequest tx {0} max_tokens {1} exceeds the cap {2}")]
     AiRequestMaxTokensExceeded(TransactionId, u32, u32),

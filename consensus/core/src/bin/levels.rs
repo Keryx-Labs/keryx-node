@@ -58,6 +58,7 @@ fn pow_and_target(hd: &serde_json::Value) -> Option<(u32, u32, u64)> {
         u64f(hd, "pomFinalState"),
         s(hd, "serviceStateHash").parse().unwrap_or_default(),
         u64f(hd, "pomTier") as u8,
+        Default::default(),
     );
     let pre: [u8; 32] = hash_override_nonce_time(&header, 0, 0).as_bytes();
     let pow = Uint256::from_le_bytes(pom_pow_value_h3(header.pom_final_state, &pre));

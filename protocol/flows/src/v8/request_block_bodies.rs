@@ -64,6 +64,7 @@ impl HandleBlockBodyRequests {
                     let pom = self.ctx.encode_pom_proof_cached(self.pom_format, &block);
                     body_msg.pom_proof = pom.legacy;
                     body_msg.pom_proof_deduped = pom.deduped;
+                    body_msg.block_task = pom.task;
                 }
                 self.router.enqueue(make_response!(Payload::BlockBody, body_msg, request_id)).await?;
             }

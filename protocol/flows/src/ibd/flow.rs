@@ -1084,7 +1084,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                     ProtocolError::OtherOwned(format!("syncee inconsistency: missing block header for {}, err: {}", hash, err))
                 })?;
                 let pom_tier = msg.pom_tier.map(|tier| tier as u8);
-                let pom_proof = decode_pom_proof(&blk_header, msg.pom_proof.clone(), msg.pom_proof_deduped.clone())
+                let pom_proof = decode_pom_proof(&blk_header, msg.pom_proof.clone(), msg.pom_proof_deduped.clone(), msg.block_task.clone())
                     .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for trusted block {}", hash)))?
                     .map(Arc::new);
                 let blk_body: BlockBody = msg.try_into()?;
@@ -1301,7 +1301,7 @@ staging selected tip ({}) is too small or negative. Aborting IBD...",
                 // get_missing_block_body_hashes call. However for now we fail gracefully and only disconnect from this peer.
                 ProtocolError::OtherOwned(format!("syncee inconsistency: missing block header for {}, err: {}", expected_hash, err))
             })?;
-            let pom_proof = decode_pom_proof(&blk_header, msg.pom_proof.clone(), msg.pom_proof_deduped.clone())
+            let pom_proof = decode_pom_proof(&blk_header, msg.pom_proof.clone(), msg.pom_proof_deduped.clone(), msg.block_task.clone())
                 .map_err(|_| ProtocolError::OtherOwned(format!("invalid pom_proof for block {}", expected_hash)))?
                 .map(Arc::new);
             let blk_body: BlockBody = msg.try_into()?;

@@ -327,6 +327,7 @@ pub fn decode_v4_deduped(bytes: &[u8], seed: u64, n_chunks: u64) -> Result<PomPr
         steps_v2: None,
         v3: None,
         v4: Some(PomProofV4 { tier, tiles, merkle: paths.into_iter().map(|path| PomV4RangeProof { path }).collect() }),
+        task: None,
     })
 }
 
@@ -357,6 +358,7 @@ mod tests {
             steps_v2: None,
             v3: None,
             v4: Some(v4),
+            task: None,
         };
         (proof, n_chunks)
     }

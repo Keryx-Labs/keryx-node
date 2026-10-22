@@ -221,6 +221,12 @@ pub const H13_ACTIVATION_DAA: u64 = 93_550_000;
 /// Targets 2026-10-09 ~14:00 UTC (from daa 117_774_522 at 2026-10-04 18:37 UTC, ~10.13 daa/s).
 pub const H14_ACTIVATION_DAA: u64 = 121_985_000;
 
+/// Mainnet H15 gate: every verifiable-inference, audit, block task, PoM v5 and holder-reward v3 rule. Node and miner.
+pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
+
+/// Testnet H15 gate: every verifiable-inference, audit and holder-reward v3 rule. Node and miner.
+pub const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -623,6 +629,494 @@ pub const POM_TIERS_H14: &[crate::pom::PomTier] = &[
     POM_TIERS_H6[4],
 ];
 
+/// Context pad tiles of each `POM_TIERS_H14` tier under the v5 walk; 0 = no pad.
+pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432];
+
+/// Matmul manifest of a tier: root `M_T`, entry count and product count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TraceManifest {
+    pub m_t: [u8; 32],
+    pub n_entries: u64,
+    pub n_products: u64,
+}
+
+/// Trace manifests of the H14 lineup, by tier. `None`: the tier is not audited.
+pub const TRACE_MANIFESTS_H14: [Option<TraceManifest>; 5] = [
+    Some(TraceManifest {
+        m_t: [
+            0x4c, 0x62, 0x12, 0xd1, 0x6c, 0x7f, 0xc5, 0x73, 0xb3, 0x72, 0xe5, 0x7e, 0x60, 0x17, 0x61, 0x90,
+            0xb6, 0x3e, 0xd3, 0x63, 0x7a, 0x7b, 0xdf, 0xa9, 0x3f, 0xbf, 0x6a, 0x7c, 0xa2, 0xbf, 0xd4, 0x92,
+        ],
+        n_entries: 249,
+        n_products: 249,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0xc5, 0x86, 0xbd, 0x7c, 0x3e, 0xf5, 0xae, 0xad, 0xd6, 0x69, 0xa4, 0x8e, 0x28, 0xbe, 0xb1, 0x35,
+            0xa9, 0xdf, 0x43, 0x89, 0x0b, 0xf4, 0xb3, 0x0a, 0x26, 0x07, 0x2c, 0xde, 0xbb, 0xa1, 0xb0, 0x45,
+        ],
+        n_entries: 361,
+        n_products: 241,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x15, 0x50, 0xe2, 0xf3, 0xa7, 0x09, 0xf1, 0x65, 0x36, 0x63, 0x11, 0x11, 0x96, 0xed, 0xeb, 0x80,
+            0x88, 0xa0, 0xc5, 0x08, 0x73, 0x68, 0x7e, 0x70, 0xef, 0x77, 0xbb, 0xbc, 0xda, 0xa9, 0x49, 0xc8,
+        ],
+        n_entries: 329,
+        n_products: 329,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x5f, 0xf3, 0xb4, 0x2f, 0xf0, 0x43, 0x56, 0x10, 0x6a, 0xe7, 0xa5, 0x65, 0x12, 0x32, 0x1f, 0xae,
+            0x0f, 0x37, 0xbd, 0xe1, 0x71, 0x49, 0x5b, 0x77, 0x4b, 0xf9, 0x44, 0xe4, 0xd0, 0x23, 0x5c, 0x33,
+        ],
+        n_entries: 497,
+        n_products: 497,
+    }),
+    None,
+];
+
+/// Trace manifests of the H14 lineup with the embedding and layer-0 norm entries, by tier.
+pub const TRACE_MANIFESTS_PREFIX: [Option<TraceManifest>; 5] = [
+    Some(TraceManifest {
+        m_t: [
+            0x9b, 0x80, 0x2a, 0xe5, 0xf4, 0xca, 0xfe, 0x07, 0x3b, 0xd9, 0x7b, 0x72, 0x22, 0x2a, 0x77, 0xf4,
+            0x4e, 0xb5, 0x97, 0x49, 0x1a, 0xb0, 0x72, 0x35, 0x18, 0x0c, 0x5e, 0xf8, 0x78, 0x3f, 0x62, 0xbc,
+        ],
+        n_entries: 251,
+        n_products: 249,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x5d, 0x67, 0x8f, 0xfb, 0xd6, 0xc4, 0x16, 0x4c, 0xc8, 0xd4, 0x00, 0x61, 0x68, 0xad, 0xc2, 0x76,
+            0x54, 0x1f, 0xdf, 0x3f, 0x18, 0x1e, 0xa8, 0xa8, 0x9c, 0xac, 0x70, 0x23, 0x1e, 0x7d, 0x7d, 0x1a,
+        ],
+        n_entries: 363,
+        n_products: 241,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0xc0, 0x9c, 0x80, 0xb1, 0x81, 0x5b, 0x93, 0xdb, 0xa8, 0xb4, 0x30, 0xf2, 0x64, 0x8e, 0x50, 0xbe,
+            0x87, 0x13, 0x7d, 0xe9, 0x45, 0xf9, 0x6c, 0xa8, 0x2e, 0x4c, 0xfa, 0x20, 0x84, 0xb2, 0xa8, 0x08,
+        ],
+        n_entries: 331,
+        n_products: 329,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x98, 0xdc, 0x87, 0xdc, 0x3c, 0xf1, 0x29, 0x72, 0x32, 0xe8, 0x9e, 0x58, 0xbf, 0xae, 0x50, 0x1c,
+            0x11, 0x72, 0xba, 0x05, 0x62, 0x68, 0x07, 0xa0, 0x86, 0xca, 0x38, 0xcd, 0xaf, 0xfb, 0x4c, 0x47,
+        ],
+        n_entries: 499,
+        n_products: 497,
+    }),
+    None,
+];
+
+/// Prefix context of a tier (`keryx_verifiable_inference::prefix::PrefixCtx`).
+pub type TracePrefix = keryx_verifiable_inference::prefix::PrefixCtx;
+
+/// Prefix contexts of the H14 lineup, by tier. `None`: the tier is not audited.
+pub const TRACE_PREFIXES: [Option<TracePrefix>; 5] = [
+    Some(TracePrefix {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 6,
+        embd_entry: 249,
+        norm_entry: 250,
+        eps: 9.999999974752427e-07,
+        embd_scale: 1.0,
+    }),
+    Some(TracePrefix {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 7,
+        embd_entry: 361,
+        norm_entry: 362,
+        eps: 9.999999747378752e-06,
+        embd_scale: 1.0,
+    }),
+    Some(TracePrefix {
+        table: [
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 107, 249, 250, 251, 252, 253,
+            254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
+            270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285,
+            286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301,
+            302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+            318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
+            334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349,
+            350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365,
+            366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381,
+            382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397,
+            398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
+            414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429,
+            430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445,
+            446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461,
+            462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
+            478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493,
+        ],
+        offset: 7,
+        embd_entry: 329,
+        norm_entry: 330,
+        eps: 9.999999974752427e-07,
+        embd_scale: 61.967735290527344,
+    }),
+    Some(TracePrefix {
+        table: [
+            188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+            204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+            220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+            15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+            31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+            47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+            79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+            222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+            238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+            254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+            108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+            124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+            140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+            172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+        ],
+        offset: 6,
+        embd_entry: 497,
+        norm_entry: 498,
+        eps: 9.999999974752427e-07,
+        embd_scale: 1.0,
+    }),
+    None,
+];
+
+/// Stage-2 data of a tier: its chain manifest, chain context and prefix context.
+#[derive(Clone, Debug)]
+pub struct TraceChain {
+    pub manifest: TraceManifest,
+    pub ctx: keryx_verifiable_inference::chain::ChainCtx,
+    pub prefix: TracePrefix,
+}
+
+/// Stage-2 data of the H14 lineup, by tier.
+pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
+    Some(TraceChain {
+        manifest: TraceManifest {
+            m_t: [
+                0x9f, 0x1e, 0xa2, 0x86, 0x81, 0xbf, 0xa1, 0x0a, 0x6a, 0xfe, 0x4d, 0x68, 0xcb, 0xe2, 0x7e, 0xbe,
+                0xa8, 0x65, 0x6f, 0x76, 0x36, 0x9a, 0xf1, 0xbf, 0xa2, 0xad, 0xbf, 0x71, 0xe1, 0x03, 0x74, 0xd0,
+            ],
+            n_entries: 347,
+            n_products: 249,
+        },
+        ctx: keryx_verifiable_inference::chain::ChainCtx {
+            n_layers: 32,
+            layer_base: 315,
+            embd_entry: 249,
+            eps: 9.999999974752427e-07,
+            embd_scale: 1.0,
+            trim_last: false,
+            n_used: 0,
+        },
+        prefix: TracePrefix {
+            table: [
+                188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+                204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+                220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+                47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+                79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+                222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+                238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+                254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+                108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+                124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+                140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+                156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+                172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+            ],
+            offset: 6,
+            embd_entry: 249,
+            norm_entry: 250,
+            eps: 9.999999974752427e-07,
+            embd_scale: 1.0,
+        },
+    }),
+    Some(TraceChain {
+        manifest: TraceManifest {
+            m_t: [
+                0x04, 0x31, 0xfa, 0x87, 0xe1, 0xa4, 0x8b, 0x48, 0x15, 0x13, 0x70, 0xc3, 0xfc, 0x76, 0x04, 0xde,
+                0x9b, 0x72, 0x46, 0x1c, 0x9a, 0xc8, 0x28, 0x81, 0xbe, 0xee, 0xbb, 0x11, 0xfe, 0xbb, 0xfd, 0xeb,
+            ],
+            n_entries: 563,
+            n_products: 241,
+        },
+        ctx: keryx_verifiable_inference::chain::ChainCtx {
+            n_layers: 40,
+            layer_base: 523,
+            embd_entry: 361,
+            eps: 9.999999747378752e-06,
+            embd_scale: 1.0,
+            trim_last: true,
+            n_used: 0,
+        },
+        prefix: TracePrefix {
+            table: [
+                188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+                204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+                220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+                47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+                79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+                222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+                238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+                254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+                108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+                124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+                140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+                156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+                172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+            ],
+            offset: 7,
+            embd_entry: 361,
+            norm_entry: 362,
+            eps: 9.999999747378752e-06,
+            embd_scale: 1.0,
+        },
+    }),
+    Some(TraceChain {
+        manifest: TraceManifest {
+            m_t: [
+                0x44, 0x63, 0xe8, 0x28, 0x28, 0xcc, 0x45, 0x8e, 0xc8, 0x67, 0x53, 0xa2, 0xc7, 0x92, 0xd8, 0xf0,
+                0xda, 0x50, 0xc0, 0xd1, 0x3d, 0x97, 0x58, 0xb9, 0xa4, 0x9a, 0xd0, 0x30, 0xdc, 0x2b, 0xef, 0x0f,
+            ],
+            n_entries: 571,
+            n_products: 329,
+        },
+        ctx: keryx_verifiable_inference::chain::ChainCtx {
+            n_layers: 48,
+            layer_base: 523,
+            embd_entry: 329,
+            eps: 9.999999974752427e-07,
+            embd_scale: 61.967735290527344,
+            trim_last: false,
+            n_used: 0,
+        },
+        prefix: TracePrefix {
+            table: [
+                238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 107, 249, 250, 251, 252, 253,
+                254, 255, 256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269,
+                270, 271, 272, 273, 274, 275, 276, 277, 278, 279, 280, 281, 282, 283, 284, 285,
+                286, 287, 288, 289, 290, 291, 292, 293, 294, 295, 296, 297, 298, 299, 300, 301,
+                302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+                318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331, 332, 333,
+                334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348, 349,
+                350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361, 362, 363, 364, 365,
+                366, 367, 368, 369, 370, 371, 372, 373, 374, 375, 376, 377, 378, 379, 380, 381,
+                382, 383, 384, 385, 386, 387, 388, 389, 390, 391, 392, 393, 394, 395, 396, 397,
+                398, 399, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
+                414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427, 428, 429,
+                430, 431, 432, 433, 434, 435, 436, 437, 438, 439, 440, 441, 442, 443, 444, 445,
+                446, 447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457, 458, 459, 460, 461,
+                462, 463, 464, 465, 466, 467, 468, 469, 470, 471, 472, 473, 474, 475, 476, 477,
+                478, 479, 480, 481, 482, 483, 484, 485, 486, 487, 488, 489, 490, 491, 492, 493,
+            ],
+            offset: 7,
+            embd_entry: 329,
+            norm_entry: 330,
+            eps: 9.999999974752427e-07,
+            embd_scale: 61.967735290527344,
+        },
+    }),
+    Some(TraceChain {
+        manifest: TraceManifest {
+            m_t: [
+                0xbc, 0x41, 0x71, 0x10, 0xea, 0x8e, 0x18, 0xdb, 0x4f, 0xe6, 0xfe, 0x65, 0x6b, 0xb6, 0xc7, 0xa4,
+                0x73, 0x75, 0x58, 0x5c, 0x86, 0xf9, 0x04, 0x7a, 0xb7, 0xe4, 0x0c, 0x28, 0xe1, 0x1d, 0x08, 0x00,
+            ],
+            n_entries: 691,
+            n_products: 497,
+        },
+        ctx: keryx_verifiable_inference::chain::ChainCtx {
+            n_layers: 64,
+            layer_base: 627,
+            embd_entry: 497,
+            eps: 9.999999974752427e-07,
+            embd_scale: 1.0,
+            trim_last: false,
+            n_used: 0,
+        },
+        prefix: TracePrefix {
+            table: [
+                188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+                204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+                220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+                47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+                79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+                222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+                238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+                254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+                108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+                124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+                140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+                156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+                172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+            ],
+            offset: 6,
+            embd_entry: 497,
+            norm_entry: 498,
+            eps: 9.999999974752427e-07,
+            embd_scale: 1.0,
+        },
+    }),
+    Some(TraceChain {
+        manifest: TraceManifest {
+            m_t: [
+                0xc8, 0x46, 0xb9, 0xcf, 0x4d, 0x7f, 0xd0, 0x11, 0x96, 0x53, 0xd5, 0x17, 0xc1, 0x1c, 0xec, 0x3a,
+                0xc0, 0x96, 0x01, 0x3e, 0xd0, 0x72, 0x68, 0x83, 0x9d, 0xb6, 0x94, 0x9f, 0x0d, 0xe7, 0xdb, 0x93,
+            ],
+            n_entries: 530,
+            n_products: 375,
+        },
+        ctx: keryx_verifiable_inference::chain::ChainCtx {
+            n_layers: 27,
+            layer_base: 503,
+            embd_entry: 395,
+            eps: 9.999999747378752e-06,
+            embd_scale: 1.0,
+            trim_last: true,
+            n_used: 8,
+        },
+        prefix: TracePrefix {
+            table: [
+                188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203,
+                204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219,
+                220, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+                15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+                47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+                63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+                79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 221,
+                222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+                238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253,
+                254, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 255, 106, 107,
+                108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123,
+                124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+                140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+                156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171,
+                172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+            ],
+            offset: 6,
+            embd_entry: 395,
+            norm_entry: 396,
+            eps: 9.999999747378752e-06,
+            embd_scale: 1.0,
+        },
+    }),
+];
+
+/// Audit rules of a tier: the verifier context, the prefix context under the prefix rule, the
+/// chain context under stage 2, and whether every traced response is audited.
+#[derive(Clone, Debug)]
+pub struct TraceRules {
+    pub ctx: keryx_verifiable_inference::verify::TierCtx,
+    pub prefix: Option<TracePrefix>,
+    pub chain: Option<keryx_verifiable_inference::chain::ChainCtx>,
+    pub audit_all: bool,
+}
+
+/// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests,
+/// `chain` stage 2 and its manifests.
+pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool) -> Option<TraceRules> {
+    if chain {
+        let c = TRACE_CHAINS_H15.get(tier as usize)?.clone()?;
+        let t = POM_TIERS_H14.get(tier as usize)?;
+        let ctx = keryx_verifiable_inference::verify::TierCtx {
+            r_t: t.root,
+            n_chunks: t.chunks,
+            m_t: c.manifest.m_t,
+            n_entries: c.manifest.n_entries,
+            n_products: c.manifest.n_products,
+        };
+        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all });
+    }
+    let manifests = if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 };
+    let m = (*manifests.get(tier as usize)?)?;
+    let t = POM_TIERS_H14.get(tier as usize)?;
+    let ctx = keryx_verifiable_inference::verify::TierCtx {
+        r_t: t.root,
+        n_chunks: t.chunks,
+        m_t: m.m_t,
+        n_entries: m.n_entries,
+        n_products: m.n_products,
+    };
+    let prefix = if prefix { Some(TRACE_PREFIXES.get(tier as usize)?.clone()?) } else { None };
+    Some(TraceRules { ctx, prefix, chain: None, audit_all })
+}
+
+/// Context floor of each tier of the H14 lineup, in tokens: the context a responder is held to.
+/// Must equal the miner's `ctx_floor` per model.
+pub const CONTEXT_FLOORS_H14: [u32; 5] = [8_192, 32_768, 32_768, 32_768, 32_768];
+
+/// Positions the chat template and the request prefix add to a prompt, at most.
+pub const CONTEXT_OVERHEAD_TOKENS: u32 = 512;
+
+/// Context floor of `tier`, in tokens.
+pub fn context_floor(tier: u8) -> Option<u32> {
+    CONTEXT_FLOORS_H14.get(tier as usize).copied()
+}
+
+/// Longest prompt, in bytes, sure to fit the context floor of `tier` under `max_tokens`: a
+/// token spans at least one byte.
+pub fn safe_prompt_len(tier: u8, max_tokens: u32) -> Option<u32> {
+    Some(context_floor(tier)?.saturating_sub(max_tokens.saturating_add(CONTEXT_OVERHEAD_TOKENS)))
+}
+
+/// Whether a traced prompt of `n_prompt` positions fits the context floor of `tier` with its
+/// `max_tokens` budget.
+pub fn prompt_fits_floor(tier: u8, n_prompt: u32, max_tokens: u32) -> bool {
+    context_floor(tier).is_some_and(|floor| n_prompt.saturating_add(max_tokens) <= floor)
+}
+
 /// Tier lineup of the service ledger and the provider queries: the H14 set once
 /// `private_inference_activation` is live, else the H6 set.
 pub fn service_tiers(private_inference_active: bool) -> &'static [crate::pom::PomTier] {
@@ -749,6 +1243,15 @@ pub const RATIO_REWARD_BPS_V2: [u64; 9] = [5_000, 5_500, 6_000, 6_500, 7_000, 7_
 /// 0/3/7/15/30/45/60/75/90 days held.
 pub const RATIO_REWARD_THRESHOLDS_V2: [u64; 9] = [0, 3, 7, 15, 30, 45, 60, 75, 90];
 
+/// Ratio-reward v3 bracket table, gated by `ratio_reward_v3_activation`: 5 % with nothing held,
+/// 10 % at 10 days of production held, then +10 % every 10 days to 80 % at 80 days, then +5 %
+/// every 10 days, 100 % at 120 days.
+pub const RATIO_REWARD_BPS_V3: [u64; 13] =
+    [500, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 8_500, 9_000, 9_500, 10_000];
+
+/// Bracket entry thresholds for `RATIO_REWARD_BPS_V3`, same semantics as `RATIO_REWARD_THRESHOLDS_V2`.
+pub const RATIO_REWARD_THRESHOLDS_V3: [u64; 13] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
 /// (~30h) so the window always falls inside retained history and is reconstructible on IBD.
@@ -787,6 +1290,11 @@ pub fn ratio_reward_bps(balance: u64, production: u64) -> u64 {
 /// `coin_age_activation` (bundled into H4).
 pub fn ratio_reward_bps_v2(balance: u64, production: u64) -> u64 {
     ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS_V2, &RATIO_REWARD_BPS_V2)
+}
+
+/// Same as `ratio_reward_bps`, against the `RATIO_REWARD_BPS_V3` table.
+pub fn ratio_reward_bps_v3(balance: u64, production: u64) -> u64 {
+    ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS_V3, &RATIO_REWARD_BPS_V3)
 }
 
 /// Division-free bracket scan shared by `ratio_reward_bps`/`ratio_reward_bps_v2`: bracket `i` is
@@ -1222,6 +1730,11 @@ pub struct Params {
     /// the v3 spot-check. Node+miner lockstep. `never()` to disable.
     pub pom_v4_activation: ForkActivation,
 
+    /// PoM v5: the re-walk also reads the tier's context pad. Strictly later than
+    /// `private_inference_activation`. Node+miner lockstep.
+    /// `never()` = dormant.
+    pub pom_v5_activation: ForkActivation,
+
     /// H10 activation DAA score. At/after this score the re-walk seed is `pom_block_seed_h10`.
     /// Strictly later than `pom_v4_activation`. Node+miner lockstep. `never()` to disable.
     pub h10_activation: ForkActivation,
@@ -1339,6 +1852,53 @@ pub struct Params {
     /// hardfork: it also switches the `inference_reward` floors to `INFERENCE_REWARD_MINIMUMS_FLAT`
     /// (fixed per model, no per-token surcharge).
     pub private_inference_activation: ForkActivation,
+    /// H15: verifiable inference. A signed AiResponse carries a trace commitment, a later chain
+    /// block draws audited responses, and the responder answers with an opening transaction.
+    /// Changes the audit fold. `never()` = dormant.
+    pub verifiable_inference_activation: ForkActivation,
+    /// A trace commitment must fit the sealed sizes of its request and answer
+    /// (`keryx_verifiable_inference::shape`), or the response is neither credited nor audited.
+    /// Changes the audit fold. `never()` = dormant.
+    pub trace_shape_activation: ForkActivation,
+    /// A traced prompt carries the request id and the audit opens one of those positions
+    /// against the model embedding (`keryx_verifiable_inference::prefix`); implies the shape
+    /// rule. Changes the audit fold. `never()` = dormant.
+    pub trace_prefix_activation: ForkActivation,
+    /// Every traced response is audited, and a trace root is admitted once within the ledger
+    /// memory. Changes the audit fold. `never()` = dormant.
+    pub trace_audit_activation: ForkActivation,
+    /// A missing opening strikes without the strike interval guard, and a traced response under
+    /// the audit rule resets the streak at its accepted opening instead of at the response.
+    /// `never()` = dormant.
+    pub trace_sanction_activation: ForkActivation,
+    /// A cohort member silent on a request whose prompt may exceed the tier context floor is
+    /// not struck unless a traced response of a cohort member proved the prompt fit. Changes
+    /// the audit fold. `never()` = dormant.
+    pub trace_context_activation: ForkActivation,
+    /// The reward of a routed request goes to a draw among the cohort members credited within
+    /// its draw window, seeded by the chain block that closes it. Changes the audit fold.
+    /// `never()` = dormant.
+    pub reward_draw_activation: ForkActivation,
+    /// An audit armed at or after it is judged on the measured work of its request and on the
+    /// queue of each member; an answer past its deadline is struck as a silence. Changes the
+    /// audit fold. `never()` = dormant.
+    pub service_window_v3_activation: ForkActivation,
+    /// A traced response accepted more than once by one chain block is judged once by the shape
+    /// and root rules. Changes the audit fold. `never()` = dormant.
+    pub trace_dedup_activation: ForkActivation,
+    /// The holder ratio bracket follows `RATIO_REWARD_BPS_V3`. Changes the coinbase.
+    /// `never()` = dormant.
+    pub ratio_reward_v3_activation: ForkActivation,
+    /// Traced responses and their openings follow stage 2. Changes the audit fold.
+    /// `never()` = dormant.
+    pub trace_chain_activation: ForkActivation,
+    /// Blocks commit and open the task of their window. Header format and hashing change.
+    /// `never()` = dormant.
+    pub block_task_activation: ForkActivation,
+    /// An opening may name the seed block it was built for; one naming another seed than its
+    /// audit's is passed over and the audit keeps waiting. Changes the audit fold.
+    /// `never()` = dormant.
+    pub trace_seed_bind_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -1589,6 +2149,7 @@ impl Params {
 
             pom_maxlevel_v4_activation: self.pom_maxlevel_v4_activation,
             pom_v4_activation: self.pom_v4_activation,
+            pom_v5_activation: self.pom_v5_activation,
             h10_activation: self.h10_activation,
 
             ratio_reward_activation: self.ratio_reward_activation,
@@ -1610,6 +2171,19 @@ impl Params {
             service_bond_v2_activation: self.service_bond_v2_activation,
             reward_routing_activation: self.reward_routing_activation,
             private_inference_activation: self.private_inference_activation,
+            verifiable_inference_activation: self.verifiable_inference_activation,
+            trace_shape_activation: self.trace_shape_activation,
+            trace_prefix_activation: self.trace_prefix_activation,
+            trace_audit_activation: self.trace_audit_activation,
+            trace_sanction_activation: self.trace_sanction_activation,
+            trace_context_activation: self.trace_context_activation,
+            reward_draw_activation: self.reward_draw_activation,
+            service_window_v3_activation: self.service_window_v3_activation,
+            trace_dedup_activation: self.trace_dedup_activation,
+            ratio_reward_v3_activation: self.ratio_reward_v3_activation,
+            trace_chain_activation: self.trace_chain_activation,
+            block_task_activation: self.block_task_activation,
+            trace_seed_bind_activation: self.trace_seed_bind_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -1760,6 +2334,7 @@ pub const MAINNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
     pom_maxlevel_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
     pom_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
+    pom_v5_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     h10_activation: ForkActivation::new(H10_ACTIVATION_DAA),
 
     // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
@@ -1822,6 +2397,19 @@ pub const MAINNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
     private_inference_activation: ForkActivation::new(H14_ACTIVATION_DAA),
+    verifiable_inference_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_shape_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_prefix_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_audit_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_sanction_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_context_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    reward_draw_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    service_window_v3_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_dedup_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    ratio_reward_v3_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_chain_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    block_task_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_seed_bind_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -1888,10 +2476,9 @@ pub const TESTNET_PARAMS: Params = Params {
     model_cap_enforcement_activation: ForkActivation::always(),
     inference_reward_minimums: INFERENCE_REWARD_MINIMUMS,
 
-    // Testnet mirrors the current mainnet state from genesis: every shipped fork
-    // (OPoI v2, PoM possession, H2 lineup, H2 minimums, ratio-reward, H3 block levels,
-    // coin-age H4, H5/H5.1/H5.2) is active at DAA 0, so the only transition exercised
-    // on this testnet is the H6 crossing at DAA 108_000.
+    // Testnet mirrors the current mainnet state from genesis: every fork shipped on mainnet
+    // (up to H14) is active from the first blocks, so the only transition exercised on this
+    // testnet is the H15 crossing at `TESTNET_H15_ACTIVATION_DAA`.
     opoi_v2_activation: ForkActivation::new(0),
     inference_reward_minimums_v2: INFERENCE_REWARD_MINIMUMS_V2,
 
@@ -1916,6 +2503,7 @@ pub const TESTNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(0),
     pom_maxlevel_v4_activation: ForkActivation::new(1),
     pom_v4_activation: ForkActivation::new(1),
+    pom_v5_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     h10_activation: ForkActivation::new(TESTNET_H10_ACTIVATION_DAA),
 
     // Ratio-reward: active from genesis (mainnet-state baseline).
@@ -1953,10 +2541,23 @@ pub const TESTNET_PARAMS: Params = Params {
     reward_routing_activation: ForkActivation::new(0),
     // Private inference — arm ABOVE the live testnet tip before deploying: the fold is sealed,
     // flipping it below already-folded history splits the testnet.
-    private_inference_activation: ForkActivation::new(6_000),
+    private_inference_activation: ForkActivation::new(1),
+    verifiable_inference_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_shape_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_prefix_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_audit_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_sanction_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_context_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    reward_draw_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    service_window_v3_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_dedup_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    ratio_reward_v3_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_chain_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    block_task_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    trace_seed_bind_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
-    exact_verification_activation: ForkActivation::new(118_000),
+    exact_verification_activation: ForkActivation::new(500),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2028,6 +2629,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
     pom_v4_activation: ForkActivation::never(),
+    pom_v5_activation: ForkActivation::never(),
     h10_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
@@ -2048,6 +2650,19 @@ pub const SIMNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     private_inference_activation: ForkActivation::never(),
+    verifiable_inference_activation: ForkActivation::never(),
+    trace_shape_activation: ForkActivation::never(),
+    trace_prefix_activation: ForkActivation::never(),
+    trace_audit_activation: ForkActivation::never(),
+    trace_sanction_activation: ForkActivation::never(),
+    trace_context_activation: ForkActivation::never(),
+    reward_draw_activation: ForkActivation::never(),
+    service_window_v3_activation: ForkActivation::never(),
+    trace_dedup_activation: ForkActivation::never(),
+    ratio_reward_v3_activation: ForkActivation::never(),
+    trace_chain_activation: ForkActivation::never(),
+    block_task_activation: ForkActivation::never(),
+    trace_seed_bind_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2116,6 +2731,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::never(),
     pom_maxlevel_v4_activation: ForkActivation::never(),
     pom_v4_activation: ForkActivation::never(),
+    pom_v5_activation: ForkActivation::never(),
     h10_activation: ForkActivation::never(),
     ratio_reward_activation: ForkActivation::never(),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
@@ -2136,6 +2752,19 @@ pub const DEVNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::never(),
     reward_routing_activation: ForkActivation::never(),
     private_inference_activation: ForkActivation::never(),
+    verifiable_inference_activation: ForkActivation::never(),
+    trace_shape_activation: ForkActivation::never(),
+    trace_prefix_activation: ForkActivation::never(),
+    trace_audit_activation: ForkActivation::never(),
+    trace_sanction_activation: ForkActivation::never(),
+    trace_context_activation: ForkActivation::never(),
+    reward_draw_activation: ForkActivation::never(),
+    service_window_v3_activation: ForkActivation::never(),
+    trace_dedup_activation: ForkActivation::never(),
+    ratio_reward_v3_activation: ForkActivation::never(),
+    trace_chain_activation: ForkActivation::never(),
+    block_task_activation: ForkActivation::never(),
+    trace_seed_bind_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2196,6 +2825,53 @@ mod ratio_reward_bps_tests {
         assert_eq!(ratio_reward_bps_v2(3 * P - 1, P), 5_000);
         assert_eq!(ratio_reward_bps_v2(90 * P - 1, P), 9_000);
     }
+
+    #[test]
+    fn v3_brackets() {
+        assert_eq!(ratio_reward_bps_v3(0, P), 500);
+        assert_eq!(ratio_reward_bps_v3(10 * P - 1, P), 500);
+        assert_eq!(ratio_reward_bps_v3(10 * P, P), 1_000);
+        assert_eq!(ratio_reward_bps_v3(22 * P, P), 2_000);
+        assert_eq!(ratio_reward_bps_v3(80 * P, P), 8_000);
+        assert_eq!(ratio_reward_bps_v3(90 * P, P), 8_500);
+        assert_eq!(ratio_reward_bps_v3(120 * P - 1, P), 9_500);
+        assert_eq!(ratio_reward_bps_v3(120 * P, P), 10_000);
+        assert_eq!(ratio_reward_bps_v3(u64::MAX / 2, P), 10_000);
+        for i in 1..RATIO_REWARD_THRESHOLDS_V3.len() {
+            assert_eq!(RATIO_REWARD_THRESHOLDS_V3[i], 10 * i as u64);
+        }
+    }
+}
+
+#[cfg(test)]
+mod h15_gate_tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_h15_rules_share_one_gate_after_h14() {
+        let p = &MAINNET_PARAMS;
+        let gates = [
+            p.pom_v5_activation,
+            p.verifiable_inference_activation,
+            p.trace_shape_activation,
+            p.trace_prefix_activation,
+            p.trace_audit_activation,
+            p.trace_sanction_activation,
+            p.trace_context_activation,
+            p.reward_draw_activation,
+            p.service_window_v3_activation,
+            p.trace_dedup_activation,
+            p.ratio_reward_v3_activation,
+            p.trace_chain_activation,
+            p.block_task_activation,
+            p.trace_seed_bind_activation,
+        ];
+        for g in gates {
+            assert_eq!(g.daa_score(), H15_ACTIVATION_DAA);
+        }
+        assert!(H15_ACTIVATION_DAA > H14_ACTIVATION_DAA);
+        assert!(p.private_inference_activation.daa_score() < H15_ACTIVATION_DAA);
+    }
 }
 
 #[cfg(test)]
@@ -2222,5 +2898,19 @@ mod h14_lineup_tests {
         assert!(INFERENCE_REWARD_MINIMUMS_FLAT.iter().all(|(id, _)| POM_TIERS_H14.iter().any(|t| t.model_id == *id)));
         let id: String = QWEN3_8_27B_MODEL_ID.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(id, "73740b443bdc00afda5fa34eb9999d3fea77dcc3f6de238fab701394cdc96fb3");
+    }
+}
+
+#[cfg(test)]
+mod trace_chain_tests {
+    use super::*;
+
+    #[test]
+    fn stage2_arms_only_with_every_tier_covered() {
+        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS, &SIMNET_PARAMS, &DEVNET_PARAMS] {
+            if p.trace_chain_activation != ForkActivation::never() {
+                assert!(TRACE_CHAINS_H15.iter().all(Option::is_some));
+            }
+        }
     }
 }

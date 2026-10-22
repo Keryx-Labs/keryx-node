@@ -90,6 +90,7 @@ use once_cell::unsync::Lazy;
 
 use super::utxo_validation::check_ai_request_tx_payload_rules;
 use crate::processes::private_inference::{PrivateEraViolation, check_private_inference_era};
+use crate::processes::verifiable_inference::check_verifiable_inference_era;
 use super::errors::{PruningImportError, PruningImportResult};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use itertools::Itertools;
@@ -178,6 +179,30 @@ pub struct VirtualStateProcessor {
     pub(super) reward_routing_activation: ForkActivation,
     /// Private-inference activation (see `params.private_inference_activation`).
     pub(super) private_inference_activation: ForkActivation,
+    /// Verifiable-inference activation (see `params.verifiable_inference_activation`).
+    pub(super) verifiable_inference_activation: ForkActivation,
+    /// Trace shape rule activation (see `params.trace_shape_activation`).
+    pub(super) trace_shape_activation: ForkActivation,
+    /// Trace prefix rule activation (see `params.trace_prefix_activation`).
+    pub(super) trace_prefix_activation: ForkActivation,
+    /// Trace audit rule activation (see `params.trace_audit_activation`).
+    pub(super) trace_audit_activation: ForkActivation,
+    /// Trace sanction rule activation (see `params.trace_sanction_activation`).
+    pub(super) trace_sanction_activation: ForkActivation,
+    /// Trace context rule activation (see `params.trace_context_activation`).
+    pub(super) trace_context_activation: ForkActivation,
+    /// Reward draw rule activation (see `params.reward_draw_activation`).
+    pub(super) reward_draw_activation: ForkActivation,
+    /// v3 service window activation (see `params.service_window_v3_activation`).
+    pub(super) service_window_v3_activation: ForkActivation,
+    /// Trace dedup rule activation (see `params.trace_dedup_activation`).
+    pub(super) trace_dedup_activation: ForkActivation,
+    /// Seed-bound opening rule activation (see `params.trace_seed_bind_activation`).
+    pub(super) trace_seed_bind_activation: ForkActivation,
+    /// Ratio-reward v3 table activation (see `params.ratio_reward_v3_activation`).
+    pub(super) ratio_reward_v3_activation: ForkActivation,
+    /// Stage-2 trace rule activation (see `params.trace_chain_activation`).
+    pub(super) trace_chain_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -405,6 +430,18 @@ impl VirtualStateProcessor {
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
             private_inference_activation: params.private_inference_activation,
+            verifiable_inference_activation: params.verifiable_inference_activation,
+            trace_shape_activation: params.trace_shape_activation,
+            trace_prefix_activation: params.trace_prefix_activation,
+            trace_audit_activation: params.trace_audit_activation,
+            trace_sanction_activation: params.trace_sanction_activation,
+            trace_context_activation: params.trace_context_activation,
+            reward_draw_activation: params.reward_draw_activation,
+            service_window_v3_activation: params.service_window_v3_activation,
+            trace_dedup_activation: params.trace_dedup_activation,
+            trace_seed_bind_activation: params.trace_seed_bind_activation,
+            ratio_reward_v3_activation: params.ratio_reward_v3_activation,
+            trace_chain_activation: params.trace_chain_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1547,6 +1584,8 @@ impl VirtualStateProcessor {
             }
             v => TxRuleError::AiRequestPayloadRule(v.to_string()),
         })?;
+        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation)
+            .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
     }
@@ -1665,6 +1704,8 @@ impl VirtualStateProcessor {
         let virtual_utxo_view = &virtual_read.utxo_set;
 
         let mut invalid_transactions = HashMap::new();
+        let mut deferred = std::collections::HashSet::new();
+        let mut has_opening = false;
         let results = self.validate_block_template_transactions_in_parallel(&txs, &virtual_state, &virtual_utxo_view);
         for (tx, res) in txs.iter().zip(results) {
             match res {
@@ -1673,14 +1714,22 @@ impl VirtualStateProcessor {
                     tx_selector.reject_selection(tx.id());
                 }
                 Ok(fee) => {
+                    if tx.is_ai_opening() {
+                        if has_opening {
+                            deferred.insert(tx.id());
+                            tx_selector.reject_selection(tx.id());
+                            continue;
+                        }
+                        has_opening = true;
+                    }
                     calculated_fees.push(fee);
                 }
             }
         }
 
-        let mut has_rejections = !invalid_transactions.is_empty();
+        let mut has_rejections = !invalid_transactions.is_empty() || !deferred.is_empty();
         if has_rejections {
-            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()));
+            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()) && !deferred.contains(&tx.id()));
         }
 
         while has_rejections {
@@ -1696,6 +1745,14 @@ impl VirtualStateProcessor {
                         has_rejections = true;
                     }
                     Ok(fee) => {
+                        if tx.is_ai_opening() {
+                            if has_opening {
+                                tx_selector.reject_selection(tx.id());
+                                has_rejections = true;
+                                continue;
+                            }
+                            has_opening = true;
+                        }
                         txs.push(tx);
                         calculated_fees.push(fee);
                     }
@@ -1838,6 +1895,7 @@ impl VirtualStateProcessor {
             0, // pom_final_state: filled by the miner from the winning walk (H3), like the nonce
             service_state_hash,
             0, // pom_tier: filled by the miner from the winning walk (H6), like pom_final_state
+            Default::default(),
         );
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();

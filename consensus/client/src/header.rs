@@ -45,6 +45,8 @@ export interface IHeader {
     serviceStateHash?: HexString;
     // H6: the winning walk's proven PoM tier. Optional; defaults to 0 (pre-gate blocks).
     pomTier?: number;
+    // Block task root of the block's window. Optional; defaults to the zero hash.
+    taskRoot?: HexString;
 }
 
 /**
@@ -76,6 +78,8 @@ export interface IRawHeader {
     serviceStateHash?: HexString;
     // H6: the winning walk's proven PoM tier. Optional; defaults to 0 (pre-gate blocks).
     pomTier?: number;
+    // Block task root of the block's window. Optional; defaults to the zero hash.
+    taskRoot?: HexString;
 }
 "#;
 
@@ -226,6 +230,20 @@ impl Header {
         self.inner_mut().pom_tier = pom_tier
     }
 
+    #[wasm_bindgen(getter = taskRoot)]
+    pub fn task_root(&self) -> String {
+        self.inner().task_root.to_hex()
+    }
+
+    #[wasm_bindgen(setter = taskRoot)]
+    pub fn set_task_root_from_js_value(&mut self, js_value: JsValue) {
+        if let Ok(bytes) = js_value.try_as_vec_u8()
+            && bytes.len() == 32
+        {
+            self.inner_mut().task_root = Hash::from_slice(&bytes);
+        }
+    }
+
     #[wasm_bindgen(getter = hash)]
     pub fn get_hash_as_hex(&self) -> String {
         self.inner().hash.to_hex()
@@ -369,6 +387,7 @@ impl TryCastFromJs for Header {
                         .and_then(|v| v.try_into_owned().ok())
                         .unwrap_or_default(),
                     pom_tier: object.get_u16("pomTier").map(|v| v as u8).unwrap_or_default(),
+                    task_root: object.get_value("taskRoot").ok().and_then(|v| v.try_into_owned().ok()).unwrap_or_default(),
                 };
 
                 Ok(header.into())

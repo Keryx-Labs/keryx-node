@@ -316,6 +316,10 @@ impl Deref for FlowContext {
     }
 }
 
+fn block_task(block: &Block) -> Option<Vec<u8>> {
+    block.pom_proof.as_ref().and_then(|p| p.task.clone())
+}
+
 impl FlowContext {
     /// PoM guard-rail. A block at/after `pom_activation` MUST carry its possession proof. Serving
     /// it "naked" (proof `None`) is what wedged the network on 2026-06-29: the receiving peer
@@ -371,12 +375,12 @@ impl FlowContext {
         }
         let hash = block.hash();
         if let Some(hit) = self.pom_wire_cache.lock().0.get(&hash) {
-            return EncodedPomProof { legacy: None, deduped: Some(hit.as_ref().clone()) };
+            return EncodedPomProof { legacy: None, deduped: Some(hit.as_ref().clone()), task: block_task(block) };
         }
         let encoded = encode_pom_proof(format, block.header.as_ref(), block.pom_proof.as_ref());
         let Some(bytes) = encoded.deduped else {
             // Compact encoding refused (non-v4 proof, unknown tier, ...). Nothing to cache.
-            return EncodedPomProof { legacy: encoded.legacy, deduped: None };
+            return EncodedPomProof { legacy: encoded.legacy, deduped: None, task: None };
         };
         let shared = Arc::new(bytes);
         {
@@ -391,7 +395,7 @@ impl FlowContext {
                 order.push_back(hash);
             }
         }
-        EncodedPomProof { legacy: None, deduped: Some(shared.as_ref().clone()) }
+        EncodedPomProof { legacy: None, deduped: Some(shared.as_ref().clone()), task: block_task(block) }
     }
 
     /// Queues a block whose possession proof is missing while still within the proof service

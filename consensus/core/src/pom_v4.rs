@@ -101,6 +101,8 @@ pub enum PomV4VerifyError {
     PowValueMismatch,
     /// The era pow fold of `final_state` does not meet the tier target.
     TargetNotMet,
+    /// The tier has no context pad under the v5 walk.
+    NoContextPad,
 }
 
 // --- walk primitives (the miner kernel must reproduce these byte-for-byte) ---
@@ -384,7 +386,7 @@ pub fn v4_offset_chain(seed: u64, tiles: &[Vec<u8>], n_tiles: u64) -> [u64; POM_
 }
 
 /// Fold a full leaf level up one level (duplicate-last on an odd count — matches `pom-rt-builder`).
-fn fold_level(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
+pub(crate) fn fold_level(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
     level.chunks(2).map(|p| if p.len() == 2 { hash_pair(&p[0], &p[1]) } else { hash_pair(&p[0], &p[0]) }).collect()
 }
 
@@ -418,6 +420,28 @@ pub fn verify_pom_proof_v4(
     r_t: &[u8; 32],
     n_chunks: u64,
 ) -> Result<u64, PomV4VerifyError> {
+    v4_check_tiles(seed, proof, r_t, n_chunks)?;
+
+    // Zero-alloc double-buffer walk. Merkle already accepted every tile.
+    let mut a = [0u8; POM_V4_TILE_BYTES];
+    let mut b = [0u8; POM_V4_TILE_BYTES];
+    v4_initial_state_into(&mut a, seed);
+    let mut src_is_a = true;
+    for step in 1..=POM_V4_K {
+        let tile = &proof.tiles[step - 1];
+        if src_is_a {
+            v4_transition_into(&mut b, &a, tile, step as u32);
+        } else {
+            v4_transition_into(&mut a, &b, tile, step as u32);
+        }
+        src_is_a = !src_is_a;
+    }
+    let final_buf: &[u8] = if src_is_a { &a } else { &b };
+    Ok(fold64(&v4_state_root(final_buf)))
+}
+
+/// Shape of the proof and every tile's range proof against `R_T` at its walk-derived offset.
+pub(crate) fn v4_check_tiles(seed: u64, proof: &PomProofV4, r_t: &[u8; 32], n_chunks: u64) -> Result<(), PomV4VerifyError> {
     if proof.tiles.len() != POM_V4_K || proof.merkle.len() != POM_V4_K {
         return Err(PomV4VerifyError::WrongShape);
     }
@@ -438,23 +462,7 @@ pub fn verify_pom_proof_v4(
     if !verify_tile_merkle_parallel(proof, &offs, r_t) {
         return Err(PomV4VerifyError::BadTilePath);
     }
-
-    // Zero-alloc double-buffer walk. Merkle already accepted every tile.
-    let mut a = [0u8; POM_V4_TILE_BYTES];
-    let mut b = [0u8; POM_V4_TILE_BYTES];
-    v4_initial_state_into(&mut a, seed);
-    let mut src_is_a = true;
-    for step in 1..=POM_V4_K {
-        let tile = &proof.tiles[step - 1];
-        if src_is_a {
-            v4_transition_into(&mut b, &a, tile, step as u32);
-        } else {
-            v4_transition_into(&mut a, &b, tile, step as u32);
-        }
-        src_is_a = !src_is_a;
-    }
-    let final_buf: &[u8] = if src_is_a { &a } else { &b };
-    Ok(fold64(&v4_state_root(final_buf)))
+    Ok(())
 }
 
 fn verify_tile_merkle_parallel(proof: &PomProofV4, offs: &[u64; POM_V4_K], r_t: &[u8; 32]) -> bool {
@@ -488,6 +496,14 @@ pub fn verify_pom_proof_v4_container<Hf: Fn(u64) -> [u8; 32]>(
     target: &[u8; 32],
     final_hash: Hf,
 ) -> Result<(), PomV4VerifyError> {
+    let v4 = v4_container_witness(proof)?;
+    check_pow_pin(proof, target, &final_hash)?;
+    let derived = verify_pom_proof_v4(seed, v4, r_t, n_chunks)?;
+    finish_container(proof, derived, target, final_hash)
+}
+
+/// The v4 witness of a post-v4 container, with every legacy and v3 field canonically empty.
+pub(crate) fn v4_container_witness(proof: &crate::pom::PomProof) -> Result<&PomProofV4, PomV4VerifyError> {
     let v4 = proof.v4.as_ref().ok_or(PomV4VerifyError::MissingV4)?;
     if proof.trace_root != [0u8; 32]
         || !proof.initial_trace_path.is_empty()
@@ -501,7 +517,32 @@ pub fn verify_pom_proof_v4_container<Hf: Fn(u64) -> [u8; 32]>(
     if proof.tier != v4.tier {
         return Err(PomV4VerifyError::TierMismatch);
     }
-    let derived = verify_pom_proof_v4(seed, v4, r_t, n_chunks)?;
+    Ok(v4)
+}
+
+/// `pow_value` of a container against its claimed `final_state` and the target.
+pub(crate) fn check_pow_pin<Hf: Fn(u64) -> [u8; 32]>(
+    proof: &crate::pom::PomProof,
+    target: &[u8; 32],
+    final_hash: &Hf,
+) -> Result<(), PomV4VerifyError> {
+    let pv = final_hash(proof.final_state);
+    if pv != proof.pow_value {
+        return Err(PomV4VerifyError::PowValueMismatch);
+    }
+    if !crate::pom::le_leq(&pv, target) {
+        return Err(PomV4VerifyError::TargetNotMet);
+    }
+    Ok(())
+}
+
+/// Header pins of a container against the verifier-derived `final_state`.
+pub(crate) fn finish_container<Hf: Fn(u64) -> [u8; 32]>(
+    proof: &crate::pom::PomProof,
+    derived: u64,
+    target: &[u8; 32],
+    final_hash: Hf,
+) -> Result<(), PomV4VerifyError> {
     if proof.final_state != derived {
         return Err(PomV4VerifyError::FinalStateMismatch);
     }
@@ -549,7 +590,7 @@ pub fn v4_walk(seed: u64, blob: &[u8]) -> Result<V4Walk, PomV4VerifyError> {
 }
 
 /// Merkle path from an aligned tile subtree (index = tile offset) up to `R_T`.
-fn v4_tile_path(leaf_hashes: &[[u8; 32]], tile_offset: u64) -> Vec<[u8; 32]> {
+pub(crate) fn v4_tile_path(leaf_hashes: &[[u8; 32]], tile_offset: u64) -> Vec<[u8; 32]> {
     let mut level: Vec<[u8; 32]> = leaf_hashes.to_vec();
     for _ in 0..TILE_SUBTREE_DEPTH {
         level = fold_level(&level);
@@ -678,6 +719,7 @@ mod tests {
             steps_v2: None,
             v3: None,
             v4: Some(v4),
+            task: None,
         }
     }
 

@@ -11,12 +11,13 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::{private_cohort_seed, verify_responder_signature},
+    collateral::{private_cohort_seed, trace_seed, verify_opening_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
 use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
+use keryx_verifiable_inference::opening::{SignedPayload, seed_block};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -30,6 +31,7 @@ impl Mempool {
         transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx));
         self.validate_transaction_in_isolation(&transaction)?;
         self.validate_ai_response_body(consensus, &transaction)?;
+        self.validate_ai_opening(consensus, &transaction)?;
         self.validate_private_request_coverage(consensus, &transaction)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
         self.populate_mempool_entries(&mut transaction);
@@ -150,6 +152,11 @@ impl Mempool {
                 self.ai_challenge_index.insert(response_hash, accepted_transaction.id());
             }
         }
+        if accepted_transaction.is_ai_opening()
+            && let Some(response_txid) = ai_opening_response_txid(&accepted_transaction.payload)
+        {
+            self.ai_opening_index.insert(response_txid, accepted_transaction.id());
+        }
 
         Ok(TransactionPostValidation { removed: removed_transaction, accepted: Some(accepted_transaction) })
     }
@@ -201,6 +208,12 @@ impl Mempool {
                 }
             }
         }
+        if transaction.tx.is_ai_opening()
+            && let Some(response_txid) = ai_opening_response_txid(&transaction.tx.payload)
+            && self.ai_opening_index.contains_key(&response_txid)
+        {
+            return Err(RuleError::RejectDuplicateAiOpening(hex::encode(response_txid)));
+        }
 
         if !self.config.accept_non_standard {
             self.check_transaction_standard_in_isolation(transaction)?;
@@ -230,6 +243,30 @@ impl Mempool {
         });
         if !named {
             return Err(RuleError::RejectAiResponseBody(hex::encode(resp.request_hash)));
+        }
+        Ok(())
+    }
+
+    /// Admission policy for openings: signed by the escrow key of a drawn response that still
+    /// awaits its opening, and naming, if any, the seed block of that draw. Policy only.
+    fn validate_ai_opening(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_opening() {
+            return Ok(());
+        }
+        let signed = SignedPayload::split(&transaction.tx.payload);
+        let response_txid = ai_opening_response_txid(&transaction.tx.payload);
+        let awaited = match (&signed, response_txid) {
+            (Some(s), Some(txid)) => {
+                consensus.awaited_opening_key(&txid) == Some(s.escrow_pubkey)
+                    && seed_block(s.body).is_none_or(|b| {
+                        consensus.awaited_opening_seed(&txid) == Some(trace_seed(&keryx_hashes::Hash::from_bytes(b), &txid))
+                    })
+                    && verify_opening_signature(&s.escrow_pubkey, &s.signature, s.body)
+            }
+            _ => false,
+        };
+        if !awaited {
+            return Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(response_txid.unwrap_or_default())));
         }
         Ok(())
     }
@@ -360,4 +397,8 @@ const MAX_PENDING_AI_RESPONSES_PER_REQUEST: usize = 256;
 
 fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiChallengePayload::deserialize(payload).map(|c| c.response_hash)
+}
+
+pub(crate) fn ai_opening_response_txid(payload: &[u8]) -> Option<[u8; 32]> {
+    SignedPayload::split(payload)?.body.get(1..33)?.try_into().ok()
 }

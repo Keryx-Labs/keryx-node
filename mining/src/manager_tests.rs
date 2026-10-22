@@ -237,6 +237,108 @@ mod tests {
         assert_eq!(insert(signed_response(&late, request_hash, Some(body))), Err(RuleError::RejectAiResponseBody(hex::encode(request_hash))));
     }
 
+    /// Openings are admitted only for a response awaiting one, signed by its escrow key, one per
+    /// response, feeless, up to the largest opening body.
+    #[test]
+    fn test_ai_opening_admission() {
+        use keryx_consensus_core::collateral::opening_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::{MAX_BODY_LEN, VERSION};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        fn opening(keypair: &Keypair, response_txid: [u8; 32], body_len: usize, tamper: bool) -> Transaction {
+            let mut body = vec![0u8; body_len];
+            body[0] = VERSION;
+            body[1..33].copy_from_slice(&response_txid);
+            let sig = keypair.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+            let mut payload = body;
+            payload.extend_from_slice(&keypair.x_only_public_key().0.serialize());
+            payload.extend_from_slice(sig.as_ref());
+            if tamper {
+                payload[40] ^= 1;
+            }
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload)
+        }
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let other = Keypair::from_seckey_slice(SECP256K1, &[2u8; 32]).unwrap();
+        let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let not_awaited = |t: [u8; 32]| Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(t)));
+
+        assert_eq!(insert(opening(&miner, a, 64, false)), not_awaited(a));
+        consensus.await_opening(a, miner.x_only_public_key().0.serialize());
+        consensus.await_opening(b, miner.x_only_public_key().0.serialize());
+        assert_eq!(insert(opening(&other, a, 64, false)), not_awaited(a));
+        assert_eq!(insert(opening(&miner, a, 64, true)), not_awaited(a));
+        insert(opening(&miner, a, 64, false)).unwrap();
+        assert_eq!(insert(opening(&miner, a, 65, false)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(a))));
+        insert(opening(&miner, b, MAX_BODY_LEN, false)).unwrap();
+    }
+
+    /// An opening naming its seed block is admitted only when that block gives the awaited draw seed.
+    #[test]
+    fn test_seeded_ai_opening_admission() {
+        use keryx_consensus_core::collateral::{opening_signature_message, trace_seed};
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::{VERSION, VERSION_SEEDED};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        fn opening(keypair: &Keypair, response_txid: [u8; 32], seed_block: Option<[u8; 32]>, filler: u8) -> Transaction {
+            let mut body = vec![filler; 100];
+            body[1..33].copy_from_slice(&response_txid);
+            match seed_block {
+                Some(block) => {
+                    body[0] = VERSION_SEEDED;
+                    body[33..65].copy_from_slice(&block);
+                    body[65] = VERSION;
+                }
+                None => body[0] = VERSION,
+            }
+            let sig = keypair.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+            let mut payload = body;
+            payload.extend_from_slice(&keypair.x_only_public_key().0.serialize());
+            payload.extend_from_slice(sig.as_ref());
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload)
+        }
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let (drawn_block, other_block) = ([0x0Du8; 32], [0x0Eu8; 32]);
+        let not_awaited = |t: [u8; 32]| Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(t)));
+        for t in [a, b] {
+            consensus.await_opening(t, miner.x_only_public_key().0.serialize());
+            consensus.await_opening_seed(t, trace_seed(&Hash::from_bytes(drawn_block), &t));
+        }
+
+        assert_eq!(insert(opening(&miner, a, Some(other_block), 1)), not_awaited(a));
+        insert(opening(&miner, a, Some(drawn_block), 2)).unwrap();
+        insert(opening(&miner, b, None, 3)).unwrap();
+    }
+
     /// Private inference: once the gate is active (the consensus reports a cohort), a request is
     /// admitted only when sealed to every escrow key of its tier cohort, and never for an empty tier.
     #[test]

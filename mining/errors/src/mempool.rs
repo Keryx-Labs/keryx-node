@@ -93,6 +93,12 @@ pub enum RuleError {
     #[error("an AiChallenge for response {0} is already in the mempool")]
     RejectDuplicateAiChallenge(String),
 
+    #[error("an opening for response {0} is already in the mempool")]
+    RejectDuplicateAiOpening(String),
+
+    #[error("the opening for response {0} is not awaited or not signed by its responder")]
+    RejectAiOpeningNotAwaited(String),
+
     // TODO: This error is added for the tx_relay flow but is never constructed neither in the golang nor in this version. Discuss if it can be removed.
     #[error("transaction {0} is invalid")]
     RejectInvalid(TransactionId),

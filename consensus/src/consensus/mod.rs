@@ -187,6 +187,7 @@ impl Consensus {
         keryx_consensus_core::pom::init_service_commit_activation(params.pom_v3_activation.daa_score());
         keryx_consensus_core::pom::init_pom_seed_h10_activation(params.h10_activation.daa_score());
         keryx_consensus_core::pom::init_private_inference_activation(params.private_inference_activation.daa_score());
+        keryx_consensus_core::pom::init_block_task_activation(params.block_task_activation.daa_score());
 
         //
         // Storage layer
@@ -737,6 +738,14 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.private_request_recipients(request_hash)
     }
 
+    fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.virtual_processor.awaited_opening_key(response_txid)
+    }
+
+    fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.virtual_processor.awaited_opening_seed(response_txid)
+    }
+
     fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {
         let Some(pp_daa) = self.headers_store.get_daa_score(pruning_point).optional().unwrap() else {
             return Err(ConsensusError::HeaderNotFound(pruning_point));
@@ -831,9 +840,8 @@ impl ConsensusApi for Consensus {
                         return Err(ConsensusError::General("malformed service-state row"));
                     }
                     // A zero version with an empty script is the canonical "stayed burned" form.
-                    let spk = (script_len > 0 || version != 0).then(|| {
-                        keryx_consensus_core::tx::ScriptPublicKey::from_vec(version, row[85..85 + script_len].to_vec())
-                    });
+                    let spk = (script_len > 0 || version != 0)
+                        .then(|| keryx_consensus_core::tx::ScriptPublicKey::from_vec(version, row[85..85 + script_len].to_vec()));
                     parsed.push(Row::Reward {
                         request_hash,
                         entry: keryx_consensus_core::collateral::RewardEntry { winner: Hash::from_bytes(winner), amount, daa, spk },
@@ -844,14 +852,14 @@ impl ConsensusApi for Consensus {
         }
         for row in parsed {
             match row {
-                Row::Burn { tx_id, index, daa } => {
-                    self.storage.service_burn_store.set(OutpointKey::new(tx_id, index), daa).unwrap()
-                }
+                Row::Burn { tx_id, index, daa } => self.storage.service_burn_store.set(OutpointKey::new(tx_id, index), daa).unwrap(),
                 Row::Strike { daa, miner, entry } => self.storage.service_strike_store.set(daa, miner, entry).unwrap(),
                 Row::Sighting { miner, daa } => self.storage.service_first_seen_store.set(miner, daa).unwrap(),
-                Row::Reward { request_hash, entry } => {
-                    self.storage.service_reward_store.set(crate::model::stores::service_reward::RewardKey(request_hash), entry).unwrap()
-                }
+                Row::Reward { request_hash, entry } => self
+                    .storage
+                    .service_reward_store
+                    .set(crate::model::stores::service_reward::RewardKey(request_hash), entry)
+                    .unwrap(),
             }
         }
         // Rebuild every derived RAM view (burned set, suspensions, commitment index, cursor).
@@ -1316,10 +1324,13 @@ impl ConsensusApi for Consensus {
         let coin_age_activation = self.config.params.coin_age_activation;
         // Parallelize processing using the context of an existing thread pool.
         let inner_multiset = self.virtual_processor.install(|| {
-            utxoset_chunk.par_iter().map(|(outpoint, entry)| MuHash::from_utxo(outpoint, entry, coin_age_activation)).reduce(MuHash::new, |mut a, b| {
-                a.combine(&b);
-                a
-            })
+            utxoset_chunk.par_iter().map(|(outpoint, entry)| MuHash::from_utxo(outpoint, entry, coin_age_activation)).reduce(
+                MuHash::new,
+                |mut a, b| {
+                    a.combine(&b);
+                    a
+                },
+            )
         });
 
         current_multiset.combine(&inner_multiset);

@@ -11,14 +11,16 @@ use keryx_consensus_core::collateral::{
     ProductionIndexSnapshot, ServiceLedgerSnapshot,
     ServiceMiss, ServicePenalty, ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
+    TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
 };
-use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers};
+use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
+use keryx_inference::private::PRIVATE_TAG_LEN;
+use keryx_inference::{AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope, PrivateResponseEnvelope};
 use keryx_txscript::script_class::ScriptClass;
 
 const _: () = assert!(keryx_consensus_core::collateral::PRIVATE_COHORT_TARGET == keryx_inference::private::MAX_PRIVATE_RECIPIENTS);
@@ -178,10 +180,11 @@ fn log_new_service_misses(
         }
         let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
         info!(
-            "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (awaiting finality)",
+            "service-bond: miss #{} by miner {} on request {}{} → {:?}, {} claims / {} sompi (awaiting finality)",
             miss.consecutive_misses,
             miss.miner,
             hex::encode(miss.request_hash),
+            if miss.opening_missing { " (opening missing)" } else { "" },
             miss.penalty,
             miss.burned.len(),
             burned_total
@@ -319,10 +322,11 @@ impl VirtualStateProcessor {
         hash: Hash,
         txid_identity: bool,
         private: bool,
-    ) -> (Vec<([u8; 32], u8, u32)>, Vec<([u8; 32], u64)>, Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>, Vec<([u8; 32], Option<Hash>)>) {
+    ) -> ServiceEvents {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
         let mut request_recipients = Vec::new();
+        let mut request_prompt_lens = Vec::new();
         let mut responses = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
         for mbad in acceptance.iter() {
@@ -345,6 +349,7 @@ impl VirtualStateProcessor {
                             }
                             requests.push((request_hash, tier as u8, req.max_tokens));
                             request_rewards.push((request_hash, req.inference_reward));
+                            request_prompt_lens.push((request_hash, plaintext_prompt_len(&req.prompt)));
                             // Past the private-inference gate the envelope names the responders
                             // obligated for (and paid by) this request. A plaintext request from a
                             // block below the gate, merged past it, folds as a public request.
@@ -367,7 +372,53 @@ impl VirtualStateProcessor {
                 }
             }
         }
-        (requests, request_rewards, request_recipients, responses)
+        ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses }
+    }
+
+    /// Traced responses with a verified responder, and correctly signed openings, accepted by
+    /// chain block `hash`, in acceptance order.
+    fn trace_events_of_chain_block(&self, hash: Hash) -> (Vec<TraceResponseEvent>, Vec<TraceOpeningEvent>) {
+        use keryx_verifiable_inference::opening::{Opening, SignedPayload};
+        let mut responses = Vec::new();
+        let mut openings = Vec::new();
+        let acceptance = self.acceptance_data_store.get(hash).unwrap();
+        for mbad in acceptance.iter() {
+            let txs = self.block_transactions_store.get(mbad.block_hash).unwrap();
+            for entry in mbad.accepted_transactions.iter() {
+                let tx = &txs[entry.index_within_block as usize];
+                if tx.is_ai_response() {
+                    let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else { continue };
+                    let (Some(trace), Some(r), Some(responder)) = (resp.trace, resp.responder.as_ref(), verified_responder(&resp)) else {
+                        continue;
+                    };
+                    let mut response_txid = [0u8; 32];
+                    response_txid.copy_from_slice(&tx.id().as_bytes());
+                    responses.push(TraceResponseEvent {
+                        response_txid,
+                        request_hash: resp.request_hash,
+                        responder,
+                        escrow_pubkey: r.escrow_pubkey,
+                        trace_root: trace.trace_root,
+                        n_prompt: trace.n_prompt,
+                        n_pos: trace.n_pos,
+                        answer_len: resp.private_body.as_deref().map_or(0, plaintext_answer_len),
+                        stage: trace.stage,
+                        tokens: trace.tokens_root.is_some(),
+                    });
+                } else if tx.is_ai_opening() {
+                    let Some(signed) = SignedPayload::split(&tx.payload) else { continue };
+                    if !verify_opening_signature(&signed.escrow_pubkey, &signed.signature, signed.body) {
+                        continue;
+                    }
+                    let Some(response_txid) = signed.body.get(1..33).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { continue };
+                    if Opening::decode(signed.body).is_none() {
+                        continue;
+                    }
+                    openings.push(TraceOpeningEvent { response_txid, escrow_pubkey: signed.escrow_pubkey, body: signed.body.to_vec() });
+                }
+            }
+        }
+        (responses, openings)
     }
 
     /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
@@ -435,6 +486,14 @@ impl VirtualStateProcessor {
 
     /// The private-inference recipients of a pending request (see
     /// [`ServiceLedger::private_recipients`]), as raw escrow pubkeys.
+    pub(crate) fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.service_ledger.lock().ledger.awaited_opening_key(response_txid)
+    }
+
+    pub(crate) fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.service_ledger.lock().ledger.awaited_opening_seed(response_txid)
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
@@ -562,11 +621,12 @@ impl VirtualStateProcessor {
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, request_recipients, responses) = self.service_events_of_chain_block(
-            hash,
-            self.reward_routing_activation.is_active(daa),
-            self.private_inference_activation.is_active(daa),
-        );
+        let ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses } = self
+            .service_events_of_chain_block(
+                hash,
+                self.reward_routing_activation.is_active(daa),
+                self.private_inference_activation.is_active(daa),
+            );
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -600,6 +660,87 @@ impl VirtualStateProcessor {
             }
             set
         };
+        if self.verifiable_inference_activation.is_active(daa) {
+            let (trace_responses, trace_openings) = self.trace_events_of_chain_block(hash);
+            let h14 = self.private_inference_activation.is_active(daa);
+            let prefix_at = |at: u64| self.trace_prefix_activation.is_active(at);
+            let audit_at = |at: u64| self.trace_audit_activation.is_active(at);
+            let chain_at = |at: u64| self.trace_chain_activation.is_active(at);
+            let tier = |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at)) } else { None };
+            let traces = TraceInputs {
+                chain_hash: hash,
+                responses: &trace_responses,
+                openings: &trace_openings,
+                tier: &tier,
+                prompt_lens: &request_prompt_lens,
+                shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa) || chain_at(daa),
+                unique_root: audit_at(daa),
+                sanction: self.trace_sanction_activation.is_active(daa),
+                context: self.trace_context_activation.is_active(daa),
+                draw: self.reward_draw_activation.is_active(daa),
+                window_v3: self.service_window_v3_activation.is_active(daa),
+                dedup: self.trace_dedup_activation.is_active(daa),
+                seed_bind: self.trace_seed_bind_activation.is_active(daa),
+            };
+            if warmup {
+                let burned = self.service_burned.read();
+                ledger.on_chain_block_warmup_with_traces(
+                    daa,
+                    &requests,
+                    &request_rewards,
+                    &request_recipients,
+                    &responses,
+                    &escrows,
+                    &producers,
+                    &traces,
+                    &|op| burned.contains_key(op),
+                    cohort,
+                );
+                return (FoldOutcome::default(), escrows);
+            }
+            let outcome = ledger.on_chain_block_with_traces(
+                daa,
+                &requests,
+                &request_rewards,
+                &request_recipients,
+                &responses,
+                &escrows,
+                &producers,
+                &traces,
+                |id| self.service_standing_at(id, daa),
+                cohort,
+            );
+            if live {
+                for (rh, miner) in outcome.late.iter() {
+                    info!("service-bond: answer of miner {} on request {} past its deadline", miner, hex::encode(rh));
+                }
+                for (rh, miner) in outcome.excused.iter() {
+                    info!(
+                        "service-bond: silence of miner {} on request {} excused (prompt may exceed the tier context floor)",
+                        miner,
+                        hex::encode(rh)
+                    );
+                }
+                for v in outcome.verdicts.iter() {
+                    match v.cause {
+                        None => info!(
+                            "service-bond: opening of response {} by miner {} accepted (request {})",
+                            hex::encode(v.response_txid),
+                            v.responder,
+                            hex::encode(v.request_hash)
+                        ),
+                        Some(cause) => info!(
+                            "service-bond: opening of response {} by miner {} rejected: {} (request {})",
+                            hex::encode(v.response_txid),
+                            v.responder,
+                            cause,
+                            hex::encode(v.request_hash)
+                        ),
+                    }
+                }
+            }
+            return (outcome, escrows);
+        }
         if warmup {
             let burned = self.service_burned.read();
             ledger.on_chain_block_warmup_with_recipients(
@@ -1135,6 +1276,9 @@ impl VirtualStateProcessor {
 
     /// Window-relative hash of the production-index snapshot at `sample` (`service_commitment_v4`).
     pub(super) fn production_index_relative_hash_at(&self, sample: Hash) -> Option<Hash> {
+        if sample == self.genesis.hash {
+            return Some(ProductionIndexSnapshot::default().relative_hash());
+        }
         self.production_index_hashes.read().get(&sample).map(|(_, relative)| *relative)
     }
 
@@ -1532,5 +1676,30 @@ mod tests {
         script.push(keryx_txscript::opcodes::codes::OpCheckSig);
         assert_eq!(csv_escrow_pubkey(&script), Some([0x11u8; 32]));
         assert_eq!(csv_escrow_pubkey(&[0u8; 10]), None);
+    }
+}
+
+/// The service-ledger inputs of one chain block.
+struct ServiceEvents {
+    requests: Vec<([u8; 32], u8, u32)>,
+    request_rewards: Vec<([u8; 32], u64)>,
+    request_recipients: Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>,
+    request_prompt_lens: Vec<([u8; 32], u32)>,
+    responses: Vec<([u8; 32], Option<Hash>)>,
+}
+
+/// Plaintext length of a request prompt: the sealed length without the envelope, else the bytes.
+fn plaintext_prompt_len(prompt: &[u8]) -> u32 {
+    match PrivateRequestEnvelope::parse(prompt) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => prompt.len().min(u32::MAX as usize) as u32,
+    }
+}
+
+/// Plaintext length of a sealed answer body.
+fn plaintext_answer_len(body: &[u8]) -> u32 {
+    match PrivateResponseEnvelope::parse(body) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => 0,
     }
 }

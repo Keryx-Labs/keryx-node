@@ -34,7 +34,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -83,6 +83,7 @@ static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H15_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -504,6 +505,29 @@ impl VirtualStateProcessor {
             info!("═══════════════════════════════════════════════════════════════");
         }
 
+        if banner_should_fire(self.verifiable_inference_activation, header)
+            && H15_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H15 · DAA {} ════════════════", self.verifiable_inference_activation.daa_score());
+            info!("  ▶ VERIFIABLE INFERENCE — every AI answer is now proven on-chain");
+            info!("    Trace         — every AiResponse commits the trace of its inference; untraced answers are not credited");
+            info!("    Audit         — every traced response is audited: the responder opens the drawn points in an opening transaction");
+            info!("    Trace chain   — openings are chained layer to layer, from the request-bound prompt prefix to the generated tokens");
+            info!("    Block task    — each block commits and opens the task of its window; header format changes");
+            info!("    Sanctions     — a missing or failed opening is struck; a trace root is admitted only once");
+            info!("    Answers       — sealed answer bodies capped at {} KiB", keryx_inference::ai_payload::MAX_AI_RESPONSE_PRIVATE_BODY_LEN / 1024);
+            info!("    Service       — answer deadlines follow the measured work of each request and the queue of each miner");
+            info!("    Context       — a silent miner is not struck on a prompt beyond its tier context unless another proved it fit");
+            info!("    Reward        — the inference reward is drawn among the miners credited on the request");
+            info!("  ▶ PROOF-OF-MODEL v5 — mining a tier now takes the card that can serve it");
+            info!("    Context pad   — the walk also covers a per-tier context buffer: minimum card 8/12/16/24/32 GB for tiers 0-4");
+            info!("  ▶ HOLDER REWARD — new bracket table");
+            info!("    Brackets      — 5% with nothing held, 80% at 80 days of production held, 100% at 120 days");
+            info!("  ▶ MANDATORY UPDATE — miners must run the H15 release");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         // H6 banner. Same latching shape as the others — fires once, on the first block at or
         // after the gate, only for a live crossing (see `banner_should_fire`).
         if banner_should_fire(self.pom_v3_activation, header)
@@ -876,7 +900,9 @@ impl VirtualStateProcessor {
                 };
                 let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
                 // Recalibrated bracket table ships bundled with H4 (one hardfork, one gate).
-                let bps = if self.coin_age_activation.is_active(pov_daa_score) {
+                let bps = if self.ratio_reward_v3_activation.is_active(pov_daa_score) {
+                    ratio_reward_bps_v3(balance, production)
+                } else if self.coin_age_activation.is_active(pov_daa_score) {
                     ratio_reward_bps_v2(balance, production)
                 } else {
                     ratio_reward_bps(balance, production)

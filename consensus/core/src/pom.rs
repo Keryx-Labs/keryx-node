@@ -67,6 +67,24 @@ pub fn pom_seed_h10_active(daa_score: u64) -> bool {
     daa_score >= POM_SEED_H10_ACTIVATION_DAA.load(Ordering::Relaxed)
 }
 
+/// Largest encoded block task opening.
+pub const BLOCK_TASK_MAX_LEN: usize = keryx_verifiable_inference::opening::MAX_BODY_LEN;
+
+/// DAA score at which headers carry the block task root. u64::MAX means "never" — initialised at
+/// startup from `Params::block_task_activation`.
+static BLOCK_TASK_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::block_task_activation`.
+pub fn init_block_task_activation(daa_score: u64) {
+    BLOCK_TASK_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Whether a header at `daa_score` carries the block task root.
+#[inline(always)]
+pub fn block_task_active(daa_score: u64) -> bool {
+    daa_score >= BLOCK_TASK_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
+
 /// DAA score at which the H14 tier lineup applies. u64::MAX means "never" — initialised at startup
 /// from `Params::private_inference_activation`, for the paths that only hold a header.
 static PRIVATE_INFERENCE_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -169,6 +187,62 @@ pub struct PomProof {
     /// result and `pow_value` = the v4 era fold (nonce-bound). Trailing field, same era-exact
     /// wire mechanism as `v3`: proofs without it re-encode through `PomProofPreV4`.
     pub v4: Option<crate::pom_v4::PomProofV4>,
+    /// Encoded block task opening (`keryx_verifiable_inference::opening::Opening`), at/after
+    /// the block task gate. Trailing field, same era-exact wire mechanism as `v4`: proofs
+    /// without it re-encode through `PomProofPreTask`.
+    pub task: Option<Vec<u8>>,
+}
+
+/// Exact pre-task layout of `PomProof` (through `v4`, no `task`). Decode-fallback and
+/// byte-identical encode source for proofs without the task extension.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PomProofPreTask {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+    pub v3: Option<crate::pom_v3::PomProofV3>,
+    pub v4: Option<crate::pom_v4::PomProofV4>,
+}
+
+impl From<PomProofPreTask> for PomProof {
+    fn from(p: PomProofPreTask) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: p.v3,
+            v4: p.v4,
+            task: None,
+        }
+    }
+}
+
+impl From<&PomProof> for PomProofPreTask {
+    fn from(p: &PomProof) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path.clone(),
+            final_trace_path: p.final_trace_path.clone(),
+            openings: p.openings.clone(),
+            steps_v2: p.steps_v2.clone(),
+            v3: p.v3.clone(),
+            v4: p.v4.clone(),
+        }
+    }
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`). Decode-fallback target for legacy
@@ -232,6 +306,7 @@ impl From<PomProofPreV4> for PomProof {
             steps_v2: p.steps_v2,
             v3: p.v3,
             v4: None,
+            task: None,
         }
     }
 }
@@ -265,6 +340,7 @@ impl From<PomProofPreV3> for PomProof {
             steps_v2: p.steps_v2,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 }
@@ -297,6 +373,7 @@ impl From<PomProofPreH4> for PomProof {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 }
@@ -333,7 +410,8 @@ impl PomProof {
             self.steps_v2.as_ref().map_or(0, |steps| steps.iter().map(|s| 32 + path_bytes(&s.weight_path)).sum());
         let v3: usize = self.v3.as_ref().map_or(0, |v3| v3.approx_bytes());
         let v4: usize = self.v4.as_ref().map_or(0, |v4| v4.approx_bytes());
-        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps + v3 + v4
+        let task: usize = self.task.as_ref().map_or(0, Vec::len);
+        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps + v3 + v4 + task
     }
 
     /// Canonical wire (borsh) encoding, era-exact: a proof without the v3 extension encodes
@@ -341,8 +419,10 @@ impl PomProof {
     /// layout), so re-served older blocks stay readable by not-yet-updated peers. ALL borsh
     /// encode sites MUST use this instead of `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        if self.v4.is_some() {
+        if self.task.is_some() {
             borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.v4.is_some() {
+            borsh::to_vec(&PomProofPreTask::from(self)).expect("PomProof borsh serialize")
         } else if self.v3.is_some() {
             borsh::to_vec(&PomProofPreV4::from(self)).expect("PomProof borsh serialize")
         } else if self.steps_v2.is_some() {
@@ -358,6 +438,7 @@ impl PomProof {
     /// the layouts can never be confused. ALL borsh decode sites MUST use this.
     pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreTask>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV4>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
@@ -367,6 +448,14 @@ impl PomProof {
     /// encoding. The witness travels outside the block hash, so a failed verification
     /// must be remembered per (block, witness) — never per block, or a single crafted
     /// witness would poison a valid hash permanently.
+    /// Drops the task extension when the block task rule is not active at `daa_score` or when it
+    /// exceeds the largest opening.
+    pub fn sanitize_task(&mut self, daa_score: u64) {
+        if !block_task_active(daa_score) || self.task.as_ref().is_some_and(|t| t.len() > BLOCK_TASK_MAX_LEN) {
+            self.task = None;
+        }
+    }
+
     pub fn wire_digest(&self) -> [u8; 32] {
         *blake3::hash(&self.to_wire_bytes()).as_bytes()
     }
@@ -864,6 +953,30 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
 }
 
 #[cfg(test)]
+mod task_sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn task_is_dropped_before_its_gate() {
+        let mut p = PomProof {
+            tier: 0,
+            trace_root: [0; 32],
+            pow_value: [0; 32],
+            final_state: 0,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: None,
+            v3: None,
+            v4: None,
+            task: Some(vec![1; 10]),
+        };
+        p.sanitize_task(1_000);
+        assert!(p.task.is_none());
+    }
+}
+
+#[cfg(test)]
 mod verify_tests {
     use super::*;
 
@@ -965,6 +1078,7 @@ mod verify_tests {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         };
         (proof, r_t, seed)
     }
@@ -996,6 +1110,7 @@ mod verify_tests {
             steps_v2: Some(steps),
             v3: None,
             v4: None,
+            task: None,
         };
         (proof, r_t)
     }

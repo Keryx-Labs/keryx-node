@@ -86,8 +86,8 @@ impl TransactionValidator {
     }
 
     fn check_transaction_inputs_count(&self, tx: &Transaction) -> TxResult<()> {
-        // Coinbase, AiResponse, and AiChallenge are data-publication transactions with no inputs.
-        if !tx.is_coinbase() && !tx.is_ai_response() && !tx.is_ai_challenge() && tx.inputs.is_empty() {
+        // Coinbase, AiResponse, AiChallenge and openings are data-publication transactions with no inputs.
+        if !tx.is_coinbase() && !tx.is_ai_response() && !tx.is_ai_challenge() && !tx.is_ai_opening() && tx.inputs.is_empty() {
             return Err(TxRuleError::NoTxInputs);
         }
 
@@ -193,6 +193,8 @@ fn check_ai_payload_len(tx: &Transaction) -> TxResult<()> {
         (MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN)
     } else if tx.is_ai_challenge() {
         (MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN)
+    } else if tx.is_ai_opening() {
+        (keryx_verifiable_inference::opening::MIN_PAYLOAD_LEN, keryx_verifiable_inference::opening::MAX_PAYLOAD_LEN)
     } else {
         return Ok(());
     };
@@ -258,16 +260,31 @@ mod tests {
         tv.validate_tx_in_isolation(&response(head.serialize())).unwrap();
         let with_body = head.clone().with_private_body(vec![0xAB; 1_000]).serialize();
         tv.validate_tx_in_isolation(&response(with_body)).unwrap();
-        let max_body = head.clone().with_private_body(vec![0xAB; MAX_AI_RESPONSE_PRIVATE_BODY_LEN]).serialize();
+        let trace = keryx_inference::TraceCommitment { trace_root: [5u8; 32], n_prompt: 3, n_pos: 9, stage: 2, tokens_root: Some([6u8; 32]) };
+        let max_body = head.clone().with_private_body(vec![0xAB; MAX_AI_RESPONSE_PRIVATE_BODY_LEN]).with_trace(trace).serialize();
         assert_eq!(max_body.len(), MAX_AI_RESPONSE_PAYLOAD_LEN);
         tv.validate_tx_in_isolation(&response(max_body)).unwrap();
 
         let oversized = head.clone().with_private_body(vec![0xAB; MAX_AI_RESPONSE_PRIVATE_BODY_LEN + 1]).serialize();
+        assert_match!(
+            tv.validate_tx_in_isolation(&response(oversized)),
+            Err(TxRuleError::AiPayloadTooLong(_, _)) | Err(TxRuleError::AiPayloadTooShort(_, _))
+        );
+        let oversized = head.clone().with_private_body(vec![0xAB; MAX_AI_RESPONSE_PRIVATE_BODY_LEN + 1]).with_trace(trace).serialize();
         assert_match!(tv.validate_tx_in_isolation(&response(oversized)), Err(TxRuleError::AiPayloadTooLong(_, _)));
         // A truncated extension header is not a layout at all.
         let mut truncated = head.serialize();
         truncated.extend_from_slice(&[0x01, 0x02]);
         assert_match!(tv.validate_tx_in_isolation(&response(truncated)), Err(TxRuleError::AiPayloadTooShort(_, _)));
+
+        // Openings are input-less data transactions bounded like the other AI payloads.
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::{MAX_PAYLOAD_LEN, MIN_PAYLOAD_LEN};
+        let opening = |len: usize| Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, vec![1u8; len]);
+        tv.validate_tx_in_isolation(&opening(MIN_PAYLOAD_LEN)).unwrap();
+        tv.validate_tx_in_isolation(&opening(MAX_PAYLOAD_LEN)).unwrap();
+        assert_match!(tv.validate_tx_in_isolation(&opening(MAX_PAYLOAD_LEN + 1)), Err(TxRuleError::AiPayloadTooLong(_, _)));
+        assert_match!(tv.validate_tx_in_isolation(&opening(MIN_PAYLOAD_LEN - 1)), Err(TxRuleError::AiPayloadTooShort(_, _)));
     }
 
     /// AiRequest payloads are valid in isolation up to the private maximum; the era rule that
@@ -423,7 +440,7 @@ mod tests {
         tv.validate_tx_in_isolation(&valid_tx).unwrap();
 
         let mut tx: Transaction = valid_tx.clone();
-        tx.subnetwork_id = SubnetworkId::from_byte(6); // bytes 3-5 are now AI subnetworks
+        tx.subnetwork_id = SubnetworkId::from_byte(7); // bytes 3-6 are now AI subnetworks
         assert_match!(tv.validate_tx_in_isolation(&tx), Err(TxRuleError::SubnetworksDisabled(_)));
 
         let mut tx = valid_tx.clone();

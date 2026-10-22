@@ -7,6 +7,7 @@ use crate::model::stores::pom_proof::PomProofStoreReader;
 use crate::processes::{
     coinbase::coinbase_outputs_limit,
     private_inference::{PrivateEraViolation, check_private_inference_era},
+    verifiable_inference::{VerifiableEraViolation, check_verifiable_inference_era},
     transaction_validator::errors::TxRuleError,
 };
 use keryx_consensus_core::{
@@ -22,6 +23,7 @@ use keryx_consensus_core::{
     },
     pom_v3::verify_pom_proof_v3_container,
     pom_v4::verify_pom_proof_v4_container,
+    pom_v5::{v5_pad_seed, verify_pom_proof_v5_container},
     tx::TransactionOutpoint,
 };
 use keryx_database::prelude::StoreError;
@@ -37,6 +39,7 @@ impl BlockBodyProcessor {
         self.check_coinbase_outputs_count(block)?;
         self.check_transactions_in_isolation(block)?;
         self.check_private_inference_era(block)?;
+        self.check_verifiable_inference_era(block)?;
         let mass = self.check_block_mass(block)?;
         self.check_duplicate_transactions(block)?;
         self.check_block_double_spends(block)?;
@@ -46,9 +49,60 @@ impl BlockBodyProcessor {
         // `skip_pom_proof` is set only for IBD body sync (proof not carried; legacy blocks have none).
         // Relay/submit/orphan paths leave it false, keeping the real-time possession check enforced.
         if !skip_pom_proof {
+            self.check_block_task(block)?;
             self.check_pom_proof(block)?;
         }
         Ok(mass)
+    }
+
+    /// Seed block of the task window of `header`, along its selected-parent chain.
+    fn task_window_seed(&self, header: &keryx_consensus_core::header::Header) -> Option<Hash> {
+        use crate::model::stores::ghostdag::GhostdagStoreReader;
+        use keryx_verifiable_inference::block_task::{window, window_seed, window_start};
+        let start = window_start(window(header.daa_score)?);
+        let mut cur = Some(self.ghostdag_store.get_selected_parent(header.hash).ok()?);
+        let chain = std::iter::from_fn(|| {
+            let h = cur?;
+            let daa = self.headers_store.get_daa_score(h).ok()?;
+            cur = (h != self.genesis.hash).then(|| self.ghostdag_store.get_selected_parent(h).ok()).flatten();
+            Some((h.as_bytes(), daa))
+        });
+        window_seed(start, chain).map(Hash::from_bytes)
+    }
+
+    pub(super) fn check_block_task(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        use keryx_verifiable_inference::{
+            block_task::verify_block_task,
+            opening::{Opening, seed_block},
+            verify::Fail,
+        };
+        let header = &block.header;
+        if self.skip_opoi {
+            return Ok(());
+        }
+        if !self.block_task_activation.is_active(header.daa_score) {
+            return match block.pom_proof.as_ref().and_then(|p| p.task.as_ref()) {
+                Some(_) => Err(RuleError::BadBlockTask(Fail::Shape)),
+                None => Ok(()),
+            };
+        }
+        let proof = block.pom_proof.as_ref().ok_or(RuleError::PomProofMissing)?;
+        let bytes = proof.task.as_ref().ok_or(RuleError::BlockTaskMissing)?;
+        if bytes.len() > keryx_consensus_core::pom::BLOCK_TASK_MAX_LEN {
+            return Err(RuleError::BadBlockTask(Fail::Shape));
+        }
+        if seed_block(bytes).is_some() {
+            return Err(RuleError::BadBlockTask(Fail::Shape));
+        }
+        let opening = Opening::decode(bytes).ok_or(RuleError::BadBlockTask(Fail::Shape))?;
+        let rules = keryx_consensus_core::config::params::trace_rules(proof.tier, true, false, true)
+            .ok_or(RuleError::BadBlockTask(Fail::Manifest))?;
+        let (Some(chain), Some(prefix)) = (rules.chain.as_ref(), rules.prefix.as_ref()) else {
+            return Err(RuleError::BadBlockTask(Fail::Manifest));
+        };
+        let seed = self.task_window_seed(header).ok_or(RuleError::BlockTaskMissing)?;
+        verify_block_task(&rules.ctx, chain, prefix, &header.task_root.as_bytes(), &seed.as_bytes(), &header.hash.as_bytes(), &opening)
+            .map_err(RuleError::BadBlockTask)
     }
 
     fn check_has_transactions(block: &Block) -> BlockProcessResult<()> {
@@ -105,6 +159,28 @@ impl BlockBodyProcessor {
             if let Err(e) = self.transaction_validator.validate_tx_in_isolation(tx) {
                 return Err(RuleError::TxInIsolationValidationFailed(tx.id(), e));
             }
+        }
+        Ok(())
+    }
+
+    /// AI transactions must match the verifiable-inference era of the block, trusted blocks included,
+    /// and a block carries at most one opening once the gate is active.
+    fn check_verifiable_inference_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let mut openings = 0usize;
+        for tx in block.transactions.iter().skip(1) {
+            if let Err(v) = check_verifiable_inference_era(tx, block.header.daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation) {
+                return Err(match v {
+                    VerifiableEraViolation::OpeningBeforeActivation => RuleError::AiOpeningBeforeActivation(tx.id()),
+                    VerifiableEraViolation::TraceBeforeActivation => RuleError::AiTraceBeforeActivation(tx.id()),
+                    VerifiableEraViolation::ResponseWithoutTrace => RuleError::AiResponseWithoutTrace(tx.id()),
+                    VerifiableEraViolation::MalformedOpening => RuleError::AiOpeningMalformed(tx.id()),
+                    VerifiableEraViolation::BodyTooLongBeforeChain(len) => RuleError::AiResponseBodyTooLong(tx.id(), len),
+                });
+            }
+            openings += tx.is_ai_opening() as usize;
+        }
+        if openings > 1 {
+            return Err(RuleError::TooManyAiOpenings(openings));
         }
         Ok(())
     }
@@ -233,6 +309,8 @@ impl BlockBodyProcessor {
         let candidate = Block::from_header_arc(header).with_pom_proof(proof.clone());
         self.check_pom_proof(&candidate)
             .map_err(|e| ConsensusError::GeneralOwned(format!("PoM proof adoption rejected for {}: {}", hash, e)))?;
+        self.check_block_task(&candidate)
+            .map_err(|e| ConsensusError::GeneralOwned(format!("PoM proof adoption rejected for {}: {}", hash, e)))?;
         let mut batch = WriteBatch::default();
         match self.pom_proof_store.insert_batch(&mut batch, hash, &proof) {
             Ok(()) => {}
@@ -315,6 +393,17 @@ impl BlockBodyProcessor {
         let target = Uint256::from_compact_target_bits(header.bits).to_le_bytes();
         let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
 
+        if self.pom_v5_activation.is_active(header.daa_score) {
+            let n_pad = keryx_consensus_core::config::params::POM_V5_PAD_TILES_H14.get(proof.tier as usize).copied().unwrap_or(0);
+            let pad_seed = v5_pad_seed(proof.tier, &tier.model_id, &tier.root);
+            return verify_pom_proof_v5_container(seed, proof, tier.chunks, &tier.root, &pad_seed, n_pad, &target, final_hash)
+                .map_err(RuleError::BadPomProofV4);
+        }
+        if pom_v4 {
+            return verify_pom_proof_v4_container(seed, proof, tier.chunks, &tier.root, &target, final_hash)
+                .map_err(RuleError::BadPomProofV4);
+        }
+
         // H6: matrix-walk witness (pom_v3). The verifier NEVER re-walks (that would be
         // K * D^3 = 4.3 GMACs per block — IBD in days, the H3 lesson): it re-derives the offset
         // chain from the listed snippets, recomputes S_0 from the seed, and re-checks 32
@@ -322,11 +411,6 @@ impl BlockBodyProcessor {
         // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
         // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
         // later), so the pin check above already ran.
-        if pom_v4 {
-            return verify_pom_proof_v4_container(seed, proof, tier.chunks, &tier.root, &target, final_hash)
-                .map_err(RuleError::BadPomProofV4);
-        }
-
         if pom_v3 {
             return verify_pom_proof_v3_container(
                 &pre_pow_hash,
@@ -665,6 +749,7 @@ mod tests {
                 0,
                 Default::default(),
                 0,
+                Default::default(),
             ),
             txs,
         );
