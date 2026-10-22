@@ -847,6 +847,8 @@ const MINIMUM_KERYXD_PEER_VERSION_H12: (u32, u32, u32) = (1, 6, 0);
 const MINIMUM_KERYXD_PEER_VERSION_H13: (u32, u32, u32) = (1, 6, 1);
 /// Minimum peer version once H14 is active on the local virtual chain.
 const MINIMUM_KERYXD_PEER_VERSION_H14: (u32, u32, u32) = (1, 6, 4);
+/// Minimum peer version once H15 is active on the local virtual chain.
+const MINIMUM_KERYXD_PEER_VERSION_H15: (u32, u32, u32) = (1, 6, 5);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
@@ -911,7 +913,9 @@ impl ConnectionInitializer for FlowContext {
         // Handshake version gate (local peering policy): reject builds too old to follow our chain
         // before registering any flow — they would only churn IBD noise.
         let virtual_daa = self.consensus().unguarded_session_blocking().get_virtual_daa_score();
-        let min_version = if self.config.private_inference_activation.is_active(virtual_daa) {
+        let min_version = if self.config.verifiable_inference_activation.is_active(virtual_daa) {
+            MINIMUM_KERYXD_PEER_VERSION_H15
+        } else if self.config.private_inference_activation.is_active(virtual_daa) {
             MINIMUM_KERYXD_PEER_VERSION_H14
         } else if self.config.exact_verification_activation.is_active(virtual_daa) {
             MINIMUM_KERYXD_PEER_VERSION_H13
