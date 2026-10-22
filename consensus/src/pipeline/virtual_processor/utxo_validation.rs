@@ -509,17 +509,21 @@ impl VirtualStateProcessor {
             && H15_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
             info!("════════════════ KERYX HARDFORK H15 · DAA {} ════════════════", self.verifiable_inference_activation.daa_score());
-            info!("  Verifiable    — every AiResponse commits the trace of its inference; untraced answers are not credited");
-            info!("  Audit         — every traced response is audited: the responder opens the drawn points in an opening transaction");
-            info!("  Trace chain   — openings are chained layer to layer, from the request-bound prompt prefix to the generated tokens");
-            info!("  Sanctions     — a missing or failed opening is struck; a trace root is admitted only once");
-            info!("  Answers       — sealed answer bodies capped at {} KiB", keryx_inference::ai_payload::MAX_AI_RESPONSE_PRIVATE_BODY_LEN / 1024);
-            info!("  Service       — answer deadlines follow the measured work of each request and the queue of each miner");
-            info!("  Context       — a silent miner is not struck on a prompt beyond its tier context unless another proved it fit");
-            info!("  Reward        — the inference reward is drawn among the miners credited on the request");
-            info!("  Holder reward — new bracket table: 1% with nothing held, +5% per 10 days of production held, 100% at 200 days");
-            info!("  Block task    — each block commits and opens the task of its window; header format changes");
-            info!("  Miners        — MANDATORY update: miners must run the H15 release");
+            info!("  ▶ VERIFIABLE INFERENCE — every AI answer is now proven on-chain");
+            info!("    Trace         — every AiResponse commits the trace of its inference; untraced answers are not credited");
+            info!("    Audit         — every traced response is audited: the responder opens the drawn points in an opening transaction");
+            info!("    Trace chain   — openings are chained layer to layer, from the request-bound prompt prefix to the generated tokens");
+            info!("    Block task    — each block commits and opens the task of its window; header format changes");
+            info!("    Sanctions     — a missing or failed opening is struck; a trace root is admitted only once");
+            info!("    Answers       — sealed answer bodies capped at {} KiB", keryx_inference::ai_payload::MAX_AI_RESPONSE_PRIVATE_BODY_LEN / 1024);
+            info!("    Service       — answer deadlines follow the measured work of each request and the queue of each miner");
+            info!("    Context       — a silent miner is not struck on a prompt beyond its tier context unless another proved it fit");
+            info!("    Reward        — the inference reward is drawn among the miners credited on the request");
+            info!("  ▶ PROOF-OF-MODEL v5 — mining a tier now takes the card that can serve it");
+            info!("    Context pad   — the walk also covers a per-tier context buffer: minimum card 8/12/16/24/32 GB for tiers 0-4");
+            info!("  ▶ HOLDER REWARD — new bracket table");
+            info!("    Brackets      — 5% with nothing held, 80% at 80 days of production held, 100% at 120 days");
+            info!("  ▶ MANDATORY UPDATE — miners must run the H15 release");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
