@@ -12,7 +12,7 @@ use keryx_consensus_core::tx::{
 };
 use keryx_inference::{
     AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, INFERENCE_VAULT_SCRIPT, MAX_PRIVATE_RECIPIENTS, MIN_AI_REQUEST_PRIORITY_FEE,
-    PrivateRequestSecret, open_response, seal_request,
+    PrivateRequestSecret, open_response, seal_request, seal_request_v1,
 };
 use keryx_rpc_core::{RpcHash, RpcTransaction};
 use keryx_txscript::pay_to_address_script;
@@ -227,8 +227,11 @@ impl Inference {
         let recipients = cohort_recipients(ctx, &model_id, &seed).await?;
 
         // Seal the prompt: only the tier's escrow keys can open it, and only this secret opens the answers.
-        let (payload, secret) = seal_request(model_id, max_tokens, reward, fee, prompt.as_bytes(), &recipients)
-            .map_err(|e| Error::custom(e.to_string()))?;
+        let params = Params::from(ctx.wallet().network_id()?);
+        let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
+        let seal = if params.verifiable_inference_activation.is_active(daa) { seal_request } else { seal_request_v1 };
+        let (payload, secret) =
+            seal(model_id, max_tokens, reward, fee, prompt.as_bytes(), &recipients).map_err(|e| Error::custom(e.to_string()))?;
 
         let change = total - reward - fee;
         let change_address = account.change_address()?;

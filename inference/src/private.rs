@@ -53,7 +53,8 @@
 //! Key schedule 1, sealed by clients that predate it, drew `root_key` and `e` at random, used the
 //! salt `"KeryxPrivateInferenceV1"` and `k_response = HKDF(salt, ikm = root_key,
 //! info = "response" || R_i)`, a key every recipient can derive. Schedule-1 requests are still
-//! opened and answered so they stay servable, but nothing seals them any more.
+//! opened and answered so they stay servable; [`seal_request_v1`] seals them for cohorts that
+//! may not open schedule 2 yet.
 //!
 //! The key schedule is not on the wire: consensus parses request envelopes and accepts version
 //! 1 only, so a new version byte would be a hard fork. A responder learns the schedule from the
@@ -108,7 +109,7 @@ const INFO_RESPONSE: &[u8] = b"response";
 /// How a request derives its keys (see the module docs). Not on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeySchedule {
-    /// Random root key; every recipient can derive every responder's key. Opened, never sealed.
+    /// Random root key; every recipient can derive every responder's key.
     V1,
     /// Seed-derived root key and ephemeral secret; a responder's key needs its ECDH secret.
     V2,
@@ -441,6 +442,38 @@ pub fn seal_request_with_rng<R: RngCore + CryptoRng>(
     Ok((payload, secret))
 }
 
+/// [`seal_request`] under key schedule 1, for cohorts that may not open schedule 2 yet.
+pub fn seal_request_v1(
+    model_id: [u8; 32],
+    max_tokens: u32,
+    inference_reward: u64,
+    priority_fee: u64,
+    prompt: &[u8],
+    recipients: &[[u8; 32]],
+) -> Result<(AiRequestPayload, PrivateRequestSecret), PrivateError> {
+    seal_request_v1_with_rng(model_id, max_tokens, inference_reward, priority_fee, prompt, recipients, &mut rand::rngs::OsRng)
+}
+
+/// [`seal_request_v1`] with an explicit randomness source.
+pub fn seal_request_v1_with_rng<R: RngCore + CryptoRng>(
+    model_id: [u8; 32],
+    max_tokens: u32,
+    inference_reward: u64,
+    priority_fee: u64,
+    prompt: &[u8],
+    recipients: &[[u8; 32]],
+    rng: &mut R,
+) -> Result<(AiRequestPayload, PrivateRequestSecret), PrivateError> {
+    let mut secret = PrivateRequestSecret { schedule: KeySchedule::V1, bytes: [0u8; PRIVATE_ROOT_KEY_LEN] };
+    rng.fill_bytes(&mut secret.bytes);
+    let mut nonce = [0u8; PRIVATE_NONCE_LEN];
+    rng.fill_bytes(&mut nonce);
+    let ephemeral_secret = SecretKey::new(rng);
+    let request = AiRequestPayload::new(model_id, max_tokens, inference_reward, priority_fee, Vec::new());
+    let payload = seal_payload(&secret, &ephemeral_secret, nonce, request, prompt, recipients)?;
+    Ok((payload, secret))
+}
+
 /// Seals `prompt` into `request` (its prompt field still empty) to `recipients`, under the key
 /// schedule and root key of `secret`.
 fn seal_payload(
@@ -648,15 +681,8 @@ mod tests {
         seal_request_with_rng(MODEL, 256, 100_000_000, 30_000_000, prompt, recipients, rng).unwrap()
     }
 
-    /// What a key-schedule-1 client sealed: a random root key and a random ephemeral secret.
     fn seal_v1(prompt: &[u8], recipients: &[[u8; 32]], rng: &mut StdRng) -> (AiRequestPayload, PrivateRequestSecret) {
-        let mut secret = PrivateRequestSecret { schedule: KeySchedule::V1, bytes: [0u8; 32] };
-        rng.fill_bytes(&mut secret.bytes);
-        let mut nonce = [0u8; PRIVATE_NONCE_LEN];
-        rng.fill_bytes(&mut nonce);
-        let ephemeral = SecretKey::new(rng);
-        let request = AiRequestPayload::new(MODEL, 256, 100_000_000, 30_000_000, Vec::new());
-        (seal_payload(&secret, &ephemeral, nonce, request, prompt, recipients).unwrap(), secret)
+        seal_request_v1_with_rng(MODEL, 256, 100_000_000, 30_000_000, prompt, recipients, rng).unwrap()
     }
 
     #[test]
@@ -779,7 +805,8 @@ mod tests {
         // The older client printed the bare root key; it still opens the answer.
         let rh = [5u8; 32];
         let body = seal_response_with_rng(&a.response_key, &rh, b"answer", &mut r);
-        let printed = PrivateRequestSecret::from_hex(&hex::encode(secret.root_key())).unwrap();
+        assert_eq!(secret.to_hex(), hex::encode(secret.root_key()));
+        let printed = PrivateRequestSecret::from_hex(&secret.to_hex()).unwrap();
         assert_eq!(open_response(&printed, &rh, &pk_a, &body).unwrap(), b"answer");
         // Schedule 1's response key is the one every recipient can derive from the root key.
         assert_eq!(a.response_key.key, response_key_v1(&secret.root_key(), &pk_a));
