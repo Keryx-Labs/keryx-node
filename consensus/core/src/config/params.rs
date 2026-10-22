@@ -221,6 +221,9 @@ pub const H13_ACTIVATION_DAA: u64 = 93_550_000;
 /// Targets 2026-10-09 ~14:00 UTC (from daa 117_774_522 at 2026-10-04 18:37 UTC, ~10.13 daa/s).
 pub const H14_ACTIVATION_DAA: u64 = 121_985_000;
 
+/// Mainnet H15 gate: every verifiable-inference, audit, block task, PoM v5 and holder-reward v3 rule. Node and miner.
+pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
+
 /// Testnet H15 gate: every verifiable-inference, audit and holder-reward v3 rule. Node and miner.
 pub const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
 
@@ -2331,7 +2334,7 @@ pub const MAINNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(21_932_751),
     pom_maxlevel_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
     pom_v4_activation: ForkActivation::new(79_210_000), // relaunch frontier
-    pom_v5_activation: ForkActivation::never(),
+    pom_v5_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     h10_activation: ForkActivation::new(H10_ACTIVATION_DAA),
 
     // Ratio-reward (holder-weighted miner cut). Mainnet activation H = DAA 37_780_000, targeting
@@ -2394,19 +2397,19 @@ pub const MAINNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(77_525_000),
     reward_routing_activation: ForkActivation::new(79_210_000),
     private_inference_activation: ForkActivation::new(H14_ACTIVATION_DAA),
-    verifiable_inference_activation: ForkActivation::never(),
-    trace_shape_activation: ForkActivation::never(),
-    trace_prefix_activation: ForkActivation::never(),
-    trace_audit_activation: ForkActivation::never(),
-    trace_sanction_activation: ForkActivation::never(),
-    trace_context_activation: ForkActivation::never(),
-    reward_draw_activation: ForkActivation::never(),
-    service_window_v3_activation: ForkActivation::never(),
-    trace_dedup_activation: ForkActivation::never(),
-    ratio_reward_v3_activation: ForkActivation::never(),
-    trace_chain_activation: ForkActivation::never(),
-    block_task_activation: ForkActivation::never(),
-    trace_seed_bind_activation: ForkActivation::never(),
+    verifiable_inference_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_shape_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_prefix_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_audit_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_sanction_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_context_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    reward_draw_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    service_window_v3_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_dedup_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    ratio_reward_v3_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_chain_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    block_task_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    trace_seed_bind_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2837,6 +2840,37 @@ mod ratio_reward_bps_tests {
         for i in 1..RATIO_REWARD_THRESHOLDS_V3.len() {
             assert_eq!(RATIO_REWARD_THRESHOLDS_V3[i], 10 * i as u64);
         }
+    }
+}
+
+#[cfg(test)]
+mod h15_gate_tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_h15_rules_share_one_gate_after_h14() {
+        let p = &MAINNET_PARAMS;
+        let gates = [
+            p.pom_v5_activation,
+            p.verifiable_inference_activation,
+            p.trace_shape_activation,
+            p.trace_prefix_activation,
+            p.trace_audit_activation,
+            p.trace_sanction_activation,
+            p.trace_context_activation,
+            p.reward_draw_activation,
+            p.service_window_v3_activation,
+            p.trace_dedup_activation,
+            p.ratio_reward_v3_activation,
+            p.trace_chain_activation,
+            p.block_task_activation,
+            p.trace_seed_bind_activation,
+        ];
+        for g in gates {
+            assert_eq!(g.daa_score(), H15_ACTIVATION_DAA);
+        }
+        assert!(H15_ACTIVATION_DAA > H14_ACTIVATION_DAA);
+        assert!(p.private_inference_activation.daa_score() < H15_ACTIVATION_DAA);
     }
 }
 
