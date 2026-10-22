@@ -1240,16 +1240,14 @@ pub const RATIO_REWARD_BPS_V2: [u64; 9] = [5_000, 5_500, 6_000, 6_500, 7_000, 7_
 /// 0/3/7/15/30/45/60/75/90 days held.
 pub const RATIO_REWARD_THRESHOLDS_V2: [u64; 9] = [0, 3, 7, 15, 30, 45, 60, 75, 90];
 
-/// Ratio-reward v3 bracket table, gated by `ratio_reward_v3_activation`: 1 % with nothing held,
-/// then +5 % every 10 days of production held, 100 % at 200 days.
-pub const RATIO_REWARD_BPS_V3: [u64; 21] = [
-    100, 500, 1_000, 1_500, 2_000, 2_500, 3_000, 3_500, 4_000, 4_500, 5_000, 5_500, 6_000, 6_500, 7_000, 7_500, 8_000, 8_500,
-    9_000, 9_500, 10_000,
-];
+/// Ratio-reward v3 bracket table, gated by `ratio_reward_v3_activation`: 5 % with nothing held,
+/// 10 % at 10 days of production held, then +10 % every 10 days to 80 % at 80 days, then +5 %
+/// every 10 days, 100 % at 120 days.
+pub const RATIO_REWARD_BPS_V3: [u64; 13] =
+    [500, 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 8_500, 9_000, 9_500, 10_000];
 
 /// Bracket entry thresholds for `RATIO_REWARD_BPS_V3`, same semantics as `RATIO_REWARD_THRESHOLDS_V2`.
-pub const RATIO_REWARD_THRESHOLDS_V3: [u64; 21] =
-    [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200];
+pub const RATIO_REWARD_THRESHOLDS_V3: [u64; 13] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
 
 /// Length (in blocks) of the trailing window over which a payout address's production (coinbase
 /// earned) is summed. 24h at 10 BPS = 864_000 blocks. HARD CONSTRAINT: must stay `< pruning_depth`
@@ -2827,17 +2825,17 @@ mod ratio_reward_bps_tests {
 
     #[test]
     fn v3_brackets() {
-        assert_eq!(ratio_reward_bps_v3(0, P), 100);
-        assert_eq!(ratio_reward_bps_v3(10 * P - 1, P), 100);
-        assert_eq!(ratio_reward_bps_v3(10 * P, P), 500);
-        assert_eq!(ratio_reward_bps_v3(22 * P, P), 1_000);
-        assert_eq!(ratio_reward_bps_v3(90 * P, P), 4_500);
-        assert_eq!(ratio_reward_bps_v3(200 * P - 1, P), 9_500);
-        assert_eq!(ratio_reward_bps_v3(200 * P, P), 10_000);
+        assert_eq!(ratio_reward_bps_v3(0, P), 500);
+        assert_eq!(ratio_reward_bps_v3(10 * P - 1, P), 500);
+        assert_eq!(ratio_reward_bps_v3(10 * P, P), 1_000);
+        assert_eq!(ratio_reward_bps_v3(22 * P, P), 2_000);
+        assert_eq!(ratio_reward_bps_v3(80 * P, P), 8_000);
+        assert_eq!(ratio_reward_bps_v3(90 * P, P), 8_500);
+        assert_eq!(ratio_reward_bps_v3(120 * P - 1, P), 9_500);
+        assert_eq!(ratio_reward_bps_v3(120 * P, P), 10_000);
         assert_eq!(ratio_reward_bps_v3(u64::MAX / 2, P), 10_000);
         for i in 1..RATIO_REWARD_THRESHOLDS_V3.len() {
             assert_eq!(RATIO_REWARD_THRESHOLDS_V3[i], 10 * i as u64);
-            assert_eq!(RATIO_REWARD_BPS_V3[i], 500 * i as u64);
         }
     }
 }
