@@ -194,7 +194,7 @@ impl DbWindowedProductionPrefixStore {
     /// highest-retained cumulative (see `collapse_below_preserves_queries`). Because it changes no value
     /// the consensus reads, it needs no cross-node coordination (a collapsed and a freshly-built node
     /// return identical `windowed()`), and can never cause a UTXO / consensus divergence.
-    pub fn collapse_below(&self, batch: &mut WriteBatch, floor_index: u64, entry_budget: u64) -> Result<u64, StoreError> {
+    pub fn collapse_below(&self, batch: &mut WriteBatch, floor_index: u64, entry_budget: u64) -> Result<(u64, bool), StoreError> {
         let mut opts = ReadOptions::default();
         opts.set_iterate_range(rocksdb::PrefixRange([self.entries_prefix].as_slice()));
         let it = self.db.iterator_opt(IteratorMode::Start, opts);
@@ -202,8 +202,10 @@ impl DbWindowedProductionPrefixStore {
         // Per-SPK max cumulative among this call's collapsed entries (bucket bytes → cumulative).
         let mut folded: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut deleted = 0u64;
+        let mut complete = true;
         for item in it {
             if deleted >= entry_budget {
+                complete = false;
                 break;
             }
             let (key, value) = item?;
@@ -226,7 +228,7 @@ impl DbWindowedProductionPrefixStore {
             let existing = self.db.get(&fk)?.map(decode_u64).unwrap_or(0);
             batch.put(fk, existing.max(cumulative).to_le_bytes());
         }
-        Ok(deleted)
+        Ok((deleted, complete))
     }
 
     /// Dump, per SPK holding entries in `(bottom, top]`, the cumulative at `bottom` and those
@@ -521,12 +523,12 @@ mod tests {
         // Tiny budget forces multiple partial passes (incl. mid-bucket cuts).
         loop {
             let mut batch = WriteBatch::default();
-            let n = store.collapse_below(&mut batch, floor_index, 2).unwrap();
+            let (n, complete) = store.collapse_below(&mut batch, floor_index, 2).unwrap();
             db.write(batch).unwrap();
             for (sb, b, want) in &before {
                 assert_eq!(store.windowed(&spk(*sb), *b, w).unwrap(), *want, "post partial-collapse spk {sb} b {b}");
             }
-            if n == 0 {
+            if complete {
                 break;
             }
         }

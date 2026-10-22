@@ -89,6 +89,10 @@ pub struct PruningProcessor {
     // (see `gc_old_pom_proofs`). In-memory only — on restart the sweep simply re-walks from
     // the pruning point, issuing harmless no-op deletes for proofs that are already gone.
     pom_gc_cursor: AtomicU64,
+
+    // Highest prefix floor completely swept. This avoids rescanning the full RocksDB prefix
+    // after every virtual update while the pruning point remains unchanged.
+    ratio_prefix_collapsed_through: AtomicU64,
 }
 
 impl Deref for PruningProcessor {
@@ -121,6 +125,7 @@ impl PruningProcessor {
             config,
             is_consensus_exiting,
             pom_gc_cursor: AtomicU64::new(0),
+            ratio_prefix_collapsed_through: AtomicU64::new(0),
         }
     }
 
@@ -201,19 +206,24 @@ impl PruningProcessor {
         if floor_index == 0 {
             return; // the whole chain is still within one ratio window of the pruning point
         }
+        if floor_index <= self.ratio_prefix_collapsed_through.load(Ordering::Relaxed) {
+            return; // this floor has already been fully swept
+        }
         let mut batch = WriteBatch::default();
-        let deleted = match self.windowed_production_prefix_store.collapse_below(&mut batch, floor_index, COLLAPSE_BUDGET) {
-            Ok(n) => n,
+        let (deleted, complete) = match self.windowed_production_prefix_store.collapse_below(&mut batch, floor_index, COLLAPSE_BUDGET) {
+            Ok(result) => result,
             Err(e) => {
                 warn!("ratio prefix collapse skipped: {e}");
                 return;
             }
         };
-        if deleted == 0 {
-            return; // caught up — nothing newly fell below the floor
+        if complete {
+            self.ratio_prefix_collapsed_through.fetch_max(floor_index, Ordering::Relaxed);
         }
-        self.db.write(batch).unwrap();
-        debug!("Ratio prefix collapse: folded {deleted} entries below chain index {floor_index} into per-SPK floors");
+        if deleted > 0 {
+            self.db.write(batch).unwrap();
+            debug!("Ratio prefix collapse: folded {deleted} entries below chain index {floor_index} into per-SPK floors");
+        }
     }
 
     /// Garbage-collect PoM possession proofs older than `POM_PROOF_GC_DEPTH_CHAIN_BLOCKS` chain blocks.
