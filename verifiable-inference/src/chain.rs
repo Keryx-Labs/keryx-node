@@ -275,7 +275,9 @@ pub fn verify_chain_point(
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
             let (b0, n) = norm_fragment(seed, i, k);
             let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
-            fragment_link(&p.x, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
+            let x_one = crate::verify::x_len(k, o.layout) as usize;
+            let xs = if p.x.len() == x_one { &p.x[..] } else { p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)? };
+            fragment_link(xs, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
         }
         (manifest::LINK_GLU, LinkOpening::Source { src, y, ids: Some(ids) }) if o.input.n_exp > 1 => {
             let se = open_entry(tier, src, pl.src as u64)?;
@@ -520,6 +522,9 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         _ => return Err(Fail::Shape),
     };
     let post = if kind == Resid::Attn { ll.post_attn } else { ll.post_ffn };
+    if ll.moe.is_some() && kind == Resid::Out && post == manifest::NONE && !matches!(p.add, ResidAdd::Moe(_)) {
+        return Err(Fail::Shape);
+    }
     if let ResidAdd::Moe(m) = &p.add {
         let moe = ll.moe.filter(|_| kind == Resid::Out && post == manifest::NONE).ok_or(Fail::Shape)?;
         let ctx2 = MoeCheck { tier, ctx, shape: &shape, pos_root: &pos_root, layer, down: rank, dim, c, seed };

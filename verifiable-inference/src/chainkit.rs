@@ -1066,6 +1066,21 @@ mod moe_tests {
     }
 
     #[test]
+    fn a_moe_residual_must_carry_its_experts() {
+        let m = build(false, None, 1);
+        let resp = ResponseCtx { trace_root: m.trace_root, n_prompt: 1, n_pos: 1 };
+        let mut n = 0;
+        for s in seeds() {
+            let Some(mut p) = m.open(&s) else { continue };
+            let c = draw::point(&s, chain::RESID_POINT)[2] % (D as u64 * 4 / B3_CHUNK as u64);
+            p.add = ResidAdd::Chunk(leaf_chunk(&m.pos, 5, c));
+            assert_eq!(verify_resid_point(&m.tier, &m.ctx, &resp, &s, &p), Err(crate::verify::Fail::Shape));
+            n += 1;
+        }
+        assert!(n > 0);
+    }
+
+    #[test]
     fn swapped_experts_are_refused() {
         let m = build(true, None, 1);
         let results: Vec<_> = seeds().filter_map(|s| m.check(&s)).collect();
