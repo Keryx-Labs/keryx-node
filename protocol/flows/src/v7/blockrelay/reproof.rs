@@ -3,7 +3,7 @@ use crate::{
     flow_context::{FlowContext, RequestScope},
     flow_trait::Flow,
 };
-use keryx_consensus_core::{block::Block, blockstatus::BlockStatus};
+use keryx_consensus_core::{block::Block, blockstatus::BlockStatus, config::params::POM_PROOF_SERVE_DEPTH_DAA};
 use keryx_core::{debug, info};
 use keryx_hashes::Hash;
 use keryx_p2p_lib::{
@@ -62,6 +62,14 @@ impl PomReproofFlow {
                 self.ctx.abandon_pom_reproof(hash);
                 debug!("PoM re-proof: {} is header-only here, dropped from the re-fetch queue", hash);
                 continue;
+            }
+            if let Ok(header) = session.async_get_header(hash).await {
+                let sink_daa = session.async_get_sink_daa_score_timestamp().await.daa_score;
+                if sink_daa.saturating_sub(header.daa_score) > POM_PROOF_SERVE_DEPTH_DAA {
+                    self.ctx.abandon_pom_reproof(hash);
+                    debug!("PoM re-proof: {} is below the proof serve depth, dropped from the re-fetch queue", hash);
+                    continue;
+                }
             }
             drop(session);
             if let Err(e) = self.try_readopt_pom_proof(hash).await {
