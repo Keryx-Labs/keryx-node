@@ -848,7 +848,7 @@ const MINIMUM_KERYXD_PEER_VERSION_H13: (u32, u32, u32) = (1, 6, 1);
 /// Minimum peer version once H14 is active on the local virtual chain.
 const MINIMUM_KERYXD_PEER_VERSION_H14: (u32, u32, u32) = (1, 6, 4);
 /// Minimum peer version once H15 is active on the local virtual chain.
-const MINIMUM_KERYXD_PEER_VERSION_H15: (u32, u32, u32) = (1, 6, 5);
+const MINIMUM_KERYXD_PEER_VERSION_H15: (u32, u32, u32) = (1, 6, 6);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
