@@ -35,6 +35,12 @@ pub fn blocks(leaf: &[u8], layout: u8, k: usize) -> Option<Vec<(f32, [i8; 32])>>
     Some(out)
 }
 
+/// Whether a block is one the quantizer writes: a zero scale, or a positive scale with a value at
+/// full magnitude.
+pub fn canonical(d: f32, q: &[i8; 32]) -> bool {
+    d == 0.0 || (d > 0.0 && q.iter().any(|&v| v.unsigned_abs() == 127))
+}
+
 pub const MMVQ: u8 = 0;
 pub const MMQ_D4: u8 = 1;
 pub const MMQ_DS4: u8 = 2;

@@ -134,8 +134,10 @@ pub struct MoeAdd {
     pub slots: Vec<LeafChunk>,
     pub shexp: LeafChunk,
     pub router_row: (EntryOpening, ChunkRange),
-    pub gate: EntryOpening,
-    pub gate_x: LeafBytes,
+    /// The whole attention residual of the layer.
+    pub resid: LeafBytes,
+    /// The whole FFN norm weight of the layer.
+    pub norm: (EntryOpening, ChunkRange),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -284,8 +286,8 @@ impl W {
                 }
                 self.leaf_chunk(&m.shexp);
                 self.weights(&m.router_row);
-                self.entry(&m.gate);
-                self.leaf_bytes(&m.gate_x);
+                self.leaf_bytes(&m.resid);
+                self.weights(&m.norm);
             }
         }
     }
@@ -395,8 +397,8 @@ impl R<'_> {
                     slots,
                     shexp: self.leaf_chunk()?,
                     router_row: self.weights()?,
-                    gate: self.entry()?,
-                    gate_x: self.leaf_bytes()?,
+                    resid: self.leaf_bytes()?,
+                    norm: self.weights()?,
                 }))
             }
             _ => return None,

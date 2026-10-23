@@ -48,6 +48,26 @@ fn q8_0_rows(seed: u64, rows: usize, scale: f32) -> Vec<u8> {
     out
 }
 
+/// A Q8_1 row of `D` zero values with block scale `d`.
+fn zero_q8_row(d: f32) -> Vec<u8> {
+    (0..D / 32)
+        .flat_map(|_| {
+            let mut b = f16::from_f32(d).to_le_bytes().to_vec();
+            b.extend_from_slice(&[0u8; 34]);
+            b
+        })
+        .collect()
+}
+
+/// A Q8_1 row of `D` values with block scale `d` and one value per block at full magnitude.
+fn peaked_q8_row(d: f32) -> Vec<u8> {
+    let mut x = zero_q8_row(d);
+    for blk in x.chunks_exact_mut(36) {
+        blk[4] = 127;
+    }
+    x
+}
+
 fn rank(l: usize, p: usize) -> usize {
     l * PER_LAYER + p
 }
@@ -298,6 +318,38 @@ impl Tier {
                 leaves[2 * OUTPUT] = x_o;
             } else {
                 empty(&mut leaves, OUTPUT);
+            }
+            leaves[chain::meta_leaf(np, N_LAYERS as u64, 0) as usize] = chain::meta(t as u32, 1, tok).to_vec();
+            let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+            positions.push(Position { tok, leaves, hashes });
+        }
+        let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
+        let trace_root = b3_root(&pos_roots);
+        Trace { n_prompt, positions, pos_roots, trace_root }
+    }
+
+    /// A trace over `tokens` with every product input `zero_q8_row(d)`, every output zero and
+    /// every residual equal to the token embedding.
+    pub fn scaled_zero_trace(&self, tokens: &[u32], n_prompt: u32, d: f32) -> Trace {
+        let np = N_PRODUCTS as u64;
+        let n_leaves = chain::n_pos_leaves(np, N_LAYERS as u64, 0) as usize;
+        let x = zero_q8_row(d);
+        let mut positions = Vec::with_capacity(tokens.len());
+        for (t, &tok) in tokens.iter().enumerate() {
+            let mut leaves = vec![Vec::new(); n_leaves];
+            let h: Vec<u8> = self.embedding(tok).iter().flat_map(|a| a.to_le_bytes()).collect();
+            for l in 0..N_LAYERS {
+                for p in 0..PER_LAYER {
+                    let r = rank(l, p);
+                    leaves[2 * r] = x.clone();
+                    leaves[2 * r + 1] = if p == FFN_UP { Vec::new() } else { vec![0u8; 4 * self.entry(r).m as usize] };
+                }
+                leaves[chain::resid_leaf(np, l as u64, Resid::Attn) as usize] = h.clone();
+                leaves[chain::resid_leaf(np, l as u64, Resid::Out) as usize] = h.clone();
+            }
+            if t + 1 >= n_prompt as usize {
+                leaves[2 * OUTPUT] = x.clone();
+                leaves[2 * OUTPUT + 1] = vec![0u8; 4 * HEAD_M];
             }
             leaves[chain::meta_leaf(np, N_LAYERS as u64, 0) as usize] = chain::meta(t as u32, 1, tok).to_vec();
             let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
@@ -575,6 +627,32 @@ mod tests {
     }
 
     #[test]
+    fn a_response_with_oversized_input_scales_is_refused() {
+        use crate::chain::verify_chain_prefix_point;
+        let tier = Tier::new();
+        let request = *blake3::hash(b"request").as_bytes();
+        let mut tokens: Vec<u32> = request.iter().map(|&b| b as u32).collect();
+        tokens.extend((0..8u32).map(|i| (i * 37 + 5) % VOCAB as u32));
+        let (tc, cc, pc) = (tier.tier(), tier.chain_ctx(), tier.prefix_ctx(0));
+        let accepted = |trace: &Trace| -> Vec<u32> {
+            let rc = resp(trace);
+            (0..48u32)
+                .filter(|s| {
+                    let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+                    (0..draw::POINTS).all(|i| {
+                        let (p, tok, link) = tier.open_point(trace, &seed, i);
+                        verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None).is_ok()
+                    }) && verify_chain_prefix_point(&tc, &cc, &pc, &rc, &seed, &request, &tier.open_prefix(trace, &seed, 0)).is_ok()
+                        && verify_resid_point(&tc, &cc, &rc, &seed, &tier.open_resid(trace, &seed)).is_ok()
+                })
+                .collect()
+        };
+        assert_eq!(accepted(&tier.trace(&tokens, prefix::PREFIX_LEN)).len(), 48);
+        let forged = accepted(&tier.scaled_zero_trace(&tokens, prefix::PREFIX_LEN, 1.0e4));
+        assert!(forged.is_empty(), "accepted for seeds {forged:?}");
+    }
+
+    #[test]
     fn a_zeroed_input_is_refused() {
         let (tier, mut trace) = honest();
         let r = rank(1, ATTN_Q);
@@ -811,6 +889,11 @@ mod moe_tests {
     }
 
     fn build(order_swap: bool, bump_slot: Option<usize>, batch: u32) -> Moe {
+        build_with(order_swap, bump_slot, batch, None)
+    }
+
+    /// `gate_scale`: router input committed as `peaked_q8_row(gate_scale)` under scores of no input.
+    fn build_with(order_swap: bool, bump_slot: Option<usize>, batch: u32, gate_scale: Option<f32>) -> Moe {
         let router = vecf(1, E * D, 0.05);
         let bias = vecf(2, E, 0.01);
         let norm: Vec<f32> = (0..D).map(|i| 1.0 + 0.001 * (i % 7) as f32).collect();
@@ -848,7 +931,10 @@ mod moe_tests {
 
         let r = vecf(3, D, 2.0);
         let x = chain::rms_norm(&r, &norm, EPS);
-        let scores: Vec<f32> = (0..E).map(|e| router[e * D..(e + 1) * D].iter().zip(&x).map(|(&w, &v)| w as f64 * v).sum::<f64>() as f32).collect();
+        let scores: Vec<f32> = match gate_scale {
+            Some(_) => vecf(30, E, 3.0),
+            None => (0..E).map(|e| router[e * D..(e + 1) * D].iter().zip(&x).map(|(&w, &v)| w as f64 * v).sum::<f64>() as f32).collect(),
+        };
         let sel: Vec<f64> = scores.iter().zip(&bias).map(|(&s, &b)| 1.0 / (1.0 + (-(s as f64)).exp()) + b as f64).collect();
         let mut ids: Vec<u32> = (0..E as u32).collect();
         ids.sort_by(|&a, &b| sel[b as usize].total_cmp(&sel[a as usize]));
@@ -872,7 +958,10 @@ mod moe_tests {
         let np = 4u64;
         let n_leaves = chain::n_pos_leaves(np, 1, 1) as usize;
         let mut leaves = vec![Vec::new(); n_leaves];
-        leaves[6] = q8_1_row(&x);
+        leaves[6] = match gate_scale {
+            Some(d) => peaked_q8_row(d),
+            None => q8_1_row(&x),
+        };
         leaves[3] = y_exps;
         leaves[5] = bytes(&sh);
         leaves[chain::resid_leaf(np, 0, Resid::Attn) as usize] = bytes(&r);
@@ -924,8 +1013,8 @@ mod moe_tests {
                     slots: (0..U as u64).map(|s| leaf_chunk(&self.pos, 3, s * per + c)).collect(),
                     shexp: leaf_chunk(&self.pos, 5, c),
                     router_row: (self.eo(4), self.range(row as usize * 4 * D, 4 * D)),
-                    gate: self.eo(3),
-                    gate_x: leaf_bytes(&self.pos, 6),
+                    resid: leaf_bytes(&self.pos, chain::resid_leaf(np, 0, Resid::Attn)),
+                    norm: (self.eo(6), self.range(4 * E * D + 4 * E, 4 * D)),
                 })),
             })
         }
@@ -946,6 +1035,13 @@ mod moe_tests {
         let m = build(false, None, 1);
         let n = seeds().filter_map(|s| m.check(&s).map(|r| r.unwrap_or_else(|e| panic!("{e:?}")))).count();
         assert!(n > 0);
+    }
+
+    #[test]
+    fn router_scores_over_an_oversized_input_scale_are_refused() {
+        let m = build_with(false, None, 1, Some(1.0e4));
+        let results: Vec<_> = seeds().filter_map(|s| m.check(&s)).collect();
+        assert!(!results.is_empty() && results.iter().all(|r| r.is_err()), "{results:?}");
     }
 
     #[test]
@@ -1107,6 +1203,34 @@ mod block_task_tests {
             verify_block_task(&tier.tier(), &tier.chain_ctx(), &pc, &trace.trace_root, &window_seed, &block, &opening(&tier, &trace, &block))
                 .unwrap_or_else(|e| panic!("block {s}: {e:?}"));
         }
+    }
+
+    fn accepted_blocks(tier: &Tier, trace: &Trace, window_seed: &Hash) -> Vec<u32> {
+        let pc = tier.prefix_ctx(0);
+        (0..48u32)
+            .filter(|s| {
+                let block = *blake3::hash(&s.to_le_bytes()).as_bytes();
+                verify_block_task(&tier.tier(), &tier.chain_ctx(), &pc, &trace.trace_root, window_seed, &block, &opening(tier, trace, &block)).is_ok()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_task_with_oversized_input_scales_is_refused() {
+        let tier = Tier::new();
+        let window_seed = [0x5Au8; 32];
+        let trace = tier.scaled_zero_trace(&task_tokens(&tier.prefix_ctx(0).table, &window_seed), TASK_LEN, 1.0e4);
+        let accepted = accepted_blocks(&tier, &trace, &window_seed);
+        assert!(accepted.is_empty(), "accepted for blocks {accepted:?}");
+    }
+
+    #[test]
+    fn a_task_with_undersized_input_scales_is_refused() {
+        let tier = Tier::new();
+        let window_seed = [0x5Au8; 32];
+        let trace = tier.scaled_zero_trace(&task_tokens(&tier.prefix_ctx(0).table, &window_seed), TASK_LEN, 1.0e-3);
+        let accepted = accepted_blocks(&tier, &trace, &window_seed);
+        assert!(accepted.is_empty(), "accepted for blocks {accepted:?}");
     }
 
     #[test]
