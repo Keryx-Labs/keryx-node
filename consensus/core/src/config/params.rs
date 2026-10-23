@@ -2408,7 +2408,7 @@ pub const MAINNET_PARAMS: Params = Params {
     trace_dedup_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     ratio_reward_v3_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     trace_chain_activation: ForkActivation::new(H15_ACTIVATION_DAA),
-    block_task_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
@@ -2553,7 +2553,7 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_dedup_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     ratio_reward_v3_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     trace_chain_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
-    block_task_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
@@ -2863,7 +2863,6 @@ mod h15_gate_tests {
             p.trace_dedup_activation,
             p.ratio_reward_v3_activation,
             p.trace_chain_activation,
-            p.block_task_activation,
             p.trace_seed_bind_activation,
         ];
         for g in gates {
@@ -2871,6 +2870,8 @@ mod h15_gate_tests {
         }
         assert!(H15_ACTIVATION_DAA > H14_ACTIVATION_DAA);
         assert!(p.private_inference_activation.daa_score() < H15_ACTIVATION_DAA);
+        assert_eq!(p.block_task_activation, ForkActivation::never());
+        assert_eq!(TESTNET_PARAMS.block_task_activation, ForkActivation::never());
     }
 }
 
