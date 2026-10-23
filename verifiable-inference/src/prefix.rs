@@ -4,7 +4,7 @@ use crate::draw;
 use crate::manifest;
 use crate::merkle::{Hash, b3_fold, b3_verify};
 use crate::opening::PrefixPoint;
-use crate::verify::{Fail, PosShape, ResponseCtx, TierCtx, layout_for, open_bytes, open_entry, open_row, x_len};
+use crate::verify::{Fail, PosShape, ResponseCtx, TierCtx, expected_ubatch, layout_for, open_bytes, open_entry, open_row, x_len};
 use crate::{q8, quant};
 
 /// Prefix tokens, one per byte of the request id.
@@ -132,6 +132,9 @@ pub(crate) fn verify_prefix_point_at(
     let pos_root = b3_fold(n_pos_leaves, 0, blake3::hash(&p.x).as_bytes(), &p.x_path).ok_or(Fail::Trace)?;
     if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
+    }
+    if p.n_ubatch != expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
     }
     if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);

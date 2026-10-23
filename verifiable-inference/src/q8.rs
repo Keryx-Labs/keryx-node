@@ -41,6 +41,21 @@ pub fn canonical(d: f32, q: &[i8; 32]) -> bool {
     d == 0.0 || (d > 0.0 && q.iter().any(|&v| v.unsigned_abs() == 127))
 }
 
+/// Largest `|s - d * sum(q)|` of a block, in units of its scale.
+const SUM_SLACK: f64 = 24.0;
+
+/// Whether every stored partial sum of a row agrees with the values of its block.
+pub fn sums_consistent(leaf: &[u8], layout: u8, k: usize) -> bool {
+    let (Some((_, sums)), Some(blocks)) = (decode(leaf, layout, k), blocks(leaf, layout, k)) else {
+        return false;
+    };
+    let Some(sums) = sums else { return true };
+    sums.iter().zip(&blocks).all(|(&s, (d, q))| {
+        let sq = q.iter().map(|&v| v as f64).sum::<f64>() * *d as f64;
+        (s as f64 - sq).abs() <= SUM_SLACK * d.abs() as f64 + (s as f64).abs() / 1024.0
+    })
+}
+
 pub const MMVQ: u8 = 0;
 pub const MMQ_D4: u8 = 1;
 pub const MMQ_DS4: u8 = 2;
@@ -91,4 +106,39 @@ pub fn decode(leaf: &[u8], layout: u8, k: usize) -> Option<(Vec<f32>, Option<Vec
         s.truncate(k / 32);
     }
     Some((x, has_s.then_some(s)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::q8_1_row;
+
+    fn row() -> Vec<u8> {
+        q8_1_row(&(0..512).map(|i| ((i * 37 % 101) as f64 - 50.0) * 0.013).collect::<Vec<_>>())
+    }
+
+    fn set_sum(x: &mut [u8], block: usize, s: f32) {
+        x[block * 36 + 2..block * 36 + 4].copy_from_slice(&f16::from_f32(s).to_le_bytes());
+    }
+
+    #[test]
+    fn honest_sums_pass() {
+        assert!(sums_consistent(&row(), MMVQ, 512));
+    }
+
+    #[test]
+    fn a_shifted_sum_fails() {
+        let mut x = row();
+        let (d, s) = (f16::read(&x, 36 * 3), f16::read(&x, 36 * 3 + 2));
+        set_sum(&mut x, 3, s + 100.0 * d);
+        assert!(!sums_consistent(&x, MMVQ, 512));
+    }
+
+    #[test]
+    fn a_zero_block_needs_a_zero_sum() {
+        let mut x = q8_1_row(&vec![0.0; 512]);
+        assert!(sums_consistent(&x, MMVQ, 512));
+        set_sum(&mut x, 0, 0.5);
+        assert!(!sums_consistent(&x, MMVQ, 512));
+    }
 }

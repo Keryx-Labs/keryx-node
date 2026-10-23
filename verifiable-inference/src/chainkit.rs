@@ -11,7 +11,7 @@ use crate::prefix::expected_input;
 use crate::q8;
 use crate::quant;
 use crate::f16;
-use crate::testkit::{q8_1_row, serialize};
+use crate::testkit::{in_layout, layout_at, q8_1_row, serialize};
 use crate::verify::TierCtx;
 
 pub const D: usize = 512;
@@ -101,6 +101,22 @@ pub struct Trace {
     pub positions: Vec<Position>,
     pub pos_roots: Vec<Hash>,
     pub trace_root: Hash,
+    /// Batch size committed at every position instead of the expected one.
+    pub ubatch: Option<u32>,
+}
+
+impl Trace {
+    /// Committed batch size and product input layout at position `t`.
+    pub fn layout(&self, t: u64) -> (u32, u8) {
+        layout_of(self.ubatch, t, self.n_prompt)
+    }
+}
+
+fn layout_of(forced: Option<u32>, t: u64, n_prompt: u32) -> (u32, u8) {
+    match forced {
+        Some(ub) => (ub, crate::verify::layout_for(ub, quant::Q8_0)),
+        None => layout_at(t, n_prompt),
+    }
 }
 
 impl Tier {
@@ -258,6 +274,11 @@ impl Tier {
 
     /// A stage-2 trace of an honest pass over `tokens`, one position per token.
     pub fn trace(&self, tokens: &[u32], n_prompt: u32) -> Trace {
+        self.trace_declaring(tokens, n_prompt, None)
+    }
+
+    /// [`Self::trace`] committing batch size `ubatch` at every position when given.
+    pub fn trace_declaring(&self, tokens: &[u32], n_prompt: u32, ubatch: Option<u32>) -> Trace {
         let np = N_PRODUCTS as u64;
         let n_leaves = chain::n_pos_leaves(np, N_LAYERS as u64, 0) as usize;
         let as_f32 = |v: &[f64]| -> Vec<f32> { v.iter().map(|&a| a as f32).collect() };
@@ -305,7 +326,7 @@ impl Tier {
                     (SSM_F_A, &x_in, bytes(&y_fa)),
                     (SSM_F_B, &x_fb, bytes(&y_fb)),
                 ] {
-                    leaves[2 * rank(l, p)] = x.clone();
+                    leaves[2 * rank(l, p)] = in_layout(x, layout_of(ubatch, t as u64, n_prompt).1);
                     leaves[2 * rank(l, p) + 1] = y;
                 }
                 leaves[chain::resid_leaf(np, l as u64, Resid::Attn) as usize] = bytes(&r);
@@ -319,13 +340,13 @@ impl Tier {
             } else {
                 empty(&mut leaves, OUTPUT);
             }
-            leaves[chain::meta_leaf(np, N_LAYERS as u64, 0) as usize] = chain::meta(t as u32, 1, tok).to_vec();
+            leaves[chain::meta_leaf(np, N_LAYERS as u64, 0) as usize] = chain::meta(t as u32, layout_of(ubatch, t as u64, n_prompt).0, tok).to_vec();
             let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
             positions.push(Position { tok, leaves, hashes });
         }
         let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
         let trace_root = b3_root(&pos_roots);
-        Trace { n_prompt, positions, pos_roots, trace_root }
+        Trace { n_prompt, positions, pos_roots, trace_root, ubatch }
     }
 
     /// A trace over `tokens` with every product input `zero_q8_row(d)`, every output zero and
@@ -341,7 +362,7 @@ impl Tier {
             for l in 0..N_LAYERS {
                 for p in 0..PER_LAYER {
                     let r = rank(l, p);
-                    leaves[2 * r] = x.clone();
+                    leaves[2 * r] = in_layout(&x, layout_at(t as u64, n_prompt).1);
                     leaves[2 * r + 1] = if p == FFN_UP { Vec::new() } else { vec![0u8; 4 * self.entry(r).m as usize] };
                 }
                 leaves[chain::resid_leaf(np, l as u64, Resid::Attn) as usize] = h.clone();
@@ -351,13 +372,13 @@ impl Tier {
                 leaves[2 * OUTPUT] = x.clone();
                 leaves[2 * OUTPUT + 1] = vec![0u8; 4 * HEAD_M];
             }
-            leaves[chain::meta_leaf(np, N_LAYERS as u64, 0) as usize] = chain::meta(t as u32, 1, tok).to_vec();
+            leaves[chain::meta_leaf(np, N_LAYERS as u64, 0) as usize] = chain::meta(t as u32, layout_at(t as u64, n_prompt).0, tok).to_vec();
             let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
             positions.push(Position { tok, leaves, hashes });
         }
         let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
         let trace_root = b3_root(&pos_roots);
-        Trace { n_prompt, positions, pos_roots, trace_root }
+        Trace { n_prompt, positions, pos_roots, trace_root, ubatch: None }
     }
 }
 
@@ -441,7 +462,7 @@ impl Tier {
         let yc = (row * 4 / B3_CHUNK as u64) as usize;
         let ych = leaf_chunk(pos, 2 * gate as u64 + 1, yc as u64);
         let point = Point {
-            n_ubatch: 1,
+            n_ubatch: trace.layout(t).0,
             pos_path: b3_path(&trace.pos_roots, t as usize),
             meta_path: b3_path(&pos.hashes, chain::meta_leaf(np, N_LAYERS as u64, 0) as usize),
             entry: self.entry_opening(drawn),
@@ -503,7 +524,7 @@ impl Tier {
         let k = self.entry(attn_norm(0)).k;
         let (b0, n) = chain::norm_fragment(seed, prefix::PREFIX_POINT, k);
         PrefixPoint {
-            n_ubatch: 1,
+            n_ubatch: trace.layout(t as u64).0,
             pos_path: b3_path(&trace.pos_roots, t),
             meta_path: b3_path(&pos.hashes, chain::meta_leaf(np, N_LAYERS as u64, 0) as usize),
             entry: self.entry_opening(0),
@@ -541,7 +562,7 @@ impl Tier {
             Resid::Out => ResidSrc::Chunk(leaf_chunk(pos, chain::resid_leaf(np, layer, Resid::Attn), c)),
         };
         ResidPoint {
-            n_ubatch: 1,
+            n_ubatch: trace.layout(t).0,
             tok: pos.tok,
             pos_path: b3_path(&trace.pos_roots, t as usize),
             meta_path: b3_path(&pos.hashes, chain::meta_leaf(np, N_LAYERS as u64, 0) as usize),
@@ -967,10 +988,10 @@ mod moe_tests {
         leaves[chain::resid_leaf(np, 0, Resid::Attn) as usize] = bytes(&r);
         leaves[chain::resid_leaf(np, 0, Resid::Out) as usize] = bytes(&out);
         leaves[chain::router_leaf(np, 1, 0) as usize] = bytes(&scores);
-        leaves[chain::meta_leaf(np, 1, 1) as usize] = chain::meta(0, batch, 7).to_vec();
+        leaves[chain::meta_leaf(np, 1, 1) as usize] = chain::meta(0, 1, 7).to_vec();
         let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
         let trace_root = b3_root(&[b3_root(&hashes)]);
-        Moe { weights, chunk_leaves, entries, entry_leaves, tier, ctx, pos: Position { tok: 7, leaves, hashes }, trace_root, n_ubatch: batch }
+        Moe { weights, chunk_leaves, entries, entry_leaves, tier, ctx, pos: Position { tok: 7, leaves, hashes }, trace_root, n_ubatch: 1 }
     }
 
     impl Moe {
@@ -1230,6 +1251,16 @@ mod block_task_tests {
         let window_seed = [0x5Au8; 32];
         let trace = tier.scaled_zero_trace(&task_tokens(&tier.prefix_ctx(0).table, &window_seed), TASK_LEN, 1.0e-3);
         let accepted = accepted_blocks(&tier, &trace, &window_seed);
+        assert!(accepted.is_empty(), "accepted for blocks {accepted:?}");
+    }
+
+    #[test]
+    fn a_task_declaring_another_batch_size_is_refused() {
+        let tier = Tier::new();
+        let window_seed = [0x5Au8; 32];
+        let tokens = task_tokens(&tier.prefix_ctx(0).table, &window_seed);
+        assert_eq!(accepted_blocks(&tier, &tier.trace(&tokens, TASK_LEN), &window_seed).len(), 48);
+        let accepted = accepted_blocks(&tier, &tier.trace_declaring(&tokens, TASK_LEN, Some(1)), &window_seed);
         assert!(accepted.is_empty(), "accepted for blocks {accepted:?}");
     }
 

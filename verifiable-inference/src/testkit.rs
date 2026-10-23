@@ -9,11 +9,10 @@ use crate::opening::{ChunkRange, EntryOpening, Opening, Point, PrefixPoint};
 use crate::prefix::{self, PrefixCtx};
 use crate::q8;
 use crate::quant;
-use crate::verify::TierCtx;
+use crate::verify::{TierCtx, expected_ubatch, layout_for};
 
 const K: usize = 512;
 const M: usize = 4;
-const N_UBATCH: u32 = 1;
 
 /// Vocabulary of the synthetic model: token id = byte value.
 pub const VOCAB: usize = 256;
@@ -61,6 +60,33 @@ fn q8_0_rows(seed: u64, rows: usize, scale: f32) -> Vec<u8> {
 }
 
 /// Q8_1 row (`mmvq` layout) of `v`, rounded the way the kernel does.
+/// `leaf`, a row of 32-value MMVQ blocks, in the byte layout of `layout`.
+pub(crate) fn in_layout(leaf: &[u8], layout: u8) -> Vec<u8> {
+    if layout == q8::MMVQ {
+        return leaf.to_vec();
+    }
+    let mut out = Vec::with_capacity(leaf.len());
+    for g in leaf.chunks(4 * 36) {
+        for b in g.chunks(36) {
+            if layout == q8::MMQ_D4 {
+                out.extend_from_slice(&f16::read(b, 0).to_le_bytes());
+            } else {
+                out.extend_from_slice(&b[..4]);
+            }
+        }
+        for b in g.chunks(36) {
+            out.extend_from_slice(&b[4..36]);
+        }
+    }
+    out
+}
+
+/// Committed batch size and input layout of a Q8_0 product at position `t`.
+pub(crate) fn layout_at(t: u64, n_prompt: u32) -> (u32, u8) {
+    let ub = expected_ubatch(t, n_prompt);
+    (ub, layout_for(ub, quant::Q8_0))
+}
+
 pub(crate) fn q8_1_row(v: &[f64]) -> Vec<u8> {
     let mut leaf = Vec::with_capacity(v.len() / 32 * 36);
     for blk in v.chunks(32) {
@@ -227,9 +253,11 @@ impl Model {
                 let v = rc.y_hat as f32 + if honest { 0.0 } else { 1.0 + rc.scale as f32 };
                 out.extend_from_slice(&v.to_le_bytes());
             }
+            let (ub, layout) = layout_at(t as u64, n_prompt);
+            let leaf = in_layout(&leaf, layout);
             let mut meta = [0u8; 8];
             meta[..4].copy_from_slice(&(t as u32).to_le_bytes());
-            meta[4..].copy_from_slice(&N_UBATCH.to_le_bytes());
+            meta[4..].copy_from_slice(&ub.to_le_bytes());
             pos_leaves.push(vec![*blake3::hash(&leaf).as_bytes(), *blake3::hash(&out).as_bytes(), *blake3::hash(&meta).as_bytes()]);
             x.push(leaf);
             y.push(out);
@@ -247,7 +275,7 @@ impl Model {
                 let row = d[2] % M as u64;
                 let rb = self.entry().row_bytes as u64;
                 Point {
-                    n_ubatch: N_UBATCH,
+                    n_ubatch: expected_ubatch(t as u64, resp.n_prompt),
                     pos_path: b3_path(&resp.pos_roots, t),
                     meta_path: b3_path(&resp.pos_leaves[t], 2),
                     entry: self.entry_opening(0),
@@ -275,7 +303,7 @@ impl Model {
         let (e, n) = (&self.entries[1].0, &self.entries[2].0);
         let rb = e.row_bytes as u64;
         o.prefix = Some(PrefixPoint {
-            n_ubatch: N_UBATCH,
+            n_ubatch: expected_ubatch(t as u64, resp.n_prompt),
             pos_path: b3_path(&resp.pos_roots, t),
             meta_path: b3_path(&resp.pos_leaves[t], 2),
             entry: self.entry_opening(0),

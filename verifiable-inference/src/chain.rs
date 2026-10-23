@@ -499,6 +499,9 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
 
     let dst_leaf = chunk_leaf(&p.dst, total, c)?;
     let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
+    if p.n_ubatch != crate::verify::expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
+    }
     if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &p.pos_path)
         || !b3_verify(&pos_root, shape.n_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path)
     {

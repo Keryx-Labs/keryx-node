@@ -10,6 +10,8 @@ use crate::{q8, quant};
 pub const EPS: f64 = 1e-5;
 pub const EPS_GEGLU: f64 = 3e-5;
 const MMVQ_MAX_BATCH: u32 = 8;
+/// Prompt positions per batch of the traced run.
+pub const UBATCH: u32 = 512;
 const MATRIX_ROW_PADDING: u64 = 512;
 
 /// Consensus data of a tier.
@@ -129,6 +131,15 @@ pub(crate) fn open_row(tier: &TierCtx, entry: &Entry, r: &ChunkRange, row: u64) 
     }
     let rb = entry.row_bytes as u64;
     open_bytes(tier, entry, r, row * rb, rb)
+}
+
+/// Batch size the traced run computes position `t` with.
+pub fn expected_ubatch(t: u64, n_prompt: u32) -> u32 {
+    if t >= n_prompt as u64 {
+        return 1;
+    }
+    let start = t / UBATCH as u64 * UBATCH as u64;
+    UBATCH.min(n_prompt - start as u32)
 }
 
 pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
@@ -253,6 +264,9 @@ pub(crate) fn verify_point_at(
     if !b3_verify(&resp.trace_root, n_traced, t, &pos_root, &p.pos_path) {
         return Err(Fail::Trace);
     }
+    if p.n_ubatch != expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
+    }
     if !b3_verify(&pos_root, n_pos_leaves, shape.meta_index, &shape.meta_hash(t, p.n_ubatch), &p.meta_path) {
         return Err(Fail::Trace);
     }
@@ -288,6 +302,9 @@ pub(crate) fn verify_point_at(
     };
 
     let k = g_entry.k as usize;
+    if !q8::sums_consistent(x, layout, k) {
+        return Err(Fail::Mismatch);
+    }
     let dot_row = |entry: &Entry, r: &ChunkRange, rr: u64| -> Result<Recomputed, Fail> {
         let bytes = open_expert_row(tier, entry, r, exp, rr)?;
         dot::canonical_dot(entry.wtype, &bytes, k, x, layout).ok_or(Fail::Unsupported)
