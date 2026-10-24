@@ -498,6 +498,37 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_attention_path(response_txid)
     }
 
+    /// Pieces an audit of `tier` accepted at `at` needs.
+    fn required_pieces_at(&self, tier: u8, at: u64) -> u8 {
+        let rules = trace_rules(
+            tier,
+            self.trace_prefix_activation.is_active(at),
+            self.trace_audit_activation.is_active(at),
+            self.trace_chain_activation.is_active(at),
+            self.attention_activation.is_active(at),
+        );
+        keryx_consensus_core::collateral::required_pieces(rules.as_ref())
+    }
+
+    pub(crate) fn awaited_opening_pieces(&self, response_txid: &[u8; 32]) -> Option<u8> {
+        self.service_ledger.lock().ledger.awaited_opening_pieces(response_txid, |t, at| self.required_pieces_at(t, at))
+    }
+
+    /// Whether the opening `tx` proves a piece its response still owes, from the key, seed and
+    /// attention path the audit awaits (the signature is a validity rule, checked elsewhere).
+    pub(crate) fn opening_awaited(&self, tx: &keryx_consensus_core::tx::Transaction) -> bool {
+        use keryx_consensus_core::collateral::{opening_body_piece, trace_seed};
+        use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
+        let Some(s) = SignedPayload::split(&tx.payload) else { return false };
+        let Some(txid) = s.body.get(1..33).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { return false };
+        let sync = self.service_ledger.lock();
+        let ledger = &sync.ledger;
+        ledger.awaited_opening_key(&txid) == Some(s.escrow_pubkey)
+            && seed_block(s.body).is_none_or(|b| ledger.awaited_opening_seed(&txid) == Some(trace_seed(&Hash::from_bytes(b), &txid)))
+            && attn_path(s.body).is_none_or(|p| ledger.awaited_attention_path(&txid) == Some(p))
+            && ledger.awaited_opening_pieces(&txid, |t, at| self.required_pieces_at(t, at)).is_some_and(|m| m & opening_body_piece(s.body) != 0)
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())

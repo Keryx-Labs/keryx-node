@@ -1721,7 +1721,7 @@ impl VirtualStateProcessor {
                 }
                 Ok(fee) => {
                     if tx.is_ai_opening() {
-                        if has_opening {
+                        if has_opening || !self.opening_awaited(tx) {
                             deferred.insert(tx.id());
                             tx_selector.reject_selection(tx.id());
                             continue;
@@ -1752,7 +1752,7 @@ impl VirtualStateProcessor {
                     }
                     Ok(fee) => {
                         if tx.is_ai_opening() {
-                            if has_opening {
+                            if has_opening || !self.opening_awaited(&tx) {
                                 tx_selector.reject_selection(tx.id());
                                 has_rejections = true;
                                 continue;

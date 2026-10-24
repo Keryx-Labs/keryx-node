@@ -200,6 +200,12 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// The pieces a drawn response still owes.
+    fn awaited_opening_pieces(&self, response_txid: &[u8; 32]) -> Option<u8> {
+        let _ = response_txid;
+        None
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         unimplemented!()
     }

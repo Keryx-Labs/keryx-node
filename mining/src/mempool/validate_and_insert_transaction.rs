@@ -11,7 +11,7 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::{private_cohort_seed, trace_seed, verify_opening_signature, verify_responder_signature},
+    collateral::{opening_body_piece, private_cohort_seed, trace_seed, verify_opening_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
@@ -247,8 +247,9 @@ impl Mempool {
     }
 
     /// Admission policy for openings: signed by the escrow key of a drawn response that still
-    /// awaits its opening, naming, if any, the seed block of that draw, and for an attention
-    /// phase, built for the path the response awaits. Policy only.
+    /// awaits its opening, naming, if any, the seed block of that draw, proving a piece the
+    /// response still owes, and for an attention phase, built for the path the response awaits.
+    /// Policy only.
     fn validate_ai_opening(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
         if !transaction.tx.is_ai_opening() {
             return Ok(());
@@ -262,6 +263,7 @@ impl Mempool {
                         consensus.awaited_opening_seed(&txid) == Some(trace_seed(&keryx_hashes::Hash::from_bytes(b), &txid))
                     })
                     && attn_path(s.body).is_none_or(|p| consensus.awaited_attention_path(&txid) == Some(p))
+                    && consensus.awaited_opening_pieces(&txid).is_some_and(|m| m & opening_body_piece(s.body) != 0)
                     && verify_opening_signature(&s.escrow_pubkey, &s.signature, s.body)
             }
             _ => false,

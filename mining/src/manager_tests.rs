@@ -310,6 +310,19 @@ mod tests {
         insert(phase(&miner, c, vec![2], 2)).unwrap();
         assert_eq!(insert(phase(&miner, c, vec![3], 3)), not_awaited(c), "another child");
         assert_eq!(insert(phase(&miner, c, vec![2], 4)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(c))));
+
+        let d = [0xD4u8; 32];
+        consensus.await_opening(d, miner.x_only_public_key().0.serialize());
+        consensus.await_attention_path(d, vec![]);
+        consensus.await_pieces(d, 1);
+        assert_eq!(insert(phase(&miner, d, vec![], 5)), not_awaited(d), "an audit without attention takes no attention phase");
+        assert_eq!(insert(piece(&miner, d, 69, false, VERSION_RECUR)), not_awaited(d), "nor a recurrent piece");
+        insert(opening(&miner, d, 70, false)).unwrap();
+        let e = [0xE5u8; 32];
+        consensus.await_opening(e, miner.x_only_public_key().0.serialize());
+        consensus.await_pieces(e, 2 | 4);
+        assert_eq!(insert(opening(&miner, e, 71, false)), not_awaited(e), "a proven trace piece is not taken again");
+        insert(piece(&miner, e, 72, false, VERSION_RECUR)).unwrap();
     }
 
     /// An opening naming its seed block is admitted only when that block gives the awaited draw seed.

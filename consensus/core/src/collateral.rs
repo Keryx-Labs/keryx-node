@@ -294,7 +294,8 @@ const PIECE_RECUR: u8 = 4;
 const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR;
 
 /// Pieces an audit under `rules` needs.
-fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
+/// Pieces an audit under `rules` needs.
+pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
     match rules {
         Some(r) if r.attention => {
             PIECE_TRACE | PIECE_ATTN | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
@@ -375,7 +376,8 @@ fn trace_opening_valid(
 }
 
 /// The piece an opening body, seeded or not, proves.
-fn body_piece(body: &[u8]) -> u8 {
+/// Piece an opening body proves.
+pub fn opening_body_piece(body: &[u8]) -> u8 {
     use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_RECUR, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
         Some(VERSION_ATTN) => PIECE_ATTN,
@@ -1661,7 +1663,7 @@ impl ServiceLedger {
             }
             let rules = (tr.tier)(a.tier, a.accepted_daa);
             let required = required_pieces(rules.as_ref());
-            let piece = body_piece(&op.body);
+            let piece = opening_body_piece(&op.body);
             if piece & required == 0 || a.pieces & piece != 0 {
                 continue;
             }
@@ -1819,6 +1821,13 @@ impl ServiceLedger {
     /// Draw seed of a drawn response still awaiting its opening.
     pub fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.trace_audits.get(response_txid).and_then(|a| a.seed)
+    }
+
+    /// Pieces a drawn response still owes, `required` giving the pieces of a tier at an
+    /// acceptance DAA.
+    pub fn awaited_opening_pieces(&self, response_txid: &[u8; 32], required: impl Fn(u8, u64) -> u8) -> Option<u8> {
+        let a = self.trace_audits.get(response_txid).filter(|a| a.seed.is_some())?;
+        Some(required(a.tier, a.accepted_daa) & !a.pieces)
     }
 
     /// Path of the attention phase a drawn response awaits; `None` while a child is still to
