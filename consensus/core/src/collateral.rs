@@ -149,8 +149,20 @@ pub fn verify_responder_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64]
 pub const TRACE_SEED_DELAY_DAA: u64 = 100;
 /// Domain separator of the trace draw seed.
 pub const TRACE_DRAW_DOMAIN: &[u8] = b"KeryxTraceDrawV1";
-/// Window to open the next phase of an attention opening once its child is drawn.
-pub const ATTN_PHASE_WINDOW_DAA: u64 = 3_000;
+/// Base of the window to open the next phase of an attention opening.
+pub const ATTN_PHASE_BASE_DAA: u64 = 3_000;
+
+/// Window to open the next phase of an attention opening once its child is drawn: a base plus
+/// the replay of the response, its prompt at a floor of 100 positions per second and each
+/// generated position at the generation floor of its tier.
+pub fn attn_phase_window_daa(tier: u8, max_tokens: u32, n_prompt: u32, n_pos: u32) -> u64 {
+    let per_token: u64 = match tier {
+        0..=2 => 2,
+        3 => 3,
+        _ => 4,
+    };
+    ATTN_PHASE_BASE_DAA + n_prompt as u64 / 10 + n_pos.saturating_sub(n_prompt).min(max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP)) as u64 * per_token
+}
 /// Domain separator of the child drawn after an attention phase.
 pub const ATTN_CHILD_DOMAIN: &[u8] = b"KeryxAttnChildV1";
 
@@ -1688,7 +1700,7 @@ impl ServiceLedger {
             if let Some((root, n, weights)) = next {
                 let path = a.attn.take().map(|p| p.path).unwrap_or_default();
                 a.attn = Some(AttnProgress { path, root, n, accepted_daa: daa, drawn: false, weights });
-                a.deadline_daa = a.deadline_daa.max(daa + TRACE_SEED_DELAY_DAA + ATTN_PHASE_WINDOW_DAA);
+                a.deadline_daa = a.deadline_daa.max(daa + TRACE_SEED_DELAY_DAA + attn_phase_window_daa(a.tier, a.max_tokens, a.n_prompt, a.n_pos));
                 self.trace_audits.insert(op.response_txid, a);
                 continue;
             }
@@ -4814,11 +4826,19 @@ mod tests {
         }
 
         #[test]
+        fn the_attention_phase_window_scales_with_the_replay() {
+            assert_eq!(crate::collateral::attn_phase_window_daa(0, 0, 0, 0), 3_000);
+            assert_eq!(crate::collateral::attn_phase_window_daa(2, 1_000, 30_000, 30_900), 7_800);
+            assert_eq!(crate::collateral::attn_phase_window_daa(4, 8_000, 0, 5_000), 19_384);
+            assert_eq!(crate::collateral::attn_phase_window_daa(3, 100, 2_000, 9_000), 3_500);
+        }
+
+        #[test]
         fn a_missing_attention_phase_strikes_after_its_window() {
-            use crate::collateral::{ATTN_PHASE_WINDOW_DAA, TRACE_SEED_DELAY_DAA};
+            use crate::collateral::{TRACE_SEED_DELAY_DAA, attn_phase_window_daa};
             let (mut run, _) = after_phase_0(three_phases);
             let deadline = run.deadline();
-            assert!(deadline >= 203 + TRACE_SEED_DELAY_DAA + ATTN_PHASE_WINDOW_DAA);
+            assert!(deadline >= 203 + TRACE_SEED_DELAY_DAA + attn_phase_window_daa(0, 0, 0, 0));
             let h = Hash::from_bytes([3u8; 32]);
             assert!(run.fold(deadline, h, &[], &[]).is_empty());
             assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
