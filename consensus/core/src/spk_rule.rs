@@ -97,9 +97,9 @@ pub fn spk_rule_active(daa_score: u64) -> bool {
 /// active. Each list arms only at its own gate, so H5 addresses stay spendable until DAA reaches H5.
 #[inline]
 pub fn spk_rule_matches(script: &[u8], daa_score: u64) -> bool {
-    (daa_score >= SPK_RULE_ACTIVATION_DAA && SPK_RULE_SCRIPTS.iter().any(|s| *s == script))
-        || (daa_score >= SPK_RULE_ACTIVATION_DAA_H5 && SPK_RULE_SCRIPTS_H5.iter().any(|s| *s == script))
-        || (daa_score >= SPK_RULE_ACTIVATION_DAA_H10 && SPK_RULE_SCRIPTS_H10.iter().any(|s| *s == script))
+    (daa_score >= SPK_RULE_ACTIVATION_DAA && SPK_RULE_SCRIPTS.contains(&script))
+        || (daa_score >= SPK_RULE_ACTIVATION_DAA_H5 && SPK_RULE_SCRIPTS_H5.contains(&script))
+        || (daa_score >= SPK_RULE_ACTIVATION_DAA_H10 && SPK_RULE_SCRIPTS_H10.contains(&script))
 }
 
 #[cfg(test)]

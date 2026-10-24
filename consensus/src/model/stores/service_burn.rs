@@ -24,7 +24,7 @@ impl DbServiceBurnStore {
     }
 
     /// All burned outpoints with their miss daa, for the boot load.
-    pub fn iterator(&self) -> impl Iterator<Item = Result<(Box<[u8]>, u64), Box<dyn std::error::Error>>> + '_ {
+    pub fn iterator(&self) -> impl Iterator<Item = super::StoreRow<u64>> + '_ {
         self.access.iterator()
     }
 

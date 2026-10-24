@@ -1,8 +1,8 @@
-/// RocksDB-backed stores for the OPoI slash mechanism (Phase 3 A4).
-///
-/// Two stores:
-/// - `DbAiResponseStore`: confirmed AiResponse txs, keyed by response_hash.
-/// - `DbAiSlashedStore`: slashed escrow outpoints, keyed by outpoint bytes.
+//! RocksDB-backed stores for the OPoI slash mechanism (Phase 3 A4).
+//!
+//! Two stores:
+//! - `DbAiResponseStore`: confirmed AiResponse txs, keyed by response_hash.
+//! - `DbAiSlashedStore`: slashed escrow outpoints, keyed by outpoint bytes.
 
 use std::{fmt, mem::size_of, sync::Arc};
 

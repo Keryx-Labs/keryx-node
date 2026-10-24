@@ -395,9 +395,9 @@ pub(crate) fn fold_level(level: &[[u8; 32]]) -> Vec<[u8; 32]> {
 pub fn v4_tile_subtree_root(tile: &[u8]) -> [u8; 32] {
     debug_assert_eq!(tile.len(), POM_V4_TILE_BYTES);
     let mut level: [[u8; 32]; 32] = [[0u8; 32]; 32];
-    for i in 0..32 {
+    for (i, slot) in level.iter_mut().enumerate() {
         let off = i * POM_V4_CHUNK_BYTES;
-        level[i] = blake(&tile[off..off + POM_V4_CHUNK_BYTES]);
+        *slot = blake(&tile[off..off + POM_V4_CHUNK_BYTES]);
     }
     let mut n = 32usize;
     for _ in 0..TILE_SUBTREE_DEPTH {
@@ -469,9 +469,11 @@ fn verify_tile_merkle_parallel(proof: &PomProofV4, offs: &[u64; POM_V4_K], r_t: 
     #[cfg(not(target_arch = "wasm32"))]
     {
         use rayon::prelude::*;
-        return !proof.tiles.par_iter().enumerate().any(|(i, tile)| {
-            !verify_merkle(v4_tile_subtree_root(tile), offs[i], &proof.merkle[i].path, r_t)
-        });
+        !proof
+            .tiles
+            .par_iter()
+            .enumerate()
+            .any(|(i, tile)| !verify_merkle(v4_tile_subtree_root(tile), offs[i], &proof.merkle[i].path, r_t))
     }
     #[cfg(target_arch = "wasm32")]
     {

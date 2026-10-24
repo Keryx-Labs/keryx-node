@@ -468,7 +468,8 @@ async fn private_inference_era_rules_for_requests_invalidate_the_block() {
     use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_REQUEST;
     use keryx_inference::{AiRequestPayload, MAX_AI_REQUEST_PAYLOAD_LEN};
 
-    let cases: [(ForkActivation, Vec<u8>, fn(&RuleError) -> bool); 2] = [
+    type Case = (ForkActivation, Vec<u8>, fn(&RuleError) -> bool);
+    let cases: [Case; 2] = [
         (ForkActivation::never(), vec![0u8; MAX_AI_REQUEST_PAYLOAD_LEN + 1], |e| {
             matches!(e, RuleError::AiRequestTooLongBeforeActivation(_, _))
         }),
@@ -769,7 +770,7 @@ async fn service_cohort_from_recent_tier_producers() {
     let mut m1 = new_miner_data();
     let mut extra = m1.extra_data.to_vec();
     extra.extend_from_slice(format!("/escrow:{}", "11".repeat(32)).as_bytes());
-    m1.extra_data = extra.into();
+    m1.extra_data = extra;
     let m2 = new_miner_data();
     let id1 = miner_key(&m1.script_public_key);
     let e1 = escrow_miner_key(&[0x11u8; 32]);
@@ -869,8 +870,8 @@ async fn windowed_production_prefix_accumulates_per_producer_and_slides() {
 
     // Window = last 3 selected-chain blocks (chain indices 5,6,7 ⇒ producers i=4,5,6). Producers i=0..3
     // aged out ⇒ dropped to zero; i=4 contributes one cut; the repeat (i=5,6) chains to two cuts.
-    for i in 0..4 {
-        assert_eq!(windowed(&producers[i]), 0, "producer {i} aged out of the window ⇒ entry dropped");
+    for (i, p) in producers.iter().enumerate().take(4) {
+        assert_eq!(windowed(p), 0, "producer {i} aged out of the window ⇒ entry dropped");
     }
     assert_eq!(windowed(&producers[4]), one_cut, "a single in-window block contributes exactly one base cut");
     assert_eq!(
@@ -926,8 +927,8 @@ async fn windowed_production_prefix_h3_per_blue_daa_window() {
 
     // daa window = (6−3, 6] in daa units ⇒ chain indices 5,6,7 (daa 4,5,6), crediting the MERGED
     // blues = the producers of blocks 4,5,6 (0-indexed producers[3], producers[4], producers[5]).
-    for i in 0..3 {
-        assert_eq!(windowed(&producers[i]), 0, "producer {i} merged below the daa window ⇒ zero");
+    for (i, p) in producers.iter().enumerate().take(3) {
+        assert_eq!(windowed(p), 0, "producer {i} merged below the daa window ⇒ zero");
     }
     assert_eq!(windowed(&producers[3]), one_cut, "block 4's producer is credited at merge index 5");
     assert_eq!(windowed(&producers[4]), one_cut, "block 5's producer is credited at merge index 6");
@@ -1246,15 +1247,13 @@ async fn coin_age_maturation_choreography_adversarial() {
     }
     s8.push((B + 200, cluster, vec![]));
     let mut alive: Vec<u64> = (100..120).collect();
-    let mut next_id = 200u64;
-    for k in 0..12u64 {
+    for (next_id, k) in (200u64..).zip(0..12u64) {
         let hi = B + W + 15 * k + 20;
         let lo = B + W + 15 * k + 5;
         s8.push((hi, vec![], vec![]));
         let victim = alive.remove((k as usize * 7) % alive.len());
         s8.push((lo, vec![(next_id, 0xE1, 333 + k, lo - 3)], vec![victim]));
         alive.push(next_id);
-        next_id += 1;
     }
     s8.push((B + W + 400, vec![], vec![]));
     run("s8_oscillation_hammer", &s8);

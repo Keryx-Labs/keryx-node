@@ -41,6 +41,9 @@ pub use keryx_database;
 pub use keryx_database::prelude::DB;
 use std::fmt::Display;
 
+/// A row of a store iterator: raw key and decoded value.
+pub type StoreRow<V> = Result<(Box<[u8]>, V), Box<dyn std::error::Error>>;
+
 #[derive(PartialEq, Eq, Clone, Copy, Hash)]
 pub(crate) struct U64Key([u8; size_of::<u64>()]);
 

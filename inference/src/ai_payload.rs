@@ -1,7 +1,7 @@
-/// On-chain AI request/response payload types.
-///
-/// Shared between the consensus validator (node) and the miner so both
-/// sides always agree on the binary layout.
+//! On-chain AI request/response payload types.
+//!
+//! Shared between the consensus validator (node) and the miner so both
+//! sides always agree on the binary layout.
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_REQUEST` transactions:
 /// `[model_id: 32] [max_tokens: 4 LE] [inference_reward: 8 LE] [priority_fee: 8 LE] [prompt…]`

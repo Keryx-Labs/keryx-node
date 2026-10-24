@@ -640,7 +640,7 @@ mod tests {
     fn inference_vault_output_is_standard() {
         let dummy_prev_out = TransactionOutpoint::new(keryx_hashes::Hash::from_u64_word(1), 1);
         let dummy_tx_input = TransactionInput::new(dummy_prev_out, vec![0u8; 65], MAX_TX_IN_SEQUENCE_NUM, 1);
-        let addr = Address::new(Prefix::Testnet, Version::PubKey, &vec![1u8; 32]);
+        let addr = Address::new(Prefix::Testnet, Version::PubKey, &[1u8; 32]);
         let change = TransactionOutput::new(SOMPI_PER_KASPA, keryx_txscript::pay_to_address_script(&addr));
 
         let with_escrow = |spk: ScriptPublicKey| {
@@ -680,7 +680,7 @@ mod tests {
 
         let dummy_prev_out = TransactionOutpoint::new(keryx_hashes::Hash::from_u64_word(1), 1);
         let dummy_tx_input = TransactionInput::new(dummy_prev_out, vec![0u8; 65], MAX_TX_IN_SEQUENCE_NUM, 1);
-        let addr = Address::new(Prefix::Testnet, Version::PubKey, &vec![1u8; 32]);
+        let addr = Address::new(Prefix::Testnet, Version::PubKey, &[1u8; 32]);
         let change = TransactionOutput::new(SOMPI_PER_KASPA, keryx_txscript::pay_to_address_script(&addr));
         let with_transient = |subnetwork_id, transient_mass| {
             let tx = Transaction::new(TX_VERSION, vec![dummy_tx_input.clone()], vec![change.clone()], 0, subnetwork_id, 0, vec![]);

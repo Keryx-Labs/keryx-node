@@ -880,6 +880,9 @@ pub fn verify_pom_proof<Hf: Fn(u64) -> [u8; 32]>(
     Ok(())
 }
 
+/// A Merkle inclusion check: leaf, chunk index, sibling path.
+type InclusionCheck<'a> = ([u8; 32], u64, &'a [[u8; 32]]);
+
 /// H4 verifier — recompute-from-chunks. The prover supplies the K chunks its winning walk
 /// read (in step order), each Merkle-proven under the tier root `r_t`; the verifier re-walks
 /// every transition itself, deriving each chunk index (`state % N`) and the `final_state`.
@@ -918,7 +921,7 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
     // Walk transitions are sequential (each chunk index depends on prior state), but the Merkle
     // inclusion checks are independent once `(leaf, index, path)` are known — parallelise them.
     let mut state = seed;
-    let mut checks: Vec<([u8; 32], u64, &[[u8; 32]])> = Vec::with_capacity(steps.len());
+    let mut checks: Vec<InclusionCheck> = Vec::with_capacity(steps.len());
     for step in steps.iter() {
         let off = state % n_chunks;
         checks.push((blake(&step.chunk), off, step.weight_path.as_slice()));

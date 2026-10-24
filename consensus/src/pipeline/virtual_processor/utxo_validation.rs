@@ -336,12 +336,12 @@ impl VirtualStateProcessor {
         // least finality-deep past the pruning point), and is skipped in the same trust windows
         // as the coinbase check — a node that cannot yet reproduce the fold trusts the
         // utxo-commitment-pinned chain instead.
-        if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase_at(header.daa_score) {
-            if let Some(expected) = self.expected_service_state_hash(header)? {
-                if header.service_state_hash != expected {
-                    return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
-                }
-            }
+        if keryx_consensus_core::pom::service_commit_active(header.daa_score)
+            && !self.trust_coinbase_at(header.daa_score)
+            && let Some(expected) = self.expected_service_state_hash(header)?
+            && header.service_state_hash != expected
+        {
+            return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
         }
 
         // Verify the header pruning point
@@ -586,12 +586,11 @@ impl VirtualStateProcessor {
             }
         } else {
             for tx in txs.iter().skip(1) {
-                if tx.is_ai_request() {
-                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        if req.max_tokens > AI_REQUEST_MAX_TOKENS_CAP {
-                            return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
-                        }
-                    }
+                if tx.is_ai_request()
+                    && let Some(req) = AiRequestPayload::deserialize(&tx.payload)
+                    && req.max_tokens > AI_REQUEST_MAX_TOKENS_CAP
+                {
+                    return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
                 }
             }
         }
@@ -1307,7 +1306,7 @@ impl VirtualStateProcessor {
             return lo;
         }
         while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
+            let mid = lo + (hi - lo).div_ceil(2);
             if daa_at(mid) <= bound_daa { lo = mid } else { hi = mid - 1 }
         }
         lo
@@ -1938,7 +1937,7 @@ fn check_ai_request_payload_rules(
     token_step: u64,
 ) -> BlockProcessResult<()> {
     if let Some(&(_, base_reward)) = minimums.iter().find(|(id, _)| *id == req.model_id) {
-        let token_surcharge = ((req.max_tokens as u64 + 63) / 64) * token_step;
+        let token_surcharge = (req.max_tokens as u64).div_ceil(64) * token_step;
         let effective_min = base_reward + token_surcharge;
         if req.inference_reward < effective_min {
             return Err(AiRequestInferenceRewardBelowMinimum(tx.id(), req.inference_reward, effective_min, hex::encode(req.model_id)));
@@ -2025,7 +2024,6 @@ pub(super) fn check_ai_request_tx_payload_rules(
 /// All of these except the UTXO-fee one are also enforced earlier by
 /// `check_ai_request_payload_rules_all`; they stay here so this remains the single authoritative
 /// check, and so the original error precedence within a transaction is preserved.
-
 fn check_ai_request_inference_rewards(
     txs: &[Transaction],
     validated: &[(keryx_consensus_core::tx::ValidatedTransaction<'_>, u32)],
@@ -2045,10 +2043,10 @@ fn check_ai_request_inference_rewards(
             check_ai_request_payload_rules(tx, &req, minimums, token_step)?;
             // The one rule that genuinely needs UTXO validation: the fee covers priority_fee
             // (inference_reward itself goes to the output[1] escrow, not to the fee).
-            if let Some(&calculated_fee) = fee_map.get(&tx.id()) {
-                if calculated_fee < req.priority_fee {
-                    return Err(AiRequestFeeBelowInferenceReward(tx.id(), calculated_fee, req.priority_fee));
-                }
+            if let Some(&calculated_fee) = fee_map.get(&tx.id())
+                && calculated_fee < req.priority_fee
+            {
+                return Err(AiRequestFeeBelowInferenceReward(tx.id(), calculated_fee, req.priority_fee));
             }
             // Escrow output[1] structure (shared with the pre-UTXO fast path).
             check_ai_request_escrow_output(tx, &req, routed)?;
@@ -2107,13 +2105,13 @@ fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     let mut request_model_map: std::collections::HashMap<[u8; 32], [u8; 32]> =
         std::collections::HashMap::new();
     for tx in txs.iter().skip(1) {
-        if tx.is_ai_request() {
-            if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                let digest = blake2b_simd::blake2b(&tx.payload);
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&digest.as_bytes()[..32]);
-                request_model_map.insert(key, req.model_id);
-            }
+        if tx.is_ai_request()
+            && let Some(req) = AiRequestPayload::deserialize(&tx.payload)
+        {
+            let digest = blake2b_simd::blake2b(&tx.payload);
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&digest.as_bytes()[..32]);
+            request_model_map.insert(key, req.model_id);
         }
     }
 
@@ -2121,14 +2119,13 @@ fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
         if !tx.is_ai_response() {
             continue;
         }
-        if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-            if let Some(&model_id) = request_model_map.get(&resp.request_hash) {
-                if !declared_caps.contains(&model_id) {
-                    return Err(AiResponseModelCapMissing(tx.id(), hex::encode(model_id)));
-                }
-            }
-            // request not in same block → AiRequest came from an earlier block → skip
+        if let Some(resp) = AiResponsePayload::deserialize(&tx.payload)
+            && let Some(&model_id) = request_model_map.get(&resp.request_hash)
+            && !declared_caps.contains(&model_id)
+        {
+            return Err(AiResponseModelCapMissing(tx.id(), hex::encode(model_id)));
         }
+        // request not in same block → AiRequest came from an earlier block → skip
     }
     Ok(())
 }

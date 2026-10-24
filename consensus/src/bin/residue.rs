@@ -63,7 +63,7 @@ fn main() {
 
     // Committed lineage: the persisted virtual multiset, block-by-block validated against every
     // header utxo_commitment on the way here.
-    let vs_bytes = db.get(&[P_VIRTUAL_STATE]).unwrap().expect("virtual state present");
+    let vs_bytes = db.get([P_VIRTUAL_STATE]).unwrap().expect("virtual state present");
     let vs: VirtualState = bincode::deserialize(&vs_bytes).unwrap();
     let mut committed = vs.multiset.clone();
     println!("virtual daa        : {}", vs.daa_score);
@@ -78,7 +78,7 @@ fn main() {
             break;
         }
         total += 1;
-        if total % 10_000_000 == 0 {
+        if total.is_multiple_of(10_000_000) {
             eprintln!("[{:>6.1}s] scanned {} virtual entries", t0.elapsed().as_secs_f64(), total);
         }
         let entry = match bincode::deserialize::<UtxoEntryL>(&v) {
