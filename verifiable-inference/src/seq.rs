@@ -21,7 +21,7 @@ pub struct SeqLayout {
 
 impl SeqLayout {
     pub fn n_leaves(&self) -> u64 {
-        2 * self.heads * (self.n_attn + self.n_recur)
+        2 * self.heads * (self.n_attn + self.n_recur) + self.heads * self.n_attn
     }
 
     /// Key cache leaf of head `h` of attention layer `slot`.
@@ -42,6 +42,12 @@ impl SeqLayout {
     /// Checkpoint leaf of head `h` of recurrent layer `slot`.
     pub fn checkpoint(&self, slot: u64, h: u64) -> Option<u64> {
         self.record(slot, h).map(|i| i + 1)
+    }
+
+    /// Softmax mass leaf of key/value head `h` of attention layer `slot`: per position, the log
+    /// mass of each query head of the group, f32.
+    pub fn lse(&self, slot: u64, h: u64) -> Option<u64> {
+        (slot < self.n_attn && h < self.heads).then(|| 2 * self.heads * (self.n_attn + self.n_recur) + slot * self.heads + h)
     }
 }
 
@@ -147,7 +153,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for s in 0..3 {
             for h in 0..4 {
-                assert!(seen.insert(l.kcache(s, h).unwrap()) && seen.insert(l.vcache(s, h).unwrap()));
+                assert!(seen.insert(l.kcache(s, h).unwrap()) && seen.insert(l.vcache(s, h).unwrap()) && seen.insert(l.lse(s, h).unwrap()));
             }
         }
         for s in 0..5 {
@@ -157,7 +163,7 @@ mod tests {
         }
         assert_eq!(seen.len() as u64, l.n_leaves());
         assert!(seen.iter().all(|&i| i < l.n_leaves()));
-        assert!(l.kcache(3, 0).is_none() && l.record(0, 4).is_none() && l.record(5, 0).is_none());
+        assert!(l.kcache(3, 0).is_none() && l.lse(3, 0).is_none() && l.lse(0, 4).is_none() && l.record(0, 4).is_none() && l.record(5, 0).is_none());
     }
 
     #[test]

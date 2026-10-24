@@ -1512,15 +1512,36 @@ mod attn_tests {
     use crate::opening::AttnOpening;
     use crate::seq::{self, SeqLayout, SeqSpan};
 
-    /// Sequence leaves of attention caches: key then value leaf of each head of one layer.
+    /// Sequence leaves of one attention layer: key, value and log mass leaf of each head.
     struct Seq {
+        layout: SeqLayout,
         leaves: Vec<Vec<u8>>,
         hashes: Vec<Hash>,
         root: Hash,
     }
 
+    /// Log mass leaf of each key/value head: per position, the log mass of each query head of the
+    /// group over the attended positions.
+    fn lse_leaves(g: usize, scale: f64, attended: impl Fn(usize) -> std::ops::RangeInclusive<usize>, queries: &[Vec<Vec<f64>>], keys: &[Vec<Vec<f32>>], values: &[Vec<Vec<f32>>]) -> Vec<Vec<u8>> {
+        let n_kv = keys[0].len();
+        (0..n_kv)
+            .map(|kv| {
+                (0..queries.len())
+                    .flat_map(|t| {
+                        let ks: Vec<Vec<f32>> = attended(t).map(|p| keys[p][kv].clone()).collect();
+                        let vs: Vec<Vec<f32>> = attended(t).map(|p| values[p][kv].clone()).collect();
+                        (0..g).flat_map(move |qi| {
+                            let p = crate::attn::partial(crate::attn::Arith::Exact, &queries[t][kv * g + qi], scale, &ks, &vs).unwrap();
+                            (crate::attn_blocks::lse(&p) as f32).to_le_bytes()
+                        }).collect::<Vec<u8>>()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     impl Seq {
-        fn new(heads: usize, kcache: &[Vec<Vec<u8>>], vcache: Option<&[Vec<Vec<u8>>]>) -> Seq {
+        fn new(heads: usize, kcache: &[Vec<Vec<u8>>], vcache: Option<&[Vec<Vec<u8>>]>, lse: &[Vec<u8>]) -> Seq {
             let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: heads as u64 };
             let mut leaves = vec![Vec::new(); layout.n_leaves() as usize];
             for h in 0..kcache[0].len() {
@@ -1529,9 +1550,18 @@ mod attn_tests {
                     leaves[layout.vcache(0, h as u64).unwrap() as usize] = v.iter().flat_map(|p| p[h].clone()).collect();
                 }
             }
+            for (h, b) in lse.iter().enumerate() {
+                leaves[layout.lse(0, h as u64).unwrap() as usize] = b.clone();
+            }
             let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
             let root = b3_root(&hashes);
-            Seq { leaves, hashes, root }
+            Seq { layout, leaves, hashes, root }
+        }
+
+        /// Span of the log mass of query head `qi` of the group of `g` of head `kv` at `t`.
+        fn lse_span(&self, kv: u64, g: usize, t: usize, qi: usize) -> SeqSpan {
+            let lo = (t * g + qi) * 4;
+            self.span(self.layout.lse(0, kv).unwrap(), lo, lo + 4)
         }
 
         fn span(&self, leaf: u64, lo: usize, hi: usize) -> SeqSpan {
@@ -1664,7 +1694,7 @@ mod attn_tests {
             let op = open(&path, prev.as_deref());
             match verify_attn_phase(tier, ctx, resp, seed, &path, root.as_ref(), &op) {
                 Ok(AttnStep::Done) => deepest = deepest.max(path.len()),
-                Ok(AttnStep::Next { root, n }) => stack.extend((0..n).map(|i| ([path.clone(), vec![i]].concat(), Some(op.partials.clone()), Some(root)))),
+                Ok(AttnStep::Next { root, n, .. }) => stack.extend((0..n).map(|i| ([path.clone(), vec![i]].concat(), Some(op.partials.clone()), Some(root)))),
                 Err(e) => return Err((path, e)),
             }
         }
@@ -1786,10 +1816,11 @@ mod attn_tests {
         }
         let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
         let pos_root = b3_root(&pos_roots);
-        let seq = Seq::new(NKV, &kcache, Some(&vcache));
-        let queries = (0..N_POS).map(|t| (0..NH).map(|h| prep.query(&shape(c), &split(&qg_proj[t]).0[h * HD..(h + 1) * HD], t as u64)).collect()).collect();
-        let keys = kcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
-        let values = vcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
+        let queries: Vec<Vec<Vec<f64>>> = (0..N_POS).map(|t| (0..NH).map(|h| prep.query(&shape(c), &split(&qg_proj[t]).0[h * HD..(h + 1) * HD], t as u64)).collect()).collect();
+        let keys: Vec<Vec<Vec<f32>>> = kcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
+        let values: Vec<Vec<Vec<f32>>> = vcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
+        let masses = lse_leaves(NH / NKV, KQ as f64, |t| window_start(c, t)..=t, &queries, &keys, &values);
+        let seq = Seq::new(NKV, &kcache, Some(&vcache), &masses);
         At { cfg: c, weights, chunk_leaves, entries, entry_leaves, tier, ctx, positions, pos_roots, pos_root, seq, queries, keys, values }
     }
 
@@ -1831,6 +1862,8 @@ mod attn_tests {
             let la = 4 + nl as usize - 1;
             let qw = 1 + self.cfg.gated as u64;
             let (kcache, vcache) = self.caches(kv, st, t + 1);
+            let g = NH / NKV;
+            let lse = self.seq.lse_span(kv, g, t, (d[2] / NKV as u64 % g as u64) as usize);
             AttnOpening {
                 response_txid: [1; 32],
                 pos_root: self.pos_root,
@@ -1848,6 +1881,7 @@ mod attn_tests {
                 anchor_k: vec![leaf_chunk(&self.positions[ps], 3, 0)],
                 anchor_v: if self.cfg.shared_kv { Vec::new() } else { vec![leaf_chunk(&self.positions[ps], 5, 0)] },
                 absorb: Vec::new(),
+                lse,
                 ..Default::default()
             }
         }
@@ -1912,7 +1946,7 @@ mod attn_tests {
             let values: Vec<Vec<f32>> = (st..=t).map(|p| self.values[p][kv as usize].clone()).collect();
             let partials = pick_partials(&self.queries[t][qh], KQ as f64, &keys, &values, st as u64, &tree, path, |_| true).unwrap();
             if path.is_empty() {
-                AttnOpening { q_entry: whole.q_entry, o_entry: whole.o_entry, pos_path: whole.pos_path, q: whole.q, out: whole.out, partials, ..base }
+                AttnOpening { q_entry: whole.q_entry, o_entry: whole.o_entry, pos_path: whole.pos_path, q: whole.q, out: whole.out, partials, lse: whole.lse, ..base }
             } else {
                 AttnOpening { partials, ..base }
             }
@@ -2035,6 +2069,35 @@ mod attn_tests {
             let v = f32::from_le_bytes(forged.partials[m..m + 4].try_into().unwrap()) + 0.5;
             forged.partials[m..m + 4].copy_from_slice(&v.to_le_bytes());
             assert_eq!(check(k, &forged), Err(Fail::Mismatch), "phase {k}");
+        }
+    }
+
+    /// Children of an honest root phase with child 0 replaced by one that carries the combined
+    /// output under a dominating mass: the output stays, the mass moves.
+    fn dominated(op: &AttnOpening, d: usize) -> AttnOpening {
+        use crate::attn::Partial;
+        use crate::attn_blocks::{combine, decode_partials, encode_partials};
+        let mut ch = decode_partials(&op.partials, d).unwrap();
+        let whole = combine(&ch).unwrap();
+        ch[0] = Partial { o: whole.o, m: whole.m + 60.0, l: 1.0 };
+        AttnOpening { partials: encode_partials(&ch), ..op.clone() }
+    }
+
+    #[test]
+    fn the_committed_mass_binds_the_root_phase() {
+        set_test_budget(SMALL_BUDGET);
+        for c in ALL {
+            let a = build(c);
+            let (s, ops, roots) = deep(&a);
+            let check = |k: usize, op: &AttnOpening| verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &vec![0; k], roots.get(k.wrapping_sub(1)), op);
+            assert!(matches!(check(0, &ops[0]), Ok(AttnStep::Next { .. })));
+            assert_eq!(check(0, &dominated(&ops[0], HD)), Err(Fail::Mismatch));
+            let mut no_mass = ops[0].clone();
+            no_mass.lse = SeqSpan::default();
+            assert_eq!(check(0, &no_mass), Err(Fail::Trace));
+            let mut node_with_mass = ops[1].clone();
+            node_with_mass.lse = ops[0].lse.clone();
+            assert_eq!(check(1, &node_with_mass), Err(Fail::Shape));
         }
     }
 
@@ -2262,7 +2325,10 @@ mod attn_tests {
             let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
             let pos_root = b3_root(&pos_roots);
             let rows: Vec<Vec<Vec<u8>>> = cache.iter().map(|c| vec![c.clone()]).collect();
-            let seq = Seq::new(1, &rows, None);
+            let per_pos_keys: Vec<Vec<Vec<f32>>> = keys.iter().map(|k| vec![k.clone()]).collect();
+            let per_pos_values: Vec<Vec<Vec<f32>>> = keys.iter().map(|k| vec![k[..R].to_vec()]).collect();
+            let masses = lse_leaves(NH, KQ as f64, |t| 0..=t, &queries, &per_pos_keys, &per_pos_values);
+            let seq = Seq::new(1, &rows, None, &masses);
             Mla { weights, chunk_leaves, entries, entry_leaves, tier, ctx, positions, pos_roots, pos_root, seq, queries, keys }
         }
 
@@ -2302,6 +2368,7 @@ mod attn_tests {
                     anchor_k: (0..3).map(|c| leaf_chunk(&self.positions[ps], 3, c)).collect(),
                     anchor_v: Vec::new(),
                     absorb: (2 * qh..2 * qh + 2).map(|c| leaf_chunk(pos, 5, c)).collect(),
+                    lse: self.seq.lse_span(0, NH, t, qh as usize),
                     ..Default::default()
                 }
             }
@@ -2361,7 +2428,7 @@ mod attn_tests {
                 let values: Vec<Vec<f32>> = keys.iter().map(|k| k[..R].to_vec()).collect();
                 let partials = pick_partials(&self.queries[t][qh], KQ as f64, keys, &values, 0, &tree, path, |_| true).unwrap();
                 if path.is_empty() {
-                    AttnOpening { q_entry: whole.q_entry, o_entry: whole.o_entry, pos_path: whole.pos_path, q: whole.q, out: whole.out, partials, ..base }
+                    AttnOpening { q_entry: whole.q_entry, o_entry: whole.o_entry, pos_path: whole.pos_path, q: whole.q, out: whole.out, partials, lse: whole.lse, ..base }
                 } else {
                     AttnOpening { partials, ..base }
                 }
@@ -2419,6 +2486,19 @@ mod attn_tests {
             assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[0, 0], root.as_ref(), &leaf), Ok(AttnStep::Done));
             leaf.absorb = (2 * other..2 * other + 2).map(|c| leaf_chunk(&a.positions[t], 5, c)).collect();
             assert!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[0, 0], root.as_ref(), &leaf).is_err());
+        }
+
+        #[test]
+        fn the_committed_mass_binds_the_latent_root_phase() {
+            set_test_budget(SMALL_BUDGET);
+            let a = build(false, false);
+            let s = seeds().find(|s| a.tree((draw::point(s, ATTN_POINT)[0] % N_POS as u64) as usize).depth() >= 1).unwrap();
+            let root = a.open_phase(&s, &[], None);
+            assert!(matches!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[], None, &root), Ok(AttnStep::Next { .. })));
+            assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[], None, &super::dominated(&root, R)), Err(Fail::Mismatch));
+            let mut no_mass = root.clone();
+            no_mass.lse = SeqSpan::default();
+            assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[], None, &no_mass), Err(Fail::Trace));
         }
 
         #[test]

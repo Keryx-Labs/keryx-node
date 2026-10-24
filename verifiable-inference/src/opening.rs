@@ -207,6 +207,8 @@ pub struct AttnOpening {
     pub parent_path: Vec<Hash>,
     /// Partials of the children of the opened node.
     pub partials: Vec<u8>,
+    /// Committed log mass of the drawn query head at the drawn position (output phase).
+    pub lse: crate::seq::SeqSpan,
 }
 
 /// The projection outputs read by the convolutions at one position of the anchor window.
@@ -745,6 +747,7 @@ impl AttnOpening {
         w.bytes32(&self.parent);
         w.hashes(&self.parent_path);
         w.bytes32(&self.partials);
+        w.seq_span(&self.lse);
         w.0
     }
 
@@ -779,6 +782,7 @@ impl AttnOpening {
         let parent = r.bytes32()?;
         let parent_path = r.hashes()?;
         let partials = r.bytes32()?;
+        let lse = r.seq_span()?;
         let o = AttnOpening {
             response_txid,
             pos_root,
@@ -800,6 +804,7 @@ impl AttnOpening {
             parent,
             parent_path,
             partials,
+            lse,
         };
         (r.o == b.len()).then_some(o)
     }
@@ -971,6 +976,7 @@ mod attn_opening_tests {
             parent: vec![13; 264],
             parent_path: vec![[14; 32]; 8],
             partials: vec![15; 264 * 3],
+            lse: span(22, 1024),
         }
     }
 

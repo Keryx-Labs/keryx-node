@@ -5,7 +5,7 @@ use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
 use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
 use crate::attn::{ATTN_THRESHOLD, Partial};
-use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root, decode_partials, open_partial, partial_len, partials_root};
+use crate::attn_blocks::{BlockTree, LSE_TOL, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root};
 use crate::opening::{AttnOpening, PrefixPoint};
 use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
 use crate::verify::{Fail, PosShape, Report, ResponseCtx, TierCtx, open_bytes, open_entry, open_row, verify_point_at};
@@ -732,11 +732,12 @@ mod tests {
 }
 
 /// Outcome of an accepted attention phase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttnStep {
     Done,
-    /// The next phase opens one of the `n` children whose partials this phase committed under `root`.
-    Next { root: Hash, n: u64 },
+    /// The next phase opens one of the `n` children whose partials this phase committed under
+    /// `root`, drawn under `weights`.
+    Next { root: Hash, n: u64, weights: Vec<u16> },
 }
 
 /// Verify the attention point of a response opened in a single phase.
@@ -841,6 +842,7 @@ pub fn verify_attn_phase(
     if path.is_empty() {
         keep.o_entry = op.o_entry.clone();
         keep.out = op.out.clone();
+        keep.lse = op.lse.clone();
     }
     if last {
         keep.norms = op.norms.clone();
@@ -869,7 +871,7 @@ pub fn verify_attn_phase(
     }
     Ok(match children {
         None => AttnStep::Done,
-        Some(ch) => AttnStep::Next { root: partials_root(&op.partials, s.dv).ok_or(Fail::Shape)?, n: ch.len() as u64 },
+        Some(ch) => AttnStep::Next { root: partials_root(&op.partials, s.dv).ok_or(Fail::Shape)?, n: ch.len() as u64, weights: child_weights(&ch).ok_or(Fail::Shape)? },
     })
 }
 
@@ -1005,7 +1007,8 @@ fn gqa_phase(
     };
     if let Some(ch) = children {
         let gate = if qw > 1 { Some(head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, qh * hd * qw + hd, hd)?) } else { None };
-        return check_root(&op.out.bytes, layout, shape.n_head * hd, qh, ch, gate.as_deref()).then_some(()).ok_or(Fail::Mismatch);
+        let mass = committed_lse(ctx, op, s, n_pos, kv as u64, g, qh - kv * g)?;
+        return check_root_lse(&op.out.bytes, layout, shape.n_head * hd, qh, ch, gate.as_deref(), mass).then_some(()).ok_or(Fail::Mismatch);
     }
     let (q_norm, k_norm, freqs) = gqa_norms(tier, a, &op.norms)?;
     let prep = Prep { q_norm: q_norm.as_deref(), k_norm: k_norm.as_deref(), v_norm: a.v_norm == 1, freqs: freqs.as_deref(), eps: ctx.eps };
@@ -1024,8 +1027,9 @@ fn gqa_phase(
             let raw = head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, qh * hd * qw, hd * qw)?;
             let q = prep.query(&shape, &raw[..hd], s.t);
             let gate = (qw > 1).then(|| &raw[hd..]);
+            let mass = committed_lse(ctx, op, s, n_pos, kv as u64, g, qh - kv * g)?;
             ARITHS.iter().any(|&ar| {
-                crate::attn::partial(ar, &q, shape.kq_scale, &keys, &values).is_some_and(|p| check_root(&op.out.bytes, layout, shape.n_head * hd, qh, &[p], gate))
+                crate::attn::partial(ar, &q, shape.kq_scale, &keys, &values).is_some_and(|p| check_root_lse(&op.out.bytes, layout, shape.n_head * hd, qh, &[p], gate, mass))
             })
         }
     };
@@ -1101,7 +1105,8 @@ fn mla_phase(
     };
     if let Some(ch) = children {
         let (x, layout) = out.ok_or(Fail::Shape)?;
-        return check_root(x, layout, r, 0, ch, None).then_some(()).ok_or(Fail::Mismatch);
+        let mass = committed_lse(ctx, op, s, n_pos, 0, nh, qh)?;
+        return check_root_lse(x, layout, r, 0, ch, None, mass).then_some(()).ok_or(Fail::Mismatch);
     }
     let [w] = <[(EntryOpening, ChunkRange); 1]>::try_from(op.norms.clone()).map_err(|_| Fail::Shape)?;
     let k_norm = f32_weights(tier, &w, a.k_norm, r as u64, 0, r as u64)?;
@@ -1113,9 +1118,13 @@ fn mla_phase(
     let scale = f32::from_bits(a.kq_scale) as f64;
     let ok = match (parent, out) {
         (Some(p), _) => check_leaf(&q, scale, &keys, &values, p),
-        (None, Some((x, layout))) => ARITHS.iter().any(|&ar| {
-            crate::attn::partial(ar, &q, scale, &keys, &values).is_some_and(|p| block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
-        }),
+        (None, Some((x, layout))) => {
+            let mass = committed_lse(ctx, op, s, n_pos, 0, nh, qh)? as f64;
+            ARITHS.iter().any(|&ar| {
+                crate::attn::partial(ar, &q, scale, &keys, &values)
+                    .is_some_and(|p| (lse(&p) - mass).abs() <= LSE_TOL && block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
+            })
+        }
         (None, None) => false,
     };
     if !ok {
@@ -1131,6 +1140,17 @@ fn mla_phase(
 }
 
 /// Sequence tree layout of a tier.
+/// Committed log mass of query head `qi` of the group of `g` sharing key/value head `kv`, at the
+/// drawn position.
+#[allow(clippy::too_many_arguments)]
+fn committed_lse(ctx: &ChainCtx, op: &AttnOpening, s: &AttnSite, n_pos: u64, kv: u64, g: usize, qi: usize) -> Result<f32, Fail> {
+    let sl = seq_layout(ctx);
+    let leaf = sl.lse(s.slot, kv).ok_or(Fail::Shape)?;
+    let lo = (s.t * g as u64 + qi as u64) * 4;
+    let b = crate::seq::open_span(&op.seq_root, &sl, leaf, n_pos * g as u64 * 4, lo, lo + 4, &op.lse).ok_or(Fail::Trace)?;
+    Ok(f32::from_le_bytes(b.try_into().map_err(|_| Fail::Shape)?))
+}
+
 pub fn seq_layout(ctx: &ChainCtx) -> crate::seq::SeqLayout {
     crate::seq::SeqLayout { n_attn: ctx.n_attn as u64, n_recur: ctx.n_recur as u64, heads: ctx.seq_heads as u64 }
 }
