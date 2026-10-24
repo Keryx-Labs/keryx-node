@@ -117,7 +117,10 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     let out_scale = 1.0 / libm::sqrt(hd as f64);
     for rec in &recs {
         let g: Vec<f64> = if kda { rec.g.iter().map(|&x| libm::exp(x as f64)).collect() } else { vec![libm::exp(rec.g[0] as f64); hd] };
-        let o_scale = rms(&rec.o);
+        let q_norm = libm::sqrt(rec.q.iter().map(|&x| x as f64 * x as f64).sum::<f64>());
+        if q_norm > 1.0 + RECUR_TOL {
+            return Err(Fail::Mismatch);
+        }
         for (ri, row) in state.iter_mut().enumerate() {
             let col = r0 as usize + ri;
             let kv: f64 = (0..hd).map(|i| g[i] * row[i] * rec.k[i] as f64).sum();
@@ -126,7 +129,8 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
                 row[i] = g[i] * row[i] + rec.k[i] as f64 * delta;
             }
             let o = (0..hd).map(|i| row[i] * rec.q[i] as f64).sum::<f64>() * out_scale;
-            if !close(o, rec.o[col] as f64, o_scale) {
+            let bound = out_scale * q_norm * libm::sqrt(row.iter().map(|x| x * x).sum::<f64>());
+            if !close(o, rec.o[col] as f64, bound) {
                 return Err(Fail::Mismatch);
             }
         }

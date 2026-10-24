@@ -2519,6 +2519,8 @@ mod recur_tests {
         bad_ckpt: bool,
         /// The decay product carries the decay bias.
         fused_dt: bool,
+        /// One huge output column per head, the other columns forged, the output committed from them.
+        spike_o: bool,
     }
 
     struct Rt {
@@ -2696,6 +2698,11 @@ mod recur_tests {
                     }
                     o[col] = (0..HD).map(|i| s[col][i] * q[i]).sum::<f64>() / (HD as f64).sqrt();
                 }
+                if cfg.spike_o {
+                    let honest = libm::sqrt(o.iter().map(|x| x * x).sum::<f64>() / HD as f64);
+                    o.iter_mut().for_each(|x| *x += 10.0 * honest);
+                    o[0] = 60_000.0;
+                }
                 let f = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
                 let rec = Record { q: f(&q), k: f(&k), v: f(&v), o: f(&o), beta: beta as f32, g: f(&g) };
                 records[h].extend(rec.encode(links.kind));
@@ -2834,7 +2841,7 @@ mod recur_tests {
         (0..64u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
     }
 
-    const GDA: Cfg = Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false, fused_dt: false };
+    const GDA: Cfg = Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false, fused_dt: false, spike_o: false };
     const KINDS: [Cfg; 3] = [GDA, Cfg { kda: true, ..GDA }, Cfg { kda: true, fused_dt: true, ..GDA }];
 
     #[test]
@@ -2886,6 +2893,16 @@ mod recur_tests {
             let rt = build(Cfg { bad_ckpt: true, ..c });
             for s in seeds() {
                 assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
+            }
+        }
+    }
+
+    #[test]
+    fn a_huge_output_column_does_not_widen_the_tolerance() {
+        for c in KINDS {
+            let rt = build(Cfg { spike_o: true, ..c });
+            for s in seeds() {
+                assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {} fused {}", c.kda, c.fused_dt);
             }
         }
     }
