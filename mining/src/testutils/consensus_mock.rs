@@ -31,6 +31,7 @@ pub(crate) struct ConsensusMock {
     private_cohort: RwLock<Option<Vec<[u8; 32]>>>,
     awaited_openings: RwLock<HashMap<[u8; 32], [u8; 32]>>,
     awaited_seeds: RwLock<HashMap<[u8; 32], [u8; 32]>>,
+    awaited_paths: RwLock<HashMap<[u8; 32], Vec<u64>>>,
 }
 
 impl ConsensusMock {
@@ -42,6 +43,7 @@ impl ConsensusMock {
             private_cohort: RwLock::new(None),
             awaited_openings: RwLock::new(HashMap::default()),
             awaited_seeds: RwLock::new(HashMap::default()),
+            awaited_paths: RwLock::new(HashMap::default()),
         }
     }
 
@@ -51,6 +53,10 @@ impl ConsensusMock {
 
     pub(crate) fn await_opening(&self, response_txid: [u8; 32], escrow_pubkey: [u8; 32]) {
         self.awaited_openings.write().insert(response_txid, escrow_pubkey);
+    }
+
+    pub(crate) fn await_attention_path(&self, response_txid: [u8; 32], path: Vec<u64>) {
+        self.awaited_paths.write().insert(response_txid, path);
     }
 
     pub(crate) fn await_opening_seed(&self, response_txid: [u8; 32], seed: [u8; 32]) {
@@ -99,6 +105,10 @@ impl ConsensusApi for ConsensusMock {
 
     fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.awaited_seeds.read().get(response_txid).copied()
+    }
+
+    fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        self.awaited_paths.read().get(response_txid).cloned()
     }
 
     fn private_cohort_escrows(

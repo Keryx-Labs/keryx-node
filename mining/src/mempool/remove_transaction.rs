@@ -35,28 +35,27 @@ impl Mempool {
             // Remove the tx from the transaction pool and the UTXO set (handled within the pool)
             let tx = self.transaction_pool.remove_transaction(tx_id)?;
             // Clean up AI dedup indexes when a tx is evicted.
-            if tx.mtx.tx.is_ai_response() {
-                if let Some(rh) = AiResponsePayload::deserialize(&tx.mtx.tx.payload).map(|r| r.request_hash) {
-                    if let Some(entries) = self.ai_response_index.get_mut(&rh) {
-                        entries.retain(|(_, id)| id != tx_id);
-                        if entries.is_empty() {
-                            self.ai_response_index.remove(&rh);
-                        }
-                    }
+            if tx.mtx.tx.is_ai_response()
+                && let Some(rh) = AiResponsePayload::deserialize(&tx.mtx.tx.payload).map(|r| r.request_hash)
+                && let Some(entries) = self.ai_response_index.get_mut(&rh)
+            {
+                entries.retain(|(_, id)| id != tx_id);
+                if entries.is_empty() {
+                    self.ai_response_index.remove(&rh);
                 }
             }
-            if tx.mtx.tx.is_ai_challenge() {
-                if let Some(rh) = AiChallengePayload::deserialize(&tx.mtx.tx.payload).map(|c| c.response_hash) {
-                    self.ai_challenge_index.remove(&rh);
-                }
+            if tx.mtx.tx.is_ai_challenge()
+                && let Some(rh) = AiChallengePayload::deserialize(&tx.mtx.tx.payload).map(|c| c.response_hash)
+            {
+                self.ai_challenge_index.remove(&rh);
             }
             if tx.mtx.tx.is_ai_request() {
                 self.ai_private_request_index.remove(&tx_id.as_bytes());
             }
             if tx.mtx.tx.is_ai_opening()
-                && let Some(response_txid) = super::validate_and_insert_transaction::ai_opening_response_txid(&tx.mtx.tx.payload)
+                && let Some(key) = super::validate_and_insert_transaction::ai_opening_key(&tx.mtx.tx.payload)
             {
-                self.ai_opening_index.remove(&response_txid);
+                self.ai_opening_index.remove(&key);
             }
             // Update/remove descendent orphan txs (depending on `remove_redeemers`)
             let txs = self.orphan_pool.update_orphans_after_transaction_removed(&tx, remove_redeemers)?;

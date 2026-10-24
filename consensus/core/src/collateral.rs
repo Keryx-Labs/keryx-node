@@ -149,6 +149,10 @@ pub fn verify_responder_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64]
 pub const TRACE_SEED_DELAY_DAA: u64 = 100;
 /// Domain separator of the trace draw seed.
 pub const TRACE_DRAW_DOMAIN: &[u8] = b"KeryxTraceDrawV1";
+/// Window to open the next phase of an attention opening once its child is drawn.
+pub const ATTN_PHASE_WINDOW_DAA: u64 = 3_000;
+/// Domain separator of the child drawn after an attention phase.
+pub const ATTN_CHILD_DOMAIN: &[u8] = b"KeryxAttnChildV1";
 
 /// A signed response carrying a trace commitment, accepted in a chain block.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +242,63 @@ struct TraceAudit {
     identities: Vec<Hash>,
     seed: Option<[u8; 32]>,
     deadline_daa: u64,
+    /// Pieces already proven when the audit needs several ([`PIECE_TRACE`], [`PIECE_ATTN`],
+    /// [`PIECE_RECUR`]).
+    pieces: u8,
+    /// Progress of an attention opening of several phases.
+    attn: Option<AttnProgress>,
+}
+
+/// Accepted phases of an attention opening still short of its last.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttnProgress {
+    /// Child drawn after each accepted phase.
+    path: Vec<u64>,
+    /// Partials root and child count the last accepted phase committed.
+    root: [u8; 32],
+    n: u64,
+    /// DAA of the chain block that accepted the last phase.
+    accepted_daa: u64,
+    /// Whether the child of the last accepted phase is drawn.
+    drawn: bool,
+}
+
+impl AttnProgress {
+    /// Path of the phase the audit awaits, `None` until the child of the last accepted phase is
+    /// drawn.
+    fn awaited(&self) -> Option<&[u64]> {
+        self.drawn.then_some(&self.path[..])
+    }
+}
+
+/// Seed of the child drawn after attention phase `phase` of a response.
+pub fn attn_child_seed(chain_hash: &Hash, response_txid: &[u8; 32], phase: u8) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(ATTN_CHILD_DOMAIN);
+    hasher.update(&chain_hash.as_bytes());
+    hasher.update(response_txid);
+    hasher.update(&[phase]);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(hasher.finalize().as_bytes());
+    seed
+}
+
+/// The trace opening of a several-piece audit is proven.
+const PIECE_TRACE: u8 = 1;
+/// The attention opening of a several-piece audit is proven.
+const PIECE_ATTN: u8 = 2;
+/// The recurrent opening of a several-piece audit is proven.
+const PIECE_RECUR: u8 = 4;
+const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR;
+
+/// Pieces an audit under `rules` needs.
+fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
+    match rules {
+        Some(r) if r.attention => {
+            PIECE_TRACE | PIECE_ATTN | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
+        }
+        _ => PIECE_TRACE,
+    }
 }
 
 /// Draw seed of a traced response.
@@ -268,9 +329,20 @@ fn trace_opening_valid(
     if opening.points.len() != POINTS as usize {
         return Err("point count");
     }
-    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    let mut resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     if let Some(cc) = &rules.chain {
         let (Some(pc), Some(pp), Some(rp)) = (&rules.prefix, &opening.prefix, &opening.resid) else { return Err("stage-2 part missing") };
+        match (rules.attention, &opening.roots) {
+            (true, Some((pos_root, seq_root))) => {
+                if keryx_verifiable_inference::seq::trace_root(pos_root, seq_root) != audit.trace_root {
+                    return Err("trace root split");
+                }
+                resp.trace_root = *pos_root;
+            }
+            (true, None) => return Err("sequence root missing"),
+            (false, Some(_)) => return Err("sequence root before its rule"),
+            (false, None) => {}
+        }
         if opening.links.len() != opening.points.len() || opening.experts.len() != opening.points.len() {
             return Err("link count");
         }
@@ -298,6 +370,71 @@ fn trace_opening_valid(
             prefix::verify_prefix_point(&rules.ctx, pc, &resp, seed, &audit.request_hash, p).map(|_| ()).map_err(|_| "prefix point")
         }
     }
+}
+
+/// The piece an opening body, seeded or not, proves.
+fn body_piece(body: &[u8]) -> u8 {
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_RECUR, inner_body};
+    match inner_body(body).and_then(|b| b.first().copied()) {
+        Some(VERSION_ATTN) => PIECE_ATTN,
+        Some(VERSION_RECUR) => PIECE_RECUR,
+        _ => PIECE_TRACE,
+    }
+}
+
+/// Checks that a recurrent opening body proves the recurrent point of `audit` under `seed`.
+fn recur_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{opening::{RecurOpening, inner_body}, recur, verify};
+    let op = inner_body(body).as_deref().and_then(RecurOpening::decode).ok_or("malformed recurrent body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let cc = rules.chain.as_ref().ok_or("recurrence without stage-2 rules")?;
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    recur::verify_recur_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "recurrent point")
+}
+
+/// Checks that an attention opening body proves the phase `audit` awaits of its attention point
+/// under `seed`.
+fn attn_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> {
+    use keryx_verifiable_inference::{chain, opening::{AttnOpening, inner_body}, verify};
+    let op = inner_body(body).as_deref().and_then(AttnOpening::decode).ok_or("malformed attention body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let (path, root) = match &audit.attn {
+        Some(p) => (&p.path[..], Some(&p.root)),
+        None => (&[][..], None),
+    };
+    #[cfg(test)]
+    if let Some(r) = ATTN_ORACLE.with(|o| o.borrow().as_ref().map(|f| f(path, root, &op))) {
+        return r;
+    }
+    let cc = rules.chain.as_ref().ok_or("attention without stage-2 rules")?;
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    chain::verify_attn_phase(&rules.ctx, cc, &resp, seed, path, root, &op).map_err(|_| "attention point")
+}
+
+/// Verdict of an attention phase from its path, the previous partials root and the opening.
+#[cfg(test)]
+type AttnOracle = Box<dyn Fn(&[u64], Option<&[u8; 32]>, &keryx_verifiable_inference::opening::AttnOpening) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the attention verifier in the ledger tests of the calling thread.
+    static ATTN_ORACLE: std::cell::RefCell<Option<AttnOracle>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Domain separator of the trace opening signature.
@@ -734,9 +871,12 @@ struct QueuedWindow {
     /// Cohort order: work queued ahead of the request (DAA), and whether the queue exceeded
     /// [`SERVICE_QUEUE_CAP`].
     queue: Vec<(u64, bool)>,
-    /// Credited members: identity, credit daa, traced `(n_prompt, generated)`.
-    answers: Vec<(Hash, u64, Option<(u32, u32)>)>,
+    /// Credited members.
+    answers: Vec<Answer>,
 }
+
+/// A credited member: identity, credit daa, traced `(n_prompt, generated)`.
+type Answer = (Hash, u64, Option<(u32, u32)>);
 
 /// One miner's strike state: consecutive-miss count and the daa of the last actual strike.
 /// Also the persisted strike-log record: `{0, 0}` marks a served-response reset, `{0, daa}` an
@@ -1060,9 +1200,7 @@ impl ServiceLedger {
         }
         self.vault.retain(|_, claims| !claims.is_empty());
 
-        let mut outcome = FoldOutcome::default();
-        outcome.sightings = sightings;
-        outcome.expired = expired;
+        let mut outcome = FoldOutcome { sightings, expired, ..Default::default() };
 
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
         self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
@@ -1174,10 +1312,10 @@ impl ServiceLedger {
                 if misshaped.contains(&(ev.request_hash, ev.responder)) {
                     continue;
                 }
-                if self.trace_roots.contains_key(&ev.trace_root) {
-                    misshaped.push((ev.request_hash, ev.responder));
+                if let std::collections::btree_map::Entry::Vacant(e) = self.trace_roots.entry(ev.trace_root) {
+                    e.insert(daa);
                 } else {
-                    self.trace_roots.insert(ev.trace_root, daa);
+                    misshaped.push((ev.request_hash, ev.responder));
                 }
             }
         }
@@ -1375,7 +1513,7 @@ impl ServiceLedger {
                         let req_max_tokens = req.max_tokens;
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
                         let mut responded: Vec<Hash> = Vec::new();
-                        let mut answers: Vec<(Hash, u64, Option<(u32, u32)>)> = Vec::new();
+                        let mut answers: Vec<Answer> = Vec::new();
                         let mut fit = false;
                         for key in early.iter() {
                             let waits = self.reset_waits_for_opening(traces, &rh, key, req_tier, daa);
@@ -1475,6 +1613,8 @@ impl ServiceLedger {
                 identities: Vec::new(),
                 seed: None,
                 deadline_daa: 0,
+                pieces: 0,
+                attn: None,
             };
             self.resolve_trace_audit(&mut a);
             self.trace_audits.insert(ev.response_txid, a);
@@ -1498,22 +1638,62 @@ impl ServiceLedger {
             }
         }
 
+        for (txid, a) in self.trace_audits.iter_mut() {
+            if let Some(p) = a.attn.as_mut().filter(|p| !p.drawn && daa >= p.accepted_daa + TRACE_SEED_DELAY_DAA) {
+                let child = attn_child_seed(&tr.chain_hash, txid, p.path.len() as u8);
+                p.path.push(keryx_verifiable_inference::attn_blocks::draw_child(&child, p.n));
+                p.drawn = true;
+            }
+        }
+
         for op in tr.openings {
             let Some(a) = self.trace_audits.get(&op.response_txid) else { continue };
             let Some(seed) = a.seed else { continue };
             if op.escrow_pubkey != a.escrow_pubkey {
                 continue;
             }
-            if let Some(block) = keryx_verifiable_inference::opening::seed_block(&op.body) {
-                if !tr.seed_bind || trace_seed(&Hash::from_bytes(block), &op.response_txid) != seed {
-                    continue;
-                }
+            if let Some(block) = keryx_verifiable_inference::opening::seed_block(&op.body)
+                && (!tr.seed_bind || trace_seed(&Hash::from_bytes(block), &op.response_txid) != seed)
+            {
+                continue;
             }
-            let a = self.trace_audits.remove(&op.response_txid).unwrap();
-            let verdict = match (tr.tier)(a.tier, a.accepted_daa) {
-                Some(rules) => trace_opening_valid(&rules, &a, &seed, &op.response_txid, &op.body),
+            let rules = (tr.tier)(a.tier, a.accepted_daa);
+            let required = required_pieces(rules.as_ref());
+            let piece = body_piece(&op.body);
+            if piece & required == 0 || a.pieces & piece != 0 {
+                continue;
+            }
+            if piece == PIECE_ATTN
+                && let Some(path) = keryx_verifiable_inference::opening::attn_path(&op.body)
+                && Some(&path[..]) != a.attn.as_ref().map_or(Some(&[][..]), AttnProgress::awaited)
+            {
+                continue;
+            }
+            let mut a = self.trace_audits.remove(&op.response_txid).unwrap();
+            let mut next = None;
+            let verdict = match &rules {
+                Some(r) if piece == PIECE_ATTN => attn_opening_valid(r, &a, &seed, &op.response_txid, &op.body).map(|step| {
+                    if let keryx_verifiable_inference::chain::AttnStep::Next { root, n } = step {
+                        next = Some((root, n));
+                    }
+                }),
+                Some(r) if piece == PIECE_RECUR => recur_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 None => Err("no rules"),
             };
+            if let Some((root, n)) = next {
+                let path = a.attn.take().map(|p| p.path).unwrap_or_default();
+                a.attn = Some(AttnProgress { path, root, n, accepted_daa: daa, drawn: false });
+                a.deadline_daa = a.deadline_daa.max(daa + TRACE_SEED_DELAY_DAA + ATTN_PHASE_WINDOW_DAA);
+                self.trace_audits.insert(op.response_txid, a);
+                continue;
+            }
+            if verdict.is_ok() && a.pieces | piece != required {
+                a.pieces |= piece;
+                a.attn = None;
+                self.trace_audits.insert(op.response_txid, a);
+                continue;
+            }
             outcome.verdicts.push(TraceVerdict {
                 response_txid: op.response_txid,
                 request_hash: a.request_hash,
@@ -1635,6 +1815,16 @@ impl ServiceLedger {
     /// Draw seed of a drawn response still awaiting its opening.
     pub fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.trace_audits.get(response_txid).and_then(|a| a.seed)
+    }
+
+    /// Path of the attention phase a drawn response awaits; `None` while a child is still to
+    /// draw or when no attention opening is awaited.
+    pub fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        let a = self.trace_audits.get(response_txid).filter(|a| a.seed.is_some() && a.pieces & PIECE_ATTN == 0)?;
+        match &a.attn {
+            None => Some(Vec::new()),
+            Some(p) => p.awaited().map(<[u64]>::to_vec),
+        }
     }
 
     pub fn private_recipients(&self, request_hash: &[u8; 32]) -> Option<&[Hash]> {
@@ -1932,6 +2122,13 @@ const SNAPSHOT_ENCODING_VERSION_CONTEXT: u8 = 6;
 /// q × [queued: u64] [capped: u8] [a: u32] a × [identity: 32] [daa: u64] [traced: u8]
 /// ([n_prompt: u32] [generated: u32] when traced)`, pending order, queue in cohort order).
 const SNAPSHOT_ENCODING_VERSION_QUEUE: u8 = 7;
+/// Sections of version 7 (possibly empty) followed by the trace audits holding one proven piece
+/// of two (`[n: u32] n × [response_txid: 32] [piece: u8]`, key order).
+const SNAPSHOT_ENCODING_VERSION_ATTN: u8 = 8;
+/// Sections of version 8 (possibly empty) followed by the attention openings short of their
+/// last phase (`[n: u32] n × [response_txid: 32] [k: u8] k × [child: u64] [root: 32]
+/// [children: u64] [accepted_daa: u64] [drawn: u8]`, key order).
+const SNAPSHOT_ENCODING_VERSION_PHASES: u8 = 9;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -2014,7 +2211,13 @@ impl ServiceLedgerSnapshot {
         let drawn: Vec<(&[u8; 32], &RewardDraw)> = self.pending.iter().filter_map(|(rh, r)| r.draw.as_ref().map(|d| (rh, d))).collect();
         let windowed: Vec<(&[u8; 32], &QueuedWindow)> =
             self.pending.iter().filter_map(|(rh, r)| r.audit.as_ref().and_then(|a| a.v3.as_ref()).map(|w| (rh, w))).collect();
-        let version = if !drawn.is_empty() || !windowed.is_empty() {
+        let halves: Vec<(&[u8; 32], u8)> = self.trace_audits.iter().filter(|(_, a)| a.pieces != 0).map(|(k, a)| (k, a.pieces)).collect();
+        let phased: Vec<(&[u8; 32], &AttnProgress)> = self.trace_audits.iter().filter_map(|(k, a)| a.attn.as_ref().map(|p| (k, p))).collect();
+        let version = if !phased.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_PHASES
+        } else if !halves.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_ATTN
+        } else if !drawn.is_empty() || !windowed.is_empty() {
             SNAPSHOT_ENCODING_VERSION_QUEUE
         } else if !fit.is_empty() {
             SNAPSHOT_ENCODING_VERSION_CONTEXT
@@ -2204,6 +2407,27 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
+        if version >= SNAPSHOT_ENCODING_VERSION_ATTN {
+            out.extend_from_slice(&(halves.len() as u32).to_le_bytes());
+            for (txid, piece) in halves {
+                out.extend_from_slice(txid);
+                out.push(piece);
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_PHASES {
+            out.extend_from_slice(&(phased.len() as u32).to_le_bytes());
+            for (txid, p) in phased {
+                out.extend_from_slice(txid);
+                out.push(p.path.len() as u8);
+                for c in &p.path {
+                    out.extend_from_slice(&c.to_le_bytes());
+                }
+                out.extend_from_slice(&p.root);
+                out.extend_from_slice(&p.n.to_le_bytes());
+                out.extend_from_slice(&p.accepted_daa.to_le_bytes());
+                out.push(p.drawn as u8);
+            }
+        }
         out
     }
 
@@ -2220,6 +2444,8 @@ impl ServiceLedgerSnapshot {
                 | SNAPSHOT_ENCODING_VERSION_ROOT
                 | SNAPSHOT_ENCODING_VERSION_CONTEXT
                 | SNAPSHOT_ENCODING_VERSION_QUEUE
+                | SNAPSHOT_ENCODING_VERSION_ATTN
+                | SNAPSHOT_ENCODING_VERSION_PHASES
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -2381,6 +2607,8 @@ impl ServiceLedgerSnapshot {
                     identities: r.hashes()?,
                     seed: None,
                     deadline_daa: 0,
+                    pieces: 0,
+                    attn: None,
                 };
                 match r.u8()? {
                     0 => {}
@@ -2460,7 +2688,7 @@ impl ServiceLedgerSnapshot {
                 }
             }
             let n_windows = r.u32()?;
-            if n_draws == 0 && n_windows == 0 {
+            if n_draws == 0 && n_windows == 0 && version == SNAPSHOT_ENCODING_VERSION_QUEUE {
                 return Err("empty queue section".into());
             }
             for _ in 0..n_windows {
@@ -2492,6 +2720,46 @@ impl ServiceLedgerSnapshot {
                 match snap.pending.get_mut(&rh).and_then(|req| req.audit.as_mut()) {
                     Some(a) if a.v3.is_none() && a.cohort.len() == queue.len() => a.v3 = Some(QueuedWindow { arm_daa, queue, answers }),
                     _ => return Err("malformed window section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ATTN {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_ATTN {
+                return Err("empty attention section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let piece = r.u8()?;
+                match snap.trace_audits.get_mut(&txid) {
+                    Some(a) if a.pieces == 0 && a.seed.is_some() && piece != 0 && piece & !PIECE_ALL == 0 && piece != PIECE_ALL => a.pieces = piece,
+                    _ => return Err("malformed attention section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_PHASES {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty phase section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let k = r.u8()? as usize;
+                let path = (0..k).map(|_| r.u64()).collect::<Result<Vec<_>, _>>()?;
+                let root = r.key()?;
+                let children = r.u64()?;
+                let accepted_daa = r.u64()?;
+                let drawn = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("malformed phase section".into()),
+                };
+                let ok = children >= 1 && (!drawn || path.last().is_some_and(|&c| c < children));
+                match snap.trace_audits.get_mut(&txid) {
+                    Some(a) if ok && a.attn.is_none() && a.seed.is_some() && a.pieces & PIECE_ATTN == 0 => {
+                        a.attn = Some(AttnProgress { path, root, n: children, accepted_daa, drawn })
+                    }
+                    _ => return Err("malformed phase section".into()),
                 }
             }
         }
@@ -2913,7 +3181,7 @@ mod tests {
         assert_eq!(tabled.window_daa_at(99), None);
         assert_eq!(tabled.window_daa_at(251), None);
         // Large deltas exercise multi-byte varints.
-        let wide = ProductionIndexSnapshot { window_daa: (0..=150u64).map(|i| 1 << 40 | i * 300).collect(), ..snap.clone() };
+        let wide = ProductionIndexSnapshot { window_daa: (0..=150u64).map(|i| (1 << 40) | (i * 300)).collect(), ..snap.clone() };
         assert_eq!(ProductionIndexSnapshot::from_bytes(&wide.to_bytes()).unwrap(), wide);
 
         // A table that does not cover exactly [bottom, sample] is rejected.
@@ -4079,6 +4347,8 @@ mod tests {
             cohort: Vec<Hash>,
             /// `(n_prompt, n_pos)` of the traced response when set.
             positions: Option<(u32, u32)>,
+            /// Attention rule: an audit also needs the attention opening.
+            attention: bool,
         }
 
         impl Run {
@@ -4096,6 +4366,7 @@ mod tests {
                     max_tokens: 256,
                     cohort: vec![miner()],
                     positions: None,
+                    attention: false,
                 }
             }
 
@@ -4141,6 +4412,7 @@ mod tests {
                         prefix: self.prefix.map(|(o, _)| self.model.prefix_ctx(o)),
                         chain: None,
                         audit_all: self.audit_all,
+                        attention: self.attention,
                     })
                 };
                 let lens = [(RH, self.shape.map_or(0, |(p, _)| p))];
@@ -4349,6 +4621,264 @@ mod tests {
             assert!(deadline > 203);
             let h = Hash::from_bytes([3u8; 32]);
             assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        fn attention_body() -> Vec<u8> {
+            use keryx_verifiable_inference::opening::AttnOpening;
+            AttnOpening { response_txid: TXID, ..Default::default() }
+            .encode()
+        }
+
+        #[test]
+        fn a_valid_trace_opening_waits_for_the_attention_opening() {
+            let mut run = Run { attention: true, ..Run::new(true) };
+            let (deadline, body) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(crate::collateral::PIECE_TRACE));
+            let bytes = run.ledger.snapshot().to_bytes();
+            assert_eq!(bytes[0], crate::collateral::SNAPSHOT_ENCODING_VERSION_ATTN);
+            assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap().to_bytes(), bytes);
+            assert!(run.fold(deadline, h, &[], &[]).is_empty());
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_bad_attention_opening_strikes_immediately() {
+            let mut run = Run { attention: true, ..Run::new(true) };
+            run.until_draw(true, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, attention_body())]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        fn phase_body(path: &[u64]) -> Vec<u8> {
+            keryx_verifiable_inference::opening::AttnOpening { response_txid: TXID, path: path.to_vec(), partials: vec![path.len() as u8; 4], ..Default::default() }
+                .encode()
+        }
+
+        type Seen = std::rc::Rc<std::cell::RefCell<Vec<(Vec<u64>, Option<[u8; 32]>, u8)>>>;
+
+        /// Attention phases judged by `step` (by phase) instead of the verifier; returns what each
+        /// call saw.
+        fn oracle(step: impl Fn(u8) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> + 'static) -> Seen {
+            let seen: Seen = Default::default();
+            let log = seen.clone();
+            crate::collateral::ATTN_ORACLE.with(|o| {
+                *o.borrow_mut() = Some(Box::new(move |path: &[u64], root: Option<&[u8; 32]>, op: &keryx_verifiable_inference::opening::AttnOpening| {
+                    log.borrow_mut().push((path.to_vec(), root.copied(), op.path.len() as u8));
+                    step(op.path.len() as u8)
+                }))
+            });
+            seen
+        }
+
+        const R0: [u8; 32] = [0x51; 32];
+        const R1: [u8; 32] = [0x52; 32];
+
+        fn three_phases(phase: u8) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> {
+            use keryx_verifiable_inference::chain::AttnStep;
+            Ok(match phase {
+                0 => AttnStep::Next { root: R0, n: 4 },
+                1 => AttnStep::Next { root: R1, n: 3 },
+                _ => AttnStep::Done,
+            })
+        }
+
+        /// Trace opening and attention phase 0 accepted at 203.
+        fn after_phase_0(step: impl Fn(u8) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> + 'static) -> (Run, Seen) {
+            let seen = oracle(step);
+            let mut run = Run { attention: true, ..Run::new(true) };
+            let (_, body) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body), opening(ESCROW_PK, phase_body(&[]))]).is_empty());
+            (run, seen)
+        }
+
+        #[test]
+        fn the_child_seed_matches_its_known_answer() {
+            let seed = crate::collateral::attn_child_seed(&Hash::from_bytes([1u8; 32]), &[2u8; 32], 1);
+            let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, "347b8cd184f5fdf5d3ef1828b99bb28d859b019df6b09ece1ec8167ea62e534b");
+        }
+
+        #[test]
+        fn an_attention_opening_runs_its_phases_on_drawn_children() {
+            use crate::collateral::{AttnProgress, attn_child_seed};
+            use keryx_verifiable_inference::attn_blocks::draw_child;
+            let (mut run, seen) = after_phase_0(three_phases);
+            let h = Hash::from_bytes([3u8; 32]);
+            let progress = |run: &Run| run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.clone());
+            assert_eq!(progress(&run), Some(AttnProgress { path: vec![], root: R0, n: 4, accepted_daa: 203, drawn: false }));
+            let (h2, h3) = (Hash::from_bytes([0x61u8; 32]), Hash::from_bytes([0x62u8; 32]));
+            let c0 = draw_child(&attn_child_seed(&h2, &TXID, 0), 4);
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), None, "no child drawn yet");
+            assert!(run.fold(250, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
+            assert_eq!(seen.borrow().len(), 1, "a phase before its child is drawn is passed over");
+            assert!(run.fold(303, h2, &[], &[]).is_empty());
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), Some(vec![c0]));
+            assert_eq!(progress(&run).map(|p| (p.path, p.drawn)), Some((vec![c0], true)));
+            let other = (c0 + 1) % 4;
+            let wrong = [phase_body(&[c0, 0]), phase_body(&[]), phase_body(&[other])];
+            assert!(run.fold(304, h, &[], &wrong.map(|b| opening(ESCROW_PK, b))).is_empty());
+            assert_eq!(seen.borrow().len(), 1, "phases built for another path are passed over");
+            assert!(run.fold(305, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
+            assert_eq!(progress(&run), Some(AttnProgress { path: vec![c0], root: R1, n: 3, accepted_daa: 305, drawn: false }));
+            assert!(run.fold(405, h3, &[], &[]).is_empty());
+            let c1 = draw_child(&attn_child_seed(&h3, &TXID, 1), 3);
+            assert!(run.fold(406, h, &[], &[opening(ESCROW_PK, phase_body(&[c0, c1]))]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty(), "the last phase closes the audit");
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), None);
+            assert_eq!(*seen.borrow(), vec![(vec![], None, 0), (vec![c0], Some(R0), 1), (vec![c0, c1], Some(R1), 2)]);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn phase_0_is_awaited_once_the_response_is_drawn() {
+            let mut run = Run { attention: true, ..Run::new(true) };
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), None);
+            run.until_draw(true, true);
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), Some(vec![]));
+        }
+
+        #[test]
+        fn a_failed_attention_phase_strikes_immediately() {
+            let (mut run, _) = after_phase_0(|phase| if phase == 0 { three_phases(0) } else { Err("attention point") });
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(303, h, &[], &[]).is_empty());
+            let path = run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.clone()).unwrap().path;
+            assert_eq!(run.fold(304, h, &[], &[opening(ESCROW_PK, phase_body(&path))]), vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_missing_attention_phase_strikes_after_its_window() {
+            use crate::collateral::{ATTN_PHASE_WINDOW_DAA, TRACE_SEED_DELAY_DAA};
+            let (mut run, _) = after_phase_0(three_phases);
+            let deadline = run.deadline();
+            assert!(deadline >= 203 + TRACE_SEED_DELAY_DAA + ATTN_PHASE_WINDOW_DAA);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(deadline, h, &[], &[]).is_empty());
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn attention_progress_survives_the_snapshot_and_malformed_sections_are_refused() {
+            let (mut run, _) = after_phase_0(three_phases);
+            let check = |run: &Run| {
+                let bytes = run.ledger.snapshot().to_bytes();
+                assert_eq!(bytes[0], crate::collateral::SNAPSHOT_ENCODING_VERSION_PHASES);
+                let back = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+                assert_eq!(back.trace_audits.get(&TXID).and_then(|a| a.attn.clone()), run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.clone()));
+                assert_eq!(back.to_bytes(), bytes);
+                bytes
+            };
+            let bytes = check(&run);
+            let n = bytes.len();
+            let mut undrawn_with_flag = bytes.clone();
+            undrawn_with_flag[n - 1] = 1;
+            assert!(ServiceLedgerSnapshot::from_bytes(&undrawn_with_flag).is_err());
+            let mut bad_flag = bytes.clone();
+            bad_flag[n - 1] = 2;
+            assert!(ServiceLedgerSnapshot::from_bytes(&bad_flag).is_err());
+            let mut childless = bytes.clone();
+            childless[n - 17..n - 9].copy_from_slice(&0u64.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&childless).is_err());
+            assert!(run.fold(303, Hash::from_bytes([0x61u8; 32]), &[], &[]).is_empty());
+            let drawn = check(&run);
+            let n = drawn.len();
+            let mut out_of_range = drawn.clone();
+            out_of_range[n - 57..n - 49].copy_from_slice(&4u64.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&out_of_range).is_err());
+        }
+
+        #[test]
+        fn a_recurrent_opening_is_passed_over_without_its_rule() {
+            use keryx_verifiable_inference::opening::RecurOpening;
+            let mut run = Run { attention: true, ..Run::new(true) };
+            run.until_draw(true, true);
+            let body = RecurOpening { response_txid: TXID, ..Default::default() }.encode();
+            assert!(run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(0));
+        }
+
+        #[test]
+        fn pieces_follow_the_rules() {
+            use crate::collateral::{PIECE_ATTN, PIECE_RECUR, PIECE_TRACE, required_pieces};
+            use crate::config::params::trace_rules;
+            assert_eq!(required_pieces(None), PIECE_TRACE);
+            assert_eq!(required_pieces(trace_rules(1, true, true, true, false).as_ref()), PIECE_TRACE);
+            assert_eq!(required_pieces(trace_rules(1, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN);
+            assert_eq!(required_pieces(trace_rules(0, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR);
+            assert_eq!(required_pieces(trace_rules(4, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR);
+        }
+
+        #[test]
+        fn a_trace_opening_carries_the_root_halves_under_the_attention_rules() {
+            use crate::collateral::{TraceAudit, trace_opening_valid};
+            use crate::config::params::trace_rules;
+            use keryx_verifiable_inference::draw::POINTS;
+            use keryx_verifiable_inference::opening::{EntryOpening, LeafChunk, LinkOpening, Opening, Point, PrefixPoint, ResidAdd, ResidPoint, ResidSrc};
+            let (pos_root, seq_root) = ([0x11u8; 32], [0x22u8; 32]);
+            let audit = TraceAudit {
+                request_hash: RH,
+                responder: miner(),
+                escrow_pubkey: ESCROW_PK,
+                trace_root: keryx_verifiable_inference::seq::trace_root(&pos_root, &seq_root),
+                n_prompt: 4,
+                n_pos: 9,
+                accepted_daa: 0,
+                tier: 1,
+                max_tokens: 16,
+                identities: vec![miner()],
+                seed: Some([9; 32]),
+                deadline_daa: 0,
+                pieces: 0,
+                attn: None,
+            };
+            let body = |roots: Option<([u8; 32], [u8; 32])>| {
+                Opening {
+                    response_txid: TXID,
+                    points: vec![Point::default(); POINTS as usize],
+                    prefix: Some(PrefixPoint::default()),
+                    links: vec![(0, LinkOpening::None); POINTS as usize],
+                    experts: vec![None; POINTS as usize],
+                    resid: Some(ResidPoint {
+                        n_ubatch: 1,
+                        tok: 0,
+                        pos_path: vec![],
+                        meta_path: vec![],
+                        layer: EntryOpening::default(),
+                        product: EntryOpening::default(),
+                        dst: LeafChunk::default(),
+                        src: ResidSrc::Chunk(LeafChunk::default()),
+                        add: ResidAdd::Chunk(LeafChunk::default()),
+                    }),
+                    roots,
+                }
+                .encode()
+            };
+            let (with, without) = (trace_rules(1, true, true, true, true).unwrap(), trace_rules(1, true, true, true, false).unwrap());
+            let check = |r, roots| trace_opening_valid(r, &audit, &[9; 32], &TXID, &body(roots));
+            assert_eq!(check(&with, None), Err("sequence root missing"));
+            assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));
+            assert_eq!(check(&with, Some((pos_root, seq_root))), Err("point 0"));
+            assert_eq!(check(&without, Some((pos_root, seq_root))), Err("sequence root before its rule"));
+        }
+
+        #[test]
+        fn an_attention_opening_is_passed_over_without_its_rule() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, attention_body())]).is_empty());
+            assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(0));
+            assert!(run.fold(204, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
             assert!(run.ledger.trace_audits.is_empty());
             assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
             assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
@@ -5137,7 +5667,7 @@ mod tests {
             net.fold(300, chain(0), &[], &[(RH, a, Some((0, 256)))]);
             // past its own work, inside its own work plus the queue
             net.fold(103 + 381 + queued, chain(0), &[], &[(RH2, a, Some((0, 256))), (RH2, b, Some((0, 256)))]);
-            assert!(net.ledger.pending.get(&RH).is_none());
+            assert!(!net.ledger.pending.contains_key(&RH));
             let out = net.fold(net.window_end(&RH2) + 1, chain(0), &[], &[]);
             assert_eq!(Net::struck(&out), vec![b]);
             assert_eq!(out.late, vec![(RH2, b)]);

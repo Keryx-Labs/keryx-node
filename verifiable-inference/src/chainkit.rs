@@ -119,6 +119,12 @@ fn layout_of(forced: Option<u32>, t: u64, n_prompt: u32) -> (u32, u8) {
     }
 }
 
+impl Default for Tier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Tier {
     pub fn new() -> Self {
         let row_bytes = (D / 32 * 34) as u32;
@@ -202,6 +208,8 @@ impl Tier {
                 post_ffn: manifest::NONE,
                 scale: manifest::NONE,
                 moe: None,
+                attn: None,
+                recur: None,
             });
             entries.push(e);
         }
@@ -240,6 +248,7 @@ impl Tier {
             embd_scale: 1.0,
             trim_last: false,
             n_used: 0,
+            n_attn: 0, n_recur: 0, seq_heads: 0,
         }
     }
 
@@ -548,7 +557,7 @@ impl Tier {
         let sel = d[1] % (2 * N_LAYERS as u64);
         let t = chain::resid_position(ctx, &resp, sel / 2, d[0]).expect("residual position");
         let sel = d[1] % (2 * N_LAYERS as u64);
-        let (layer, kind) = (sel / 2, if sel % 2 == 0 { Resid::Attn } else { Resid::Out });
+        let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
         let pos = &trace.positions[t as usize];
         let product = if kind == Resid::Attn { rank(layer as usize, ATTN_OUTPUT) } else { rank(layer as usize, FFN_DOWN) };
         let dst_leaf = chain::resid_leaf(np, layer, kind);
@@ -641,10 +650,17 @@ mod tests {
             experts: vec![None; links.len()],
             links,
             resid: Some(tier.open_resid(&trace, &seed)),
+            roots: None,
         };
         let body = o.encode();
         assert_eq!(body[0], crate::opening::VERSION_CHAIN);
-        assert_eq!(Opening::decode(&body), Some(o));
+        assert_eq!(Opening::decode(&body), Some(o.clone()));
+        let split = Opening { roots: Some(([4; 32], [5; 32])), ..o };
+        let body = split.encode();
+        assert_eq!(body[0], crate::opening::VERSION_ROOTS);
+        assert_eq!(Opening::decode(&body), Some(split.clone()));
+        let seeded = crate::opening::seeded(&body, &[6; 32]).unwrap();
+        assert_eq!(Opening::decode(&seeded), Some(split));
     }
 
     #[test]
@@ -719,7 +735,7 @@ mod tests {
         for s in 0..64u32 {
             let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
             let d = draw::point(&seed, chain::RESID_POINT);
-            let hits = d[1] % 4 < 2 && d[2] % 2 == 0;
+            let hits = d[1] % 4 < 2 && d[2].is_multiple_of(2);
             let r = verify_resid_point(&tc, &cc, &rc, &seed, &tier.open_resid(&trace, &seed));
             if hits {
                 assert_eq!(r, Err(crate::verify::Fail::Mismatch), "seed {s}");
@@ -857,6 +873,197 @@ mod expert_tests {
 }
 
 #[cfg(test)]
+mod head_link_tests {
+    use super::*;
+    use crate::chain::{ChainCtx, verify_chain_point};
+    use crate::opening::{LinkOpening, Point};
+    use crate::verify::ResponseCtx;
+
+    const NH: usize = 4;
+    const STRIDE: usize = D + 32;
+    const M1: usize = D / NH;
+    const NP: u64 = 3;
+
+    struct H {
+        offs: Vec<usize>,
+        chunk_leaves: Vec<Hash>,
+        all: Vec<u8>,
+        entries: Vec<Vec<u8>>,
+        entry_leaves: Vec<Hash>,
+        tier: TierCtx,
+        ctx: ChainCtx,
+        pos: Position,
+        trace_root: Hash,
+    }
+
+    fn dot_rows(w: &[u8], rows: std::ops::Range<usize>, x: &[u8]) -> Vec<f32> {
+        let rb = D / 32 * 34;
+        rows.map(|r| dot::canonical_dot(quant::Q8_0, &w[r * rb..(r + 1) * rb], D, x, q8::MMVQ).unwrap().y_hat as f32).collect()
+    }
+
+    /// `shift`: each head reads its slice 32 values late; `zero_out`: the output projection reads zeros.
+    fn build(shift: bool, zero_out: bool) -> H {
+        let none = manifest::NONE;
+        let weights = vec![q8_0_rows(11, NH * STRIDE, 0.0004), q8_0_rows(12, NH * M1, 0.0004), q8_0_rows(13, D, 0.0004)];
+        let mut all = Vec::new();
+        let mut offs = Vec::new();
+        for w in &weights {
+            offs.push(all.len());
+            all.extend_from_slice(w);
+        }
+        let chunk_leaves: Vec<Hash> = all.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+        let rb = D / 32 * 34;
+        let entry = |name: &str, role: u8, m: usize, n_exp: u32, i: usize, link: u8, src: u32| {
+            let e = Entry {
+                name: name.into(),
+                wtype: quant::Q8_0,
+                k: D as u64,
+                m: m as u64,
+                n_exp,
+                chunk_base: (offs[i] / 32) as u64,
+                n_bytes: weights[i].len() as u64,
+                row_bytes: rb as u32,
+                role,
+                glu_op: 0,
+                glu_form: manifest::FORM_NONE,
+                partner: none,
+                bias: none,
+                chain: Chain::Product(ProductLink { layer: 0, link, norm: none, src }),
+            };
+            let mut b = serialize(&e);
+            b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+            b
+        };
+        let entries = vec![
+            entry("blk.0.attn_q.weight", manifest::ROLE_PRODUCT, NH * STRIDE, 1, 0, manifest::LINK_NONE, none),
+            entry("blk.0.attn_k_b.weight", manifest::ROLE_HEADS, M1, NH as u32, 1, manifest::LINK_HEAD_SLICE, 0),
+            entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, D, 1, 2, manifest::LINK_DIRECT, 1),
+        ];
+        let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+        let tier = TierCtx {
+            r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
+            n_chunks: chunk_leaves.len() as u64,
+            m_t: rt_range_proof(&entry_leaves, 0, 1).0,
+            n_entries: NP,
+            n_products: NP,
+        };
+        let ctx = ChainCtx { n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let x0 = q8_1_row(&(0..D).map(|i| ((i * 7) % 23) as f64 * 0.01 - 0.1).collect::<Vec<_>>());
+        let y0 = dot_rows(&weights[0], 0..NH * STRIDE, &x0);
+        let off = if shift { 32 } else { 0 };
+        let xs: Vec<Vec<u8>> = (0..NH).map(|h| q8_1_row(&y0[h * STRIDE + off..h * STRIDE + off + D].iter().map(|&a| a as f64).collect::<Vec<_>>())).collect();
+        let y1: Vec<f32> = (0..NH).flat_map(|h| dot_rows(&weights[1], h * M1..(h + 1) * M1, &xs[h])).collect();
+        let x2 = q8_1_row(&if zero_out { vec![0.0; D] } else { y1.iter().map(|&a| a as f64).collect() });
+        let y2 = dot_rows(&weights[2], 0..D, &x2);
+        let f = |v: &[f32]| v.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>();
+        let n_leaves = 2 * NP as usize + 2 + 1;
+        let mut leaves = vec![Vec::new(); n_leaves];
+        leaves[0] = x0;
+        leaves[1] = f(&y0);
+        leaves[2] = xs.concat();
+        leaves[3] = f(&y1);
+        leaves[4] = x2;
+        leaves[5] = f(&y2);
+        leaves[n_leaves - 1] = chain::meta(0, 1, 7).to_vec();
+        let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+        let pos = Position { tok: 7, leaves, hashes };
+        let trace_root = b3_root(&[b3_root(&pos.hashes)]);
+        H { offs, chunk_leaves, all, entries, entry_leaves, tier, ctx, pos, trace_root }
+    }
+
+    impl H {
+        fn eo(&self, i: usize) -> EntryOpening {
+            EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+        }
+
+        fn open(&self, seed: &Hash) -> (Point, LinkOpening) {
+            let d = draw::point(seed, 0);
+            let rank = (d[1] % NP) as usize;
+            let (m, n_exp) = [(NH * STRIDE, 1), (M1, NH), (D, 1)][rank];
+            let slot = if n_exp > 1 { (d[3] >> 32) % n_exp as u64 } else { 0 } as usize;
+            let row = (d[2] % m as u64) as usize;
+            let rb = (D / 32 * 34) as u64;
+            let off = self.offs[rank] as u64 + (slot * m + row) as u64 * rb;
+            let y = &self.pos.leaves[2 * rank + 1];
+            let yc = leaf_chunk(&self.pos, 2 * rank as u64 + 1, ((slot * m + row) * 4 / B3_CHUNK) as u64);
+            let p = Point {
+                n_ubatch: 1,
+                pos_path: Vec::new(),
+                meta_path: b3_path(&self.pos.hashes, self.pos.hashes.len() - 1),
+                entry: self.eo(rank),
+                partner: None,
+                bias: None,
+                rows: vec![ChunkRange {
+                    first_chunk: off / 32,
+                    chunks: self.all[(off / 32 * 32) as usize..((off + rb - 1) / 32 * 32 + 32) as usize].to_vec(),
+                    proof: rt_range_proof(&self.chunk_leaves, off / 32, (off + rb - 1) / 32 - off / 32 + 1).1,
+                }],
+                x: self.pos.leaves[2 * rank].clone(),
+                x_path: b3_path(&self.pos.hashes, 2 * rank),
+                y_total_len: y.len() as u32,
+                y_chunk_index: yc.index,
+                y_chunk: yc.chunk,
+                y_chunk_path: yc.chunk_path,
+                y_path: b3_path(&self.pos.hashes, 2 * rank + 1),
+            };
+            let link = match rank {
+                0 => LinkOpening::None,
+                1 => {
+                    let c = (slot * STRIDE + (d[3] % (D as u64 / 32)) as usize * 32) * 4 / B3_CHUNK;
+                    LinkOpening::Source { src: self.eo(0), y: leaf_chunk(&self.pos, 1, c as u64), ids: None }
+                }
+                _ => {
+                    let c = d[3] % n_chunks(self.pos.leaves[3].len());
+                    LinkOpening::Source { src: self.eo(1), y: leaf_chunk(&self.pos, 3, c), ids: None }
+                }
+            };
+            (p, link)
+        }
+
+        fn check(&self, seed: &Hash) -> (usize, Result<(), crate::verify::Fail>) {
+            let (p, link) = self.open(seed);
+            let resp = ResponseCtx { trace_root: self.trace_root, n_prompt: 1, n_pos: 1 };
+            let rank = (draw::point(seed, 0)[1] % NP) as usize;
+            (rank, verify_chain_point(&self.tier, &self.ctx, &resp, seed, 0, &p, 7, &link, None).map(|_| ()))
+        }
+    }
+
+    fn seeds() -> impl Iterator<Item = Hash> {
+        (0..96u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
+    }
+
+    #[test]
+    fn honest_head_slices_and_head_outputs_pass() {
+        let h = build(false, false);
+        let mut seen = [false; 3];
+        for s in seeds() {
+            let (rank, r) = h.check(&s);
+            seen[rank] = true;
+            r.unwrap_or_else(|e| panic!("rank {rank}: {e:?}"));
+        }
+        assert!(seen.iter().all(|&b| b));
+    }
+
+    #[test]
+    fn a_misplaced_head_slice_is_refused() {
+        let h = build(true, false);
+        for s in seeds() {
+            let (rank, r) = h.check(&s);
+            assert_eq!(r.is_err(), rank == 1, "rank {rank}");
+        }
+    }
+
+    #[test]
+    fn an_output_projection_cut_from_the_heads_is_refused() {
+        let h = build(false, true);
+        for s in seeds() {
+            let (rank, r) = h.check(&s);
+            assert_eq!(r.is_err(), rank == 2, "rank {rank}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod moe_tests {
     use super::*;
     use crate::chain::{route_weights, verify_resid_point};
@@ -937,7 +1144,7 @@ mod moe_tests {
             entry("blk.0.exp_probs_b.bias", manifest::ROLE_NORM, E, 1, 1, bias_off, 4 * E, 4 * E, Chain::None),
             entry("blk.0.ffn_norm.weight", manifest::ROLE_NORM, D, 1, 1, norm_off, 4 * D, 4 * D, Chain::None),
             entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0, Chain::Layer(LayerLinks {
-                layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe),
+                layer: 0, proj: 0, down: 2, post_attn: none, post_ffn: none, scale: none, moe: Some(moe), attn: None, recur: None,
             })),
         ];
         let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
@@ -948,7 +1155,7 @@ mod moe_tests {
             n_entries: entries.len() as u64,
             n_products: 4,
         };
-        let ctx = ChainCtx { n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32 };
+        let ctx = ChainCtx { n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
 
         let r = vecf(3, D, 2.0);
         let x = chain::rms_norm(&r, &norm, EPS);
@@ -1093,11 +1300,11 @@ mod moe_tests {
         let mut refused = 0;
         for s in seeds() {
             let d = draw::point(&s, chain::RESID_POINT);
-            if let Some(r) = m.check(&s) {
-                if d[2] % 2 == 0 {
-                    assert_eq!(r, Err(crate::verify::Fail::Mismatch));
-                    refused += 1;
-                }
+            if let Some(r) = m.check(&s)
+                && d[2].is_multiple_of(2)
+            {
+                assert_eq!(r, Err(crate::verify::Fail::Mismatch));
+                refused += 1;
             }
         }
         assert!(refused > 0);
@@ -1225,6 +1432,7 @@ mod block_task_tests {
             prefix: Some(tier.open_prefix(trace, &seed, 0)),
             links,
             resid: Some(tier.open_resid(trace, &seed)),
+            roots: None,
         }
     }
 
@@ -1292,3 +1500,1405 @@ mod block_task_tests {
     }
 }
 
+
+#[cfg(test)]
+mod attn_tests {
+    use super::*;
+    use crate::attn::{AttnShape, Prep, ROPE_NEOX, ROPE_NORM, apply_gate, group_output};
+    use crate::attn_blocks::{BlockTree, block_params, partial_len, partial_opening, pick_partials, set_test_budget};
+    use crate::chain::{ATTN_POINT, AttnStep, n_pos_leaves, verify_attn_phase, verify_attn_point};
+    use crate::manifest::AttnLinks;
+    use crate::merkle::b3_chunks_proof;
+    use crate::opening::AttnOpening;
+    use crate::seq::{self, SeqLayout, SeqSpan};
+
+    /// Sequence leaves of attention caches: key then value leaf of each head of one layer.
+    struct Seq {
+        leaves: Vec<Vec<u8>>,
+        hashes: Vec<Hash>,
+        root: Hash,
+    }
+
+    impl Seq {
+        fn new(heads: usize, kcache: &[Vec<Vec<u8>>], vcache: Option<&[Vec<Vec<u8>>]>) -> Seq {
+            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: heads as u64 };
+            let mut leaves = vec![Vec::new(); layout.n_leaves() as usize];
+            for h in 0..kcache[0].len() {
+                leaves[layout.kcache(0, h as u64).unwrap() as usize] = kcache.iter().flat_map(|p| p[h].clone()).collect();
+                if let Some(v) = vcache {
+                    leaves[layout.vcache(0, h as u64).unwrap() as usize] = v.iter().flat_map(|p| p[h].clone()).collect();
+                }
+            }
+            let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+            let root = b3_root(&hashes);
+            Seq { leaves, hashes, root }
+        }
+
+        fn span(&self, leaf: u64, lo: usize, hi: usize) -> SeqSpan {
+            let data = &self.leaves[leaf as usize];
+            let (c0, c1) = (lo / B3_CHUNK, (hi - 1) / B3_CHUNK);
+            SeqSpan {
+                first_chunk: c0 as u32,
+                bytes: data[c0 * B3_CHUNK..((c1 + 1) * B3_CHUNK).min(data.len())].to_vec(),
+                chunk_proof: b3_chunks_proof(data, c0 as u64, (c1 - c0 + 1) as u64),
+                leaf_path: b3_path(&self.hashes, leaf as usize),
+            }
+        }
+    }
+    use crate::verify::{Fail, ResponseCtx};
+
+    const NH: usize = 8;
+    const NKV: usize = 2;
+    const HD: usize = 64;
+    const QD: usize = NH * HD;
+    const KD: usize = NKV * HD;
+    const NP: u64 = 4;
+    const N_POS: usize = 6;
+    const KQ: f32 = 0.125;
+    const BASE: f32 = 10_000.0;
+    const WINDOW: u32 = 4;
+
+    fn vals(seed: u64, n: usize) -> Vec<f32> {
+        (0..n).map(|i| blake3::hash(&[seed.to_le_bytes(), (i as u64).to_le_bytes()].concat()).as_bytes()[0] as f32 / 127.5 - 1.0).collect()
+    }
+
+    fn q8_0(v: &[f32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for blk in v.chunks(32) {
+            let amax = blk.iter().fold(0f32, |m, a| m.max(a.abs()));
+            let d = f16::round(amax / 127.0);
+            out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+            out.extend(blk.iter().map(|&a| (if d == 0.0 { 0.0 } else { libm::roundf(a / d) }) as i8 as u8));
+        }
+        out
+    }
+
+    fn entry(name: &str, role: u8, k: usize, m: usize, off: usize, n: usize, chain: Chain) -> Vec<u8> {
+        let e = Entry {
+            name: name.into(),
+            wtype: if role == manifest::ROLE_PRODUCT { quant::Q8_0 } else { 0 },
+            k: k as u64,
+            m: m as u64,
+            n_exp: 1,
+            chunk_base: (off / 32) as u64,
+            n_bytes: n as u64,
+            row_bytes: n as u32,
+            role,
+            glu_op: 0,
+            glu_form: manifest::FORM_NONE,
+            partner: manifest::NONE,
+            bias: manifest::NONE,
+            chain,
+        };
+        let mut b = serialize(&e);
+        b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+        b
+    }
+
+    /// Attention variant of the synthetic layer.
+    #[derive(Clone, Copy, Default)]
+    struct Cfg {
+        /// The attention output is committed as zeros.
+        zero_out: bool,
+        /// The cache holds keys of no committed projection, the output follows it.
+        forge_cache: bool,
+        /// NEOX RoPE and q/k norms.
+        qk_norm: bool,
+        /// Unweighted value norm.
+        v_norm: bool,
+        /// RoPE over the whole head with frequency divisors.
+        freqs: bool,
+        /// Sliding window of `WINDOW` positions.
+        swa: bool,
+        /// The value projection is the key projection.
+        shared_kv: bool,
+        /// Query heads interleaved with their output gates.
+        gated: bool,
+        /// A layer without attention before the attention layer.
+        mixed: bool,
+        /// The output is committed without its gate.
+        skip_gate: bool,
+    }
+
+    const GLM: Cfg = Cfg { zero_out: false, forge_cache: false, qk_norm: false, v_norm: false, freqs: false, swa: false, shared_kv: false, gated: false, mixed: false, skip_gate: false };
+    const GEMMA_SWA: Cfg = Cfg { qk_norm: true, v_norm: true, freqs: true, swa: true, ..GLM };
+    const GEMMA_GLOBAL: Cfg = Cfg { qk_norm: true, v_norm: true, freqs: true, shared_kv: true, ..GLM };
+    const QWEN: Cfg = Cfg { qk_norm: true, gated: true, mixed: true, ..GLM };
+
+    fn shape(c: Cfg) -> AttnShape {
+        let rope_kind = if c.qk_norm { ROPE_NEOX } else { ROPE_NORM };
+        let n_rot = if c.freqs { HD } else { HD / 2 };
+        AttnShape { n_head: NH, n_head_kv: NKV, head_dim: HD, rope_kind, n_rot, rope_base: BASE as f64, kq_scale: KQ as f64 }
+    }
+
+    struct At {
+        cfg: Cfg,
+        weights: Vec<u8>,
+        chunk_leaves: Vec<Hash>,
+        entries: Vec<Vec<u8>>,
+        entry_leaves: Vec<Hash>,
+        tier: TierCtx,
+        ctx: ChainCtx,
+        positions: Vec<Position>,
+        pos_roots: Vec<Hash>,
+        pos_root: Hash,
+        seq: Seq,
+        /// Attended query of each head at each position.
+        queries: Vec<Vec<Vec<f64>>>,
+        /// Dequantized cache rows of each key/value head at each position.
+        keys: Vec<Vec<Vec<f32>>>,
+        values: Vec<Vec<Vec<f32>>>,
+    }
+
+    /// Builds the phase of a path from the partials of the previous phase.
+    type OpenPhase<'a> = &'a dyn Fn(&[u64], Option<&[u8]>) -> AttnOpening;
+    /// A path to verify, with the partials and root of the phase before it.
+    type Pending = (Vec<u64>, Option<Vec<u8>>, Option<Hash>);
+
+    /// Every phase of the attention point of `seed`, walked over every path of its block tree.
+    /// Returns the deepest phase, or the first path that fails.
+    fn walk(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, open: OpenPhase) -> Result<usize, (Vec<u64>, Fail)> {
+        let mut stack: Vec<Pending> = vec![(Vec::new(), None, None)];
+        let mut deepest = 0;
+        while let Some((path, prev, root)) = stack.pop() {
+            let op = open(&path, prev.as_deref());
+            match verify_attn_phase(tier, ctx, resp, seed, &path, root.as_ref(), &op) {
+                Ok(AttnStep::Done) => deepest = deepest.max(path.len()),
+                Ok(AttnStep::Next { root, n }) => stack.extend((0..n).map(|i| ([path.clone(), vec![i]].concat(), Some(op.partials.clone()), Some(root)))),
+                Err(e) => return Err((path, e)),
+            }
+        }
+        Ok(deepest)
+    }
+
+    fn window_start(c: Cfg, t: usize) -> usize {
+        if c.swa { (t + 1).saturating_sub(WINDOW as usize) } else { 0 }
+    }
+
+    fn build(c: Cfg) -> At {
+        let none = manifest::NONE;
+        let q_norm: Vec<f32> = (0..HD).map(|i| 0.5 + 0.03 * (i % 11) as f32).collect();
+        let k_norm: Vec<f32> = (0..HD).map(|i| 1.5 - 0.02 * (i % 13) as f32).collect();
+        let freqs: Vec<f32> = (0..HD / 2).map(|i| if i < HD / 8 { 1.0 + 0.25 * (i % 3) as f32 } else { 1e30 }).collect();
+        let mut weights = Vec::new();
+        let mut offs = [0usize; 3];
+        for (o, w) in offs.iter_mut().zip([&q_norm, &k_norm, &freqs]) {
+            *o = weights.len();
+            weights.extend(w.iter().flat_map(|a| a.to_le_bytes()));
+        }
+        let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+        let nl = 1 + c.mixed as usize;
+        let mut next = 4 + nl as u32;
+        let mut alloc = |on: bool| if on { next += 1; next - 1 } else { none };
+        let (qn, kn, rf) = (alloc(c.qk_norm), alloc(c.qk_norm), alloc(c.freqs));
+        let al = nl as u32 - 1;
+        let attn = AttnLinks {
+            q: 0, k: 1, v: if c.shared_kv { 1 } else { 2 }, q_norm: qn, k_norm: kn, n_head: NH as u32, n_head_kv: NKV as u32,
+            head_dim: HD as u32, rope_kind: shape(c).rope_kind, n_rot: shape(c).n_rot as u32, rope_base: BASE.to_bits(),
+            kq_scale: KQ.to_bits(), swa_window: if c.swa { WINDOW } else { 0 }, softcap: 0, rope_freqs: rf, v_norm: c.v_norm as u32,
+            gated: c.gated as u32, slot: 0, mla_rank: 0, absorb: none, out: none,
+        };
+        let qw = 1 + c.gated as usize;
+        let mut entries = vec![
+            entry(&format!("blk.{al}.attn_q.weight"), manifest::ROLE_PRODUCT, 512, QD * qw, 0, 0, Chain::None),
+            entry(&format!("blk.{al}.attn_k.weight"), manifest::ROLE_PRODUCT, 512, KD, 0, 0, Chain::None),
+            entry(&format!("blk.{al}.attn_v.weight"), manifest::ROLE_PRODUCT, 512, KD, 0, 0, Chain::None),
+            entry(&format!("blk.{al}.attn_output.weight"), manifest::ROLE_PRODUCT, QD, 512, 0, 0, Chain::None),
+        ];
+        if c.mixed {
+            entries.push(entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
+                layer: 0, proj: none, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: None, recur: None,
+            })));
+        }
+        entries.push(entry(&format!("blk.{al}"), manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
+            layer: al, proj: 3, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
+        })));
+        if c.qk_norm {
+            entries.push(entry("blk.0.attn_q_norm.weight", manifest::ROLE_NORM, HD, 1, offs[0], 4 * HD, Chain::None));
+            entries.push(entry("blk.0.attn_k_norm.weight", manifest::ROLE_NORM, HD, 1, offs[1], 4 * HD, Chain::None));
+        }
+        if c.freqs {
+            entries.push(entry("rope_freqs.weight", manifest::ROLE_NORM, HD / 2, 1, offs[2], 2 * HD, Chain::None));
+        }
+        let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+        let tier = TierCtx {
+            r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
+            n_chunks: chunk_leaves.len() as u64,
+            m_t: rt_range_proof(&entry_leaves, 0, 1).0,
+            n_entries: entries.len() as u64,
+            n_products: NP,
+        };
+        let ctx = ChainCtx { n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32 };
+        let prep = Prep {
+            q_norm: c.qk_norm.then_some(&q_norm[..]),
+            k_norm: c.qk_norm.then_some(&k_norm[..]),
+            v_norm: c.v_norm,
+            freqs: c.freqs.then_some(&freqs[..]),
+            eps: EPS,
+        };
+        let n_leaves = n_pos_leaves(NP, nl as u64, 0) as usize;
+        let qg_proj: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(100 + t as u64, QD * qw)).collect();
+        let split = |qg: &[f32]| -> (Vec<f32>, Vec<f32>) {
+            let (mut q, mut g) = (Vec::new(), Vec::new());
+            for h in qg.chunks_exact(HD * qw) {
+                q.extend_from_slice(&h[..HD]);
+                g.extend_from_slice(&h[HD..]);
+            }
+            (q, g)
+        };
+        let k_proj: Vec<Vec<f32>> = (0..N_POS).map(|p| vals(200 + p as u64, KD)).collect();
+        let v_proj: Vec<Vec<f32>> = if c.shared_kv { k_proj.clone() } else { (0..N_POS).map(|p| vals(300 + p as u64, KD)).collect() };
+        let f32s = |v: Vec<f64>| v.into_iter().map(|x| x as f32).collect::<Vec<f32>>();
+        let heads = |p: usize, f: &dyn Fn(&[f32], usize) -> Vec<f64>, src: &[f32]| -> Vec<Vec<u8>> {
+            (0..NKV).map(|h| q8_0(&f32s(f(&src[h * HD..(h + 1) * HD], p)))).collect()
+        };
+        let kcache: Vec<Vec<Vec<u8>>> = (0..N_POS)
+            .map(|p| {
+                let src = if c.forge_cache { vals(900 + p as u64, KD) } else { k_proj[p].clone() };
+                heads(p, &|x, p| prep.key(&shape(c), x, p as u64), &src)
+            })
+            .collect();
+        let vcache: Vec<Vec<Vec<u8>>> = (0..N_POS).map(|p| heads(p, &|x, _| prep.value(x), &v_proj[p])).collect();
+        let deq = |row: &[u8]| quant::dequant_row(quant::Q8_0, row, HD).unwrap();
+        let mut positions = Vec::new();
+        for t in 0..N_POS {
+            let mut out = Vec::new();
+            let st = window_start(c, t);
+            let (q_proj, gate) = split(&qg_proj[t]);
+            for kv in 0..NKV {
+                let keys: Vec<Vec<f32>> = (st..=t).map(|p| deq(&kcache[p][kv])).collect();
+                let values: Vec<Vec<f32>> = (st..=t).map(|p| deq(&vcache[p][kv])).collect();
+                let mut g = group_output(&shape(c), &prep, &q_proj, kv, t as u64, &keys, &values).unwrap();
+                if c.gated && !c.skip_gate {
+                    let gs = NH / NKV * HD;
+                    apply_gate(&mut g, &gate[kv * gs..(kv + 1) * gs]).unwrap();
+                }
+                out.extend(g);
+            }
+            let mut leaves = vec![Vec::new(); n_leaves];
+            leaves[1] = qg_proj[t].iter().flat_map(|a| a.to_le_bytes()).collect();
+            leaves[3] = k_proj[t].iter().flat_map(|a| a.to_le_bytes()).collect();
+            leaves[5] = v_proj[t].iter().flat_map(|a| a.to_le_bytes()).collect();
+            leaves[6] = q8_1_row(&if c.zero_out { vec![0.0; QD] } else { out });
+            leaves[n_leaves - 1] = chain::meta(t as u32, N_POS as u32, 7).to_vec();
+            let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+            positions.push(Position { tok: 7, leaves, hashes });
+        }
+        let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
+        let pos_root = b3_root(&pos_roots);
+        let seq = Seq::new(NKV, &kcache, Some(&vcache));
+        let queries = (0..N_POS).map(|t| (0..NH).map(|h| prep.query(&shape(c), &split(&qg_proj[t]).0[h * HD..(h + 1) * HD], t as u64)).collect()).collect();
+        let keys = kcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
+        let values = vcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
+        At { cfg: c, weights, chunk_leaves, entries, entry_leaves, tier, ctx, positions, pos_roots, pos_root, seq, queries, keys, values }
+    }
+
+    impl At {
+        fn eo(&self, i: usize) -> EntryOpening {
+            EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+        }
+
+        fn norm(&self, i: usize) -> (EntryOpening, ChunkRange) {
+            let e = Entry::parse(&self.entries[i]).unwrap().0;
+            let (first, last) = (e.chunk_base, e.chunk_base + (e.n_bytes - 1) / 32);
+            let range = ChunkRange {
+                first_chunk: first,
+                chunks: self.weights[first as usize * 32..(last as usize + 1) * 32].to_vec(),
+                proof: rt_range_proof(&self.chunk_leaves, first, last - first + 1).1,
+            };
+            (self.eo(i), range)
+        }
+
+        fn resp(&self) -> ResponseCtx {
+            ResponseCtx { trace_root: seq::trace_root(&self.pos_root, &self.seq.root), n_prompt: N_POS as u32, n_pos: N_POS as u32 }
+        }
+
+        /// Spans of the key and value caches of head `kv` over positions `[p0, p1)`.
+        fn caches(&self, kv: u64, p0: usize, p1: usize) -> (SeqSpan, SeqSpan) {
+            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: NKV as u64 };
+            let bb = HD / 32 * 34;
+            (self.seq.span(layout.kcache(0, kv).unwrap(), p0 * bb, p1 * bb), self.seq.span(layout.vcache(0, kv).unwrap(), p0 * bb, p1 * bb))
+        }
+
+        fn open(&self, seed: &Hash) -> AttnOpening {
+            let d = draw::point(seed, ATTN_POINT);
+            let t = (d[0] % N_POS as u64) as usize;
+            let kv = d[2] % NKV as u64;
+            let st = window_start(self.cfg, t);
+            let ps = st + (d[3] % (t - st + 1) as u64) as usize;
+            let nl = self.ctx.n_layers as u64;
+            let pos = &self.positions[t];
+            let la = 4 + nl as usize - 1;
+            let qw = 1 + self.cfg.gated as u64;
+            let (kcache, vcache) = self.caches(kv, st, t + 1);
+            AttnOpening {
+                response_txid: [1; 32],
+                pos_root: self.pos_root,
+                seq_root: self.seq.root,
+                layer: self.eo(la),
+                q_entry: self.eo(0),
+                o_entry: self.eo(3),
+                norms: (la + 1..self.entries.len()).map(|i| self.norm(i)).collect(),
+                pos_path: b3_path(&self.pos_roots, t),
+                q: (kv * qw..(kv + 1) * qw).map(|c| leaf_chunk(pos, 1, c)).collect(),
+                out: leaf_bytes(pos, 6),
+                kcache,
+                vcache,
+                anchor_pos_path: b3_path(&self.pos_roots, ps),
+                anchor_k: vec![leaf_chunk(&self.positions[ps], 3, 0)],
+                anchor_v: if self.cfg.shared_kv { Vec::new() } else { vec![leaf_chunk(&self.positions[ps], 5, 0)] },
+                absorb: Vec::new(),
+                ..Default::default()
+            }
+        }
+    }
+
+    fn seeds() -> impl Iterator<Item = Hash> {
+        (0..64u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
+    }
+
+    impl At {
+        /// Block tree of the attended positions of `t` under the current phase budget.
+        fn tree(&self, t: usize) -> BlockTree {
+            let (c, b) = block_params(2 * (HD / 32 * 34), partial_len(HD)).unwrap();
+            BlockTree::new(window_start(self.cfg, t) as u64, t as u64 + 1, c, b).unwrap()
+        }
+
+        /// Phase `path.len()` of the attention point of `seed`, `prev` the partials of the previous phase.
+        fn open_phase(&self, seed: &Hash, path: &[u64], prev: Option<&[u8]>) -> AttnOpening {
+            let d = draw::point(seed, ATTN_POINT);
+            let t = (d[0] % N_POS as u64) as usize;
+            let kv = d[2] % NKV as u64;
+            let g = (NH / NKV) as u64;
+            let qh = (kv * g + d[2] / NKV as u64 % g) as usize;
+            let tree = self.tree(t);
+            let whole = self.open(seed);
+            if tree.depth() == 0 {
+                return whole;
+            }
+            let (parent, parent_path) = match (path.last(), prev) {
+                (Some(&i), Some(b)) => partial_opening(b, HD, i as usize).unwrap(),
+                _ => Default::default(),
+            };
+            let base = AttnOpening {
+                response_txid: whole.response_txid,
+                pos_root: whole.pos_root,
+                seq_root: whole.seq_root,
+                layer: whole.layer.clone(),
+                path: path.to_vec(),
+                parent,
+                parent_path,
+                ..Default::default()
+            };
+            if path.len() as u32 == tree.depth() {
+                let (p0, p1) = tree.node(path).unwrap();
+                let ps = (p0 + d[3] % (p1 - p0)) as usize;
+                let (kcache, vcache) = self.caches(kv, p0 as usize, p1 as usize);
+                return AttnOpening {
+                    q_entry: whole.q_entry,
+                    pos_path: whole.pos_path,
+                    q: whole.q,
+                    norms: whole.norms,
+                    kcache,
+                    vcache,
+                    anchor_pos_path: b3_path(&self.pos_roots, ps),
+                    anchor_k: vec![leaf_chunk(&self.positions[ps], 3, 0)],
+                    anchor_v: if self.cfg.shared_kv { Vec::new() } else { vec![leaf_chunk(&self.positions[ps], 5, 0)] },
+                    ..base
+                };
+            }
+            let st = window_start(self.cfg, t);
+            let keys: Vec<Vec<f32>> = (st..=t).map(|p| self.keys[p][kv as usize].clone()).collect();
+            let values: Vec<Vec<f32>> = (st..=t).map(|p| self.values[p][kv as usize].clone()).collect();
+            let partials = pick_partials(&self.queries[t][qh], KQ as f64, &keys, &values, st as u64, &tree, path, |_| true).unwrap();
+            if path.is_empty() {
+                AttnOpening { q_entry: whole.q_entry, o_entry: whole.o_entry, pos_path: whole.pos_path, q: whole.q, out: whole.out, partials, ..base }
+            } else {
+                AttnOpening { partials, ..base }
+            }
+        }
+
+        fn walk(&self, seed: &Hash) -> Result<usize, (Vec<u64>, Fail)> {
+            walk(&self.tier, &self.ctx, &self.resp(), seed, &|path, prev| self.open_phase(seed, path, prev))
+        }
+    }
+
+    /// Phase budget giving leaves of two positions and nodes of two children.
+    const SMALL_BUDGET: usize = 2 * 2 * (HD / 32 * 34);
+
+    #[test]
+    fn honest_phased_points_pass_on_every_path() {
+        set_test_budget(SMALL_BUDGET);
+        for c in ALL {
+            let a = build(c);
+            let deepest = seeds().map(|s| a.walk(&s).unwrap_or_else(|e| panic!("{e:?}"))).max().unwrap();
+            assert_eq!(deepest, 2);
+        }
+    }
+
+    #[test]
+    fn a_phased_disconnected_output_fails_at_the_root() {
+        set_test_budget(SMALL_BUDGET);
+        for c in ALL {
+            let a = build(Cfg { zero_out: true, ..c });
+            for s in seeds() {
+                assert_eq!(a.walk(&s), Err((Vec::new(), Fail::Mismatch)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_phased_forged_cache_fails_at_every_leaf() {
+        set_test_budget(SMALL_BUDGET);
+        for c in ALL {
+            let a = build(Cfg { forge_cache: true, ..c });
+            for s in seeds() {
+                let t = (draw::point(&s, ATTN_POINT)[0] % N_POS as u64) as usize;
+                let (path, e) = a.walk(&s).unwrap_err();
+                assert_eq!((path.len() as u32, e), (a.tree(t).depth(), Fail::Mismatch));
+            }
+        }
+    }
+
+    /// A seed whose point takes three phases, with the honest phases of its first path.
+    fn deep(a: &At) -> (Hash, Vec<AttnOpening>, Vec<Hash>) {
+        let s = seeds().find(|s| a.tree((draw::point(s, ATTN_POINT)[0] % N_POS as u64) as usize).depth() == 2).unwrap();
+        let (mut ops, mut roots, mut prev) = (Vec::new(), Vec::new(), None::<Vec<u8>>);
+        for k in 0..3 {
+            let op = a.open_phase(&s, &vec![0; k], prev.as_deref());
+            if let Ok(AttnStep::Next { root, .. }) = verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &vec![0; k], roots.last(), &op) {
+                roots.push(root);
+            }
+            prev = Some(op.partials.clone());
+            ops.push(op);
+        }
+        (s, ops, roots)
+    }
+
+    #[test]
+    fn a_phase_must_carry_its_committed_parent() {
+        set_test_budget(SMALL_BUDGET);
+        let a = build(GLM);
+        let (s, ops, roots) = deep(&a);
+        let check = |k: usize, op: &AttnOpening| verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &vec![0; k], roots.get(k.wrapping_sub(1)), op);
+        assert_eq!(check(1, &ops[1]).map(|x| matches!(x, AttnStep::Next { .. })), Ok(true));
+        assert_eq!(check(2, &ops[2]), Ok(AttnStep::Done));
+        let mut flipped = ops[2].clone();
+        flipped.parent[3] ^= 1;
+        assert_eq!(check(2, &flipped), Err(Fail::Trace));
+        let mut sibling = ops[2].clone();
+        (sibling.parent, sibling.parent_path) = partial_opening(&ops[1].partials, HD, 1).unwrap();
+        assert_eq!(check(2, &sibling), Err(Fail::Trace));
+        let mut orphan = ops[1].clone();
+        orphan.parent.clear();
+        assert_eq!(check(1, &orphan), Err(Fail::Trace));
+        assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[0], None, &ops[1]), Err(Fail::Shape));
+        assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[], None, &ops[1]), Err(Fail::Shape));
+    }
+
+    #[test]
+    fn a_phase_carries_only_its_own_fields() {
+        set_test_budget(SMALL_BUDGET);
+        let a = build(QWEN);
+        let (s, ops, roots) = deep(&a);
+        let check = |k: usize, op: &AttnOpening| verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &vec![0; k], roots.get(k.wrapping_sub(1)), op);
+        let mut root_with_cache = ops[0].clone();
+        root_with_cache.kcache = ops[2].kcache.clone();
+        assert_eq!(check(0, &root_with_cache), Err(Fail::Shape));
+        let mut node_with_output = ops[1].clone();
+        node_with_output.out = ops[0].out.clone();
+        assert_eq!(check(1, &node_with_output), Err(Fail::Shape));
+        let mut leaf_with_partials = ops[2].clone();
+        leaf_with_partials.partials = ops[1].partials.clone();
+        assert_eq!(check(2, &leaf_with_partials), Err(Fail::Shape));
+        let mut short = ops[1].clone();
+        short.partials.truncate(partial_len(HD));
+        assert_eq!(check(1, &short), Err(Fail::Shape));
+        let mut redrawn = ops[1].clone();
+        redrawn.path = vec![1];
+        assert_eq!(check(1, &redrawn), Err(Fail::Shape));
+        let mut deeper = ops[1].clone();
+        deeper.path = vec![0, 0];
+        assert_eq!(check(1, &deeper), Err(Fail::Shape));
+        assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &ops[0]), Err(Fail::Unsupported));
+    }
+
+    #[test]
+    fn forged_partials_fail_where_they_are_combined() {
+        set_test_budget(SMALL_BUDGET);
+        let a = build(GEMMA_GLOBAL);
+        let (s, ops, roots) = deep(&a);
+        let check = |k: usize, op: &AttnOpening| verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &vec![0; k], roots.get(k.wrapping_sub(1)), op);
+        let m = 2 * HD;
+        for (k, op) in ops.iter().enumerate().take(2) {
+            let mut forged = op.clone();
+            let v = f32::from_le_bytes(forged.partials[m..m + 4].try_into().unwrap()) + 0.5;
+            forged.partials[m..m + 4].copy_from_slice(&v.to_le_bytes());
+            assert_eq!(check(k, &forged), Err(Fail::Mismatch), "phase {k}");
+        }
+    }
+
+    const ALL: [Cfg; 4] = [GLM, GEMMA_SWA, GEMMA_GLOBAL, QWEN];
+
+    #[test]
+    fn an_honest_attention_point_passes() {
+        for c in ALL {
+            let a = build(c);
+            for s in seeds() {
+                verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)).unwrap_or_else(|e| panic!("{e:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_disconnected_attention_is_refused() {
+        for c in ALL {
+            let a = build(Cfg { zero_out: true, ..c });
+            for s in seeds() {
+                assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)), Err(Fail::Mismatch));
+            }
+        }
+    }
+
+    #[test]
+    fn a_cache_of_no_committed_projection_is_refused() {
+        for c in ALL {
+            let a = build(Cfg { forge_cache: true, ..c });
+            for s in seeds() {
+                assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)), Err(Fail::Mismatch));
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_cache_span_is_refused() {
+        for c in ALL {
+            let a = build(c);
+            let s = seeds().next().unwrap();
+            let mut op = a.open(&s);
+            op.kcache.bytes.pop();
+            assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Trace));
+            let mut op = a.open(&s);
+            op.vcache.bytes.push(0);
+            assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Trace));
+        }
+    }
+
+    #[test]
+    fn a_tampered_cache_is_refused() {
+        for c in ALL {
+            let a = build(c);
+            let s = seeds().next().unwrap();
+            let mut op = a.open(&s);
+            op.kcache.bytes[5] ^= 1;
+            assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Trace));
+        }
+    }
+
+    #[test]
+    fn honest_sliding_window_points_reach_past_the_window() {
+        let a = build(GEMMA_SWA);
+        let past: Vec<Hash> = seeds().filter(|s| draw::point(s, ATTN_POINT)[0] % N_POS as u64 >= WINDOW as u64).collect();
+        assert!(!past.is_empty());
+        for s in past {
+            verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)).unwrap_or_else(|e| panic!("{e:?}"));
+        }
+    }
+
+    #[test]
+    fn missing_or_swapped_norms_are_refused() {
+        let a = build(GEMMA_SWA);
+        let s = seeds().next().unwrap();
+        let mut op = a.open(&s);
+        op.norms.pop();
+        assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Shape));
+        let mut op = a.open(&s);
+        op.norms.swap(0, 1);
+        assert!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op).is_err());
+    }
+
+    #[test]
+    fn a_shared_value_takes_no_value_anchor() {
+        let a = build(GEMMA_GLOBAL);
+        let s = seeds().next().unwrap();
+        let mut op = a.open(&s);
+        op.anchor_v = op.anchor_k.clone();
+        assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Shape));
+    }
+
+    #[test]
+    fn an_ungated_output_is_refused() {
+        let a = build(Cfg { skip_gate: true, ..QWEN });
+        for s in seeds() {
+            assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)), Err(Fail::Mismatch));
+        }
+    }
+
+    #[test]
+    fn a_layer_without_attention_is_refused() {
+        let a = build(QWEN);
+        let s = seeds().next().unwrap();
+        let mut op = a.open(&s);
+        op.layer = a.eo(4);
+        assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Shape));
+    }
+
+    #[test]
+    fn a_trace_root_without_its_sequence_half_is_refused() {
+        let a = build(GLM);
+        let s = seeds().next().unwrap();
+        let mut op = a.open(&s);
+        op.seq_root[0] ^= 1;
+        assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Trace));
+    }
+
+    mod mla {
+        use super::*;
+        use crate::attn::{head_output, rms_norm};
+
+        const NH: usize = 4;
+        const NOPE: usize = 32;
+        const ROPE: usize = 32;
+        const QW: usize = NOPE + ROPE;
+        const R: usize = 512;
+        const HD: usize = R + ROPE;
+        const VD: usize = 32;
+        const NP: u64 = 5;
+        const KQ: f32 = 0.125;
+
+        struct Mla {
+            weights: Vec<u8>,
+            chunk_leaves: Vec<Hash>,
+            entries: Vec<Vec<u8>>,
+            entry_leaves: Vec<Hash>,
+            tier: TierCtx,
+            ctx: ChainCtx,
+            positions: Vec<Position>,
+            pos_roots: Vec<Hash>,
+            pos_root: Hash,
+            seq: Seq,
+            /// Latent query of each head at each position.
+            queries: Vec<Vec<Vec<f64>>>,
+            /// Dequantized latent cache rows.
+            keys: Vec<Vec<f32>>,
+        }
+
+        /// `zero_out`: the latent output is committed as zeros; `forge_cache`: the cache holds keys
+        /// of no committed projection, the output follows it.
+        fn build(zero_out: bool, forge_cache: bool) -> Mla {
+            let none = manifest::NONE;
+            let norm: Vec<f32> = (0..R).map(|i| 0.8 + 0.01 * (i % 17) as f32).collect();
+            let weights: Vec<u8> = norm.iter().flat_map(|a| a.to_le_bytes()).collect();
+            let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+            let attn = AttnLinks {
+                q: 0, k: 1, v: none, q_norm: none, k_norm: 6, n_head: NH as u32, n_head_kv: 1, head_dim: HD as u32, rope_kind: 0,
+                n_rot: 0, rope_base: 0, kq_scale: KQ.to_bits(), swa_window: 0, softcap: 0, rope_freqs: none, v_norm: 0, gated: 0,
+                slot: 0, mla_rank: R as u32, absorb: 2, out: 3,
+            };
+            let heads = |name: &str, k: usize, m: usize| {
+                let mut e = Entry::parse(&entry(name, manifest::ROLE_PRODUCT, k, m, 0, 0, Chain::None)).unwrap().0;
+                e.role = manifest::ROLE_HEADS;
+                e.n_exp = NH as u32;
+                let mut b = serialize(&e);
+                b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+                b
+            };
+            let entries = vec![
+                entry("blk.0.attn_q.weight", manifest::ROLE_PRODUCT, 512, NH * QW, 0, 0, Chain::None),
+                entry("blk.0.attn_kv_a_mqa.weight", manifest::ROLE_PRODUCT, 512, HD, 0, 0, Chain::None),
+                heads("blk.0.attn_k_b.weight", NOPE, R),
+                heads("blk.0.attn_v_b.weight", R, VD),
+                entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, NH * VD, 512, 0, 0, Chain::None),
+                entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, Chain::Layer(LayerLinks {
+                    layer: 0, proj: 4, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: Some(attn), recur: None,
+                })),
+                entry("blk.0.attn_kv_a_norm.weight", manifest::ROLE_NORM, R, 1, 0, 4 * R, Chain::None),
+            ];
+            let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+            let tier = TierCtx {
+                r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
+                n_chunks: chunk_leaves.len() as u64,
+                m_t: rt_range_proof(&entry_leaves, 0, 1).0,
+                n_entries: entries.len() as u64,
+                n_products: NP,
+            };
+            let ctx = ChainCtx { n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let n_leaves = n_pos_leaves(NP, 1, 0) as usize;
+            let q: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(100 + t as u64, NH * QW)).collect();
+            let kv_a: Vec<Vec<f32>> = (0..N_POS).map(|p| vals(200 + p as u64, HD)).collect();
+            let absorbed: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(300 + t as u64, NH * R)).collect();
+            let cache: Vec<Vec<u8>> = (0..N_POS)
+                .map(|p| {
+                    let src = if forge_cache { vals(900 + p as u64, HD) } else { kv_a[p].clone() };
+                    let mut k: Vec<f64> = src.iter().map(|&x| x as f64).collect();
+                    rms_norm(&mut k[..R], Some(&norm), EPS);
+                    q8_0(&k.iter().map(|&x| x as f32).collect::<Vec<_>>())
+                })
+                .collect();
+            let keys: Vec<Vec<f32>> = cache.iter().map(|c| quant::dequant_row(quant::Q8_0, c, HD).unwrap()).collect();
+            let mut positions = Vec::new();
+            let mut queries = Vec::new();
+            for t in 0..N_POS {
+                let mut x = Vec::new();
+                queries.push(Vec::new());
+                for h in 0..NH {
+                    let mut qh: Vec<f64> = absorbed[t][h * R..(h + 1) * R].iter().map(|&a| a as f64).collect();
+                    qh.extend(q[t][h * QW + NOPE..(h + 1) * QW].iter().map(|&a| a as f64));
+                    queries[t].push(qh.clone());
+                    let ks = &keys[..=t];
+                    let vs: Vec<Vec<f32>> = ks.iter().map(|k| k[..R].to_vec()).collect();
+                    let lat = head_output(&qh, ks, &vs, KQ as f64).unwrap();
+                    x.extend(q8_1_row(&if zero_out { vec![0.0; R] } else { lat }));
+                }
+                let mut leaves = vec![Vec::new(); n_leaves];
+                leaves[1] = q[t].iter().flat_map(|a| a.to_le_bytes()).collect();
+                leaves[3] = kv_a[t].iter().flat_map(|a| a.to_le_bytes()).collect();
+                leaves[5] = absorbed[t].iter().flat_map(|a| a.to_le_bytes()).collect();
+                leaves[6] = x;
+                leaves[n_leaves - 1] = chain::meta(t as u32, N_POS as u32, 7).to_vec();
+                let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+                positions.push(Position { tok: 7, leaves, hashes });
+            }
+            let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
+            let pos_root = b3_root(&pos_roots);
+            let rows: Vec<Vec<Vec<u8>>> = cache.iter().map(|c| vec![c.clone()]).collect();
+            let seq = Seq::new(1, &rows, None);
+            Mla { weights, chunk_leaves, entries, entry_leaves, tier, ctx, positions, pos_roots, pos_root, seq, queries, keys }
+        }
+
+        impl Mla {
+            fn eo(&self, i: usize) -> EntryOpening {
+                EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+            }
+
+            fn resp(&self) -> ResponseCtx {
+                ResponseCtx { trace_root: seq::trace_root(&self.pos_root, &self.seq.root), n_prompt: N_POS as u32, n_pos: N_POS as u32 }
+            }
+
+            fn open(&self, seed: &Hash) -> AttnOpening {
+                let d = draw::point(seed, ATTN_POINT);
+                let t = (d[0] % N_POS as u64) as usize;
+                let qh = d[2] % NH as u64;
+                let ps = (d[3] % (t as u64 + 1)) as usize;
+                let pos = &self.positions[t];
+                let n = self.chunk_leaves.len() as u64;
+                let range = ChunkRange { first_chunk: 0, chunks: self.weights.clone(), proof: rt_range_proof(&self.chunk_leaves, 0, n).1 };
+                let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1 };
+                let bb = HD / 32 * 34;
+                AttnOpening {
+                    response_txid: [1; 32],
+                    pos_root: self.pos_root,
+                    seq_root: self.seq.root,
+                    layer: self.eo(5),
+                    q_entry: self.eo(0),
+                    o_entry: self.eo(3),
+                    norms: vec![(self.eo(6), range)],
+                    pos_path: b3_path(&self.pos_roots, t),
+                    q: vec![leaf_chunk(pos, 1, 0)],
+                    out: leaf_bytes(pos, 6),
+                    kcache: self.seq.span(layout.kcache(0, 0).unwrap(), 0, (t + 1) * bb),
+                    vcache: SeqSpan::default(),
+                    anchor_pos_path: b3_path(&self.pos_roots, ps),
+                    anchor_k: (0..3).map(|c| leaf_chunk(&self.positions[ps], 3, c)).collect(),
+                    anchor_v: Vec::new(),
+                    absorb: (2 * qh..2 * qh + 2).map(|c| leaf_chunk(pos, 5, c)).collect(),
+                    ..Default::default()
+                }
+            }
+        }
+
+        /// Phase budget giving leaves of two positions and nodes of two children.
+        const SMALL_BUDGET: usize = 2 * partial_len(R);
+
+        impl Mla {
+            fn tree(&self, t: usize) -> BlockTree {
+                let (c, b) = block_params(HD / 32 * 34, partial_len(R)).unwrap();
+                BlockTree::new(0, t as u64 + 1, c, b).unwrap()
+            }
+
+            /// Phase `path.len()` of the attention point of `seed`, `prev` the partials of the previous phase.
+            fn open_phase(&self, seed: &Hash, path: &[u64], prev: Option<&[u8]>) -> AttnOpening {
+                let d = draw::point(seed, ATTN_POINT);
+                let t = (d[0] % N_POS as u64) as usize;
+                let qh = (d[2] % NH as u64) as usize;
+                let tree = self.tree(t);
+                let whole = self.open(seed);
+                if tree.depth() == 0 {
+                    return whole;
+                }
+                let (parent, parent_path) = match (path.last(), prev) {
+                    (Some(&i), Some(b)) => partial_opening(b, R, i as usize).unwrap(),
+                    _ => Default::default(),
+                };
+                let base = AttnOpening {
+                    response_txid: whole.response_txid,
+                    pos_root: whole.pos_root,
+                    seq_root: whole.seq_root,
+                    layer: whole.layer.clone(),
+                    path: path.to_vec(),
+                    parent,
+                    parent_path,
+                    ..Default::default()
+                };
+                if path.len() as u32 == tree.depth() {
+                    let (p0, p1) = tree.node(path).unwrap();
+                    let ps = (p0 + d[3] % (p1 - p0)) as usize;
+                    let bb = HD / 32 * 34;
+                    let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: 1 };
+                    return AttnOpening {
+                        q_entry: whole.q_entry,
+                        pos_path: whole.pos_path,
+                        q: whole.q,
+                        norms: whole.norms,
+                        kcache: self.seq.span(layout.kcache(0, 0).unwrap(), p0 as usize * bb, p1 as usize * bb),
+                        anchor_pos_path: b3_path(&self.pos_roots, ps),
+                        anchor_k: (0..3).map(|c| leaf_chunk(&self.positions[ps], 3, c)).collect(),
+                        absorb: whole.absorb,
+                        ..base
+                    };
+                }
+                let keys = &self.keys[..=t];
+                let values: Vec<Vec<f32>> = keys.iter().map(|k| k[..R].to_vec()).collect();
+                let partials = pick_partials(&self.queries[t][qh], KQ as f64, keys, &values, 0, &tree, path, |_| true).unwrap();
+                if path.is_empty() {
+                    AttnOpening { q_entry: whole.q_entry, o_entry: whole.o_entry, pos_path: whole.pos_path, q: whole.q, out: whole.out, partials, ..base }
+                } else {
+                    AttnOpening { partials, ..base }
+                }
+            }
+
+            fn walk(&self, seed: &Hash) -> Result<usize, (Vec<u64>, Fail)> {
+                walk(&self.tier, &self.ctx, &self.resp(), seed, &|path, prev| self.open_phase(seed, path, prev))
+            }
+        }
+
+        #[test]
+        fn honest_phased_latent_points_pass_on_every_path() {
+            set_test_budget(SMALL_BUDGET);
+            let a = build(false, false);
+            assert_eq!(seeds().map(|s| a.walk(&s).unwrap_or_else(|e| panic!("{e:?}"))).max(), Some(2));
+        }
+
+        #[test]
+        fn a_phased_disconnected_latent_output_fails_at_the_root() {
+            set_test_budget(SMALL_BUDGET);
+            let a = build(true, false);
+            for s in seeds() {
+                assert_eq!(a.walk(&s), Err((Vec::new(), Fail::Mismatch)));
+            }
+        }
+
+        #[test]
+        fn a_phased_forged_latent_cache_fails_at_every_leaf() {
+            set_test_budget(SMALL_BUDGET);
+            let a = build(false, true);
+            for s in seeds() {
+                let t = (draw::point(&s, ATTN_POINT)[0] % N_POS as u64) as usize;
+                let (path, e) = a.walk(&s).unwrap_err();
+                assert_eq!((path.len() as u32, e), (a.tree(t).depth(), Fail::Mismatch));
+            }
+        }
+
+        #[test]
+        fn a_phased_latent_leaf_takes_the_drawn_head_query() {
+            set_test_budget(SMALL_BUDGET);
+            let a = build(false, false);
+            let s = seeds().find(|s| a.tree((draw::point(s, ATTN_POINT)[0] % N_POS as u64) as usize).depth() == 2).unwrap();
+            let d = draw::point(&s, ATTN_POINT);
+            let (t, other) = ((d[0] % N_POS as u64) as usize, (d[2] + 1) % NH as u64);
+            let (mut prev, mut root) = (None::<Vec<u8>>, None);
+            for k in 0..2 {
+                let op = a.open_phase(&s, &vec![0; k], prev.as_deref());
+                match verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &vec![0; k], root.as_ref(), &op) {
+                    Ok(AttnStep::Next { root: r, .. }) => root = Some(r),
+                    x => panic!("{x:?}"),
+                }
+                prev = Some(op.partials);
+            }
+            let mut leaf = a.open_phase(&s, &[0, 0], prev.as_deref());
+            assert_eq!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[0, 0], root.as_ref(), &leaf), Ok(AttnStep::Done));
+            leaf.absorb = (2 * other..2 * other + 2).map(|c| leaf_chunk(&a.positions[t], 5, c)).collect();
+            assert!(verify_attn_phase(&a.tier, &a.ctx, &a.resp(), &s, &[0, 0], root.as_ref(), &leaf).is_err());
+        }
+
+        #[test]
+        fn an_honest_latent_attention_point_passes() {
+            let a = build(false, false);
+            for s in seeds() {
+                verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)).unwrap_or_else(|e| panic!("{e:?}"));
+            }
+        }
+
+        #[test]
+        fn a_disconnected_latent_output_is_refused() {
+            let a = build(true, false);
+            for s in seeds() {
+                assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)), Err(Fail::Mismatch));
+            }
+        }
+
+        #[test]
+        fn a_latent_cache_of_no_committed_projection_is_refused() {
+            let a = build(false, true);
+            for s in seeds() {
+                assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &a.open(&s)), Err(Fail::Mismatch));
+            }
+        }
+
+        #[test]
+        fn a_tampered_latent_cache_is_refused() {
+            let a = build(false, false);
+            let s = seeds().next().unwrap();
+            let mut op = a.open(&s);
+            op.kcache.bytes[7] ^= 1;
+            assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Trace));
+        }
+
+        #[test]
+        fn a_latent_layer_takes_no_value_cache() {
+            let a = build(false, false);
+            let s = seeds().next().unwrap();
+            let mut op = a.open(&s);
+            op.vcache = op.kcache.clone();
+            assert_eq!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op), Err(Fail::Shape));
+        }
+
+        #[test]
+        fn another_head_query_is_refused() {
+            let a = build(false, false);
+            let s = seeds().next().unwrap();
+            let qh = draw::point(&s, ATTN_POINT)[2] % NH as u64;
+            let other = (qh + 1) % NH as u64;
+            let mut op = a.open(&s);
+            let t = (draw::point(&s, ATTN_POINT)[0] % N_POS as u64) as usize;
+            op.absorb = (2 * other..2 * other + 2).map(|c| leaf_chunk(&a.positions[t], 5, c)).collect();
+            assert!(verify_attn_point(&a.tier, &a.ctx, &a.resp(), &s, &op).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod recur_tests {
+    use super::*;
+    use crate::chain::ChainCtx;
+    use crate::manifest::{RECUR_GDA, RECUR_KDA, RecurLinks};
+    use crate::merkle::b3_chunks_proof;
+    use crate::opening::{RecurOpening, RecurTap};
+    use crate::recur::{RECUR_POINT, RECUR_ROWS, verify_recur_point};
+    use crate::seq::{self, Record, SeqLayout, SeqSpan};
+    use crate::verify::{Fail, ResponseCtx};
+
+    const HD: usize = 32;
+    const NV: usize = 8;
+    const IV: usize = 4;
+    const CL: usize = 4;
+    const N_POS: usize = 10;
+
+    fn vals(seed: u64, n: usize, a: f32) -> Vec<f32> {
+        (0..n).map(|i| a * (blake3::hash(&[seed.to_le_bytes(), (i as u64).to_le_bytes()].concat()).as_bytes()[0] as f32 / 127.5 - 1.0)).collect()
+    }
+
+    fn sig(x: f64) -> f64 {
+        1.0 / (1.0 + libm::exp(-x))
+    }
+
+    fn l2(x: &mut [f64]) {
+        let r = 1.0 / libm::sqrt(x.iter().map(|a| a * a).sum::<f64>().max(EPS * EPS));
+        x.iter_mut().for_each(|a| *a *= r);
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct Cfg {
+        kda: bool,
+        /// The state restarts from zero at every position.
+        reset: bool,
+        /// Keys of no committed projection, the recurrence following them.
+        fake_k: bool,
+        zero_out: bool,
+        /// Checkpoints shifted away from the recurrence.
+        bad_ckpt: bool,
+    }
+
+    struct Rt {
+        cfg: Cfg,
+        weights: Vec<u8>,
+        chunk_leaves: Vec<Hash>,
+        entries: Vec<Vec<u8>>,
+        entry_leaves: Vec<Hash>,
+        offs: Vec<usize>,
+        tier: TierCtx,
+        ctx: ChainCtx,
+        links: RecurLinks,
+        out_rank: usize,
+        positions: Vec<Position>,
+        pos_roots: Vec<Hash>,
+        pos_root: Hash,
+        seq_leaves: Vec<Vec<u8>>,
+        seq_hashes: Vec<Hash>,
+        seq_root: Hash,
+    }
+
+    fn entry(name: &str, role: u8, k: usize, m: usize, off: usize, n: usize) -> Vec<u8> {
+        let e = Entry {
+            name: name.into(),
+            wtype: if role == manifest::ROLE_PRODUCT { quant::Q8_0 } else { 0 },
+            k: k as u64,
+            m: m as u64,
+            n_exp: 1,
+            chunk_base: (off / 32) as u64,
+            n_bytes: n as u64,
+            row_bytes: n as u32,
+            role,
+            glu_op: 0,
+            glu_form: manifest::FORM_NONE,
+            partner: manifest::NONE,
+            bias: manifest::NONE,
+            chain: Chain::None,
+        };
+        let mut b = serialize(&e);
+        b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+        b
+    }
+
+    fn build(cfg: Cfg) -> Rt {
+        let none = manifest::NONE;
+        let kda = cfg.kda;
+        let nk = if kda { NV } else { 2 };
+        let qkv_m = (2 * nk + NV) * HD;
+        let gw = if kda { HD } else { 1 };
+        // Products: query/key/value sources, beta, decay, gate, output projection.
+        let names: Vec<(&str, usize)> = if kda {
+            vec![("attn_q", NV * HD), ("attn_k", NV * HD), ("attn_v", NV * HD), ("ssm_beta", NV), ("ssm_f_b", NV * HD), ("ssm_g_b", NV * HD), ("attn_output", 512)]
+        } else {
+            vec![("attn_qkv", qkv_m), ("ssm_beta", NV), ("ssm_alpha", NV), ("attn_gate", NV * HD), ("ssm_out", 512)]
+        };
+        let np = names.len();
+        let (src, beta_r, decay_r, gate_r, out_r) = if kda { ([0, 1, 2], 3, 4, 5, 6) } else { ([0, 0, 0], 1, 2, 3, 4) };
+        let conv_n = if kda { NV * HD } else { qkv_m };
+        let mut wv: Vec<(String, Vec<f32>)> = Vec::new();
+        let n_conv = if kda { 3 } else { 1 };
+        for c in 0..n_conv {
+            wv.push((format!("blk.0.ssm_conv1d_{c}.weight"), vals(40 + c as u64, CL * conv_n, 0.6)));
+        }
+        wv.push(("blk.0.ssm_dt.bias".into(), vals(50, NV * gw, 0.5)));
+        wv.push(("blk.0.ssm_a".into(), (0..NV).map(|i| -(0.2 + 0.1 * i as f32)).collect()));
+        wv.push(("blk.0.ssm_norm.weight".into(), (0..HD).map(|i| 1.0 + 0.01 * i as f32).collect()));
+        let mut weights = Vec::new();
+        let mut offs = Vec::new();
+        for (_, w) in &wv {
+            offs.push(weights.len());
+            weights.extend(w.iter().flat_map(|a| a.to_le_bytes()));
+        }
+        let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+        let wbase = np + 1;
+        let conv_idx = |c: usize| (wbase + if kda { c } else { 0 }) as u32;
+        let links = RecurLinks {
+            kind: if kda { RECUR_KDA } else { RECUR_GDA },
+            slot: 0,
+            n_v_heads: NV as u32,
+            n_k_heads: nk as u32,
+            head_dim: HD as u32,
+            q: src[0],
+            k: src[1],
+            v: src[2],
+            conv_q: conv_idx(0),
+            conv_k: conv_idx(1),
+            conv_v: conv_idx(2),
+            beta: beta_r,
+            decay: decay_r,
+            dt: (wbase + n_conv) as u32,
+            a: (wbase + n_conv + 1) as u32,
+            norm: (wbase + n_conv + 2) as u32,
+            gate: gate_r,
+            interval: IV as u32,
+            conv_len: CL as u32,
+        };
+        let mut entries: Vec<Vec<u8>> = names
+            .iter()
+            .map(|&(n, m)| entry(&format!("blk.0.{n}.weight"), manifest::ROLE_PRODUCT, if n.ends_with("output") || n == "ssm_out" { NV * HD } else { 512 }, m, 0, 0))
+            .collect();
+        let mut layer = Entry::parse(&entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0)).unwrap().0;
+        layer.chain = Chain::Layer(LayerLinks {
+            layer: 0, proj: out_r, down: none, post_attn: none, post_ffn: none, scale: none, moe: None, attn: None, recur: Some(links),
+        });
+        let mut lb = serialize(&layer);
+        lb.extend_from_slice(&manifest::chain_bytes(&layer.chain));
+        entries.push(lb);
+        for (i, (n, w)) in wv.iter().enumerate() {
+            entries.push(entry(n, manifest::ROLE_NORM, w.len(), 1, offs[i], 4 * w.len()));
+        }
+        let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+        let tier = TierCtx {
+            r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
+            n_chunks: chunk_leaves.len() as u64,
+            m_t: rt_range_proof(&entry_leaves, 0, 1).0,
+            n_entries: entries.len() as u64,
+            n_products: np as u64,
+        };
+        let ctx = ChainCtx {
+            n_layers: 1, layer_base: np as u32, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0,
+            n_recur: 1, seq_heads: NV as u32,
+        };
+
+        // Committed projection outputs per position.
+        let ys: Vec<Vec<Vec<f32>>> = (0..N_POS)
+            .map(|t| names.iter().enumerate().map(|(r, &(_, m))| vals(1000 * (r as u64 + 1) + t as u64, m, 1.0)).collect())
+            .collect();
+        let conv_w = |c: usize| &wv[if kda { c } else { 0 }].1;
+        let (dt, a, norm) = (&wv[n_conv].1, &wv[n_conv + 1].1, &wv[n_conv + 2].1);
+        let conv = |c: usize, t: usize, ch: usize| -> f64 {
+            let x = (0..CL).map(|j| {
+                let tp = t as i64 - (CL - 1) as i64 + j as i64;
+                if tp < 0 { 0.0 } else { ys[tp as usize][src[c] as usize][ch] as f64 }
+            });
+            let s: f64 = x.enumerate().map(|(j, v)| conv_w(c)[ch * CL + j] as f64 * v).sum();
+            s * sig(s)
+        };
+        let mut state = vec![vec![vec![0f64; HD]; HD]; NV];
+        let mut records: Vec<Vec<u8>> = vec![Vec::new(); NV];
+        let mut ckpts: Vec<Vec<u8>> = vec![Vec::new(); NV];
+        let mut outs: Vec<Vec<f64>> = Vec::new();
+        for (t, y_t) in ys.iter().enumerate() {
+            let mut y_all = Vec::new();
+            for h in 0..NV {
+                let hk = h % nk;
+                let (qo, ko, vo) = if kda { (h * HD, h * HD, h * HD) } else { (hk * HD, (nk + hk) * HD, 2 * nk * HD + h * HD) };
+                let mut q: Vec<f64> = (0..HD).map(|i| conv(0, t, qo + i)).collect();
+                let mut k: Vec<f64> = if cfg.fake_k { vals(7000 + t as u64 * 31 + h as u64, HD, 1.0).iter().map(|&x| x as f64).collect() } else { (0..HD).map(|i| conv(1, t, ko + i)).collect() };
+                let v: Vec<f64> = (0..HD).map(|i| conv(2, t, vo + i)).collect();
+                l2(&mut q);
+                l2(&mut k);
+                let beta = sig(y_t[beta_r as usize][h] as f64);
+                let g: Vec<f64> = (0..gw).map(|i| a[h] as f64 * {
+                    let x = y_t[decay_r as usize][h * gw + i] as f64 + dt[h * gw + i] as f64;
+                    if x > 20.0 { x } else { libm::log1p(libm::exp(x)) }
+                }).collect();
+                let eg = |i: usize| libm::exp(if kda { g[i] } else { g[0] });
+                let s = &mut state[h];
+                if cfg.reset {
+                    s.iter_mut().for_each(|r| r.iter_mut().for_each(|x| *x = 0.0));
+                }
+                let mut o = vec![0f64; HD];
+                for col in 0..HD {
+                    let kv: f64 = (0..HD).map(|i| eg(i) * s[col][i] * k[i]).sum();
+                    let d = (v[col] - kv) * beta;
+                    for i in 0..HD {
+                        s[col][i] = eg(i) * s[col][i] + k[i] * d;
+                    }
+                    o[col] = (0..HD).map(|i| s[col][i] * q[i]).sum::<f64>() / (HD as f64).sqrt();
+                }
+                let f = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
+                let rec = Record { q: f(&q), k: f(&k), v: f(&v), o: f(&o), beta: beta as f32, g: f(&g) };
+                records[h].extend(rec.encode(links.kind));
+                if (t + 1) % IV == 0 {
+                    for row in s.iter() {
+                        ckpts[h].extend(row.iter().flat_map(|&x| ((x + if cfg.bad_ckpt { 0.5 } else { 0.0 }) as f32).to_le_bytes()));
+                    }
+                }
+                let ms = o.iter().map(|x| x * x).sum::<f64>() / HD as f64;
+                let rn = 1.0 / libm::sqrt(ms + EPS);
+                for i in 0..HD {
+                    let z = ys[t][gate_r as usize][h * HD + i] as f64;
+                    let act = if kda { sig(z) } else { z * sig(z) };
+                    y_all.push(o[i] * rn * norm[i] as f64 * act);
+                }
+            }
+            y_all.resize(512, 0.0);
+            outs.push(if cfg.zero_out { vec![0.0; 512] } else { y_all });
+        }
+        let n_leaves = 2 * np + 2 + 1;
+        let mut positions = Vec::new();
+        for t in 0..N_POS {
+            let mut leaves = vec![Vec::new(); n_leaves];
+            for r in 0..np {
+                leaves[2 * r + 1] = ys[t][r].iter().flat_map(|a| a.to_le_bytes()).collect();
+            }
+            leaves[2 * out_r as usize] = q8_1_row(&outs[t]);
+            leaves[n_leaves - 1] = chain::meta(t as u32, 1, 7).to_vec();
+            let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+            positions.push(Position { tok: 7, leaves, hashes });
+        }
+        let pos_roots: Vec<Hash> = positions.iter().map(|p| b3_root(&p.hashes)).collect();
+        let pos_root = b3_root(&pos_roots);
+        let layout = SeqLayout { n_attn: 0, n_recur: 1, heads: NV as u64 };
+        let mut seq_leaves = vec![Vec::new(); layout.n_leaves() as usize];
+        for h in 0..NV {
+            seq_leaves[layout.record(0, h as u64).unwrap() as usize] = records[h].clone();
+            seq_leaves[layout.checkpoint(0, h as u64).unwrap() as usize] = ckpts[h].clone();
+        }
+        let seq_hashes: Vec<Hash> = seq_leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+        let seq_root = b3_root(&seq_hashes);
+        Rt { cfg, weights, chunk_leaves, entries, entry_leaves, offs, tier, ctx, links, out_rank: out_r as usize, positions, pos_roots, pos_root, seq_leaves, seq_hashes, seq_root }
+    }
+
+    impl Rt {
+        fn eo(&self, i: usize) -> EntryOpening {
+            EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+        }
+
+        fn wrange(&self, entry: usize, off: usize, n: usize) -> (EntryOpening, ChunkRange) {
+            let wi = entry - self.ctx.layer_base as usize - 1;
+            let (lo, hi) = (self.offs[wi] + 4 * off, self.offs[wi] + 4 * (off + n));
+            let (first, last) = (lo / 32, (hi - 1) / 32);
+            let range = ChunkRange {
+                first_chunk: first as u64,
+                chunks: self.weights[first * 32..(last + 1) * 32].to_vec(),
+                proof: rt_range_proof(&self.chunk_leaves, first as u64, (last - first + 1) as u64).1,
+            };
+            (self.eo(entry), range)
+        }
+
+        fn span(&self, leaf: u64, lo: usize, hi: usize) -> SeqSpan {
+            let data = &self.seq_leaves[leaf as usize];
+            let (c0, c1) = (lo / B3_CHUNK, (hi - 1) / B3_CHUNK);
+            SeqSpan {
+                first_chunk: c0 as u32,
+                bytes: data[c0 * B3_CHUNK..((c1 + 1) * B3_CHUNK).min(data.len())].to_vec(),
+                chunk_proof: b3_chunks_proof(data, c0 as u64, (c1 - c0 + 1) as u64),
+                leaf_path: b3_path(&self.seq_hashes, leaf as usize),
+            }
+        }
+
+        fn resp(&self) -> ResponseCtx {
+            ResponseCtx { trace_root: seq::trace_root(&self.pos_root, &self.seq_root), n_prompt: 1, n_pos: N_POS as u32 }
+        }
+
+        fn open(&self, seed: &Hash) -> RecurOpening {
+            let l = self.links;
+            let (kda, nk, hd) = (self.cfg.kda, l.n_k_heads as usize, HD);
+            let d = draw::point(seed, RECUR_POINT);
+            let h = (d[2] % NV as u64) as usize;
+            let hk = h % nk;
+            let s = (d[0] % N_POS.div_ceil(IV) as u64) as usize;
+            let (c, e) = (s * IV, ((s + 1) * IV).min(N_POS));
+            let r0 = d[3] % (hd as u64 / RECUR_ROWS) * RECUR_ROWS;
+            let p = c + ((d[3] >> 32) % (e - c) as u64) as usize;
+            let layout = SeqLayout { n_attn: 0, n_recur: 1, heads: NV as u64 };
+            let rl = seq::record_len(l.kind, hd);
+            let rows = |m: usize| {
+                let (lo, hi) = seq::checkpoint_rows(hd as u64, m as u64, r0, RECUR_ROWS);
+                self.span(layout.checkpoint(0, h as u64).unwrap(), lo as usize, hi as usize)
+            };
+            let offs = if kda { [h * hd, h * hd, h * hd] } else { [hk * hd, (nk + hk) * hd, 2 * nk * hd + h * hd] };
+            let n_taps = (p + 1).min(CL);
+            let chunk_of = |off: usize| (off * 4 / B3_CHUNK) as u64;
+            let srcs = [l.q, l.k, l.v];
+            let taps = (p + 1 - n_taps..=p)
+                .map(|t| {
+                    let pos = &self.positions[t];
+                    let lc = |x: usize| leaf_chunk(pos, 2 * srcs[x] as u64 + 1, chunk_of(offs[x]));
+                    RecurTap { pos_path: b3_path(&self.pos_roots, t), q: lc(0), k: lc(1), v: lc(2) }
+                })
+                .collect();
+            let gw = if kda { hd } else { 1 };
+            let pos = &self.positions[p];
+            let conv_e = [l.conv_q, l.conv_k, l.conv_v];
+            let mut weights: Vec<(EntryOpening, ChunkRange)> = (0..3).map(|x| self.wrange(conv_e[x] as usize, offs[x] * CL, hd * CL)).collect();
+            weights.push(self.wrange(l.dt as usize, h * gw, gw));
+            weights.push(self.wrange(l.a as usize, h, 1));
+            weights.push(self.wrange(l.norm as usize, 0, hd));
+            RecurOpening {
+                response_txid: [1; 32],
+                pos_root: self.pos_root,
+                seq_root: self.seq_root,
+                layer: self.eo(self.ctx.layer_base as usize),
+                out_entry: self.eo(self.out_rank),
+                weights,
+                records: self.span(layout.record(0, h as u64).unwrap(), c * rl, e * rl),
+                start_rows: if s == 0 { SeqSpan::default() } else { rows(s) },
+                end_rows: if e - c == IV { rows(s + 1) } else { SeqSpan::default() },
+                taps,
+                beta: leaf_chunk(pos, 2 * l.beta as u64 + 1, chunk_of(h)),
+                decay: leaf_chunk(pos, 2 * l.decay as u64 + 1, chunk_of(h * gw)),
+                gate: leaf_chunk(pos, 2 * l.gate as u64 + 1, chunk_of(h * hd)),
+                out: leaf_bytes(pos, 2 * self.out_rank as u64),
+            }
+        }
+
+        fn check(&self, seed: &Hash) -> Result<(), Fail> {
+            verify_recur_point(&self.tier, &self.ctx, &self.resp(), seed, &self.open(seed))
+        }
+    }
+
+    fn seeds() -> impl Iterator<Item = Hash> {
+        (0..64u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
+    }
+
+    const KINDS: [Cfg; 2] = [Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false }, Cfg { kda: true, reset: false, fake_k: false, zero_out: false, bad_ckpt: false }];
+
+    #[test]
+    fn an_honest_recurrent_point_passes() {
+        for c in KINDS {
+            let rt = build(c);
+            let mut segs = [false; 3];
+            for s in seeds() {
+                segs[(draw::point(&s, RECUR_POINT)[0] % 3) as usize] = true;
+                rt.check(&s).unwrap_or_else(|e| panic!("kda {}: {e:?}", c.kda));
+            }
+            assert!(segs.iter().all(|&b| b));
+        }
+    }
+
+    #[test]
+    fn a_trace_built_token_by_token_is_refused() {
+        for c in KINDS {
+            let rt = build(Cfg { reset: true, ..c });
+            for s in seeds() {
+                assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
+            }
+        }
+    }
+
+    #[test]
+    fn keys_of_no_committed_projection_are_refused() {
+        for c in KINDS {
+            let rt = build(Cfg { fake_k: true, ..c });
+            for s in seeds() {
+                assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
+            }
+        }
+    }
+
+    #[test]
+    fn a_disconnected_output_is_refused() {
+        for c in KINDS {
+            let rt = build(Cfg { zero_out: true, ..c });
+            for s in seeds() {
+                assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
+            }
+        }
+    }
+
+    #[test]
+    fn shifted_checkpoints_are_refused() {
+        for c in KINDS {
+            let rt = build(Cfg { bad_ckpt: true, ..c });
+            for s in seeds() {
+                assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
+            }
+        }
+    }
+
+    #[test]
+    fn tampered_records_and_short_windows_are_refused() {
+        for c in KINDS {
+            let rt = build(c);
+            let s = seeds().next().unwrap();
+            let mut op = rt.open(&s);
+            op.records.bytes[3] ^= 1;
+            assert_eq!(verify_recur_point(&rt.tier, &rt.ctx, &rt.resp(), &s, &op), Err(Fail::Trace));
+            let s = seeds().find(|s| {
+                let d = draw::point(s, RECUR_POINT);
+                let seg = (d[0] % 3) as usize;
+                let (c0, e) = (seg * IV, ((seg + 1) * IV).min(N_POS));
+                c0 + ((d[3] >> 32) % (e - c0) as u64) as usize >= CL
+            }).unwrap();
+            let mut op = rt.open(&s);
+            op.taps.remove(0);
+            assert_eq!(verify_recur_point(&rt.tier, &rt.ctx, &rt.resp(), &s, &op), Err(Fail::Shape));
+            let mut op = rt.open(&s);
+            op.seq_root[0] ^= 1;
+            assert_eq!(verify_recur_point(&rt.tier, &rt.ctx, &rt.resp(), &s, &op), Err(Fail::Trace));
+        }
+    }
+}

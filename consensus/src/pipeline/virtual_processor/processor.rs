@@ -113,6 +113,9 @@ use std::{
 /// Blue-score lead of a UTXO-invalid heaviest branch over the sink past which the node stops.
 const DIVERGENCE_HALT_BLUE_DEPTH: u64 = 1_000;
 
+/// Production entries of a block: SPK and amount.
+type BlockProduction = std::sync::Arc<Vec<(ScriptPublicKey, u64)>>;
+
 pub struct VirtualStateProcessor {
     // Channels
     receiver: CrossbeamReceiver<VirtualStateProcessingMessage>,
@@ -199,6 +202,8 @@ pub struct VirtualStateProcessor {
     pub(super) trace_dedup_activation: ForkActivation,
     /// Seed-bound opening rule activation (see `params.trace_seed_bind_activation`).
     pub(super) trace_seed_bind_activation: ForkActivation,
+    /// Attention opening activation (see `params.attention_activation`).
+    pub(super) attention_activation: ForkActivation,
     /// Ratio-reward v3 table activation (see `params.ratio_reward_v3_activation`).
     pub(super) ratio_reward_v3_activation: ForkActivation,
     /// Stage-2 trace rule activation (see `params.trace_chain_activation`).
@@ -236,7 +241,7 @@ pub struct VirtualStateProcessor {
     /// `windowed_production_for_block` and re-reads the SAME growing prefix of coinbases —
     /// quadratic RocksDB reads without this memo (measured: virtual thread pegged at ~4
     /// UTXO-validated blocks/s on an IBD catch-up). Bounded by periodic clear.
-    pub(super) block_production_cache: parking_lot::RwLock<BlockHashMap<std::sync::Arc<Vec<(ScriptPublicKey, u64)>>>>,
+    pub(super) block_production_cache: parking_lot::RwLock<BlockHashMap<BlockProduction>>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -440,6 +445,7 @@ impl VirtualStateProcessor {
             service_window_v3_activation: params.service_window_v3_activation,
             trace_dedup_activation: params.trace_dedup_activation,
             trace_seed_bind_activation: params.trace_seed_bind_activation,
+            attention_activation: params.attention_activation,
             ratio_reward_v3_activation: params.ratio_reward_v3_activation,
             trace_chain_activation: params.trace_chain_activation,
             finality_depth: params.finality_depth(),
@@ -1566,12 +1572,12 @@ impl VirtualStateProcessor {
             if mutable_tx.tx.is_ai_response() && mutable_tx.tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
                 return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN));
             }
-        } else if mutable_tx.tx.is_ai_request() {
-            if let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload) {
-                let cap = keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
-                if req.max_tokens > cap {
-                    return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
-                }
+        } else if mutable_tx.tx.is_ai_request()
+            && let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload)
+        {
+            let cap = keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
+            if req.max_tokens > cap {
+                return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
             }
         }
         // Private inference: the block rule, evaluated at the virtual score.
@@ -1584,7 +1590,7 @@ impl VirtualStateProcessor {
             }
             v => TxRuleError::AiRequestPayloadRule(v.to_string()),
         })?;
-        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation)
+        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation, self.attention_activation)
             .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())

@@ -149,6 +149,80 @@ pub fn b3_leaf_from_chunk(total_len: u64, c: u64, chunk: &[u8], path: &[Hash]) -
 
 pub const B3_CHUNK: usize = 1024;
 
+/// Range proof of the `count` leaves from `first` in the trace tree over `leaves`.
+pub fn b3_range_proof(leaves: &[Hash], first: u64, count: u64) -> Vec<Hash> {
+    let mut level = leaves.to_vec();
+    let (mut lo, mut hi) = (first, first + count - 1);
+    let mut proof = Vec::new();
+    while level.len() > 1 {
+        let n = level.len();
+        if !lo.is_multiple_of(2) {
+            proof.push(level[lo as usize - 1]);
+        }
+        if hi.is_multiple_of(2) && (hi as usize) + 1 < n {
+            proof.push(level[hi as usize + 1]);
+        }
+        let mut next: Vec<Hash> = level.chunks_exact(2).map(|c| b3_merge(&c[0], &c[1], n == 2)).collect();
+        if !n.is_multiple_of(2) {
+            next.push(level[n - 1]);
+        }
+        level = next;
+        lo /= 2;
+        hi /= 2;
+    }
+    proof
+}
+
+/// Trace tree root reached from the contiguous `leaves` at `first` in a tree of `n_leaves` leaves.
+pub fn b3_range_fold(n_leaves: u64, first: u64, leaves: &[Hash], proof: &[Hash]) -> Option<Hash> {
+    if leaves.is_empty() || first.checked_add(leaves.len() as u64)? > n_leaves || proof.len() > 128 {
+        return None;
+    }
+    let mut level = leaves.to_vec();
+    let (mut lo, mut n) = (first, n_leaves);
+    let mut p = proof.iter();
+    while n > 1 {
+        let hi = lo + level.len() as u64 - 1;
+        let mut cur = Vec::with_capacity(level.len() + 2);
+        let start = if lo.is_multiple_of(2) {
+            lo
+        } else {
+            cur.push(*p.next()?);
+            lo - 1
+        };
+        cur.extend_from_slice(&level);
+        if hi.is_multiple_of(2) && hi + 1 < n {
+            cur.push(*p.next()?);
+        }
+        level = cur.chunks(2).map(|c| if c.len() == 2 { b3_merge(&c[0], &c[1], n == 2) } else { c[0] }).collect();
+        lo = start / 2;
+        n = n.div_ceil(2);
+    }
+    (p.next().is_none() && level.len() == 1).then(|| level[0])
+}
+
+/// BLAKE3 hash of an input of `total_len` bytes rebuilt from its chunks starting at `first`,
+/// given end to end in `bytes`.
+pub fn b3_leaf_from_chunks(total_len: u64, first: u64, bytes: &[u8], proof: &[Hash]) -> Option<Hash> {
+    let n = total_len.div_ceil(B3_CHUNK as u64).max(1);
+    let count = (bytes.len() as u64).div_ceil(B3_CHUNK as u64);
+    let end = first.checked_add(count)?;
+    if count == 0 || end > n || bytes.len() as u64 != total_len.min(end * B3_CHUNK as u64) - first * B3_CHUNK as u64 {
+        return None;
+    }
+    if n == 1 {
+        return proof.is_empty().then(|| *blake3::hash(bytes).as_bytes());
+    }
+    let cvs: Vec<Hash> = bytes.chunks(B3_CHUNK).enumerate().map(|(i, c)| b3_chunk_cv(c, first + i as u64)).collect();
+    b3_range_fold(n, first, &cvs, proof)
+}
+
+/// Range proof of the chunks `first..first + count` of `data`.
+pub fn b3_chunks_proof(data: &[u8], first: u64, count: u64) -> Vec<Hash> {
+    let cvs: Vec<Hash> = data.chunks(B3_CHUNK).enumerate().map(|(i, c)| b3_chunk_cv(c, i as u64)).collect();
+    if cvs.len() <= 1 { Vec::new() } else { b3_range_proof(&cvs, first, count) }
+}
+
 /// Chaining value of chunk `c` of a multi-chunk input.
 pub fn b3_chunk_cv(chunk: &[u8], c: u64) -> Hash {
     let mut h = blake3::Hasher::new();
@@ -200,6 +274,52 @@ mod tests {
             for c in 0..n {
                 let path = b3_path(&cvs, c);
                 assert!(b3_verify_chunk(&leaf, len as u64, c as u64, &data[c * B3_CHUNK..((c + 1) * B3_CHUNK).min(len)], &path));
+            }
+        }
+    }
+
+    #[test]
+    fn b3_ranges() {
+        for n in [1usize, 2, 3, 4, 5, 7, 11, 33, 38, 64, 100] {
+            let l = leaves(n);
+            let root = b3_root(&l);
+            for first in 0..n {
+                for count in 1..=n - first {
+                    let proof = b3_range_proof(&l, first as u64, count as u64);
+                    let span = &l[first..first + count];
+                    assert_eq!(b3_range_fold(n as u64, first as u64, span, &proof), Some(root), "n {n} first {first} count {count}");
+                    let mut bad = span.to_vec();
+                    bad[count - 1][0] ^= 1;
+                    assert_ne!(b3_range_fold(n as u64, first as u64, &bad, &proof), Some(root));
+                    if first > 0 {
+                        assert_ne!(b3_range_fold(n as u64, first as u64 - 1, span, &proof), Some(root));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_ranges_rebuild_the_blake3_hash() {
+        for len in [700usize, 1024, 1025, 3000, 7 * 1024 + 5, 19584] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 13 + 1) as u8).collect();
+            let leaf = *blake3::hash(&data).as_bytes();
+            let n = len.div_ceil(B3_CHUNK);
+            for first in 0..n {
+                for count in 1..=n - first {
+                    let bytes = &data[first * B3_CHUNK..((first + count) * B3_CHUNK).min(len)];
+                    let proof = b3_chunks_proof(&data, first as u64, count as u64);
+                    assert_eq!(b3_leaf_from_chunks(len as u64, first as u64, bytes, &proof), Some(leaf), "len {len} first {first} count {count}");
+                    if first + count < n {
+                        assert_ne!(b3_leaf_from_chunks(len as u64, first as u64 + 1, &data[(first + 1) * B3_CHUNK..((first + 1 + count) * B3_CHUNK).min(len)], &proof), Some(leaf));
+                    }
+                    if count < n && first + count == n && first > 0 {
+                        assert_ne!(b3_leaf_from_chunks(len as u64, first as u64 - 1, bytes, &proof), Some(leaf));
+                    }
+                    if bytes.len() > 1 {
+                        assert!(b3_leaf_from_chunks(len as u64, first as u64, &bytes[1..], &proof).is_none_or(|h| h != leaf));
+                    }
+                }
             }
         }
     }

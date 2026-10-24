@@ -4,7 +4,9 @@ use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
 use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
-use crate::opening::PrefixPoint;
+use crate::attn::{ATTN_THRESHOLD, Partial};
+use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root, decode_partials, open_partial, partial_len, partials_root};
+use crate::opening::{AttnOpening, PrefixPoint};
 use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
 use crate::verify::{Fail, PosShape, Report, ResponseCtx, TierCtx, open_bytes, open_entry, open_row, verify_point_at};
 use crate::{q8, quant};
@@ -13,6 +15,8 @@ use crate::{q8, quant};
 pub const STAGE_CHAIN: u8 = 2;
 /// Draw index of the residual point.
 pub const RESID_POINT: u32 = draw::POINTS + 1;
+/// Draw index of the attention point.
+pub const ATTN_POINT: u32 = RESID_POINT + 1;
 
 /// Consensus chain data of a tier.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -27,6 +31,12 @@ pub struct ChainCtx {
     pub trim_last: bool,
     /// Active experts per position of an expert product; 0 = no expert products.
     pub n_used: u32,
+    /// Attention layers carrying key/value cache leaves; 0 = none.
+    pub n_attn: u32,
+    /// Recurrent layers carrying sequence leaves; 0 = none.
+    pub n_recur: u32,
+    /// Heads per layer in the sequence tree (the largest key/value or recurrent head count).
+    pub seq_heads: u32,
 }
 /// Relative tolerance of a residual addition, per element.
 pub const EPS_RESID: f64 = 1e-6;
@@ -59,7 +69,7 @@ pub fn meta_leaf(n_products: u64, n_layers: u64, n_router: u64) -> u64 {
     2 * n_products + 2 * n_layers + n_router
 }
 
-fn n_router(ctx: &ChainCtx) -> u64 {
+pub(crate) fn n_router(ctx: &ChainCtx) -> u64 {
     if ctx.n_used > 0 { ctx.n_layers as u64 } else { 0 }
 }
 
@@ -162,7 +172,7 @@ pub fn residual_link(dst: &[f32], add: &[f64], src: &[f32], scale: f64) -> Resul
     for ((&d, &a), &s) in dst.iter().zip(add).zip(src) {
         let s = s as f64;
         let tol = EPS_RESID * scale.abs() * (a.abs() + s.abs()) + f32::MIN_POSITIVE as f64;
-        if !((d as f64 - scale * (a + s)).abs() <= tol) {
+        if !(d as f64 - scale * (a + s)).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
             return Err(Fail::Mismatch);
         }
     }
@@ -180,11 +190,11 @@ pub fn shape(tier: &TierCtx, ctx: &ChainCtx, tok: u32) -> PosShape {
     }
 }
 
-fn f32s(b: &[u8]) -> Vec<f32> {
+pub(crate) fn f32s(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
-fn f32_weights(tier: &TierCtx, w: &(EntryOpening, ChunkRange), index: u32, k: u64, offset: u64, n: u64) -> Result<Vec<f32>, Fail> {
+pub(crate) fn f32_weights(tier: &TierCtx, w: &(EntryOpening, ChunkRange), index: u32, k: u64, offset: u64, n: u64) -> Result<Vec<f32>, Fail> {
     let e = open_entry(tier, &w.0, index as u64)?;
     if e.role != manifest::ROLE_NORM || e.wtype != 0 || e.k != k {
         return Err(Fail::Manifest);
@@ -215,14 +225,14 @@ fn chunk_leaf_raw(c: &ExpertIds, total_len: u64, index: u64) -> Result<Hash, Fai
     b3_leaf_from_chunk(total_len, index, &c.chunk, &c.chunk_path).ok_or(Fail::Trace)
 }
 
-fn chunk_leaf(c: &LeafChunk, total_len: u64, index: u64) -> Result<Hash, Fail> {
+pub(crate) fn chunk_leaf(c: &LeafChunk, total_len: u64, index: u64) -> Result<Hash, Fail> {
     if c.total_len as u64 != total_len || c.index as u64 != index {
         return Err(Fail::Shape);
     }
     b3_leaf_from_chunk(total_len, index, &c.chunk, &c.chunk_path).ok_or(Fail::Trace)
 }
 
-fn leaf_chunk(pos_root: &Hash, shape: &PosShape, leaf: u64, c: &LeafChunk, total_len: u64, index: u64) -> Result<Vec<f32>, Fail> {
+pub(crate) fn leaf_chunk(pos_root: &Hash, shape: &PosShape, leaf: u64, c: &LeafChunk, total_len: u64, index: u64) -> Result<Vec<f32>, Fail> {
     let h = chunk_leaf(c, total_len, index)?;
     if !b3_verify(pos_root, shape.n_leaves, leaf, &h, &c.leaf_path) {
         return Err(Fail::Trace);
@@ -313,15 +323,36 @@ pub fn verify_chain_point(
                 (manifest::LINK_GLU, manifest::FORM_PAIR_GATE) => se.m,
                 (manifest::LINK_GLU, manifest::FORM_SPLIT) => se.m / 2,
                 (manifest::LINK_DIRECT, manifest::FORM_NONE) if se.role == manifest::ROLE_PRODUCT => se.m,
+                (manifest::LINK_DIRECT, manifest::FORM_NONE) if se.role == manifest::ROLE_HEADS => se.m * se.n_exp as u64,
                 _ => return Err(Fail::Manifest),
             };
-            if m_out != k || se.n_exp != 1 {
+            if m_out != k || (se.n_exp != 1 && se.role != manifest::ROLE_HEADS) {
                 return Err(Fail::Manifest);
             }
             let total = 4 * m_out;
             let c = draw::point(seed, i)[3] % n_chunks(total);
             let h = leaf_chunk(&o.pos_root, &shape, 2 * pl.src as u64 + 1, y, total, c)?;
             glu_link(&p.x, o.layout, k as usize, (c * B3_CHUNK as u64 / 128) as usize, &h)?;
+        }
+        (manifest::LINK_HEAD_SLICE, LinkOpening::Source { src, y, ids: None }) if o.input.role == manifest::ROLE_HEADS => {
+            let se = open_entry(tier, src, pl.src as u64)?;
+            let n_head = o.input.n_exp as u64;
+            if se.role != manifest::ROLE_PRODUCT || se.n_exp != 1 || n_head < 2 || se.m % n_head != 0 {
+                return Err(Fail::Manifest);
+            }
+            let stride = se.m / n_head;
+            if k > stride || !k.is_multiple_of(32) || !stride.is_multiple_of(32) {
+                return Err(Fail::Manifest);
+            }
+            let per_chunk = (B3_CHUNK / 4) as u64;
+            let start = o.slot * stride;
+            let c = (start + draw::point(seed, i)[3] % (k / 32) * 32) / per_chunk;
+            let h = leaf_chunk(&o.pos_root, &shape, 2 * pl.src as u64 + 1, y, 4 * se.m, c)?;
+            let (lo, hi) = ((c * per_chunk).max(start), ((c + 1) * per_chunk).min(start + k));
+            let vals = h.get((lo - c * per_chunk) as usize..(hi - c * per_chunk) as usize).ok_or(Fail::Shape)?;
+            let x_one = crate::verify::x_len(k, o.layout) as usize;
+            let xs = p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)?;
+            glu_link(xs, o.layout, k as usize, ((lo - start) / 32) as usize, vals)?;
         }
         _ => return Err(Fail::Shape),
     }
@@ -409,7 +440,7 @@ impl MoeCheck<'_> {
 
         let body = n_used * self.dim * 4;
         let per_slot = self.dim * 4 / B3_CHUNK as u64;
-        if body % B3_CHUNK as u64 != 0 || (self.dim * 4) % B3_CHUNK as u64 != 0 {
+        if !body.is_multiple_of(B3_CHUNK as u64) || !(self.dim * 4).is_multiple_of(B3_CHUNK as u64) {
             return Err(Fail::Shape);
         }
         let total = body + 4 * n_used;
@@ -431,7 +462,7 @@ impl MoeCheck<'_> {
             dot += wj as f64 * vj;
             mag += (wj as f64 * vj).abs();
         }
-        if !((scores[row as usize] as f64 - dot).abs() <= EPS_ROUTER * mag + f32::MIN_POSITIVE as f64) {
+        if !(scores[row as usize] as f64 - dot).abs().partial_cmp(&(EPS_ROUTER * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
             return Err(Fail::Mismatch);
         }
 
@@ -448,7 +479,7 @@ impl MoeCheck<'_> {
                 sum += ws * y[j] as f64;
                 mag += (ws * y[j] as f64).abs();
             }
-            if !((dst[j] as f64 - sum).abs() <= EPS_MOE * mag + f32::MIN_POSITIVE as f64) {
+            if !(dst[j] as f64 - sum).abs().partial_cmp(&(EPS_MOE * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
                 return Err(Fail::Mismatch);
             }
         }
@@ -480,7 +511,7 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     }
     let d = draw::point(seed, RESID_POINT);
     let sel = d[1] % (2 * n_layers);
-    let (layer, kind) = (sel / 2, if sel % 2 == 0 { Resid::Attn } else { Resid::Out });
+    let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
     let t = resid_position(ctx, resp, layer, d[0])?;
     let shape = shape(tier, ctx, p.tok);
 
@@ -699,3 +730,472 @@ mod tests {
         assert_eq!(residual_link(&r, &raw, &h, 1.0), Err(Fail::Mismatch));
     }
 }
+
+/// Outcome of an accepted attention phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttnStep {
+    Done,
+    /// The next phase opens one of the `n` children whose partials this phase committed under `root`.
+    Next { root: Hash, n: u64 },
+}
+
+/// Verify the attention point of a response opened in a single phase.
+pub fn verify_attn_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &AttnOpening) -> Result<(), Fail> {
+    match verify_attn_phase(tier, ctx, resp, seed, &[], None, op)? {
+        AttnStep::Done => Ok(()),
+        AttnStep::Next { .. } => Err(Fail::Unsupported),
+    }
+}
+
+/// Drawn attention point: layer links, query position, draws and the block tree of the attended
+/// positions.
+struct AttnSite {
+    ll: manifest::LayerLinks,
+    a: manifest::AttnLinks,
+    slot: u64,
+    t: u64,
+    d: [u64; 4],
+    tree: BlockTree,
+    /// Values per partial.
+    dv: usize,
+}
+
+fn attn_site(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &AttnOpening) -> Result<AttnSite, Fail> {
+    let (nl, n_pos, n_attn) = (ctx.n_layers as u64, resp.n_pos as u64, ctx.n_attn as u64);
+    if n_pos == 0 || nl == 0 || n_attn == 0 || n_attn > nl || ctx.seq_heads == 0 {
+        return Err(Fail::Unsupported);
+    }
+    if crate::seq::trace_root(&op.pos_root, &op.seq_root) != resp.trace_root {
+        return Err(Fail::Trace);
+    }
+    let d = draw::point(seed, ATTN_POINT);
+    let slot = d[1] % n_attn;
+    let layer = (op.layer.index as u64).checked_sub(ctx.layer_base as u64).filter(|&l| l < nl).ok_or(Fail::Manifest)?;
+    let le = open_entry(tier, &op.layer, ctx.layer_base as u64 + layer)?;
+    let (ll, a) = match le.chain {
+        Chain::Layer(ll) if le.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => (ll, ll.attn.ok_or(Fail::Shape)?),
+        _ => return Err(Fail::Manifest),
+    };
+    if a.slot as u64 != slot {
+        return Err(Fail::Manifest);
+    }
+    let t = resid_position(ctx, resp, layer, d[0])?;
+    if a.softcap != 0 || a.v_norm > 1 || a.gated > 1 {
+        return Err(Fail::Unsupported);
+    }
+    let hd = a.head_dim as usize;
+    if hd == 0 || !hd.is_multiple_of(32) {
+        return Err(Fail::Manifest);
+    }
+    let (start, row, dv) = if a.mla_rank != 0 {
+        (0, hd / 32 * 34, a.mla_rank as usize)
+    } else {
+        let start = if a.swa_window > 0 { (t + 1).saturating_sub(a.swa_window as u64) } else { 0 };
+        (start, 2 * (hd / 32 * 34), hd)
+    };
+    let (c, b) = block_params(row, partial_len(dv)).ok_or(Fail::Manifest)?;
+    let tree = BlockTree::new(start, t + 1, c, b).ok_or(Fail::Manifest)?;
+    Ok(AttnSite { ll, a, slot, t, d, tree, dv })
+}
+
+/// Verify phase `path.len()` of the attention point of a response; `path` holds the child drawn
+/// after each earlier phase and `parent_root` the partials root the previous phase committed.
+pub fn verify_attn_phase(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    resp: &ResponseCtx,
+    seed: &Hash,
+    path: &[u64],
+    parent_root: Option<&Hash>,
+    op: &AttnOpening,
+) -> Result<AttnStep, Fail> {
+    let s = attn_site(tier, ctx, resp, seed, op)?;
+    let depth = s.tree.depth() as usize;
+    if op.path != path || path.len() > depth {
+        return Err(Fail::Shape);
+    }
+    let parent = match (path.split_last(), parent_root) {
+        (None, None) if op.parent.is_empty() && op.parent_path.is_empty() => None,
+        (Some((&i, up)), Some(root)) => {
+            let n = s.tree.children(up).ok_or(Fail::Shape)?.len() as u64;
+            Some(open_partial(root, n, i, &op.parent, &op.parent_path, s.dv).ok_or(Fail::Trace)?)
+        }
+        _ => return Err(Fail::Shape),
+    };
+    let last = path.len() == depth;
+    let mut keep = AttnOpening {
+        response_txid: op.response_txid,
+        pos_root: op.pos_root,
+        seq_root: op.seq_root,
+        layer: op.layer.clone(),
+        path: op.path.clone(),
+        parent: op.parent.clone(),
+        parent_path: op.parent_path.clone(),
+        ..Default::default()
+    };
+    if path.is_empty() || last {
+        keep.q_entry = op.q_entry.clone();
+        keep.pos_path = op.pos_path.clone();
+        keep.q = op.q.clone();
+    }
+    if path.is_empty() {
+        keep.o_entry = op.o_entry.clone();
+        keep.out = op.out.clone();
+    }
+    if last {
+        keep.norms = op.norms.clone();
+        keep.kcache = op.kcache.clone();
+        keep.vcache = op.vcache.clone();
+        keep.anchor_pos_path = op.anchor_pos_path.clone();
+        keep.anchor_k = op.anchor_k.clone();
+        keep.anchor_v = op.anchor_v.clone();
+        keep.absorb = op.absorb.clone();
+    } else {
+        keep.partials = op.partials.clone();
+    }
+    if *op != keep {
+        return Err(Fail::Shape);
+    }
+    let children = if last {
+        None
+    } else {
+        let n = s.tree.children(path).ok_or(Fail::Shape)?.len();
+        Some(decode_partials(&op.partials, s.dv).filter(|p| p.len() == n).ok_or(Fail::Shape)?)
+    };
+    match (&parent, &children) {
+        (Some(p), Some(ch)) => check_node(p, ch).then_some(()).ok_or(Fail::Mismatch)?,
+        _ if s.a.mla_rank != 0 => mla_phase(tier, ctx, resp, op, &s, path, parent.as_ref(), children.as_deref())?,
+        _ => gqa_phase(tier, ctx, resp, op, &s, path, parent.as_ref(), children.as_deref())?,
+    }
+    Ok(match children {
+        None => AttnStep::Done,
+        Some(ch) => AttnStep::Next { root: partials_root(&op.partials, s.dv).ok_or(Fail::Shape)?, n: ch.len() as u64 },
+    })
+}
+
+/// Attended query of the drawn head of the attention point of `seed` and its score scale, from
+/// the query fields of `op`: the query entry, norms, query chunks at the drawn position and their
+/// path, and the latent query of a latent-cache layer.
+pub fn attn_query(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &AttnOpening) -> Result<(Vec<f64>, f64), Fail> {
+    let s = attn_site(tier, ctx, resp, seed, op)?;
+    let q = if s.a.mla_rank != 0 { mla_query(tier, ctx, resp, op, &s)? } else { gqa_query(tier, ctx, resp, op, &s)? };
+    Ok((q, f32::from_bits(s.a.kq_scale) as f64))
+}
+
+fn gqa_shape(a: &manifest::AttnLinks) -> crate::attn::AttnShape {
+    crate::attn::AttnShape {
+        n_head: a.n_head as usize,
+        n_head_kv: a.n_head_kv as usize,
+        head_dim: a.head_dim as usize,
+        rope_kind: a.rope_kind,
+        n_rot: a.n_rot as usize,
+        rope_base: f32::from_bits(a.rope_base) as f64,
+        kq_scale: f32::from_bits(a.kq_scale) as f64,
+    }
+}
+
+/// Query norm, key norm and RoPE frequency weights a grouped-query layer declares.
+type GqaNorms = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
+
+fn gqa_norms(tier: &TierCtx, a: &manifest::AttnLinks, norms: &[(EntryOpening, ChunkRange)]) -> Result<GqaNorms, Fail> {
+    let hd = a.head_dim as u64;
+    let declared = [(a.q_norm, hd), (a.k_norm, hd), (a.rope_freqs, (a.n_rot / 2) as u64)];
+    let declared: Vec<(u32, u64)> = declared.into_iter().filter(|&(i, _)| i != manifest::NONE).collect();
+    if norms.len() != declared.len() {
+        return Err(Fail::Shape);
+    }
+    let mut weights = declared.iter().zip(norms).map(|(&(i, k), w)| f32_weights(tier, w, i, k, 0, k)).collect::<Result<Vec<_>, _>>()?.into_iter();
+    let mut take = |i: u32| if i != manifest::NONE { weights.next() } else { None };
+    Ok((take(a.q_norm), take(a.k_norm), take(a.rope_freqs)))
+}
+
+/// Key/value head and query head of a grouped-query point.
+fn gqa_heads(s: &AttnSite, g: usize) -> (usize, usize) {
+    let kv = (s.d[2] % s.a.n_head_kv as u64) as usize;
+    (kv, kv * g + (s.d[2] / s.a.n_head_kv as u64 % g as u64) as usize)
+}
+
+fn gqa_query(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, op: &AttnOpening, s: &AttnSite) -> Result<Vec<f64>, Fail> {
+    let a = &s.a;
+    let shape = gqa_shape(a);
+    let (g, hd, qw) = (shape.group().ok_or(Fail::Manifest)?, shape.head_dim, 1 + a.gated as usize);
+    let qe = open_entry(tier, &op.q_entry, a.q as u64)?;
+    if qe.m as usize != shape.n_head * hd * qw {
+        return Err(Fail::Manifest);
+    }
+    let (q_norm, k_norm, freqs) = gqa_norms(tier, a, &op.norms)?;
+    let prep = crate::attn::Prep { q_norm: q_norm.as_deref(), k_norm: k_norm.as_deref(), v_norm: a.v_norm == 1, freqs: freqs.as_deref(), eps: ctx.eps };
+    if !prep.fits(&shape) {
+        return Err(Fail::Manifest);
+    }
+    let (pshape, q_leaf) = (shape_any(tier, ctx), 2 * a.q as u64 + 1);
+    let root_t = anchor_root(&op.pos_root, resp.n_pos as u64, s.t, &pshape, q_leaf, &op.q, 4 * qe.m, &op.pos_path)?;
+    let raw = head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, gqa_heads(s, g).1 * hd * qw, hd)?;
+    Ok(prep.query(&shape, &raw, s.t))
+}
+
+fn mla_query(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, op: &AttnOpening, s: &AttnSite) -> Result<Vec<f64>, Fail> {
+    let a = &s.a;
+    let (nh, hd, r) = (a.n_head as usize, a.head_dim as usize, a.mla_rank as usize);
+    let rope = hd.checked_sub(r).filter(|_| r.is_multiple_of(32) && nh > 0).ok_or(Fail::Manifest)?;
+    let qe = open_entry(tier, &op.q_entry, a.q as u64)?;
+    if !qe.m.is_multiple_of(nh as u64) {
+        return Err(Fail::Manifest);
+    }
+    let qh_w = (qe.m / nh as u64) as usize;
+    let nope = qh_w.checked_sub(rope).filter(|&n| n > 0).ok_or(Fail::Manifest)?;
+    let (pshape, q_leaf, qh) = (shape_any(tier, ctx), 2 * a.q as u64 + 1, (s.d[2] % nh as u64) as usize);
+    let root_t = anchor_root(&op.pos_root, resp.n_pos as u64, s.t, &pshape, q_leaf, &op.q, 4 * qe.m, &op.pos_path)?;
+    let mut q: Vec<f64> = head_from_chunks(&root_t, &pshape, 2 * a.absorb as u64 + 1, &op.absorb, 4 * (nh * r) as u64, qh * r, r)?
+        .iter()
+        .map(|&x| x as f64)
+        .collect();
+    q.extend(head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, qh * qh_w + nope, rope)?.iter().map(|&x| x as f64));
+    Ok(q)
+}
+
+/// Layout of the attention-output input at the drawn position and the position root its opened
+/// leaf reaches.
+fn out_root(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, op: &AttnOpening, s: &AttnSite, rank: u32, wtype: u32) -> Result<(u8, Hash), Fail> {
+    let layout = crate::verify::layout_for(crate::verify::expected_ubatch(s.t, resp.n_prompt), wtype);
+    let root_t = b3_fold(shape_any(tier, ctx).n_leaves, 2 * rank as u64, blake3::hash(&op.out.bytes).as_bytes(), &op.out.leaf_path).ok_or(Fail::Trace)?;
+    b3_verify(&op.pos_root, resp.n_pos as u64, s.t, &root_t, &op.pos_path).then_some((layout, root_t)).ok_or(Fail::Trace)
+}
+
+/// The output check (whole opening or root phase) or the leaf check of a grouped-query layer.
+#[allow(clippy::too_many_arguments)]
+fn gqa_phase(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    resp: &ResponseCtx,
+    op: &AttnOpening,
+    s: &AttnSite,
+    path: &[u64],
+    parent: Option<&Partial>,
+    children: Option<&[Partial]>,
+) -> Result<(), Fail> {
+    use crate::attn::{ARITHS, Prep};
+    let (a, n_pos) = (&s.a, resp.n_pos as u64);
+    if a.absorb != manifest::NONE || a.out != manifest::NONE || !op.absorb.is_empty() {
+        return Err(Fail::Shape);
+    }
+    let shape = gqa_shape(a);
+    let g = shape.group().ok_or(Fail::Manifest)?;
+    let hd = shape.head_dim;
+    let (kv, qh) = gqa_heads(s, g);
+    let qe = open_entry(tier, &op.q_entry, a.q as u64)?;
+    let qw = 1 + a.gated as usize;
+    if qe.m as usize != shape.n_head * hd * qw {
+        return Err(Fail::Manifest);
+    }
+    let pshape = shape_any(tier, ctx);
+    let q_leaf = 2 * a.q as u64 + 1;
+    let (root_t, layout) = if path.is_empty() {
+        let oe = open_entry(tier, &op.o_entry, s.ll.proj as u64)?;
+        if oe.k as usize != shape.n_head * hd {
+            return Err(Fail::Manifest);
+        }
+        let (layout, root_t) = out_root(tier, ctx, resp, op, s, s.ll.proj, oe.wtype)?;
+        if op.out.bytes.len() as u64 != crate::verify::x_len(oe.k, layout) {
+            return Err(Fail::Shape);
+        }
+        (root_t, layout)
+    } else {
+        (anchor_root(&op.pos_root, n_pos, s.t, &pshape, q_leaf, &op.q, 4 * qe.m, &op.pos_path)?, 0)
+    };
+    if let Some(ch) = children {
+        let gate = if qw > 1 { Some(head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, qh * hd * qw + hd, hd)?) } else { None };
+        return check_root(&op.out.bytes, layout, shape.n_head * hd, qh, ch, gate.as_deref()).then_some(()).ok_or(Fail::Mismatch);
+    }
+    let (q_norm, k_norm, freqs) = gqa_norms(tier, a, &op.norms)?;
+    let prep = Prep { q_norm: q_norm.as_deref(), k_norm: k_norm.as_deref(), v_norm: a.v_norm == 1, freqs: freqs.as_deref(), eps: ctx.eps };
+    if !prep.fits(&shape) {
+        return Err(Fail::Manifest);
+    }
+    let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
+    let sl = seq_layout(ctx);
+    let krows = cache_rows(ctx, &op.seq_root, sl.kcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.kcache)?;
+    let vrows = cache_rows(ctx, &op.seq_root, sl.vcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.vcache)?;
+    let keys = krows.iter().map(|r| dequant_head(r, hd)).collect::<Result<Vec<_>, _>>()?;
+    let values = vrows.iter().map(|r| dequant_head(r, hd)).collect::<Result<Vec<_>, _>>()?;
+    let ok = match parent {
+        Some(p) => check_leaf(&gqa_query(tier, ctx, resp, op, s)?, shape.kq_scale, &keys, &values, p),
+        None => {
+            let raw = head_from_chunks(&root_t, &pshape, q_leaf, &op.q, 4 * qe.m, qh * hd * qw, hd * qw)?;
+            let q = prep.query(&shape, &raw[..hd], s.t);
+            let gate = (qw > 1).then(|| &raw[hd..]);
+            ARITHS.iter().any(|&ar| {
+                crate::attn::partial(ar, &q, shape.kq_scale, &keys, &values).is_some_and(|p| check_root(&op.out.bytes, layout, shape.n_head * hd, qh, &[p], gate))
+            })
+        }
+    };
+    if !ok {
+        return Err(Fail::Mismatch);
+    }
+    let i = (s.d[3] % (p1 - p0)) as usize;
+    let ps = p0 + i as u64;
+    let kv_total = 4 * (shape.n_head_kv * hd) as u64;
+    let root_ps = anchor_root(&op.pos_root, n_pos, ps, &pshape, 2 * a.k as u64 + 1, &op.anchor_k, kv_total, &op.anchor_pos_path)?;
+    let k_proj = head_from_chunks(&root_ps, &pshape, 2 * a.k as u64 + 1, &op.anchor_k, kv_total, kv * hd, hd)?;
+    let v_proj = if a.v == a.k {
+        if !op.anchor_v.is_empty() {
+            return Err(Fail::Shape);
+        }
+        k_proj.clone()
+    } else {
+        head_from_chunks(&root_ps, &pshape, 2 * a.v as u64 + 1, &op.anchor_v, kv_total, kv * hd, hd)?
+    };
+    let k_c = prep.key(&shape, &k_proj, ps);
+    let v_c = prep.value(&v_proj);
+    (q8_0_matches(krows[i], &k_c) && q8_0_matches(vrows[i], &v_c)).then_some(()).ok_or(Fail::Mismatch)
+}
+
+/// The output check (whole opening or root phase) or the leaf check of a latent-cache layer: one
+/// drawn query head against the shared latent cache.
+#[allow(clippy::too_many_arguments)]
+fn mla_phase(
+    tier: &TierCtx,
+    ctx: &ChainCtx,
+    resp: &ResponseCtx,
+    op: &AttnOpening,
+    s: &AttnSite,
+    path: &[u64],
+    parent: Option<&Partial>,
+    children: Option<&[Partial]>,
+) -> Result<(), Fail> {
+    use crate::attn::ARITHS;
+    let (a, n_pos) = (&s.a, resp.n_pos as u64);
+    let (nh, hd, r) = (a.n_head as usize, a.head_dim as usize, a.mla_rank as usize);
+    let rope = hd.checked_sub(r).filter(|_| r.is_multiple_of(32)).ok_or(Fail::Manifest)?;
+    let none = manifest::NONE;
+    if a.n_head_kv != 1 || a.n_rot != 0 || a.swa_window != 0 || a.gated != 0 || a.v_norm != 0 || a.q_norm != none || a.rope_freqs != none {
+        return Err(Fail::Unsupported);
+    }
+    if a.v != none || a.k_norm == none || a.absorb == none || nh == 0 {
+        return Err(Fail::Manifest);
+    }
+    let qe = open_entry(tier, &op.q_entry, a.q as u64)?;
+    if !qe.m.is_multiple_of(nh as u64) {
+        return Err(Fail::Manifest);
+    }
+    (qe.m / nh as u64).checked_sub(rope as u64).filter(|&n| n > 0).ok_or(Fail::Manifest)?;
+    if !op.anchor_v.is_empty() || op.vcache != crate::seq::SeqSpan::default() {
+        return Err(Fail::Shape);
+    }
+    let pshape = shape_any(tier, ctx);
+    let qh = (s.d[2] % nh as u64) as usize;
+    let out = if path.is_empty() {
+        let out_rank = if a.out == none { s.ll.proj } else { a.out };
+        let oe = open_entry(tier, &op.o_entry, out_rank as u64)?;
+        if oe.k as usize != r || oe.n_exp as usize != nh || oe.role != manifest::ROLE_HEADS {
+            return Err(Fail::Manifest);
+        }
+        let (layout, _) = out_root(tier, ctx, resp, op, s, out_rank, oe.wtype)?;
+        let x_one = crate::verify::x_len(oe.k, layout) as usize;
+        if op.out.bytes.len() != nh * x_one {
+            return Err(Fail::Shape);
+        }
+        Some((&op.out.bytes[qh * x_one..(qh + 1) * x_one], layout))
+    } else {
+        None
+    };
+    if let Some(ch) = children {
+        let (x, layout) = out.ok_or(Fail::Shape)?;
+        return check_root(x, layout, r, 0, ch, None).then_some(()).ok_or(Fail::Mismatch);
+    }
+    let [w] = <[(EntryOpening, ChunkRange); 1]>::try_from(op.norms.clone()).map_err(|_| Fail::Shape)?;
+    let k_norm = f32_weights(tier, &w, a.k_norm, r as u64, 0, r as u64)?;
+    let q = mla_query(tier, ctx, resp, op, s)?;
+    let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
+    let rows = cache_rows(ctx, &op.seq_root, seq_layout(ctx).kcache(s.slot, 0), n_pos, hd, p0, p1, &op.kcache)?;
+    let keys = rows.iter().map(|row| dequant_head(row, hd)).collect::<Result<Vec<_>, _>>()?;
+    let values: Vec<Vec<f32>> = keys.iter().map(|k| k[..r].to_vec()).collect();
+    let scale = f32::from_bits(a.kq_scale) as f64;
+    let ok = match (parent, out) {
+        (Some(p), _) => check_leaf(&q, scale, &keys, &values, p),
+        (None, Some((x, layout))) => ARITHS.iter().any(|&ar| {
+            crate::attn::partial(ar, &q, scale, &keys, &values).is_some_and(|p| block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
+        }),
+        (None, None) => false,
+    };
+    if !ok {
+        return Err(Fail::Mismatch);
+    }
+    let i = (s.d[3] % (p1 - p0)) as usize;
+    let ps = p0 + i as u64;
+    let root_ps = anchor_root(&op.pos_root, n_pos, ps, &pshape, 2 * a.k as u64 + 1, &op.anchor_k, 4 * hd as u64, &op.anchor_pos_path)?;
+    let kv_a = head_from_chunks(&root_ps, &pshape, 2 * a.k as u64 + 1, &op.anchor_k, 4 * hd as u64, 0, hd)?;
+    let mut key: Vec<f64> = kv_a.iter().map(|&x| x as f64).collect();
+    crate::attn::rms_norm(&mut key[..r], Some(&k_norm), ctx.eps);
+    q8_0_matches(rows[i], &key).then_some(()).ok_or(Fail::Mismatch)
+}
+
+/// Sequence tree layout of a tier.
+pub fn seq_layout(ctx: &ChainCtx) -> crate::seq::SeqLayout {
+    crate::seq::SeqLayout { n_attn: ctx.n_attn as u64, n_recur: ctx.n_recur as u64, heads: ctx.seq_heads as u64 }
+}
+
+/// Q8_0 head rows of positions `[p0, p1)` of the cache sequence leaf `leaf`, from `span`.
+#[allow(clippy::too_many_arguments)]
+fn cache_rows<'a>(ctx: &ChainCtx, seq_root: &Hash, leaf: Option<u64>, n_pos: u64, hd: usize, p0: u64, p1: u64, span: &'a crate::seq::SeqSpan) -> Result<Vec<&'a [u8]>, Fail> {
+    let bb = (hd / 32 * 34) as u64;
+    let leaf = leaf.ok_or(Fail::Shape)?;
+    let bytes = crate::seq::open_span(seq_root, &seq_layout(ctx), leaf, n_pos * bb, p0 * bb, p1 * bb, span).ok_or(Fail::Trace)?;
+    Ok(bytes.chunks_exact(bb as usize).collect())
+}
+
+fn dequant_head(row: &[u8], hd: usize) -> Result<Vec<f32>, Fail> {
+    quant::dequant_row(quant::Q8_0, row, hd).ok_or(Fail::Shape)
+}
+
+/// Root of position `p` reached by the first of `chunks` of the f32 leaf `leaf`, checked against
+/// the position tree.
+#[allow(clippy::too_many_arguments)]
+fn anchor_root(pos_root: &Hash, n_pos: u64, p: u64, shape: &PosShape, leaf: u64, chunks: &[LeafChunk], total: u64, path: &[Hash]) -> Result<Hash, Fail> {
+    let c = chunks.first().ok_or(Fail::Shape)?;
+    let h = chunk_leaf(c, total, c.index as u64)?;
+    let root = b3_fold(shape.n_leaves, leaf, &h, &c.leaf_path).ok_or(Fail::Trace)?;
+    b3_verify(pos_root, n_pos, p, &root, path).then_some(root).ok_or(Fail::Trace)
+}
+
+/// Values `[lo, lo + n)` of the f32 leaf `leaf` at the position of `root`, from its opened chunks.
+fn head_from_chunks(root: &Hash, shape: &PosShape, leaf: u64, chunks: &[LeafChunk], total: u64, lo: usize, n: usize) -> Result<Vec<f32>, Fail> {
+    let mut out = vec![0f32; n];
+    let mut covered = vec![false; n];
+    for c in chunks {
+        let vals = leaf_chunk(root, shape, leaf, c, total, c.index as u64)?;
+        let base = c.index as usize * B3_CHUNK / 4;
+        for (j, v) in vals.iter().enumerate() {
+            if let Some(i) = (base + j).checked_sub(lo).filter(|&i| i < n) {
+                out[i] = *v;
+                covered[i] = true;
+            }
+        }
+    }
+    covered.iter().all(|&c| c).then_some(out).ok_or(Fail::Shape)
+}
+
+/// Whether the Q8_0 blocks `b` are a canonical quantization of `v` within one step per value.
+fn q8_0_matches(b: &[u8], v: &[f64]) -> bool {
+    if b.len() != v.len().div_ceil(32) * 34 {
+        return false;
+    }
+    let vmax = v.iter().fold(0f64, |m, a| m.max(a.abs()));
+    b.chunks_exact(34).zip(v.chunks(32)).all(|(blk, vals)| {
+        let d = crate::f16::read(blk, 0);
+        let q: [i8; 32] = std::array::from_fn(|j| blk[2 + j] as i8);
+        if !d.is_finite() || !q8::canonical(d, &q) {
+            return false;
+        }
+        if d == 0.0 {
+            return vals.iter().all(|a| a.abs() <= 1e-6 * vmax);
+        }
+        vals.iter().enumerate().all(|(j, a)| (q[j] as f64 - a / d as f64).abs() <= THRESHOLD)
+    })
+}
+
+/// Leaf layout of a position, independent of its token.
+pub(crate) fn shape_any(tier: &TierCtx, ctx: &ChainCtx) -> PosShape {
+    shape(tier, ctx, 0)
+}
+

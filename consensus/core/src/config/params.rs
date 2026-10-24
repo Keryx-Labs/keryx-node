@@ -849,6 +849,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             embd_scale: 1.0,
             trim_last: false,
             n_used: 0,
+            n_attn: 0, n_recur: 0, seq_heads: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -893,6 +894,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             embd_scale: 1.0,
             trim_last: true,
             n_used: 0,
+            n_attn: 0, n_recur: 0, seq_heads: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -937,6 +939,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             embd_scale: 61.967735290527344,
             trim_last: false,
             n_used: 0,
+            n_attn: 0, n_recur: 0, seq_heads: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -981,6 +984,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             embd_scale: 1.0,
             trim_last: false,
             n_used: 0,
+            n_attn: 0, n_recur: 0, seq_heads: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -1025,6 +1029,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             embd_scale: 1.0,
             trim_last: true,
             n_used: 8,
+            n_attn: 0, n_recur: 0, seq_heads: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -1054,6 +1059,85 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
     }),
 ];
 
+/// Manifests of the H14 lineup under the attention rules, with the attention and recurrent layers
+/// they describe.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceNext {
+    pub manifest: TraceManifest,
+    pub n_attn: u32,
+    pub n_recur: u32,
+    pub seq_heads: u32,
+}
+
+/// Next-gate manifests of the H14 lineup, by tier.
+pub const TRACE_ATTN_H_NEXT: [Option<TraceNext>; 5] = [
+    Some(TraceNext {
+        manifest: TraceManifest {
+            m_t: [
+                0x13, 0x10, 0x23, 0x9c, 0x03, 0x04, 0x56, 0x0a, 0xfb, 0xc6, 0xac, 0x95, 0xfc, 0x54, 0x2e, 0xa6,
+                0xef, 0x4b, 0x25, 0x77, 0x25, 0xaf, 0x7c, 0x11, 0x88, 0x56, 0x89, 0xbd, 0x61, 0xbf, 0x19, 0xc2,
+            ],
+            n_entries: 459,
+            n_products: 249,
+        },
+        n_attn: 8,
+        n_recur: 24,
+        seq_heads: 32,
+    }),
+    Some(TraceNext {
+        manifest: TraceManifest {
+            m_t: [
+                0x3b, 0xbe, 0x87, 0xed, 0x68, 0xf0, 0xeb, 0x59, 0xe2, 0xb2, 0x1b, 0xe9, 0x99, 0x6f, 0xf3, 0x28,
+                0xd5, 0x64, 0x47, 0xdf, 0xbe, 0x5b, 0x8b, 0x2e, 0x98, 0xcc, 0xa6, 0x87, 0x24, 0x27, 0xcb, 0x66,
+            ],
+            n_entries: 563,
+            n_products: 241,
+        },
+        n_attn: 40,
+        n_recur: 0,
+        seq_heads: 2,
+    }),
+    Some(TraceNext {
+        manifest: TraceManifest {
+            m_t: [
+                0x0b, 0xf8, 0x50, 0x5d, 0x05, 0x55, 0x17, 0xe9, 0x96, 0x74, 0x43, 0x19, 0x01, 0x76, 0x47, 0x75,
+                0x2a, 0xb1, 0xa5, 0xbf, 0xc6, 0xa3, 0x93, 0xb3, 0x6d, 0x66, 0x74, 0x14, 0xd4, 0x8f, 0xbe, 0x69,
+            ],
+            n_entries: 668,
+            n_products: 329,
+        },
+        n_attn: 48,
+        n_recur: 0,
+        seq_heads: 8,
+    }),
+    Some(TraceNext {
+        manifest: TraceManifest {
+            m_t: [
+                0x3b, 0xcd, 0xca, 0xef, 0xa6, 0x5e, 0xd4, 0x4d, 0x90, 0x45, 0x7f, 0x19, 0x57, 0x1f, 0x8e, 0x29,
+                0x31, 0x4c, 0x15, 0x42, 0x9d, 0xa4, 0x44, 0x0d, 0xb2, 0x6e, 0xfd, 0x8f, 0xca, 0xf0, 0xd7, 0x2f,
+            ],
+            n_entries: 915,
+            n_products: 497,
+        },
+        n_attn: 16,
+        n_recur: 48,
+        seq_heads: 48,
+    }),
+    Some(TraceNext {
+        manifest: TraceManifest {
+            m_t: [
+                0x25, 0xcd, 0xe7, 0x35, 0x5c, 0xfd, 0x5e, 0xde, 0xa8, 0x25, 0x99, 0x28, 0xaa, 0xb1, 0x48, 0x49,
+                0x73, 0x9c, 0x93, 0x1b, 0xa4, 0x42, 0xa5, 0xe6, 0xd4, 0xe4, 0x71, 0x0a, 0x05, 0x98, 0x06, 0x44,
+            ],
+            n_entries: 657,
+            n_products: 375,
+        },
+        n_attn: 7,
+        n_recur: 20,
+        seq_heads: 32,
+    }),
+];
+
 /// Audit rules of a tier: the verifier context, the prefix context under the prefix rule, the
 /// chain context under stage 2, and whether every traced response is audited.
 #[derive(Clone, Debug)]
@@ -1062,13 +1146,22 @@ pub struct TraceRules {
     pub prefix: Option<TracePrefix>,
     pub chain: Option<keryx_verifiable_inference::chain::ChainCtx>,
     pub audit_all: bool,
+    /// An audit also needs the attention opening of the response.
+    pub attention: bool,
 }
 
 /// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests,
-/// `chain` stage 2 and its manifests.
-pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool) -> Option<TraceRules> {
+/// `chain` stage 2 and its manifests, `attention` the attention manifests of the tiers that have one.
+pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attention: bool) -> Option<TraceRules> {
     if chain {
-        let c = TRACE_CHAINS_H15.get(tier as usize)?.clone()?;
+        let mut c = TRACE_CHAINS_H15.get(tier as usize)?.clone()?;
+        let attn = if attention { *TRACE_ATTN_H_NEXT.get(tier as usize)? } else { None };
+        if let Some(n) = &attn {
+            c.manifest = n.manifest;
+            c.ctx.n_attn = n.n_attn;
+            c.ctx.n_recur = n.n_recur;
+            c.ctx.seq_heads = n.seq_heads;
+        }
         let t = POM_TIERS_H14.get(tier as usize)?;
         let ctx = keryx_verifiable_inference::verify::TierCtx {
             r_t: t.root,
@@ -1077,7 +1170,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool) -> Opti
             n_entries: c.manifest.n_entries,
             n_products: c.manifest.n_products,
         };
-        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all });
+        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all, attention: attn.is_some() });
     }
     let manifests = if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 };
     let m = (*manifests.get(tier as usize)?)?;
@@ -1090,7 +1183,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool) -> Opti
         n_products: m.n_products,
     };
     let prefix = if prefix { Some(TRACE_PREFIXES.get(tier as usize)?.clone()?) } else { None };
-    Some(TraceRules { ctx, prefix, chain: None, audit_all })
+    Some(TraceRules { ctx, prefix, chain: None, audit_all, attention: false })
 }
 
 /// Context floor of each tier of the H14 lineup, in tokens: the context a responder is held to.
@@ -1899,6 +1992,8 @@ pub struct Params {
     /// audit's is passed over and the audit keeps waiting. Changes the audit fold.
     /// `never()` = dormant.
     pub trace_seed_bind_activation: ForkActivation,
+    /// Attention openings of responses (`VERSION_ATTN`) are accepted. `never()` = dormant.
+    pub attention_activation: ForkActivation,
     /// Header `service_state_hash` also commits the service-ledger snapshot at the pruning point
     /// (see `collateral::service_commitment_v2`); a fresh sync imports and verifies that snapshot.
     pub service_ledger_activation: ForkActivation,
@@ -2184,6 +2279,7 @@ impl Params {
             trace_chain_activation: self.trace_chain_activation,
             block_task_activation: self.block_task_activation,
             trace_seed_bind_activation: self.trace_seed_bind_activation,
+            attention_activation: self.attention_activation,
             service_ledger_activation: self.service_ledger_activation,
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
@@ -2410,6 +2506,7 @@ pub const MAINNET_PARAMS: Params = Params {
     trace_chain_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::new(H15_ACTIVATION_DAA),
+    attention_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2555,6 +2652,7 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_chain_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
+    attention_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(500),
@@ -2663,6 +2761,7 @@ pub const SIMNET_PARAMS: Params = Params {
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::never(),
+    attention_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2765,6 +2864,7 @@ pub const DEVNET_PARAMS: Params = Params {
     trace_chain_activation: ForkActivation::never(),
     block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::never(),
+    attention_activation: ForkActivation::never(),
     service_ledger_activation: ForkActivation::never(),
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
@@ -2791,7 +2891,7 @@ mod ratio_reward_bps_tests {
     fn v1_brackets_unchanged() {
         // Regression lock for the pre-existing table after factoring out `ratio_bracket_bps`.
         assert_eq!(ratio_reward_bps(0, P), 4_000);
-        assert_eq!(ratio_reward_bps(1 * P, P), 5_200);
+        assert_eq!(ratio_reward_bps(P, P), 5_200);
         assert_eq!(ratio_reward_bps(3 * P, P), 6_400);
         assert_eq!(ratio_reward_bps(7 * P, P), 7_600);
         assert_eq!(ratio_reward_bps(15 * P, P), 8_800);
@@ -2837,8 +2937,8 @@ mod ratio_reward_bps_tests {
         assert_eq!(ratio_reward_bps_v3(120 * P - 1, P), 9_500);
         assert_eq!(ratio_reward_bps_v3(120 * P, P), 10_000);
         assert_eq!(ratio_reward_bps_v3(u64::MAX / 2, P), 10_000);
-        for i in 1..RATIO_REWARD_THRESHOLDS_V3.len() {
-            assert_eq!(RATIO_REWARD_THRESHOLDS_V3[i], 10 * i as u64);
+        for (i, &t) in RATIO_REWARD_THRESHOLDS_V3.iter().enumerate().skip(1) {
+            assert_eq!(t, 10 * i as u64);
         }
     }
 }
@@ -2868,7 +2968,7 @@ mod h15_gate_tests {
         for g in gates {
             assert_eq!(g.daa_score(), H15_ACTIVATION_DAA);
         }
-        assert!(H15_ACTIVATION_DAA > H14_ACTIVATION_DAA);
+        const { assert!(H15_ACTIVATION_DAA > H14_ACTIVATION_DAA) };
         assert!(p.private_inference_activation.daa_score() < H15_ACTIVATION_DAA);
         assert_eq!(p.block_task_activation, ForkActivation::never());
         assert_eq!(TESTNET_PARAMS.block_task_activation, ForkActivation::never());
@@ -2913,5 +3013,24 @@ mod trace_chain_tests {
                 assert!(TRACE_CHAINS_H15.iter().all(Option::is_some));
             }
         }
+    }
+
+    #[test]
+    fn attention_switches_only_the_tiers_that_have_a_manifest() {
+        for tier in 0..5u8 {
+            let base = trace_rules(tier, true, true, true, false).unwrap();
+            let attn = trace_rules(tier, true, true, true, true).unwrap();
+            assert!(!base.attention && base.chain.unwrap().n_attn == 0);
+            match &TRACE_ATTN_H_NEXT[tier as usize] {
+                Some(n) => {
+                    let ctx = attn.chain.unwrap();
+                    assert!(attn.attention && attn.ctx.m_t == n.manifest.m_t && ctx.n_attn == n.n_attn && ctx.n_recur == n.n_recur);
+                    assert_ne!(attn.ctx.m_t, base.ctx.m_t);
+                    assert!(n.n_attn > 0 && n.n_attn + n.n_recur <= ctx.n_layers && n.seq_heads > 0);
+                }
+                None => assert!(!attn.attention && attn.ctx.m_t == base.ctx.m_t),
+            }
+        }
+        assert!(trace_rules(1, true, true, false, true).is_some_and(|r| !r.attention));
     }
 }

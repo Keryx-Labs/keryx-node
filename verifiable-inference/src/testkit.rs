@@ -292,7 +292,7 @@ impl Model {
                 }
             })
             .collect();
-        Opening { response_txid: txid, points, prefix: None, links: Vec::new(), experts: Vec::new(), resid: None }
+        Opening { response_txid: txid, points, prefix: None, links: Vec::new(), experts: Vec::new(), resid: None, roots: None }
     }
 
     /// [`Self::open`] with the prefix point of `(request id, offset)`.

@@ -238,17 +238,21 @@ mod tests {
     }
 
     /// Openings are admitted only for a response awaiting one, signed by its escrow key, one per
-    /// response, feeless, up to the largest opening body.
+    /// piece of a response, feeless, up to the largest opening body.
     #[test]
     fn test_ai_opening_admission() {
         use keryx_consensus_core::collateral::opening_signature_message;
         use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
-        use keryx_verifiable_inference::opening::{MAX_BODY_LEN, VERSION};
+        use keryx_verifiable_inference::opening::{MAX_BODY_LEN, VERSION, VERSION_ATTN, VERSION_RECUR};
         use secp256k1::{Keypair, Message, SECP256K1};
 
         fn opening(keypair: &Keypair, response_txid: [u8; 32], body_len: usize, tamper: bool) -> Transaction {
+            piece(keypair, response_txid, body_len, tamper, VERSION)
+        }
+
+        fn piece(keypair: &Keypair, response_txid: [u8; 32], body_len: usize, tamper: bool, version: u8) -> Transaction {
             let mut body = vec![0u8; body_len];
-            body[0] = VERSION;
+            body[0] = version;
             body[1..33].copy_from_slice(&response_txid);
             let sig = keypair.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
             let mut payload = body;
@@ -284,7 +288,28 @@ mod tests {
         assert_eq!(insert(opening(&miner, a, 64, true)), not_awaited(a));
         insert(opening(&miner, a, 64, false)).unwrap();
         assert_eq!(insert(opening(&miner, a, 65, false)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(a))));
+        insert(piece(&miner, a, 66, false, VERSION_ATTN)).unwrap();
+        insert(piece(&miner, a, 67, false, VERSION_RECUR)).unwrap();
+        assert_eq!(insert(piece(&miner, a, 68, false, VERSION_ATTN)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(a))));
         insert(opening(&miner, b, MAX_BODY_LEN, false)).unwrap();
+
+        let phase = |keypair: &Keypair, response_txid: [u8; 32], path: Vec<u64>, filler: u8| {
+            let mut body = keryx_verifiable_inference::opening::AttnOpening { response_txid, path, partials: vec![filler; 8], ..Default::default() }.encode();
+            let sig = keypair.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+            body.extend_from_slice(&keypair.x_only_public_key().0.serialize());
+            body.extend_from_slice(sig.as_ref());
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, body)
+        };
+        let c = [0xC3u8; 32];
+        consensus.await_opening(c, miner.x_only_public_key().0.serialize());
+        assert_eq!(insert(phase(&miner, c, vec![], 1)), not_awaited(c), "no attention phase awaited");
+        consensus.await_attention_path(c, vec![]);
+        insert(phase(&miner, c, vec![], 1)).unwrap();
+        assert_eq!(insert(phase(&miner, c, vec![2], 2)), not_awaited(c), "a path not drawn yet");
+        consensus.await_attention_path(c, vec![2]);
+        insert(phase(&miner, c, vec![2], 2)).unwrap();
+        assert_eq!(insert(phase(&miner, c, vec![3], 3)), not_awaited(c), "another child");
+        assert_eq!(insert(phase(&miner, c, vec![2], 4)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(c))));
     }
 
     /// An opening naming its seed block is admitted only when that block gives the awaited draw seed.
@@ -398,7 +423,8 @@ mod tests {
         keys.sort_unstable();
         consensus.set_private_cohort(Some(keys.clone()));
 
-        let request = |funding: u32, prompt: &[u8], pick: &dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]>| {
+        type Pick<'a> = dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]> + 'a;
+        let request = |funding: u32, prompt: &[u8], pick: &Pick<'_>| {
             let funded = create_transaction_with_utxo_entry(funding, 0);
             let seed = private_cohort_seed(&funded.tx.inputs[0].previous_outpoint);
             let cohort: Vec<Hash> = keys.iter().copied().map(Hash::from_bytes).collect();

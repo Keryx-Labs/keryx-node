@@ -194,6 +194,12 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// The path of the attention phase a response awaits.
+    fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        let _ = response_txid;
+        None
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         unimplemented!()
     }

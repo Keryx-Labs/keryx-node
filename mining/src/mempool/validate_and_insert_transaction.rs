@@ -17,7 +17,7 @@ use keryx_consensus_core::{
 };
 use keryx_core::{debug, info};
 use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
-use keryx_verifiable_inference::opening::{SignedPayload, seed_block};
+use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -141,21 +141,21 @@ impl Mempool {
             self.ai_private_request_index.insert(accepted_transaction.id().as_bytes(), envelope.recipient_keys().copied().collect());
         }
         // Register in dedup indexes so no duplicate AI txs for the same hash get in.
-        if accepted_transaction.is_ai_response() {
-            if let Some(resp) = AiResponsePayload::deserialize(&accepted_transaction.payload) {
-                let responder = resp.responder.as_ref().map(|r| r.escrow_pubkey);
-                self.ai_response_index.entry(resp.request_hash).or_default().push((responder, accepted_transaction.id()));
-            }
+        if accepted_transaction.is_ai_response()
+            && let Some(resp) = AiResponsePayload::deserialize(&accepted_transaction.payload)
+        {
+            let responder = resp.responder.as_ref().map(|r| r.escrow_pubkey);
+            self.ai_response_index.entry(resp.request_hash).or_default().push((responder, accepted_transaction.id()));
         }
-        if accepted_transaction.is_ai_challenge() {
-            if let Some(response_hash) = ai_challenge_response_hash(&accepted_transaction.payload) {
-                self.ai_challenge_index.insert(response_hash, accepted_transaction.id());
-            }
+        if accepted_transaction.is_ai_challenge()
+            && let Some(response_hash) = ai_challenge_response_hash(&accepted_transaction.payload)
+        {
+            self.ai_challenge_index.insert(response_hash, accepted_transaction.id());
         }
         if accepted_transaction.is_ai_opening()
-            && let Some(response_txid) = ai_opening_response_txid(&accepted_transaction.payload)
+            && let Some(key) = ai_opening_key(&accepted_transaction.payload)
         {
-            self.ai_opening_index.insert(response_txid, accepted_transaction.id());
+            self.ai_opening_index.insert(key, accepted_transaction.id());
         }
 
         Ok(TransactionPostValidation { removed: removed_transaction, accepted: Some(accepted_transaction) })
@@ -179,40 +179,39 @@ impl Mempool {
 
         // One AiResponse per (request, responder), with a per-request cap. A V2 responder
         // signature must verify so the dedup key cannot be forged by third parties.
-        if transaction.tx.is_ai_response() {
-            if let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) {
-                let responder = match resp.responder.as_ref() {
-                    Some(r) => {
-                        if !verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()) {
-                            return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
-                        }
-                        Some(r.escrow_pubkey)
+        if transaction.tx.is_ai_response()
+            && let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload)
+        {
+            let responder = match resp.responder.as_ref() {
+                Some(r) => {
+                    if !verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()) {
+                        return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
                     }
-                    None => None,
-                };
-                if let Some(entries) = self.ai_response_index.get(&resp.request_hash) {
-                    if entries.iter().any(|(key, _)| *key == responder) {
-                        return Err(RuleError::RejectDuplicateAiResponse(hex::encode(resp.request_hash)));
-                    }
-                    if entries.len() >= MAX_PENDING_AI_RESPONSES_PER_REQUEST {
-                        return Err(RuleError::RejectAiResponsesSaturated(hex::encode(resp.request_hash)));
-                    }
+                    Some(r.escrow_pubkey)
+                }
+                None => None,
+            };
+            if let Some(entries) = self.ai_response_index.get(&resp.request_hash) {
+                if entries.iter().any(|(key, _)| *key == responder) {
+                    return Err(RuleError::RejectDuplicateAiResponse(hex::encode(resp.request_hash)));
+                }
+                if entries.len() >= MAX_PENDING_AI_RESPONSES_PER_REQUEST {
+                    return Err(RuleError::RejectAiResponsesSaturated(hex::encode(resp.request_hash)));
                 }
             }
         }
         // One AiChallenge per response: reject if a challenge for the same response_hash is already pending.
-        if transaction.tx.is_ai_challenge() {
-            if let Some(response_hash) = ai_challenge_response_hash(&transaction.tx.payload) {
-                if self.ai_challenge_index.contains_key(&response_hash) {
-                    return Err(RuleError::RejectDuplicateAiChallenge(hex::encode(response_hash)));
-                }
-            }
+        if transaction.tx.is_ai_challenge()
+            && let Some(response_hash) = ai_challenge_response_hash(&transaction.tx.payload)
+            && self.ai_challenge_index.contains_key(&response_hash)
+        {
+            return Err(RuleError::RejectDuplicateAiChallenge(hex::encode(response_hash)));
         }
         if transaction.tx.is_ai_opening()
-            && let Some(response_txid) = ai_opening_response_txid(&transaction.tx.payload)
-            && self.ai_opening_index.contains_key(&response_txid)
+            && let Some(key) = ai_opening_key(&transaction.tx.payload)
+            && self.ai_opening_index.contains_key(&key)
         {
-            return Err(RuleError::RejectDuplicateAiOpening(hex::encode(response_txid)));
+            return Err(RuleError::RejectDuplicateAiOpening(hex::encode(key.0)));
         }
 
         if !self.config.accept_non_standard {
@@ -248,7 +247,8 @@ impl Mempool {
     }
 
     /// Admission policy for openings: signed by the escrow key of a drawn response that still
-    /// awaits its opening, and naming, if any, the seed block of that draw. Policy only.
+    /// awaits its opening, naming, if any, the seed block of that draw, and for an attention
+    /// phase, built for the path the response awaits. Policy only.
     fn validate_ai_opening(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
         if !transaction.tx.is_ai_opening() {
             return Ok(());
@@ -261,6 +261,7 @@ impl Mempool {
                     && seed_block(s.body).is_none_or(|b| {
                         consensus.awaited_opening_seed(&txid) == Some(trace_seed(&keryx_hashes::Hash::from_bytes(b), &txid))
                     })
+                    && attn_path(s.body).is_none_or(|p| consensus.awaited_attention_path(&txid) == Some(p))
                     && verify_opening_signature(&s.escrow_pubkey, &s.signature, s.body)
             }
             _ => false,
@@ -401,4 +402,13 @@ fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
 
 pub(crate) fn ai_opening_response_txid(payload: &[u8]) -> Option<[u8; 32]> {
     SignedPayload::split(payload)?.body.get(1..33)?.try_into().ok()
+}
+
+/// Response, piece (the version of the inner body) and attention path of an opening.
+pub(crate) fn ai_opening_key(payload: &[u8]) -> Option<([u8; 32], u8, Vec<u64>)> {
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_SEEDED};
+    let body = SignedPayload::split(payload)?.body;
+    let inner = if body.first() == Some(&VERSION_SEEDED) { *body.get(65)? } else { *body.first()? };
+    let path = if inner == VERSION_ATTN { attn_path(body).unwrap_or_default() } else { Vec::new() };
+    Some((body.get(1..33)?.try_into().ok()?, inner, path))
 }

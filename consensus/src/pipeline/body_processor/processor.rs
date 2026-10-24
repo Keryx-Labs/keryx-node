@@ -97,6 +97,7 @@ pub struct BlockBodyProcessor {
     pub(super) block_task_activation: ForkActivation,
     pub(super) trace_chain_activation: ForkActivation,
     pub(super) trace_seed_bind_activation: ForkActivation,
+    pub(super) attention_activation: ForkActivation,
     pub(super) h10_activation: ForkActivation,
     pub(super) private_inference_activation: ForkActivation,
     pub(super) verifiable_inference_activation: ForkActivation,
@@ -263,6 +264,7 @@ impl BlockBodyProcessor {
             block_task_activation: params.block_task_activation,
             trace_chain_activation: params.trace_chain_activation,
             trace_seed_bind_activation: params.trace_seed_bind_activation,
+            attention_activation: params.attention_activation,
             h10_activation: params.h10_activation,
             private_inference_activation: params.private_inference_activation,
             verifiable_inference_activation: params.verifiable_inference_activation,
@@ -352,20 +354,20 @@ impl BlockBodyProcessor {
         // without re-verification (pre-v3 verifiers re-walk all K transitions — unbounded
         // re-verification would be a cheap CPU DoS).
         let witness_digest = if bad_witness_rejects_delivery { block.pom_proof.as_ref().map(|p| p.wire_digest()) } else { None };
-        if let Some(digest) = witness_digest {
-            if self.bad_witness_cache.read().contains(block.hash(), &digest) {
-                return Err(RuleError::KnownBadPomWitness);
-            }
+        if let Some(digest) = witness_digest
+            && self.bad_witness_cache.read().contains(block.hash(), &digest)
+        {
+            return Err(RuleError::KnownBadPomWitness);
         }
 
         let mass = match self.validate_body(block, is_trusted, skip_pom_proof) {
             Ok(mass) => mass,
             Err(e) => {
                 // Remember failed witnesses per (block, witness) — see the cache above.
-                if witness_scoped_error(&e) {
-                    if let Some(digest) = witness_digest {
-                        self.bad_witness_cache.write().insert(block.hash(), digest);
-                    }
+                if witness_scoped_error(&e)
+                    && let Some(digest) = witness_digest
+                {
+                    self.bad_witness_cache.write().insert(block.hash(), digest);
                 }
                 if marks_block_invalid(&e, bad_witness_rejects_delivery) {
                     self.statuses_store.write().set(block.hash(), BlockStatus::StatusInvalid).unwrap();

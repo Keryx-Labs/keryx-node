@@ -117,7 +117,7 @@ impl StandingIndex {
     /// already carry their own penalty and no longer demote the reward rate.
     fn standing(&self, id: &Hash, pov: u64, v2: bool) -> bool {
         let anchor = pov.saturating_sub(keryx_consensus_core::collateral::SERVICE_STANDING_LAG_DAA);
-        if !self.first_seen.get(id).is_some_and(|&f| f <= anchor) {
+        if self.first_seen.get(id).is_none_or(|&f| f > anchor) {
             return false;
         }
         if v2 {
@@ -334,41 +334,41 @@ impl VirtualStateProcessor {
             for entry in mbad.accepted_transactions.iter() {
                 let tx = &txs[entry.index_within_block as usize];
                 if tx.is_ai_request() {
-                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        if let Some(tier) = service_tiers(private).iter().position(|t| t.model_id == req.model_id) {
-                            // Past the gate a request is identified by its transaction id, which is
-                            // unique by construction. The payload digest is not: the same prompt with
-                            // the same parameters is the same hash, so two senders — or one retry —
-                            // used to collide into a single, unanswerable assignment.
-                            let mut request_hash = [0u8; 32];
-                            if txid_identity {
-                                request_hash.copy_from_slice(&tx.id().as_bytes());
-                            } else {
-                                let digest = blake2b_simd::blake2b(&tx.payload);
-                                request_hash.copy_from_slice(&digest.as_bytes()[..32]);
-                            }
-                            requests.push((request_hash, tier as u8, req.max_tokens));
-                            request_rewards.push((request_hash, req.inference_reward));
-                            request_prompt_lens.push((request_hash, plaintext_prompt_len(&req.prompt)));
-                            // Past the private-inference gate the envelope names the responders
-                            // obligated for (and paid by) this request. A plaintext request from a
-                            // block below the gate, merged past it, folds as a public request.
-                            if private
-                                && req.is_private()
-                                && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
-                                && let Some(first) = tx.inputs.first()
-                            {
-                                let mut recipients: Vec<Hash> = envelope.recipient_keys().map(escrow_miner_key).collect();
-                                recipients.sort_unstable();
-                                recipients.dedup();
-                                request_recipients.push((request_hash, private_cohort_seed(&first.previous_outpoint), recipients));
-                            }
+                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload)
+                        && let Some(tier) = service_tiers(private).iter().position(|t| t.model_id == req.model_id)
+                    {
+                        // Past the gate a request is identified by its transaction id, which is
+                        // unique by construction. The payload digest is not: the same prompt with
+                        // the same parameters is the same hash, so two senders — or one retry —
+                        // used to collide into a single, unanswerable assignment.
+                        let mut request_hash = [0u8; 32];
+                        if txid_identity {
+                            request_hash.copy_from_slice(&tx.id().as_bytes());
+                        } else {
+                            let digest = blake2b_simd::blake2b(&tx.payload);
+                            request_hash.copy_from_slice(&digest.as_bytes()[..32]);
+                        }
+                        requests.push((request_hash, tier as u8, req.max_tokens));
+                        request_rewards.push((request_hash, req.inference_reward));
+                        request_prompt_lens.push((request_hash, plaintext_prompt_len(&req.prompt)));
+                        // Past the private-inference gate the envelope names the responders
+                        // obligated for (and paid by) this request. A plaintext request from a
+                        // block below the gate, merged past it, folds as a public request.
+                        if private
+                            && req.is_private()
+                            && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
+                            && let Some(first) = tx.inputs.first()
+                        {
+                            let mut recipients: Vec<Hash> = envelope.recipient_keys().map(escrow_miner_key).collect();
+                            recipients.sort_unstable();
+                            recipients.dedup();
+                            request_recipients.push((request_hash, private_cohort_seed(&first.previous_outpoint), recipients));
                         }
                     }
-                } else if tx.is_ai_response() {
-                    if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-                        responses.push((resp.request_hash, verified_responder(&resp)));
-                    }
+                } else if tx.is_ai_response()
+                    && let Some(resp) = AiResponsePayload::deserialize(&tx.payload)
+                {
+                    responses.push((resp.request_hash, verified_responder(&resp)));
                 }
             }
         }
@@ -494,6 +494,10 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_opening_seed(response_txid)
     }
 
+    pub(crate) fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        self.service_ledger.lock().ledger.awaited_attention_path(response_txid)
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
@@ -528,7 +532,7 @@ impl VirtualStateProcessor {
                 providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
             }
         }
-        providers.sort_by(|x, y| (x.tier, x.identity, x.escrow_pubkey).cmp(&(y.tier, y.identity, y.escrow_pubkey)));
+        providers.sort_by_key(|x| (x.tier, x.identity, x.escrow_pubkey));
         ServiceProvidersSnapshot { virtual_daa_score, providers }
     }
 
@@ -666,7 +670,9 @@ impl VirtualStateProcessor {
             let prefix_at = |at: u64| self.trace_prefix_activation.is_active(at);
             let audit_at = |at: u64| self.trace_audit_activation.is_active(at);
             let chain_at = |at: u64| self.trace_chain_activation.is_active(at);
-            let tier = |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at)) } else { None };
+            let attn_at = |at: u64| self.attention_activation.is_active(at);
+            let tier =
+                |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at)) } else { None };
             let traces = TraceInputs {
                 chain_hash: hash,
                 responses: &trace_responses,
@@ -794,12 +800,8 @@ impl VirtualStateProcessor {
             return lo;
         }
         while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
-            if daa_at(mid) <= bound_daa {
-                lo = mid
-            } else {
-                hi = mid - 1
-            }
+            let mid = lo + (hi - lo).div_ceil(2);
+            if daa_at(mid) <= bound_daa { lo = mid } else { hi = mid - 1 }
         }
         lo
     }
@@ -1532,10 +1534,10 @@ impl VirtualStateProcessor {
         hashes.clear();
         for (sample, bytes) in self.service_ledger_snapshot_store.entries() {
             hashes.insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
-            if Some(sample) == own_pp {
-                if let Ok(snapshot) = ServiceLedgerSnapshot::from_bytes(&bytes) {
-                    *self.service_imported_producers.write() = snapshot.recent_producers;
-                }
+            if Some(sample) == own_pp
+                && let Ok(snapshot) = ServiceLedgerSnapshot::from_bytes(&bytes)
+            {
+                *self.service_imported_producers.write() = snapshot.recent_producers;
             }
         }
     }
@@ -1594,6 +1596,31 @@ impl VirtualStateProcessor {
             .read()
             .get(producer)
             .is_some_and(|&until| until.saturating_sub(SERVICE_SUSPENSION_DAA) <= daa_score && daa_score < until)
+    }
+}
+
+/// The service-ledger inputs of one chain block.
+struct ServiceEvents {
+    requests: Vec<([u8; 32], u8, u32)>,
+    request_rewards: Vec<([u8; 32], u64)>,
+    request_recipients: Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>,
+    request_prompt_lens: Vec<([u8; 32], u32)>,
+    responses: Vec<([u8; 32], Option<Hash>)>,
+}
+
+/// Plaintext length of a request prompt: the sealed length without the envelope, else the bytes.
+fn plaintext_prompt_len(prompt: &[u8]) -> u32 {
+    match PrivateRequestEnvelope::parse(prompt) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => prompt.len().min(u32::MAX as usize) as u32,
+    }
+}
+
+/// Plaintext length of a sealed answer body.
+fn plaintext_answer_len(body: &[u8]) -> u32 {
+    match PrivateResponseEnvelope::parse(body) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => 0,
     }
 }
 
@@ -1676,30 +1703,5 @@ mod tests {
         script.push(keryx_txscript::opcodes::codes::OpCheckSig);
         assert_eq!(csv_escrow_pubkey(&script), Some([0x11u8; 32]));
         assert_eq!(csv_escrow_pubkey(&[0u8; 10]), None);
-    }
-}
-
-/// The service-ledger inputs of one chain block.
-struct ServiceEvents {
-    requests: Vec<([u8; 32], u8, u32)>,
-    request_rewards: Vec<([u8; 32], u64)>,
-    request_recipients: Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>,
-    request_prompt_lens: Vec<([u8; 32], u32)>,
-    responses: Vec<([u8; 32], Option<Hash>)>,
-}
-
-/// Plaintext length of a request prompt: the sealed length without the envelope, else the bytes.
-fn plaintext_prompt_len(prompt: &[u8]) -> u32 {
-    match PrivateRequestEnvelope::parse(prompt) {
-        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
-        Err(_) => prompt.len().min(u32::MAX as usize) as u32,
-    }
-}
-
-/// Plaintext length of a sealed answer body.
-fn plaintext_answer_len(body: &[u8]) -> u32 {
-    match PrivateResponseEnvelope::parse(body) {
-        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
-        Err(_) => 0,
     }
 }

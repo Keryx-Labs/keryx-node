@@ -1,0 +1,525 @@
+//! Attention openings by blocks of positions: softmax partials in a tree, one level per phase.
+
+use crate::attn::{ARITHS, ATTN_THRESHOLD, Arith, Partial, partial};
+use crate::merkle::{Hash, b3_path, b3_root, b3_verify};
+
+/// Bytes one phase of an attention opening may spend on cache rows or on partials.
+pub const BLOCK_BUDGET: usize = 96 * 1024;
+/// Largest difference of the log-sum-exp of two partials of the same positions.
+pub const LSE_TOL: f64 = 1.0 / 256.0;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BUDGET: std::cell::Cell<usize> = const { std::cell::Cell::new(BLOCK_BUDGET) };
+}
+
+/// Sets the phase budget of the calling test thread.
+#[cfg(test)]
+pub(crate) fn set_test_budget(b: usize) {
+    TEST_BUDGET.with(|c| c.set(b));
+}
+
+fn budget() -> usize {
+    #[cfg(test)]
+    return TEST_BUDGET.with(|c| c.get());
+    #[cfg(not(test))]
+    BLOCK_BUDGET
+}
+
+/// Positions per leaf and children per node for cache rows of `row_bytes` per position and
+/// partials of `partial_bytes`; `None` when a phase cannot hold two partials or one row.
+pub fn block_params(row_bytes: usize, partial_bytes: usize) -> Option<(u64, u64)> {
+    let budget = budget();
+    let fit = |unit: usize| {
+        let mut n = 1usize;
+        while 2 * n * unit <= budget {
+            n *= 2;
+        }
+        (unit > 0 && n * unit <= budget).then_some(n as u64)
+    };
+    let (c, b) = (fit(row_bytes)?, fit(partial_bytes)?);
+    (b >= 2).then_some((c, b))
+}
+
+/// Encoded length of a partial of `d` values.
+pub const fn partial_len(d: usize) -> usize {
+    2 * d + 8
+}
+
+/// `p` as f16 values, then `m` and `l` as f32.
+pub fn encode_partial(p: &Partial) -> Vec<u8> {
+    let mut out = Vec::with_capacity(partial_len(p.o.len()));
+    for &x in &p.o {
+        out.extend_from_slice(&crate::f16::from_f32(x as f32).to_le_bytes());
+    }
+    out.extend_from_slice(&(p.m as f32).to_le_bytes());
+    out.extend_from_slice(&(p.l as f32).to_le_bytes());
+    out
+}
+
+/// Partials of `d` values end to end; `None` on a length mismatch, a non-finite value or a sum
+/// below one (the largest score contributes one).
+pub fn decode_partials(b: &[u8], d: usize) -> Option<Vec<Partial>> {
+    let n = partial_len(d);
+    if d == 0 || b.is_empty() || !b.len().is_multiple_of(n) {
+        return None;
+    }
+    b.chunks_exact(n)
+        .map(|c| {
+            let o: Vec<f64> = (0..d).map(|i| crate::f16::read(c, 2 * i) as f64).collect();
+            let f = |off: usize| f32::from_le_bytes(c[off..off + 4].try_into().unwrap()) as f64;
+            let (m, l) = (f(2 * d), f(2 * d + 4));
+            (o.iter().all(|x| x.is_finite()) && m.is_finite() && l.is_finite() && l >= 1.0).then_some(Partial { o, m, l })
+        })
+        .collect()
+}
+
+/// Leaves of `c` positions aligned on multiples of `c`, over `[lo, hi)`, under nodes of `b` children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockTree {
+    pub lo: u64,
+    pub hi: u64,
+    pub c: u64,
+    pub b: u64,
+}
+
+impl BlockTree {
+    pub fn new(lo: u64, hi: u64, c: u64, b: u64) -> Option<Self> {
+        (lo < hi && c >= 1 && b >= 2).then_some(Self { lo, hi, c, b })
+    }
+
+    pub fn n_leaves(&self) -> u64 {
+        (self.hi - 1) / self.c - self.lo / self.c + 1
+    }
+
+    /// Levels of partials above the leaves: zero for a single leaf.
+    pub fn depth(&self) -> u32 {
+        let (n, mut d, mut span) = (self.n_leaves(), 0u32, 1u64);
+        while span < n {
+            span = span.saturating_mul(self.b);
+            d += 1;
+        }
+        d
+    }
+
+    fn leaves_per_node(&self, level: u32) -> u64 {
+        self.b.saturating_pow(self.depth() - level)
+    }
+
+    fn positions(&self, a: u64, z: u64) -> (u64, u64) {
+        let first = self.lo / self.c;
+        (self.lo.max((first + a) * self.c), self.hi.min((first + z) * self.c))
+    }
+
+    fn leaf_range(&self, path: &[u64]) -> Option<(u64, u64)> {
+        if path.len() > self.depth() as usize {
+            return None;
+        }
+        let (mut a, mut z) = (0, self.n_leaves());
+        for (level, &i) in path.iter().enumerate() {
+            let s = self.leaves_per_node(level as u32 + 1);
+            if i >= (z - a).div_ceil(s) {
+                return None;
+            }
+            a += i * s;
+            z = z.min(a + s);
+        }
+        Some((a, z))
+    }
+
+    /// Positions of the node reached from the root by `path`, one child index per level.
+    pub fn node(&self, path: &[u64]) -> Option<(u64, u64)> {
+        self.leaf_range(path).map(|(a, z)| self.positions(a, z))
+    }
+
+    /// Positions of each child of the node reached by `path`; `None` for a leaf.
+    pub fn children(&self, path: &[u64]) -> Option<Vec<(u64, u64)>> {
+        if path.len() >= self.depth() as usize {
+            return None;
+        }
+        let (a, z) = self.leaf_range(path)?;
+        let s = self.leaves_per_node(path.len() as u32 + 1);
+        Some((a..z).step_by(s as usize).map(|x| self.positions(x, z.min(x + s))).collect())
+    }
+}
+
+/// Partial of the union of the runs of `parts`.
+pub fn combine(parts: &[Partial]) -> Option<Partial> {
+    let d = parts.first()?.o.len();
+    if parts.iter().any(|p| p.o.len() != d) {
+        return None;
+    }
+    let m = parts.iter().map(|p| p.m).fold(f64::NEG_INFINITY, f64::max);
+    let w: Vec<f64> = parts.iter().map(|p| p.l * libm::exp(p.m - m)).collect();
+    let l: f64 = w.iter().sum();
+    let mut o = vec![0f64; d];
+    for (wi, p) in w.iter().zip(parts) {
+        for (a, &x) in o.iter_mut().zip(&p.o) {
+            *a += wi * x;
+        }
+    }
+    o.iter_mut().for_each(|a| *a /= l);
+    (m.is_finite() && l.is_finite() && o.iter().all(|a| a.is_finite())).then_some(Partial { o, m, l })
+}
+
+/// Largest difference between `a` and `b`, in Q8 steps of each block of 32 values of `b`.
+fn steps(a: &[f64], b: &[f64]) -> Option<f64> {
+    if a.len() != b.len() || !b.len().is_multiple_of(32) {
+        return None;
+    }
+    let mut dev = 0f64;
+    for (x, y) in a.chunks_exact(32).zip(b.chunks_exact(32)) {
+        let step = (y.iter().fold(0f64, |m, v| m.max(v.abs())) / 127.0).max(f64::MIN_POSITIVE);
+        dev = x.iter().zip(y).fold(dev, |m, (p, q)| m.max((p - q).abs() / step));
+    }
+    Some(dev)
+}
+
+/// Whether `a` and `b`, two partials of the same positions, agree.
+pub fn same_partial(a: &Partial, b: &Partial) -> bool {
+    let lse = |p: &Partial| p.m + libm::log(p.l);
+    (lse(a) - lse(b)).abs() <= LSE_TOL && steps(&a.o, &b.o).is_some_and(|d| d <= ATTN_THRESHOLD)
+}
+
+/// Whether `children` combine into `parent`.
+pub fn check_node(parent: &Partial, children: &[Partial]) -> bool {
+    combine(children).is_some_and(|c| same_partial(&c, parent))
+}
+
+/// Whether the committed attention-output input `x` (`n_out` values, Q8_1 in `layout`) carries
+/// head `head` as `children` combined, scaled by the sigmoid of `gate` when gated.
+pub fn check_root(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[Partial], gate: Option<&[f32]>) -> bool {
+    let Some(mut o) = combine(children).map(|p| p.o) else { return false };
+    let d = o.len();
+    if !d.is_multiple_of(32) || (head + 1) * d > n_out {
+        return false;
+    }
+    if let Some(g) = gate
+        && crate::attn::apply_gate(&mut o, g).is_none()
+    {
+        return false;
+    }
+    crate::chain::block_deviation(x, layout, n_out, head * d / 32, &o).is_some_and(|dv| dv <= ATTN_THRESHOLD)
+}
+
+/// Whether `claimed` is the partial of query `q` (unscaled) over the rows of a leaf under one of
+/// the kernel roundings.
+pub fn check_leaf(q: &[f64], scale: f64, keys: &[Vec<f32>], values: &[Vec<f32>], claimed: &Partial) -> bool {
+    ARITHS.iter().any(|&a| partial(a, q, scale, keys, values).is_some_and(|p| same_partial(&p, claimed)))
+}
+
+/// Partials end to end.
+pub fn encode_partials(parts: &[Partial]) -> Vec<u8> {
+    parts.iter().flat_map(encode_partial).collect()
+}
+
+fn partial_leaves(bytes: &[u8], d: usize) -> Option<Vec<Hash>> {
+    let n = partial_len(d);
+    (d > 0 && !bytes.is_empty() && bytes.len().is_multiple_of(n)).then(|| bytes.chunks_exact(n).map(|c| *blake3::hash(c).as_bytes()).collect())
+}
+
+/// Root over the encoded partials `bytes` of `d` values, one leaf per partial.
+pub fn partials_root(bytes: &[u8], d: usize) -> Option<Hash> {
+    partial_leaves(bytes, d).map(|l| b3_root(&l))
+}
+
+/// Encoded partial `i` of `bytes` and its path under `partials_root`.
+pub fn partial_opening(bytes: &[u8], d: usize, i: usize) -> Option<(Vec<u8>, Vec<Hash>)> {
+    let leaves = partial_leaves(bytes, d)?;
+    let n = partial_len(d);
+    (i < leaves.len()).then(|| (bytes[i * n..(i + 1) * n].to_vec(), b3_path(&leaves, i)))
+}
+
+/// Partial `i` of the `n` committed under `root`, from its encoding and path.
+pub fn open_partial(root: &Hash, n: u64, i: u64, bytes: &[u8], path: &[Hash], d: usize) -> Option<Partial> {
+    if bytes.len() != partial_len(d) || !b3_verify(root, n, i, blake3::hash(bytes).as_bytes(), path) {
+        return None;
+    }
+    decode_partials(bytes, d)?.pop()
+}
+
+/// Child drawn by the chain randomness `rand` among `n`.
+pub fn draw_child(rand: &Hash, n: u64) -> u64 {
+    let h = blake3::hash(&[rand.as_slice(), b"attn-child"].concat());
+    u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap()) % n.max(1)
+}
+
+/// Partials under `arith` of the children of the node at `path`, from query `q` (unscaled) and
+/// the cache rows of positions `lo..`.
+#[allow(clippy::too_many_arguments)]
+pub fn children_partials(arith: Arith, q: &[f64], scale: f64, keys: &[Vec<f32>], values: &[Vec<f32>], lo: u64, tree: &BlockTree, path: &[u64]) -> Option<Vec<Partial>> {
+    tree.children(path)?
+        .into_iter()
+        .map(|(p0, p1)| {
+            let r = p0.checked_sub(lo)? as usize..p1.checked_sub(lo)? as usize;
+            partial(arith, q, scale, keys.get(r.clone())?, values.get(r)?)
+        })
+        .collect()
+}
+
+/// Encoded partials of the children of `path` under the first rounding whose decoded partials
+/// pass `check`.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_partials(q: &[f64], scale: f64, keys: &[Vec<f32>], values: &[Vec<f32>], lo: u64, tree: &BlockTree, path: &[u64], check: impl Fn(&[Partial]) -> bool) -> Option<Vec<u8>> {
+    let d = values.first()?.len();
+    ARITHS.iter().find_map(|&a| {
+        let enc = encode_partials(&children_partials(a, q, scale, keys, values, lo, tree, path)?);
+        decode_partials(&enc, d).is_some_and(|p| check(&p)).then_some(enc)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::q8;
+    use crate::testkit::q8_1_row;
+
+    const D: usize = 64;
+    const SCALE: f64 = 0.125;
+
+    fn vecf(seed: u64, n: usize) -> Vec<f64> {
+        (0..n).map(|i| (((i as u64).wrapping_mul(2_654_435_761) ^ seed.wrapping_mul(40_503)) % 2001) as f64 / 1000.0 - 1.0).collect()
+    }
+
+    fn rows(seed: u64, n: usize) -> Vec<Vec<f32>> {
+        (0..n).map(|p| vecf(seed + p as u64, D).iter().map(|&x| x as f32).collect()).collect()
+    }
+
+    struct Case {
+        q: Vec<f64>,
+        keys: Vec<Vec<f32>>,
+        values: Vec<Vec<f32>>,
+        tree: BlockTree,
+    }
+
+    fn case(lo: u64, hi: u64, c: u64, b: u64) -> Case {
+        Case { q: vecf(3, D).iter().map(|x| 2.0 * x).collect(), keys: rows(10, hi as usize), values: rows(5000, hi as usize), tree: BlockTree::new(lo, hi, c, b).unwrap() }
+    }
+
+    impl Case {
+        fn run(&self, (p0, p1): (u64, u64), arith: Arith) -> Partial {
+            let r = p0 as usize..p1 as usize;
+            partial(arith, &self.q, SCALE, &self.keys[r.clone()], &self.values[r]).unwrap()
+        }
+
+        fn children(&self, path: &[u64], arith: Arith) -> Vec<Partial> {
+            self.tree.children(path).unwrap().into_iter().map(|r| self.run(r, arith)).collect()
+        }
+
+        fn decoded(&self, path: &[u64], arith: Arith) -> Vec<Partial> {
+            let bytes: Vec<u8> = self.children(path, arith).iter().flat_map(encode_partial).collect();
+            decode_partials(&bytes, D).unwrap()
+        }
+
+        fn x(&self, arith: Arith) -> Vec<u8> {
+            let mut all = vec![0.0; D];
+            all.extend(self.run((self.tree.lo, self.tree.hi), arith).o);
+            q8_1_row(&all)
+        }
+
+        fn leaf_rows(&self, path: &[u64]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+            let (p0, p1) = self.tree.node(path).unwrap();
+            (self.keys[p0 as usize..p1 as usize].to_vec(), self.values[p0 as usize..p1 as usize].to_vec())
+        }
+    }
+
+    #[test]
+    fn block_params_follow_the_tier_shapes() {
+        let q8 = |n: usize| n / 32 * 34;
+        assert_eq!(block_params(2 * q8(128), partial_len(128)), Some((256, 256)));
+        assert_eq!(block_params(2 * q8(256), partial_len(256)), Some((128, 128)));
+        assert_eq!(block_params(2 * q8(512), partial_len(512)), Some((64, 64)));
+        assert_eq!(block_params(q8(576), partial_len(512)), Some((128, 64)));
+        assert_eq!(block_params(BLOCK_BUDGET + 1, 8), None);
+        assert_eq!(block_params(8, BLOCK_BUDGET), None);
+    }
+
+    #[test]
+    fn the_tree_covers_every_position_once_on_aligned_leaves() {
+        for (lo, hi, c, b) in [(0, 1, 4, 2), (0, 300, 64, 4), (5, 300, 64, 4), (70, 1100, 16, 3), (0, 32768, 64, 64), (31744, 32768, 128, 128)] {
+            let t = BlockTree::new(lo, hi, c, b).unwrap();
+            let d = t.depth();
+            assert!(b.pow(d) >= t.n_leaves() && (d == 0 || b.pow(d - 1) < t.n_leaves()));
+            assert_eq!(t.node(&[]), Some((lo, hi)));
+            let mut stack = vec![Vec::<u64>::new()];
+            let mut leaves = Vec::new();
+            while let Some(path) = stack.pop() {
+                match t.children(&path) {
+                    Some(ch) => {
+                        let (p0, p1) = t.node(&path).unwrap();
+                        assert_eq!((ch[0].0, ch.last().unwrap().1), (p0, p1));
+                        assert!(ch.windows(2).all(|w| w[0].1 == w[1].0) && ch.len() as u64 <= b);
+                        assert_eq!(t.node(&[path.clone(), vec![ch.len() as u64]].concat()), None);
+                        stack.extend((0..ch.len() as u64).map(|i| [path.clone(), vec![i]].concat()));
+                    }
+                    None => {
+                        assert_eq!(path.len(), d as usize);
+                        leaves.push(t.node(&path).unwrap());
+                    }
+                }
+            }
+            leaves.sort();
+            assert_eq!(leaves.len() as u64, t.n_leaves());
+            assert_eq!((leaves[0].0, leaves.last().unwrap().1), (lo, hi));
+            assert!(leaves.windows(2).all(|w| w[0].1 == w[1].0 && w[1].0 % c == 0));
+            assert!(leaves.iter().all(|&(p0, p1)| p1 - p0 <= c && p0 / c == (p1 - 1) / c));
+        }
+        assert_eq!(BlockTree::new(0, 32768, 256, 256).unwrap().depth(), 1);
+        assert_eq!(BlockTree::new(0, 32768, 64, 64).unwrap().depth(), 2);
+        assert_eq!(BlockTree::new(3, 3, 4, 2), None);
+    }
+
+    #[test]
+    fn partials_round_trip_and_reject_bad_encodings() {
+        let k = case(0, 40, 16, 2);
+        let p = k.run((0, 40), Arith::Exact);
+        let e = encode_partial(&p);
+        assert_eq!(e.len(), partial_len(D));
+        let back = &decode_partials(&e, D).unwrap()[0];
+        assert!(same_partial(back, &p));
+        assert_eq!(decode_partials(&e[1..], D), None);
+        let mut low = e.clone();
+        low[2 * D + 4..].copy_from_slice(&0.5f32.to_le_bytes());
+        assert_eq!(decode_partials(&low, D), None);
+        let mut nan = e.clone();
+        nan[2 * D..2 * D + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(decode_partials(&nan, D), None);
+    }
+
+    #[test]
+    fn combined_leaves_give_the_whole_run() {
+        let k = case(5, 300, 16, 4);
+        for a in ARITHS {
+            let whole = k.run((5, 300), a);
+            let leaves: Vec<Partial> = (0..k.tree.n_leaves()).map(|i| {
+                let first = 5 / 16;
+                k.run((5u64.max((first + i) * 16), 300u64.min((first + i + 1) * 16)), a)
+            }).collect();
+            let c = combine(&leaves).unwrap();
+            assert!(same_partial(&c, &whole), "{a:?}");
+            if a == Arith::Exact {
+                assert!(c.o.iter().zip(&whole.o).all(|(x, y)| (x - y).abs() < 1e-12));
+            }
+        }
+    }
+
+    #[test]
+    fn an_honest_opening_passes_every_phase_on_every_path() {
+        let k = case(5, 300, 16, 5);
+        assert_eq!(k.tree.depth(), 2);
+        for a in ARITHS {
+            let x = k.x(a);
+            assert!(check_root(&x, q8::MMVQ, 2 * D, 1, &k.decoded(&[], a), None), "{a:?}");
+            for i in 0..k.tree.children(&[]).unwrap().len() as u64 {
+                let parent = &k.decoded(&[], a)[i as usize];
+                assert!(check_node(parent, &k.decoded(&[i], a)), "{a:?} {i}");
+                for j in 0..k.tree.children(&[i]).unwrap().len() as u64 {
+                    let claimed = &k.decoded(&[i], a)[j as usize];
+                    let (kr, vr) = k.leaf_rows(&[i, j]);
+                    assert!(check_leaf(&k.q, SCALE, &kr, &vr, claimed), "{a:?} {i} {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_forged_output_needs_a_forged_child_and_the_child_is_caught_below() {
+        let k = case(0, 256, 16, 4);
+        let honest = k.decoded(&[], Arith::Exact);
+        let mut forged_x = vec![0.0; D];
+        forged_x.extend(vecf(77, D).iter().map(|v| v * 0.3));
+        let forged_x = q8_1_row(&forged_x);
+        assert!(!check_root(&forged_x, q8::MMVQ, 2 * D, 1, &honest, None));
+        let mut lie = honest.clone();
+        let o: Vec<f64> = vecf(77, D).iter().map(|v| v * 0.3).collect();
+        lie[2] = decode_partials(&encode_partial(&Partial { o, m: honest[2].m + 60.0, l: 1.0 }), D).unwrap().remove(0);
+        assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None));
+        assert!(!check_node(&lie[2], &k.decoded(&[2], Arith::Exact)));
+        for j in 0..4u64 {
+            let (kr, vr) = k.leaf_rows(&[2, j]);
+            assert!(check_leaf(&k.q, SCALE, &kr, &vr, &k.decoded(&[2], Arith::Exact)[j as usize]));
+        }
+    }
+
+    #[test]
+    fn forged_partials_fail_their_checks() {
+        let k = case(0, 256, 16, 4);
+        let parent = &k.decoded(&[], Arith::Exact)[1];
+        let children = k.decoded(&[1], Arith::Exact);
+        let (kr, vr) = k.leaf_rows(&[1, 3]);
+        let leaf = &children[3];
+        let mut bad_m = leaf.clone();
+        bad_m.m += 0.05;
+        let mut bad_l = leaf.clone();
+        bad_l.l *= 1.05;
+        let mut bad_o = leaf.clone();
+        bad_o.o[7] += 0.1;
+        for bad in [&bad_m, &bad_l, &bad_o] {
+            assert!(!check_leaf(&k.q, SCALE, &kr, &vr, bad), "{bad:?}");
+        }
+        let (kr2, vr2) = k.leaf_rows(&[1, 2]);
+        assert!(!check_leaf(&k.q, SCALE, &kr2, &vr2, leaf));
+        assert!(!check_node(parent, &children[..3]));
+        let mut swapped = children.clone();
+        swapped.swap(0, 3);
+        assert!(check_node(parent, &swapped));
+    }
+
+    #[test]
+    fn committed_partials_open_only_at_their_index() {
+        let k = case(0, 256, 16, 4);
+        let bytes = encode_partials(&k.children(&[], Arith::Exact));
+        let root = partials_root(&bytes, D).unwrap();
+        for i in 0..4 {
+            let (b, path) = partial_opening(&bytes, D, i).unwrap();
+            let p = open_partial(&root, 4, i as u64, &b, &path, D).unwrap();
+            assert_eq!(p, decode_partials(&b, D).unwrap()[0]);
+            assert_eq!(open_partial(&root, 4, (i as u64 + 1) % 4, &b, &path, D), None);
+            let mut flipped = b.clone();
+            flipped[5] ^= 1;
+            assert_eq!(open_partial(&root, 4, i as u64, &flipped, &path, D), None);
+            assert_eq!(open_partial(&root, 4, i as u64, &b[1..], &path, D), None);
+        }
+        assert_eq!(partial_opening(&bytes, D, 4), None);
+        assert_eq!(partials_root(&bytes[1..], D), None);
+        assert_eq!(partials_root(&[], D), None);
+    }
+
+    #[test]
+    fn drawn_children_stay_in_range_and_spread() {
+        for n in [1u64, 2, 5, 64, 512] {
+            let mut seen = std::collections::HashSet::new();
+            for s in 0..10_000u32 {
+                let i = draw_child(blake3::hash(&s.to_le_bytes()).as_bytes(), n);
+                assert!(i < n);
+                seen.insert(i);
+            }
+            assert_eq!(seen.len() as u64, n.min(512));
+        }
+    }
+
+    #[test]
+    fn picked_partials_pass_the_check_they_are_picked_for() {
+        let k = case(5, 300, 16, 5);
+        let x = k.x(Arith::F16);
+        let picked = pick_partials(&k.q, SCALE, &k.keys[5..], &k.values[5..], 5, &k.tree, &[], |p| check_root(&x, q8::MMVQ, 2 * D, 1, p, None)).unwrap();
+        assert!(check_root(&x, q8::MMVQ, 2 * D, 1, &decode_partials(&picked, D).unwrap(), None));
+        assert_eq!(pick_partials(&k.q, SCALE, &k.keys[5..], &k.values[5..], 5, &k.tree, &[], |_| false), None);
+        assert_eq!(pick_partials(&k.q, SCALE, &k.keys[6..], &k.values[6..], 6, &k.tree, &[], |_| true), None);
+    }
+
+    #[test]
+    fn the_gate_scales_the_combined_head() {
+        let k = case(0, 64, 16, 4);
+        let gate: Vec<f32> = vecf(9, D).iter().map(|&x| 3.0 * x as f32).collect();
+        let mut o = k.run((0, 64), Arith::Exact).o;
+        crate::attn::apply_gate(&mut o, &gate).unwrap();
+        let mut all = vec![0.0; D];
+        all.extend(o);
+        let x = q8_1_row(&all);
+        let ch = k.decoded(&[], Arith::Exact);
+        assert!(check_root(&x, q8::MMVQ, 2 * D, 1, &ch, Some(&gate)));
+        assert!(!check_root(&x, q8::MMVQ, 2 * D, 1, &ch, None));
+        assert!(!check_root(&x, q8::MMVQ, 2 * D, 0, &ch, Some(&gate)));
+    }
+}

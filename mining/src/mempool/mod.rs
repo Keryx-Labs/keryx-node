@@ -30,6 +30,9 @@ pub(crate) mod remove_transaction;
 pub(crate) mod replace_by_fee;
 pub(crate) mod validate_and_insert_transaction;
 
+/// A pending response: its responder escrow key (`None` for an unsigned v1 responder) and tx id.
+type ResponseEntry = (Option<[u8; 32]>, TransactionId);
+
 /// Mempool contains transactions intended to be inserted into a block and mined.
 ///
 /// Some important properties to consider:
@@ -54,11 +57,12 @@ pub(crate) struct Mempool {
     counters: Arc<MiningCounters>,
     /// Deduplication index: request_hash → pending (responder escrow key, tx_id) entries.
     /// One AiResponse per (request, responder); `None` is the unsigned v1 responder.
-    ai_response_index: HashMap<[u8; 32], Vec<(Option<[u8; 32]>, TransactionId)>>,
+    ai_response_index: HashMap<[u8; 32], Vec<ResponseEntry>>,
     /// Deduplication index: response_hash → tx_id. One AiChallenge per response.
     ai_challenge_index: HashMap<[u8; 32], TransactionId>,
-    /// Deduplication index: response tx id → opening tx_id. One opening per response.
-    ai_opening_index: HashMap<[u8; 32], TransactionId>,
+    /// Deduplication index: (response tx id, piece, attention path) → opening tx_id. One opening
+    /// per piece of a response, and per path for an attention phase.
+    ai_opening_index: HashMap<([u8; 32], u8, Vec<u64>), TransactionId>,
     /// Private-inference index: request tx id → the escrow keys the pending AiRequest is sealed
     /// to. Admits a named responder's inline-body AiResponse while its request still sits here.
     ai_private_request_index: HashMap<[u8; 32], Vec<[u8; 32]>>,

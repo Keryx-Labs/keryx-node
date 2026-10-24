@@ -746,6 +746,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.awaited_opening_seed(response_txid)
     }
 
+    fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        self.virtual_processor.awaited_attention_path(response_txid)
+    }
+
     fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {
         let Some(pp_daa) = self.headers_store.get_daa_score(pruning_point).optional().unwrap() else {
             return Err(ConsensusError::HeaderNotFound(pruning_point));
