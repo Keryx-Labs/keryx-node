@@ -882,7 +882,7 @@ pub fn attn_query(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Has
     Ok((q, f32::from_bits(s.a.kq_scale) as f64))
 }
 
-fn gqa_shape(a: &manifest::AttnLinks) -> crate::attn::AttnShape {
+pub(crate) fn gqa_shape(a: &manifest::AttnLinks) -> crate::attn::AttnShape {
     crate::attn::AttnShape {
         n_head: a.n_head as usize,
         n_head_kv: a.n_head_kv as usize,

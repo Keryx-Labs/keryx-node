@@ -19,6 +19,7 @@ pub mod quant;
 pub mod recur;
 pub mod seq;
 pub mod shape;
+pub mod support;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
 pub mod verify;
