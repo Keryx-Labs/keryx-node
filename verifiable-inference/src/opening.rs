@@ -226,6 +226,7 @@ pub struct RecurOpening {
     pub seq_root: Hash,
     pub layer: EntryOpening,
     pub out_entry: EntryOpening,
+    pub decay_entry: EntryOpening,
     /// Convolution weights of the head's query, key and value channels, then its decay bias,
     /// decay scale and the output norm.
     pub weights: Vec<(EntryOpening, ChunkRange)>,
@@ -807,6 +808,7 @@ impl RecurOpening {
         w.0.extend_from_slice(&self.seq_root);
         w.entry(&self.layer);
         w.entry(&self.out_entry);
+        w.entry(&self.decay_entry);
         w.u8(self.weights.len() as u8);
         for x in &self.weights {
             w.weights(x);
@@ -838,6 +840,7 @@ impl RecurOpening {
         let seq_root: Hash = r.take(32)?.try_into().ok()?;
         let layer = r.entry()?;
         let out_entry = r.entry()?;
+        let decay_entry = r.entry()?;
         let nw = r.u8()? as usize;
         let weights = (0..nw).map(|_| r.weights()).collect::<Option<Vec<_>>>()?;
         let records = r.seq_span()?;
@@ -849,7 +852,7 @@ impl RecurOpening {
             .collect::<Option<Vec<_>>>()?;
         let (beta, decay, gate) = (r.leaf_chunk()?, r.leaf_chunk()?, r.leaf_chunk()?);
         let out = r.leaf_bytes()?;
-        let o = RecurOpening { response_txid, pos_root, seq_root, layer, out_entry, weights, records, start_rows, end_rows, taps, beta, decay, gate, out };
+        let o = RecurOpening { response_txid, pos_root, seq_root, layer, out_entry, decay_entry, weights, records, start_rows, end_rows, taps, beta, decay, gate, out };
         (r.o == b.len()).then_some(o)
     }
 }
@@ -875,6 +878,7 @@ mod recur_opening_tests {
             seq_root: [3; 32],
             layer: e(9),
             out_entry: e(4),
+            decay_entry: e(5),
             weights: (0..6).map(|i| (e(20 + i), ChunkRange { first_chunk: i as u64, chunks: vec![i as u8; 64], proof: vec![[i as u8; 32]; 2] })).collect(),
             records: span(5, 50_000),
             start_rows: span(6, 8192),

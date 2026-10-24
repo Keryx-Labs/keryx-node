@@ -206,11 +206,16 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         return Err(Fail::Mismatch);
     }
     let gw = if kda { hd } else { 1 };
+    let de = open_entry(tier, &op.decay_entry, r.decay as u64)?;
+    if de.role != manifest::ROLE_PRODUCT {
+        return Err(Fail::Manifest);
+    }
+    let dt_in = de.bias == manifest::NONE;
     let (rt, dy) = chunk_values(&pshape, 2 * r.decay as u64 + 1, &op.decay, 4 * nv64 * gw as u64, h as usize * gw, gw)?;
     same_root(rt)?;
     let dt = f32_weights(tier, &op.weights[3], r.dt, nv64 * gw as u64, h * gw as u64, gw as u64)?;
     let a = f32_weights(tier, &op.weights[4], r.a, nv64, h, 1)?;
-    let g: Vec<f64> = (0..gw).map(|i| a[0] as f64 * softplus(dy[i] as f64 + dt[i] as f64)).collect();
+    let g: Vec<f64> = (0..gw).map(|i| a[0] as f64 * softplus(dy[i] as f64 + if dt_in { dt[i] as f64 } else { 0.0 })).collect();
     if !all_close(&g, &rec.g) {
         return Err(Fail::Mismatch);
     }

@@ -2517,6 +2517,8 @@ mod recur_tests {
         zero_out: bool,
         /// Checkpoints shifted away from the recurrence.
         bad_ckpt: bool,
+        /// The decay product carries the decay bias.
+        fused_dt: bool,
     }
 
     struct Rt {
@@ -2627,6 +2629,13 @@ mod recur_tests {
         for (i, (n, w)) in wv.iter().enumerate() {
             entries.push(entry(n, manifest::ROLE_NORM, w.len(), 1, offs[i], 4 * w.len()));
         }
+        if cfg.fused_dt {
+            let mut e = Entry::parse(&entries[decay_r as usize]).unwrap().0;
+            e.bias = links.dt;
+            let mut b = serialize(&e);
+            b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+            entries[decay_r as usize] = b;
+        }
         let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
         let tier = TierCtx {
             r_t: rt_range_proof(&chunk_leaves, 0, 1).0,
@@ -2670,7 +2679,7 @@ mod recur_tests {
                 l2(&mut k);
                 let beta = sig(y_t[beta_r as usize][h] as f64);
                 let g: Vec<f64> = (0..gw).map(|i| a[h] as f64 * {
-                    let x = y_t[decay_r as usize][h * gw + i] as f64 + dt[h * gw + i] as f64;
+                    let x = y_t[decay_r as usize][h * gw + i] as f64 + if cfg.fused_dt { 0.0 } else { dt[h * gw + i] as f64 };
                     if x > 20.0 { x } else { libm::log1p(libm::exp(x)) }
                 }).collect();
                 let eg = |i: usize| libm::exp(if kda { g[i] } else { g[0] });
@@ -2803,6 +2812,7 @@ mod recur_tests {
                 seq_root: self.seq_root,
                 layer: self.eo(self.ctx.layer_base as usize),
                 out_entry: self.eo(self.out_rank),
+                decay_entry: self.eo(l.decay as usize),
                 weights,
                 records: self.span(layout.record(0, h as u64).unwrap(), c * rl, e * rl),
                 start_rows: if s == 0 { SeqSpan::default() } else { rows(s) },
@@ -2824,7 +2834,8 @@ mod recur_tests {
         (0..64u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
     }
 
-    const KINDS: [Cfg; 2] = [Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false }, Cfg { kda: true, reset: false, fake_k: false, zero_out: false, bad_ckpt: false }];
+    const GDA: Cfg = Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false, fused_dt: false };
+    const KINDS: [Cfg; 3] = [GDA, Cfg { kda: true, ..GDA }, Cfg { kda: true, fused_dt: true, ..GDA }];
 
     #[test]
     fn an_honest_recurrent_point_passes() {
@@ -2833,7 +2844,7 @@ mod recur_tests {
             let mut segs = [false; 3];
             for s in seeds() {
                 segs[(draw::point(&s, RECUR_POINT)[0] % 3) as usize] = true;
-                rt.check(&s).unwrap_or_else(|e| panic!("kda {}: {e:?}", c.kda));
+                rt.check(&s).unwrap_or_else(|e| panic!("kda {} fused {}: {e:?}", c.kda, c.fused_dt));
             }
             assert!(segs.iter().all(|&b| b));
         }
@@ -2877,6 +2888,26 @@ mod recur_tests {
                 assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
             }
         }
+    }
+
+    #[test]
+    fn the_decay_bias_follows_the_decay_product_entry() {
+        for c in KINDS {
+            let rt = build(c);
+            let s = seeds().next().unwrap();
+            let mut op = rt.open(&s);
+            op.decay_entry = rt.eo(rt.links.gate as usize);
+            assert!(verify_recur_point(&rt.tier, &rt.ctx, &rt.resp(), &s, &op).is_err());
+            let mut op = rt.open(&s);
+            op.decay_entry = rt.eo(rt.links.dt as usize);
+            assert!(verify_recur_point(&rt.tier, &rt.ctx, &rt.resp(), &s, &op).is_err());
+        }
+        let honest = build(Cfg { kda: true, ..GDA });
+        let fused = build(Cfg { kda: true, fused_dt: true, ..GDA });
+        let s = seeds().next().unwrap();
+        let mut op = fused.open(&s);
+        op.decay_entry = honest.eo(honest.links.decay as usize);
+        assert!(verify_recur_point(&fused.tier, &fused.ctx, &fused.resp(), &s, &op).is_err());
     }
 
     #[test]

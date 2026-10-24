@@ -155,7 +155,8 @@ pub struct RecurLinks {
     pub conv_k: u32,
     pub conv_v: u32,
     pub beta: u32,
-    /// Product whose output gives the decay before its bias and softplus.
+    /// Product whose output gives the decay before softplus, before its bias unless the product
+    /// entry carries it.
     pub decay: u32,
     /// Norm-role entries of the decay bias, the decay scale and the output norm.
     pub dt: u32,
