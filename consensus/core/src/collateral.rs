@@ -1690,7 +1690,9 @@ impl ServiceLedger {
             }
             if verdict.is_ok() && a.pieces | piece != required {
                 a.pieces |= piece;
-                a.attn = None;
+                if piece == PIECE_ATTN {
+                    a.attn = None;
+                }
                 self.trace_audits.insert(op.response_txid, a);
                 continue;
             }
@@ -4735,6 +4737,39 @@ mod tests {
             assert_eq!(run.ledger.awaited_attention_path(&TXID), None);
             assert_eq!(*seen.borrow(), vec![(vec![], None, 0), (vec![c0], Some(R0), 1), (vec![c0, c1], Some(R1), 2)]);
             assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn a_trace_opening_after_phase_0_keeps_the_attention_progress() {
+            use crate::collateral::attn_child_seed;
+            use keryx_verifiable_inference::attn_blocks::draw_child;
+            for same_block in [true, false] {
+                let seen = oracle(three_phases);
+                let mut run = Run { attention: true, ..Run::new(true) };
+                let (_, trace) = run.until_draw(true, true);
+                let h = Hash::from_bytes([3u8; 32]);
+                if same_block {
+                    assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, phase_body(&[])), opening(ESCROW_PK, trace)]).is_empty());
+                } else {
+                    assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, phase_body(&[]))]).is_empty());
+                    assert!(run.fold(250, h, &[], &[opening(ESCROW_PK, trace)]).is_empty());
+                }
+                assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(crate::collateral::PIECE_TRACE));
+                assert_eq!(run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.as_ref().map(|p| (p.root, p.n))), Some((R0, 4)));
+                assert_eq!(run.ledger.awaited_attention_path(&TXID), None, "phase 0 is not awaited again");
+                assert!(run.fold(260, h, &[], &[opening(ESCROW_PK, phase_body(&[]))]).is_empty());
+                assert_eq!(seen.borrow().len(), 1, "a replayed phase 0 is passed over");
+                let (h2, h3) = (Hash::from_bytes([0x61u8; 32]), Hash::from_bytes([0x62u8; 32]));
+                assert!(run.fold(303, h2, &[], &[]).is_empty());
+                let c0 = draw_child(&attn_child_seed(&h2, &TXID, 0), 4);
+                assert_eq!(run.ledger.awaited_attention_path(&TXID), Some(vec![c0]));
+                assert!(run.fold(305, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
+                assert!(run.fold(405, h3, &[], &[]).is_empty());
+                let c1 = draw_child(&attn_child_seed(&h3, &TXID, 1), 3);
+                assert!(run.fold(406, h, &[], &[opening(ESCROW_PK, phase_body(&[c0, c1]))]).is_empty());
+                assert!(run.ledger.trace_audits.is_empty(), "same block {same_block}");
+                assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            }
         }
 
         #[test]

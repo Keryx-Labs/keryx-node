@@ -667,6 +667,12 @@ pub fn seed_block(body: &[u8]) -> Option<Hash> {
     body.get(33..65)?.try_into().ok()
 }
 
+/// Whether `body` decodes as a trace, attention or recurrent opening.
+pub fn is_audit_body(body: &[u8]) -> bool {
+    Opening::decode(body).is_some()
+        || inner_body(body).is_some_and(|b| AttnOpening::decode(&b).is_some() || RecurOpening::decode(&b).is_some())
+}
+
 /// The body inside a seeded envelope, or `body` itself when unseeded.
 pub fn inner_body(body: &[u8]) -> Option<Vec<u8>> {
     if body.first() != Some(&VERSION_SEEDED) {
@@ -854,6 +860,34 @@ impl RecurOpening {
         let out = r.leaf_bytes()?;
         let o = RecurOpening { response_txid, pos_root, seq_root, layer, out_entry, decay_entry, weights, records, start_rows, end_rows, taps, beta, decay, gate, out };
         (r.o == b.len()).then_some(o)
+    }
+}
+
+#[cfg(test)]
+mod audit_body_tests {
+    use super::*;
+
+    fn seeded(body: &[u8]) -> Vec<u8> {
+        let mut v = vec![VERSION_SEEDED];
+        v.extend_from_slice(&body[1..33]);
+        v.extend_from_slice(&[9u8; 32]);
+        v.push(body[0]);
+        v.extend_from_slice(&body[33..]);
+        v
+    }
+
+    #[test]
+    fn attention_and_recurrent_bodies_are_audit_bodies() {
+        let attn = AttnOpening { response_txid: [4; 32], path: vec![1], partials: vec![2; 4], ..Default::default() }.encode();
+        let recur = RecurOpening { response_txid: [4; 32], ..Default::default() }.encode();
+        for b in [&attn, &recur] {
+            assert!(is_audit_body(b));
+            assert!(is_audit_body(&seeded(b)));
+            assert_eq!(inner_body(&seeded(b)).as_deref(), Some(&b[..]));
+            assert!(!is_audit_body(&b[..b.len() - 1]));
+        }
+        assert!(!is_audit_body(&[]));
+        assert!(!is_audit_body(&[0xEE; 64]));
     }
 }
 

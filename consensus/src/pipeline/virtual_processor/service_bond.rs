@@ -378,7 +378,7 @@ impl VirtualStateProcessor {
     /// Traced responses with a verified responder, and correctly signed openings, accepted by
     /// chain block `hash`, in acceptance order.
     fn trace_events_of_chain_block(&self, hash: Hash) -> (Vec<TraceResponseEvent>, Vec<TraceOpeningEvent>) {
-        use keryx_verifiable_inference::opening::{Opening, SignedPayload};
+        use keryx_verifiable_inference::opening::{SignedPayload, is_audit_body};
         let mut responses = Vec::new();
         let mut openings = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
@@ -411,7 +411,7 @@ impl VirtualStateProcessor {
                         continue;
                     }
                     let Some(response_txid) = signed.body.get(1..33).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { continue };
-                    if Opening::decode(signed.body).is_none() {
+                    if !is_audit_body(signed.body) {
                         continue;
                     }
                     openings.push(TraceOpeningEvent { response_txid, escrow_pubkey: signed.escrow_pubkey, body: signed.body.to_vec() });
