@@ -261,6 +261,8 @@ struct AttnProgress {
     accepted_daa: u64,
     /// Whether the child of the last accepted phase is drawn.
     drawn: bool,
+    /// Draw weights of the `n` children.
+    weights: Vec<u16>,
 }
 
 impl AttnProgress {
@@ -1641,7 +1643,7 @@ impl ServiceLedger {
         for (txid, a) in self.trace_audits.iter_mut() {
             if let Some(p) = a.attn.as_mut().filter(|p| !p.drawn && daa >= p.accepted_daa + TRACE_SEED_DELAY_DAA) {
                 let child = attn_child_seed(&tr.chain_hash, txid, p.path.len() as u8);
-                p.path.push(keryx_verifiable_inference::attn_blocks::draw_child(&child, p.n));
+                p.path.push(keryx_verifiable_inference::attn_blocks::draw_weighted_child(&child, &p.weights));
                 p.drawn = true;
             }
         }
@@ -1673,17 +1675,17 @@ impl ServiceLedger {
             let mut next = None;
             let verdict = match &rules {
                 Some(r) if piece == PIECE_ATTN => attn_opening_valid(r, &a, &seed, &op.response_txid, &op.body).map(|step| {
-                    if let keryx_verifiable_inference::chain::AttnStep::Next { root, n } = step {
-                        next = Some((root, n));
+                    if let keryx_verifiable_inference::chain::AttnStep::Next { root, n, weights } = step {
+                        next = Some((root, n, weights));
                     }
                 }),
                 Some(r) if piece == PIECE_RECUR => recur_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 None => Err("no rules"),
             };
-            if let Some((root, n)) = next {
+            if let Some((root, n, weights)) = next {
                 let path = a.attn.take().map(|p| p.path).unwrap_or_default();
-                a.attn = Some(AttnProgress { path, root, n, accepted_daa: daa, drawn: false });
+                a.attn = Some(AttnProgress { path, root, n, accepted_daa: daa, drawn: false, weights });
                 a.deadline_daa = a.deadline_daa.max(daa + TRACE_SEED_DELAY_DAA + ATTN_PHASE_WINDOW_DAA);
                 self.trace_audits.insert(op.response_txid, a);
                 continue;
@@ -2129,8 +2131,10 @@ const SNAPSHOT_ENCODING_VERSION_QUEUE: u8 = 7;
 const SNAPSHOT_ENCODING_VERSION_ATTN: u8 = 8;
 /// Sections of version 8 (possibly empty) followed by the attention openings short of their
 /// last phase (`[n: u32] n × [response_txid: 32] [k: u8] k × [child: u64] [root: 32]
-/// [children: u64] [accepted_daa: u64] [drawn: u8]`, key order).
-const SNAPSHOT_ENCODING_VERSION_PHASES: u8 = 9;
+/// [children: u64] [accepted_daa: u64] [drawn: u8] children × [weight: u16]`, key order).
+const SNAPSHOT_ENCODING_VERSION_PHASES: u8 = 10;
+/// Children an attention phase may commit.
+const MAX_ATTN_CHILDREN: u64 = 1 << 16;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -2428,6 +2432,9 @@ impl ServiceLedgerSnapshot {
                 out.extend_from_slice(&p.n.to_le_bytes());
                 out.extend_from_slice(&p.accepted_daa.to_le_bytes());
                 out.push(p.drawn as u8);
+                for w in &p.weights {
+                    out.extend_from_slice(&w.to_le_bytes());
+                }
             }
         }
         out
@@ -2756,10 +2763,14 @@ impl ServiceLedgerSnapshot {
                     1 => true,
                     _ => return Err("malformed phase section".into()),
                 };
-                let ok = children >= 1 && (!drawn || path.last().is_some_and(|&c| c < children));
+                if !(1..=MAX_ATTN_CHILDREN).contains(&children) {
+                    return Err("malformed phase section".into());
+                }
+                let weights = (0..children).map(|_| r.u16()).collect::<Result<Vec<_>, _>>()?;
+                let ok = weights.iter().all(|&w| w >= 1) && (!drawn || path.last().is_some_and(|&c| c < children));
                 match snap.trace_audits.get_mut(&txid) {
                     Some(a) if ok && a.attn.is_none() && a.seed.is_some() && a.pieces & PIECE_ATTN == 0 => {
-                        a.attn = Some(AttnProgress { path, root, n: children, accepted_daa, drawn })
+                        a.attn = Some(AttnProgress { path, root, n: children, accepted_daa, drawn, weights })
                     }
                     _ => return Err("malformed phase section".into()),
                 }
@@ -4682,11 +4693,14 @@ mod tests {
         const R0: [u8; 32] = [0x51; 32];
         const R1: [u8; 32] = [0x52; 32];
 
+        const W0: [u16; 4] = [1, 1, 60_000, 1];
+        const W1: [u16; 3] = [5, 5, 5];
+
         fn three_phases(phase: u8) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> {
             use keryx_verifiable_inference::chain::AttnStep;
             Ok(match phase {
-                0 => AttnStep::Next { root: R0, n: 4 },
-                1 => AttnStep::Next { root: R1, n: 3 },
+                0 => AttnStep::Next { root: R0, n: 4, weights: W0.to_vec() },
+                1 => AttnStep::Next { root: R1, n: 3, weights: W1.to_vec() },
                 _ => AttnStep::Done,
             })
         }
@@ -4711,13 +4725,13 @@ mod tests {
         #[test]
         fn an_attention_opening_runs_its_phases_on_drawn_children() {
             use crate::collateral::{AttnProgress, attn_child_seed};
-            use keryx_verifiable_inference::attn_blocks::draw_child;
+            use keryx_verifiable_inference::attn_blocks::draw_weighted_child;
             let (mut run, seen) = after_phase_0(three_phases);
             let h = Hash::from_bytes([3u8; 32]);
             let progress = |run: &Run| run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.clone());
-            assert_eq!(progress(&run), Some(AttnProgress { path: vec![], root: R0, n: 4, accepted_daa: 203, drawn: false }));
+            assert_eq!(progress(&run), Some(AttnProgress { path: vec![], root: R0, n: 4, accepted_daa: 203, drawn: false, weights: W0.to_vec() }));
             let (h2, h3) = (Hash::from_bytes([0x61u8; 32]), Hash::from_bytes([0x62u8; 32]));
-            let c0 = draw_child(&attn_child_seed(&h2, &TXID, 0), 4);
+            let c0 = draw_weighted_child(&attn_child_seed(&h2, &TXID, 0), &W0);
             assert_eq!(run.ledger.awaited_attention_path(&TXID), None, "no child drawn yet");
             assert!(run.fold(250, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
             assert_eq!(seen.borrow().len(), 1, "a phase before its child is drawn is passed over");
@@ -4729,9 +4743,9 @@ mod tests {
             assert!(run.fold(304, h, &[], &wrong.map(|b| opening(ESCROW_PK, b))).is_empty());
             assert_eq!(seen.borrow().len(), 1, "phases built for another path are passed over");
             assert!(run.fold(305, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
-            assert_eq!(progress(&run), Some(AttnProgress { path: vec![c0], root: R1, n: 3, accepted_daa: 305, drawn: false }));
+            assert_eq!(progress(&run), Some(AttnProgress { path: vec![c0], root: R1, n: 3, accepted_daa: 305, drawn: false, weights: W1.to_vec() }));
             assert!(run.fold(405, h3, &[], &[]).is_empty());
-            let c1 = draw_child(&attn_child_seed(&h3, &TXID, 1), 3);
+            let c1 = draw_weighted_child(&attn_child_seed(&h3, &TXID, 1), &W1);
             assert!(run.fold(406, h, &[], &[opening(ESCROW_PK, phase_body(&[c0, c1]))]).is_empty());
             assert!(run.ledger.trace_audits.is_empty(), "the last phase closes the audit");
             assert_eq!(run.ledger.awaited_attention_path(&TXID), None);
@@ -4742,7 +4756,7 @@ mod tests {
         #[test]
         fn a_trace_opening_after_phase_0_keeps_the_attention_progress() {
             use crate::collateral::attn_child_seed;
-            use keryx_verifiable_inference::attn_blocks::draw_child;
+            use keryx_verifiable_inference::attn_blocks::draw_weighted_child;
             for same_block in [true, false] {
                 let seen = oracle(three_phases);
                 let mut run = Run { attention: true, ..Run::new(true) };
@@ -4761,11 +4775,11 @@ mod tests {
                 assert_eq!(seen.borrow().len(), 1, "a replayed phase 0 is passed over");
                 let (h2, h3) = (Hash::from_bytes([0x61u8; 32]), Hash::from_bytes([0x62u8; 32]));
                 assert!(run.fold(303, h2, &[], &[]).is_empty());
-                let c0 = draw_child(&attn_child_seed(&h2, &TXID, 0), 4);
+                let c0 = draw_weighted_child(&attn_child_seed(&h2, &TXID, 0), &W0);
                 assert_eq!(run.ledger.awaited_attention_path(&TXID), Some(vec![c0]));
                 assert!(run.fold(305, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
                 assert!(run.fold(405, h3, &[], &[]).is_empty());
-                let c1 = draw_child(&attn_child_seed(&h3, &TXID, 1), 3);
+                let c1 = draw_weighted_child(&attn_child_seed(&h3, &TXID, 1), &W1);
                 assert!(run.fold(406, h, &[], &[opening(ESCROW_PK, phase_body(&[c0, c1]))]).is_empty());
                 assert!(run.ledger.trace_audits.is_empty(), "same block {same_block}");
                 assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
@@ -4816,19 +4830,26 @@ mod tests {
             let bytes = check(&run);
             let n = bytes.len();
             let mut undrawn_with_flag = bytes.clone();
-            undrawn_with_flag[n - 1] = 1;
+            undrawn_with_flag[n - 9] = 1;
             assert!(ServiceLedgerSnapshot::from_bytes(&undrawn_with_flag).is_err());
             let mut bad_flag = bytes.clone();
-            bad_flag[n - 1] = 2;
+            bad_flag[n - 9] = 2;
             assert!(ServiceLedgerSnapshot::from_bytes(&bad_flag).is_err());
             let mut childless = bytes.clone();
-            childless[n - 17..n - 9].copy_from_slice(&0u64.to_le_bytes());
+            childless[n - 25..n - 17].copy_from_slice(&0u64.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&childless).is_err());
+            let mut weightless = bytes.clone();
+            weightless[n - 2..].copy_from_slice(&0u16.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&weightless).is_err());
+            let mut huge = bytes.clone();
+            huge[n - 25..n - 17].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&huge).is_err());
             assert!(ServiceLedgerSnapshot::from_bytes(&childless).is_err());
             assert!(run.fold(303, Hash::from_bytes([0x61u8; 32]), &[], &[]).is_empty());
             let drawn = check(&run);
             let n = drawn.len();
             let mut out_of_range = drawn.clone();
-            out_of_range[n - 57..n - 49].copy_from_slice(&4u64.to_le_bytes());
+            out_of_range[n - 65..n - 57].copy_from_slice(&4u64.to_le_bytes());
             assert!(ServiceLedgerSnapshot::from_bytes(&out_of_range).is_err());
         }
 
