@@ -2652,7 +2652,7 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_chain_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
-    attention_activation: ForkActivation::never(),
+    attention_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(500),
