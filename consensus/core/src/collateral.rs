@@ -1408,8 +1408,12 @@ impl ServiceLedger {
 
         if let Some(tr) = traces {
             self.fold_traces(daa, tr, &misshaped, warmup, &is_established, &mut outcome);
-            let closing: Vec<[u8; 32]> =
-                self.pending.iter().filter(|(_, r)| r.draw.as_ref().is_some_and(|d| daa >= d.close_daa)).map(|(h, _)| *h).collect();
+            let closing: Vec<[u8; 32]> = self
+                .pending
+                .iter()
+                .filter(|(h, r)| r.draw.as_ref().is_some_and(|d| daa >= d.close_daa && !self.draw_awaits_audit(h, d)))
+                .map(|(h, _)| *h)
+                .collect();
             for rh in closing {
                 self.close_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
             }
@@ -1970,6 +1974,13 @@ impl ServiceLedger {
             return;
         }
         self.maybe_award(rh, first, warmup, outcome);
+    }
+
+    /// Whether a candidate of the draw of `rh` still awaits the verdict of a trace audit on it.
+    fn draw_awaits_audit(&self, rh: &[u8; 32], draw: &RewardDraw) -> bool {
+        self.trace_audits
+            .values()
+            .any(|a| a.request_hash == *rh && a.identities.iter().any(|id| draw.candidates.iter().any(|(c, _)| c == id)))
     }
 
     /// Removes identities the audit sanctioned on `rh` from its open draw.
@@ -5625,6 +5636,40 @@ mod tests {
             let draw = net.ledger.pending.get(&RH).unwrap().draw.clone().unwrap();
             assert_eq!(draw.open_daa, 101);
             assert_eq!(draw.candidates.len(), 2);
+        }
+
+        #[test]
+        fn a_draw_waits_for_the_audit_of_its_candidates() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, b, None)]);
+            let audit = super::super::TraceAudit {
+                request_hash: RH,
+                responder: a,
+                escrow_pubkey: [0u8; 32],
+                trace_root: [0u8; 32],
+                n_prompt: 4,
+                n_pos: 9,
+                accepted_daa: 102,
+                tier: 0,
+                max_tokens: 256,
+                identities: vec![a],
+                seed: Some([9; 32]),
+                deadline_daa: 9_999,
+                pieces: 0,
+                attn: None,
+            };
+            net.ledger.trace_audits.insert([0xAAu8; 32], audit);
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            assert!(net.fold(close, chain(9), &[], &[]).rewards.is_empty());
+            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_some(), "an audit still open keeps the draw open");
+            // The audit sanctions its responder: only the other candidate remains.
+            net.ledger.trace_audits.clear();
+            net.ledger.drop_draw_candidates(&RH, &[a]);
+            let out = net.fold(close + 1, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![b]);
         }
 
         #[test]
