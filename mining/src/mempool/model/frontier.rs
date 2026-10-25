@@ -139,13 +139,26 @@ impl Frontier {
         //       next sampled transaction happens to cross the bound
         let desired_mass = (policy.max_block_mass as f64 * MASS_LIMIT_FACTOR) as u64;
 
-        let mut distr = Uniform::new(0f64, self.total_weight());
         let mut down_iter = self.search_tree.descending_iter();
         let mut top = down_iter.next().unwrap();
         let mut cache = HashSet::new();
         let mut sequence = SequenceSelectorInput::default();
         let mut total_selected_mass: u64 = 0;
         let mut collisions = 0;
+
+        // Feeless transactions carry zero weight and cannot be sampled
+        let total_weight = self.total_weight();
+        if !(total_weight > 0.0) {
+            for key in std::iter::once(top).chain(down_iter) {
+                if total_selected_mass > desired_mass {
+                    break;
+                }
+                sequence.push(key.tx.clone(), key.mass);
+                total_selected_mass += key.mass;
+            }
+            return sequence;
+        }
+        let mut distr = Uniform::new(0f64, total_weight);
 
         // The sampling process is converging so the cache will eventually hold all entries, which guarantees loop exit
         'outer: while cache.len() < self.search_tree.len() && total_selected_mass <= desired_mass {
@@ -167,6 +180,18 @@ impl Frontier {
                             }
                         }
                         let remaining_weight = self.search_tree.prefix_weight(top);
+                        if !(remaining_weight > 0.0) {
+                            for key in std::iter::once(top).chain(down_iter.by_ref()) {
+                                if total_selected_mass > desired_mass {
+                                    break;
+                                }
+                                if cache.insert(key.tx.id()) {
+                                    sequence.push(key.tx.clone(), key.mass);
+                                    total_selected_mass += key.mass;
+                                }
+                            }
+                            break 'outer;
+                        }
                         distr = Uniform::new(0f64, remaining_weight);
                     }
                     let query = distr.sample(rng);
@@ -307,6 +332,26 @@ mod tests {
         }
 
         let _sample = frontier.sample_inplace(&mut rng, &Policy::new(500_000), &mut 0);
+    }
+
+    #[test]
+    pub fn test_sampling_feeless_transactions() {
+        let mut rng = thread_rng();
+        let policy = Policy::new(500_000);
+        for paid in [0u64, 3, 200] {
+            let mut frontier = Frontier::new(1.0);
+            for i in 0..paid {
+                frontier.insert(build_feerate_key(rng.gen_range(1..1_000_000), 1650, i)).then_some(()).unwrap();
+            }
+            for i in paid..paid + 100 {
+                frontier.insert(build_feerate_key(0, 100_000, i)).then_some(()).unwrap();
+            }
+            assert!(frontier.total_mass() > policy.max_block_mass * COLLISION_FACTOR);
+
+            let ids = frontier.build_selector(&policy).select_transactions().iter().map(|tx| tx.id()).collect_vec();
+            assert_eq!(ids.len(), ids.iter().unique().count());
+            assert!(ids.len() as u64 > paid, "feeless transactions must still be selected");
+        }
     }
 
     #[test]
