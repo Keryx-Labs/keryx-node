@@ -1261,6 +1261,7 @@ impl ServiceLedger {
         self.vault.retain(|_, claims| !claims.is_empty());
 
         let mut outcome = FoldOutcome { sightings, expired, ..Default::default() };
+        let sanction = traces.is_some_and(|tr| tr.sanction);
 
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
         self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
@@ -1433,7 +1434,11 @@ impl ServiceLedger {
             let reset_at_opening = self.reset_waits_for_opening(traces, rh, r, req_tier, daa);
             for identity in served {
                 // A warmup fold leaves strikes alone: the baseline already carries this reset.
-                if !warmup && !reset_at_opening && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
+                if !warmup
+                    && !reset_at_opening
+                    && !(sanction && self.struck_at(&identity, daa))
+                    && self.strike_state(&identity).is_some_and(|e| e.count > 0)
+                {
                     let preserved = self.reset_preserved_last_daa(&identity, daa);
                     self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: preserved });
                     outcome.resets.push((identity, preserved));
@@ -1635,7 +1640,7 @@ impl ServiceLedger {
 
         for identity in served_at_arm {
             // A warmup fold leaves strikes alone: the baseline already carries this reset.
-            if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
+            if !warmup && !(sanction && self.struck_at(&identity, daa)) && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
                 let preserved = self.reset_preserved_last_daa(&identity, daa);
                 self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: preserved });
                 outcome.resets.push((identity, preserved));
@@ -1674,10 +1679,13 @@ impl ServiceLedger {
         is_established: &dyn Fn(&Hash) -> bool,
         outcome: &mut FoldOutcome,
     ) {
+        let mut audited: std::collections::HashSet<([u8; 32], Hash)> =
+            if tr.sanction { self.trace_audits.values().map(|a| (a.request_hash, a.responder)).collect() } else { Default::default() };
         for ev in tr.responses {
             if self.trace_audits.contains_key(&ev.response_txid)
                 || self.trace_roots.contains_key(&ev.response_txid)
                 || misshaped.contains(&(ev.request_hash, ev.responder))
+                || (tr.sanction && !audited.insert((ev.request_hash, ev.responder)))
             {
                 continue;
             }
@@ -1790,7 +1798,7 @@ impl ServiceLedger {
             });
             if verdict.is_ok() && tr.sanction && !warmup {
                 for miner in a.identities.iter() {
-                    if self.strike_state(miner).is_some_and(|e| e.count > 0) {
+                    if !self.struck_at(miner, daa) && self.strike_state(miner).is_some_and(|e| e.count > 0) {
                         let preserved = self.reset_preserved_last_daa(miner, daa);
                         self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: preserved });
                         outcome.resets.push((*miner, preserved));
@@ -1800,7 +1808,7 @@ impl ServiceLedger {
             if verdict.is_err() {
                 self.drop_draw_candidates(&a.request_hash, &a.identities);
                 for miner in a.identities.iter() {
-                    if warmup {
+                    if warmup || (tr.sanction && self.struck_at(miner, daa)) {
                         continue;
                     }
                     let count = (self.consecutive_misses(miner) + 1).max(2);
@@ -1831,9 +1839,12 @@ impl ServiceLedger {
                 if warmup {
                     continue;
                 }
-                if !tr.sanction
-                    && self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
-                {
+                let skip = if tr.sanction {
+                    self.struck_at(miner, daa)
+                } else {
+                    self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
+                };
+                if skip {
                     continue;
                 }
                 let count = self.consecutive_misses(miner) + 1;
@@ -2215,6 +2226,12 @@ impl ServiceLedger {
     }
 
     /// The miner's strike state: the folded delta, falling back to the persisted baseline.
+    /// Whether the miner already took a strike in the block at `daa`: under the sanction rule a
+    /// miner takes at most one strike and no reset per block.
+    fn struck_at(&self, miner: &Hash, daa: u64) -> bool {
+        self.strike_state(miner).is_some_and(|e| e.last_daa == daa)
+    }
+
     fn strike_state(&self, miner: &Hash) -> Option<StrikeEntry> {
         self.strikes.get(miner).or_else(|| self.base.get(miner)).copied()
     }
@@ -5319,12 +5336,58 @@ mod tests {
             assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
         }
 
+        /// Two traced responses of the miner to `RH` and `RH2`, both drawn: the run and the two
+        /// opening deadlines, earliest first.
+        fn two_drawn_audits(sanction: bool) -> (Run, u64, u64) {
+            let mut run = Run::audited_all();
+            run.sanction = sanction;
+            let (_, ev) = run.event(true);
+            let r2 = run.model.response(3, 10, true);
+            let ev2 = TraceResponseEvent {
+                response_txid: TXID2,
+                request_hash: RH2,
+                trace_root: r2.trace_root,
+                n_prompt: r2.n_prompt,
+                n_pos: r2.n_pos,
+                ..ev.clone()
+            };
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
+            assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 2);
+            let first = run.deadline();
+            let last = run.ledger.trace_audits.values().map(|a| a.deadline_daa).max().unwrap();
+            assert_eq!(last, first + super::super::OPENING_BACKLOG_DAA, "the second draw waits behind the first");
+            (run, first, last)
+        }
+
         #[test]
-        fn two_missing_openings_escalate_in_one_fold_under_the_sanction_rule() {
+        fn two_missing_openings_in_one_fold_strike_once() {
+            for sanction in [false, true] {
+                let (mut run, _, last) = two_drawn_audits(sanction);
+                let misses = run.fold(last + 1, Hash::from_bytes([3u8; 32]), &[], &[]);
+                assert_eq!(misses, vec![(miner(), 1)]);
+                assert_eq!(run.ledger.strike_state(&miner()), Some(crate::collateral::StrikeEntry { count: 1, last_daa: last + 1 }));
+                assert!(run.ledger.trace_audits.is_empty());
+            }
+        }
+
+        #[test]
+        fn missing_openings_in_two_folds_escalate_under_the_sanction_rule() {
+            let (mut run, first, last) = two_drawn_audits(true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert_eq!(run.fold(first + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert_eq!(run.fold(last + 1, h, &[], &[]), vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_struck_miner_is_not_reset_in_the_same_fold_under_the_sanction_rule() {
             for sanction in [false, true] {
                 let mut run = Run::audited_all();
                 run.sanction = sanction;
-                let (_, ev) = run.event(true);
+                let (r1, ev) = run.event(false);
                 let r2 = run.model.response(3, 10, true);
                 let ev2 = TraceResponseEvent {
                     response_txid: TXID2,
@@ -5337,17 +5400,35 @@ mod tests {
                 let h0 = Hash::from_bytes([0u8; 32]);
                 assert!(run.fold(100, h0, &[], &[]).is_empty());
                 assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
-                assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
-                assert_eq!(run.ledger.trace_audits.len(), 2);
-                let deadline = run.ledger.trace_audits.values().map(|a| a.deadline_daa).max().unwrap();
-                assert_eq!(deadline, run.deadline() + super::super::OPENING_BACKLOG_DAA, "the second draw waits behind the first");
-                let misses = run.fold(deadline + 1, Hash::from_bytes([3u8; 32]), &[], &[]);
+                let ch = chain_hash(false);
+                assert!(run.fold(202, ch, &[], &[]).is_empty());
+                let bad = opening(ESCROW_PK, run.model.open(&r1, TXID, &trace_seed(&ch, &TXID)).encode());
+                let good = TraceOpeningEvent {
+                    response_txid: TXID2,
+                    escrow_pubkey: ESCROW_PK,
+                    body: run.model.open(&r2, TXID2, &trace_seed(&ch, &TXID2)).encode(),
+                };
+                assert_eq!(run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[bad, good]), vec![(miner(), 2)]);
                 if sanction {
-                    assert_eq!(misses, vec![(miner(), 1), (miner(), 2)]);
-                } else {
-                    assert_eq!(misses, vec![(miner(), 1)]);
+                    assert_eq!(run.ledger.strike_state(&miner()), Some(crate::collateral::StrikeEntry { count: 2, last_daa: 203 }));
                 }
                 assert!(run.ledger.trace_audits.is_empty());
+            }
+        }
+
+        #[test]
+        fn a_repeated_response_opens_one_audit_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let mut run = Run::audited_all();
+                run.sanction = sanction;
+                let (_, ev) = run.event(true);
+                let dup = TraceResponseEvent { response_txid: TXID2, ..ev.clone() };
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(run.fold(100, h0, &[], &[]).is_empty());
+                assert!(run.fold(102, h0, &[ev.clone()], &[]).is_empty());
+                assert!(run.fold(103, h0, &[dup], &[]).is_empty());
+                assert_eq!(run.ledger.trace_audits.len(), if sanction { 1 } else { 2 });
+                assert!(run.ledger.trace_audits.contains_key(&TXID));
             }
         }
 
