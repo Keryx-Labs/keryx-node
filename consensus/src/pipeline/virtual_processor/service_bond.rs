@@ -542,6 +542,13 @@ impl VirtualStateProcessor {
             && ledger.awaited_opening_pieces(&txid, |t, at| self.required_pieces_at(t, at)).is_some_and(|m| m & opening_body_piece(s.body) != 0)
     }
 
+    pub(crate) fn ai_response_admission(&self, request_hash: &[u8; 32], escrow_pubkey: Option<&[u8; 32]>, virtual_daa_score: u64) -> Option<bool> {
+        if !self.trace_sanction_activation.is_active(virtual_daa_score) {
+            return None;
+        }
+        Some(escrow_pubkey.is_some_and(|e| self.service_ledger.lock().ledger.response_admissible(request_hash, e)))
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())

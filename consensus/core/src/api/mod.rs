@@ -181,6 +181,14 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// Whether the ledger still takes an AiResponse to `request_hash` signed by `escrow_pubkey`:
+    /// its request is pending and not armed yet, or armed and still awaiting that responder.
+    /// `None` while the rule is not active.
+    fn ai_response_admission(&self, request_hash: &[u8; 32], escrow_pubkey: Option<&[u8; 32]>) -> Option<bool> {
+        let _ = (request_hash, escrow_pubkey);
+        None
+    }
+
     /// The escrow key expected to sign the opening of a drawn response; `None` when no opening
     /// is awaited for it.
     fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {

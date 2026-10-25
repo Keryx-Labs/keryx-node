@@ -36,6 +36,8 @@ pub(crate) struct ConsensusMock {
     awaited_responses: RwLock<HashMap<([u8; 32], [u8; 32]), u64>>,
     opening_deadlines: RwLock<HashMap<[u8; 32], u64>>,
     private_recipients: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
+    response_rule: RwLock<bool>,
+    unarmed_requests: RwLock<std::collections::HashSet<[u8; 32]>>,
 }
 
 impl ConsensusMock {
@@ -52,6 +54,8 @@ impl ConsensusMock {
             awaited_responses: RwLock::new(HashMap::default()),
             opening_deadlines: RwLock::new(HashMap::default()),
             private_recipients: RwLock::new(HashMap::default()),
+            response_rule: RwLock::new(false),
+            unarmed_requests: RwLock::new(Default::default()),
         }
     }
 
@@ -61,6 +65,14 @@ impl ConsensusMock {
 
     pub(crate) fn await_opening(&self, response_txid: [u8; 32], escrow_pubkey: [u8; 32]) {
         self.awaited_openings.write().insert(response_txid, escrow_pubkey);
+    }
+
+    pub(crate) fn set_response_rule(&self, active: bool) {
+        *self.response_rule.write() = active;
+    }
+
+    pub(crate) fn set_unarmed_request(&self, request_hash: [u8; 32]) {
+        self.unarmed_requests.write().insert(request_hash);
     }
 
     pub(crate) fn set_private_recipients(&self, request_hash: [u8; 32], keys: Vec<[u8; 32]>) {
@@ -138,6 +150,14 @@ impl ConsensusApi for ConsensusMock {
 
     fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.awaited_seeds.read().get(response_txid).copied()
+    }
+
+    fn ai_response_admission(&self, request_hash: &[u8; 32], escrow_pubkey: Option<&[u8; 32]>) -> Option<bool> {
+        (*self.response_rule.read()).then(|| {
+            escrow_pubkey.is_some_and(|e| {
+                self.unarmed_requests.read().contains(request_hash) || self.awaited_responses.read().contains_key(&(*request_hash, *e))
+            })
+        })
     }
 
     fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {

@@ -43,6 +43,7 @@ impl Mempool {
         transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx));
         self.validate_transaction_in_isolation(&transaction)?;
         self.validate_ai_response_body(consensus, &transaction)?;
+        self.validate_ai_response_awaited(consensus, &transaction)?;
         self.validate_ai_opening(consensus, &transaction)?;
         self.validate_private_request_coverage(consensus, &transaction)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
@@ -261,6 +262,26 @@ impl Mempool {
         });
         if !named {
             return Err(RuleError::RejectAiResponseBody(hex::encode(resp.request_hash)));
+        }
+        Ok(())
+    }
+
+    /// Admission policy for responses once the ledger rule is active: from a responder named by
+    /// a request still pending here, answering a request a block just carried, or one the ledger
+    /// still takes. Policy only.
+    fn validate_ai_response_awaited(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_response() {
+            return Ok(());
+        }
+        let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
+        let escrow = resp.responder.as_ref().map(|r| r.escrow_pubkey);
+        if consensus.ai_response_admission(&resp.request_hash, escrow.as_ref()) != Some(false) {
+            return Ok(());
+        }
+        let named_here = escrow.is_some_and(|e| self.ai_private_request_index.get(&resp.request_hash).is_some_and(|keys| keys.contains(&e)));
+        let just_mined = self.accepted_transactions.has(&TransactionId::from_bytes(resp.request_hash));
+        if !named_here && !just_mined {
+            return Err(RuleError::RejectAiResponseNotAwaited(hex::encode(resp.request_hash)));
         }
         Ok(())
     }

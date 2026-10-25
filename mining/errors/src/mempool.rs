@@ -84,6 +84,9 @@ pub enum RuleError {
     #[error("the AiResponse for request {0} carries an inline body, but that is not a pending private request naming this responder")]
     RejectAiResponseBody(String),
 
+    #[error("the AiResponse for request {0} is not awaited from its responder")]
+    RejectAiResponseNotAwaited(String),
+
     #[error("the private AiRequest is not sealed to {0} of the {1} escrow keys of its tier cohort")]
     RejectPrivateRequestCoverage(usize, usize),
 

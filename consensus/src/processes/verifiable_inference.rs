@@ -18,6 +18,8 @@ pub enum VerifiableEraViolation {
     MalformedOpening,
     /// An AiResponse body longer than the pre-chain maximum before `trace_chain_activation`.
     BodyTooLongBeforeChain(usize),
+    /// An AiResponse or opening with inputs, outputs, a lock time, gas or a non-zero version.
+    Form,
 }
 
 impl std::fmt::Display for VerifiableEraViolation {
@@ -28,6 +30,7 @@ impl std::fmt::Display for VerifiableEraViolation {
             Self::ResponseWithoutTrace => write!(f, "AiResponse carries no trace commitment"),
             Self::MalformedOpening => write!(f, "opening payload does not decode"),
             Self::BodyTooLongBeforeChain(len) => write!(f, "AiResponse body of {len} bytes exceeds {} before the stage-2 activation", keryx_inference::MAX_AI_RESPONSE_PRIVATE_BODY_LEN_H14),
+            Self::Form => write!(f, "AI transaction carries inputs, outputs, a lock time, gas or a non-zero version"),
         }
     }
 }
@@ -56,6 +59,11 @@ pub fn check_verifiable_inference_era(
             return Err(VerifiableEraViolation::TraceBeforeActivation);
         }
         return Ok(());
+    }
+    if (tx.is_ai_response() || tx.is_ai_opening())
+        && (tx.version != 0 || !tx.inputs.is_empty() || !tx.outputs.is_empty() || tx.lock_time != 0 || tx.gas != 0)
+    {
+        return Err(VerifiableEraViolation::Form);
     }
     if tx.is_ai_opening() {
         let signed = SignedPayload::split(&tx.payload).ok_or(VerifiableEraViolation::MalformedOpening)?;
@@ -183,6 +191,35 @@ mod tests {
             Err(VerifiableEraViolation::ResponseWithoutTrace)
         );
         assert!(check_verifiable_inference_era(&tx(SUBNETWORK_ID_AI_RESPONSE, response(true)), end, gate, ForkActivation::never(), ForkActivation::never(), ForkActivation::never()).is_ok());
+    }
+
+    #[test]
+    fn ai_transactions_carry_a_fixed_form_once_active() {
+        use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutput};
+        let (gate, never) = (ForkActivation::new(GATE), ForkActivation::never());
+        let forms = |subnet: SubnetworkId, payload: Vec<u8>| {
+            let base = tx(subnet, payload);
+            let mut locked = base.clone();
+            locked.lock_time = 1;
+            let mut gassed = base.clone();
+            gassed.gas = 1;
+            let mut versioned = base.clone();
+            versioned.version = 1;
+            let mut paid = base.clone();
+            paid.outputs.push(TransactionOutput::new(0, ScriptPublicKey::from_vec(0, vec![])));
+            (base, [locked, gassed, versioned, paid])
+        };
+        for (subnet, payload) in [(SUBNETWORK_ID_AI_RESPONSE, response(true)), (SUBNETWORK_ID_AI_OPENING, opening())] {
+            let (base, variants) = forms(subnet, payload);
+            assert!(check_verifiable_inference_era(&base, GATE, gate, never, never, never).is_ok());
+            for t in variants {
+                assert_eq!(check_verifiable_inference_era(&t, GATE, gate, never, never, never), Err(VerifiableEraViolation::Form));
+            }
+        }
+        let (_, variants) = forms(SUBNETWORK_ID_AI_RESPONSE, response(false));
+        for t in variants {
+            assert!(check_verifiable_inference_era(&t, GATE - 1, gate, never, never, never).is_ok());
+        }
     }
 
     #[test]

@@ -229,12 +229,29 @@ mod tests {
         insert(signed_response(&stranger, request_hash, None)).unwrap();
         // The named responder's sealed answer is admitted.
         insert(signed_response(&named, request_hash, Some(body.clone()))).unwrap();
+        // Under the ledger rule, a request still in the mempool admits its named responders only.
+        consensus.set_response_rule(true);
+        assert_eq!(insert(signed_response(&late, request_hash, None)), Err(RuleError::RejectAiResponseNotAwaited(hex::encode(request_hash))));
+        consensus.set_response_rule(false);
 
         // Once the request leaves the mempool (mined), the mempool index forgets it; with no ledger
         // behind the mock, a later body-carrying answer is refused again.
         let block = build_block_transactions(once(request.tx.as_ref()));
         mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block).unwrap();
         assert_eq!(insert(signed_response(&late, request_hash, Some(body))), Err(RuleError::RejectAiResponseBody(hex::encode(request_hash))));
+
+        // Under the ledger rule, a response counts only while the ledger still takes it.
+        consensus.set_response_rule(true);
+        let (fresh, armed) = ([0x33u8; 32], [0x34u8; 32]);
+        let late_key = late.x_only_public_key().0.serialize();
+        // A request a block just carried is not in the ledger yet: its answers still enter.
+        insert(signed_response(&late, request_hash, None)).unwrap();
+        assert_eq!(insert(signed_response(&late, fresh, None)), Err(RuleError::RejectAiResponseNotAwaited(hex::encode(fresh))));
+        consensus.set_unarmed_request(fresh);
+        insert(signed_response(&late, fresh, None)).unwrap();
+        consensus.await_response(armed, late_key, 10);
+        insert(signed_response(&late, armed, None)).unwrap();
+        assert_eq!(insert(signed_response(&stranger, armed, None)), Err(RuleError::RejectAiResponseNotAwaited(hex::encode(armed))));
     }
 
     /// Openings are admitted only for a response awaiting one, signed by its escrow key, one per

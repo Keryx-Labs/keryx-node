@@ -1928,6 +1928,13 @@ impl ServiceLedger {
             .then_some(audit.window_end_daa)
     }
 
+    /// Whether a response to `request_hash` signed by `escrow_pubkey` can still count: the
+    /// request is pending and not armed yet, or armed and awaiting that responder.
+    pub fn response_admissible(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> bool {
+        self.pending.get(request_hash).is_some_and(|r| r.audit.is_none())
+            || self.awaited_response_deadline(request_hash, escrow_pubkey).is_some()
+    }
+
     /// Opening deadline of a drawn response still awaiting its opening.
     pub fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
         self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.deadline_daa)
@@ -5414,6 +5421,22 @@ mod tests {
                 }
                 assert!(run.ledger.trace_audits.is_empty());
             }
+        }
+
+        #[test]
+        fn a_response_is_admissible_until_its_responder_answered() {
+            let mut run = Run::audited_all();
+            let (member, stranger) = (miner().as_bytes(), [9u8; 32]);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(!run.ledger.response_admissible(&RH, &member), "unknown request");
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.ledger.response_admissible(&RH, &stranger), "pending, not armed");
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.ledger.response_admissible(&RH, &member));
+            assert!(!run.ledger.response_admissible(&RH, &stranger), "armed, not a member");
+            let (_, ev) = run.event(true);
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(!run.ledger.response_admissible(&RH, &member), "already answered");
         }
 
         #[test]

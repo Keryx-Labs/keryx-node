@@ -174,6 +174,7 @@ impl BlockBodyProcessor {
                     VerifiableEraViolation::TraceBeforeActivation => RuleError::AiTraceBeforeActivation(tx.id()),
                     VerifiableEraViolation::ResponseWithoutTrace => RuleError::AiResponseWithoutTrace(tx.id()),
                     VerifiableEraViolation::MalformedOpening => RuleError::AiOpeningMalformed(tx.id()),
+                    VerifiableEraViolation::Form => RuleError::AiTxForm(tx.id()),
                     VerifiableEraViolation::BodyTooLongBeforeChain(len) => RuleError::AiResponseBodyTooLong(tx.id(), len),
                 });
             }

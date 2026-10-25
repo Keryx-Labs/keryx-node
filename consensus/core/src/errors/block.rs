@@ -219,6 +219,9 @@ pub enum RuleError {
     #[error("opening tx {0} does not decode")]
     AiOpeningMalformed(TransactionId),
 
+    #[error("AI tx {0} carries inputs, outputs, a lock time, gas or a version other than zero")]
+    AiTxForm(TransactionId),
+
     #[error("AiResponse tx {0} carries a {1}-byte body above the pre-stage-2 maximum")]
     AiResponseBodyTooLong(TransactionId, usize),
 
