@@ -34,6 +34,8 @@ pub(crate) struct ConsensusMock {
     awaited_paths: RwLock<HashMap<[u8; 32], Vec<u64>>>,
     awaited_pieces: RwLock<HashMap<[u8; 32], u8>>,
     awaited_responses: RwLock<HashMap<([u8; 32], [u8; 32]), u64>>,
+    opening_deadlines: RwLock<HashMap<[u8; 32], u64>>,
+    private_recipients: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
 }
 
 impl ConsensusMock {
@@ -48,6 +50,8 @@ impl ConsensusMock {
             awaited_paths: RwLock::new(HashMap::default()),
             awaited_pieces: RwLock::new(HashMap::default()),
             awaited_responses: RwLock::new(HashMap::default()),
+            opening_deadlines: RwLock::new(HashMap::default()),
+            private_recipients: RwLock::new(HashMap::default()),
         }
     }
 
@@ -57,6 +61,14 @@ impl ConsensusMock {
 
     pub(crate) fn await_opening(&self, response_txid: [u8; 32], escrow_pubkey: [u8; 32]) {
         self.awaited_openings.write().insert(response_txid, escrow_pubkey);
+    }
+
+    pub(crate) fn set_private_recipients(&self, request_hash: [u8; 32], keys: Vec<[u8; 32]>) {
+        self.private_recipients.write().insert(request_hash, keys);
+    }
+
+    pub(crate) fn set_opening_deadline(&self, response_txid: [u8; 32], deadline: u64) {
+        self.opening_deadlines.write().insert(response_txid, deadline);
     }
 
     pub(crate) fn await_response(&self, request_hash: [u8; 32], escrow_pubkey: [u8; 32], deadline: u64) {
@@ -128,12 +140,16 @@ impl ConsensusApi for ConsensusMock {
         self.awaited_seeds.read().get(response_txid).copied()
     }
 
+    fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        self.private_recipients.read().get(request_hash).cloned()
+    }
+
     fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
         self.awaited_responses.read().get(&(*request_hash, *escrow_pubkey)).copied()
     }
 
     fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
-        self.awaited_openings.read().contains_key(response_txid).then_some(0)
+        self.awaited_openings.read().contains_key(response_txid).then(|| self.opening_deadlines.read().get(response_txid).copied().unwrap_or(0))
     }
 
     fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {

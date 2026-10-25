@@ -430,6 +430,60 @@ mod tests {
         assert!(!contained_by(soon.id(), &selected) && !contained_by(late.id(), &selected), "fee selection alone leaves them out");
     }
 
+    /// A response more urgent than the opening that cannot share its block leads instead.
+    #[test]
+    fn test_an_urgent_response_goes_before_a_heavy_opening() {
+        use keryx_consensus_core::collateral::{opening_signature_message, responder_signature_message};
+        use keryx_consensus_core::subnets::{SUBNETWORK_ID_AI_OPENING, SUBNETWORK_ID_AI_RESPONSE};
+        use keryx_inference::{AiResponder, AiResponsePayload};
+        use keryx_verifiable_inference::opening::{MAX_BODY_LEN, VERSION};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        const SMALL_BLOCK: u64 = 120_000;
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, SMALL_BLOCK, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let key = miner.x_only_public_key().0.serialize();
+        let response_txid = [0xA1u8; 32];
+        consensus.await_opening(response_txid, key);
+        consensus.set_opening_deadline(response_txid, 500);
+        let mut body = vec![0u8; MAX_BODY_LEN];
+        body[0] = VERSION;
+        body[1..33].copy_from_slice(&response_txid);
+        let sig = miner.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+        let mut payload = body;
+        payload.extend_from_slice(&key);
+        payload.extend_from_slice(sig.as_ref());
+        let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+        insert(opening.clone()).unwrap();
+
+        let request_hash = [0x5Au8; 32];
+        let mut resp = AiResponsePayload::new(request_hash, 1, [0x12u8; 34], 1).with_private_body(vec![7u8; 20_000]);
+        let sig = miner.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+        resp.responder = Some(AiResponder { escrow_pubkey: key, signature: *sig.as_ref() });
+        let response = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize());
+        consensus.set_private_recipients(request_hash, vec![key]);
+        insert(response.clone()).unwrap();
+
+        consensus.await_response(request_hash, key, 900);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), opening.id(), "the opening is due first");
+        consensus.await_response(request_hash, key, 100);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), response.id(), "the urgent response that cannot share the block leads");
+        assert!(!selected.iter().any(|tx| tx.id() == opening.id()));
+    }
+
     /// A full mempool admits openings and responses and never evicts them for a paying transaction.
     #[test]
     fn test_full_mempool_keeps_openings_and_responses() {
