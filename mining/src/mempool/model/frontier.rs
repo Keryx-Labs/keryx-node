@@ -233,15 +233,22 @@ impl Frontier {
     /// full transaction selection in less than 150 µs even if the frontier has 1M entries (!!). See mining/benches
     /// for more details.  
     pub fn build_selector(&self, policy: &Policy) -> Box<dyn TemplateTransactionSelector> {
-        self.build_selector_excluding(policy, &HashSet::new())
+        self.build_selector_excluding(policy, &HashSet::new(), 0)
     }
 
-    /// [`Self::build_selector`] over the frontier without the transactions of `exclude`.
-    pub fn build_selector_excluding(&self, policy: &Policy, exclude: &HashSet<TransactionId>) -> Box<dyn TemplateTransactionSelector> {
+    /// [`Self::build_selector`] over the frontier without the transactions of `exclude`, of
+    /// total mass `exclude_mass`.
+    pub fn build_selector_excluding(
+        &self,
+        policy: &Policy,
+        exclude: &HashSet<TransactionId>,
+        exclude_mass: u64,
+    ) -> Box<dyn TemplateTransactionSelector> {
         let kept = |k: &&FeerateTransactionKey| !exclude.contains(&k.tx.id());
-        if self.total_mass <= policy.max_block_mass {
+        let total_mass = self.total_mass.saturating_sub(exclude_mass);
+        if total_mass <= policy.max_block_mass {
             Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().filter(kept).map(|k| k.tx.clone()).collect()))
-        } else if self.total_mass > policy.max_block_mass * COLLISION_FACTOR {
+        } else if total_mass > policy.max_block_mass * COLLISION_FACTOR {
             let mut rng = rand::thread_rng();
             Box::new(SequenceSelector::new(self.sample_inplace_excluding(&mut rng, policy, &mut 0, exclude), policy.clone()))
         } else {
@@ -384,7 +391,7 @@ mod tests {
             let lead = build_feerate_key(0, 1650, paid);
             frontier.insert(lead.clone()).then_some(()).unwrap();
             let exclude: HashSet<TransactionId> = [lead.tx.id()].into();
-            let mut selector = LeadingSelector::new(vec![lead.tx.clone()], frontier.build_selector_excluding(&policy, &exclude));
+            let mut selector = LeadingSelector::new(vec![lead.tx.clone()], frontier.build_selector_excluding(&policy, &exclude, lead.mass));
             let selected = selector.select_transactions();
             assert_eq!(selected[0].id(), lead.tx.id());
             assert_eq!(selected.iter().filter(|tx| tx.id() == lead.tx.id()).count(), 1);

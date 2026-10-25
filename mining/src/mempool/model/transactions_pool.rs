@@ -211,7 +211,7 @@ impl TransactionsPool {
     /// Builds a transaction selector that puts `leads` first and leaves room for their `mass`
     pub(crate) fn build_selector_leading(&self, leads: Vec<Arc<Transaction>>, mass: u64) -> Box<dyn TemplateTransactionSelector> {
         let exclude = leads.iter().map(|tx| tx.id()).collect();
-        let inner = self.ready_transactions.build_selector_excluding(&Policy::new(self.config.maximum_mass_per_block.saturating_sub(mass)), &exclude);
+        let inner = self.ready_transactions.build_selector_excluding(&Policy::new(self.config.maximum_mass_per_block.saturating_sub(mass)), &exclude, mass);
         Box::new(LeadingSelector::new(leads, inner))
     }
 
@@ -244,6 +244,9 @@ impl TransactionsPool {
         // Returns a vector of transactions to be removed (the caller has to actually remove)
         // An opening or response the consensus awaits carries no fee and is never outbid
         let feerate_threshold = if awaited { f64::INFINITY } else { transaction.calculated_feerate().unwrap() };
+        if feerate_threshold <= 0.0 {
+            return Err(RuleError::RejectMempoolIsFull);
+        }
         let mut txs_to_remove = Vec::with_capacity(1); // Normally we expect a single removal
         let mut selection_overall_size = 0;
         for tx in self

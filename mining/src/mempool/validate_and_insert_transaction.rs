@@ -110,8 +110,10 @@ impl Mempool {
         // Before adding the transaction, check if there is room in the pool
         let transaction_size = transaction.mempool_estimated_bytes();
         let awaited = self.ai_tx_awaited(consensus, &transaction.tx);
-        let txs_to_remove =
-            self.transaction_pool.limit_transaction_count(&transaction, transaction_size, awaited, |mtx| self.ai_tx_awaited(consensus, &mtx.mtx.tx))?;
+        let awaited_ids = std::cell::OnceCell::new();
+        let txs_to_remove = self.transaction_pool.limit_transaction_count(&transaction, transaction_size, awaited, |mtx| {
+            awaited_ids.get_or_init(|| self.awaited_ai_ids(consensus)).contains(&mtx.id())
+        })?;
         if !txs_to_remove.is_empty() {
             let transaction_pool_len_before = self.transaction_pool.len();
             for x in txs_to_remove.iter() {
@@ -350,6 +352,24 @@ impl Mempool {
         AiResponsePayload::deserialize(&tx.payload)
             .and_then(|r| Some((r.request_hash, r.responder?.escrow_pubkey)))
             .is_some_and(|(rh, escrow)| consensus.awaited_response_deadline(&rh, &escrow).is_some())
+    }
+
+    /// Ids of the openings and responses in the mempool the consensus awaits.
+    fn awaited_ai_ids(&self, consensus: &dyn ConsensusApi) -> std::collections::HashSet<TransactionId> {
+        let mut ids: std::collections::HashSet<TransactionId> = self
+            .ai_opening_index
+            .values()
+            .filter(|id| self.transaction_pool.get(id).is_some_and(|tx| self.opening_awaited(consensus, &tx.mtx.tx)))
+            .copied()
+            .collect();
+        let entries: Vec<(([u8; 32], [u8; 32]), TransactionId)> = self
+            .ai_response_index
+            .iter()
+            .flat_map(|(request_hash, entries)| entries.iter().filter_map(move |(escrow, id)| Some(((*request_hash, (*escrow)?), *id))))
+            .collect();
+        let keys: Vec<([u8; 32], [u8; 32])> = entries.iter().map(|(k, _)| *k).collect();
+        ids.extend(consensus.awaited_response_deadlines(&keys).into_iter().zip(&entries).filter_map(|(d, (_, id))| d.map(|_| *id)));
+        ids
     }
 
     /// Openings in the mempool the consensus no longer awaits.
