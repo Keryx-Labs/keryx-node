@@ -7,6 +7,8 @@ use crate::merkle::{Hash, b3_path, b3_root, b3_verify};
 pub const BLOCK_BUDGET: usize = 96 * 1024;
 /// Largest difference of the log-sum-exp of two partials of the same positions.
 pub const LSE_TOL: f64 = 1.0 / 256.0;
+/// Largest difference between the log-sum-exp of the opened children and the committed one.
+pub const LSE_ROOT_TOL: f64 = 1.0 / 32.0;
 
 #[cfg(test)]
 thread_local! {
@@ -209,7 +211,7 @@ pub fn check_root(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[P
 /// [`check_root`] with the softmax mass of `children` matching the committed `lse` of the head.
 pub fn check_root_lse(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[Partial], gate: Option<&[f32]>, committed: f32) -> bool {
     committed.is_finite()
-        && combine(children).is_some_and(|c| (lse(&c) - committed as f64).abs() <= LSE_TOL)
+        && combine(children).is_some_and(|c| (lse(&c) - committed as f64).abs() <= LSE_ROOT_TOL)
         && check_root(x, layout, n_out, head, children, gate)
 }
 
@@ -217,15 +219,24 @@ pub fn check_root_lse(x: &[u8], layout: u8, n_out: usize, head: usize, children:
 const UNIFORM_EIGHTHS: u8 = 1;
 
 /// Draw weights of `parts`: each child's mass times its largest output value, floored at
-/// `2^-10` of the largest one, quantized to `u16` with every weight at least one.
+/// `2^-10` of the mass-weighted mean of those values, quantized to `u16` with every weight at
+/// least one; uniform when every output is zero.
 pub fn child_weights(parts: &[Partial]) -> Option<Vec<u16>> {
     let m = parts.iter().map(|p| p.m).fold(f64::NEG_INFINITY, f64::max);
-    let peak: Vec<f64> = parts.iter().map(|p| p.o.iter().fold(0f64, |a, x| a.max(x.abs()))).collect();
-    let tau = peak.iter().fold(0f64, |a, &x| a.max(x)) / 1024.0;
-    let c: Vec<f64> = parts.iter().zip(&peak).map(|(p, &o)| p.l * libm::exp(p.m - m) * (o + tau)).collect();
-    let total: f64 = c.iter().sum();
-    if parts.is_empty() || !m.is_finite() || !total.is_finite() || total <= 0.0 {
+    if parts.is_empty() || !m.is_finite() {
         return None;
+    }
+    let mass: Vec<f64> = parts.iter().map(|p| p.l * libm::exp(p.m - m)).collect();
+    let peak: Vec<f64> = parts.iter().map(|p| p.o.iter().fold(0f64, |a, x| a.max(x.abs()))).collect();
+    let total_mass: f64 = mass.iter().sum();
+    let tau = mass.iter().zip(&peak).map(|(w, o)| w * o).sum::<f64>() / total_mass / 1024.0;
+    let c: Vec<f64> = mass.iter().zip(&peak).map(|(w, &o)| w * (o + tau)).collect();
+    let total: f64 = c.iter().sum();
+    if !total_mass.is_finite() || total_mass <= 0.0 || !total.is_finite() {
+        return None;
+    }
+    if total <= 0.0 {
+        return Some(vec![1; parts.len()]);
     }
     Some(c.iter().map(|&x| ((x / total * 65535.0) as u64).clamp(1, 65535) as u16).collect())
 }
@@ -500,7 +511,7 @@ mod tests {
             let x = k.x(a);
             let mass = lse(&k.run((0, 256), a)) as f32;
             assert!(check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass), "{a:?}");
-            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + 0.05), "{a:?}");
+            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * LSE_ROOT_TOL) as f32), "{a:?}");
             assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, f32::NAN), "{a:?}");
         }
         let honest = k.decoded(&[], Arith::Exact);
@@ -546,6 +557,21 @@ mod tests {
         let mut nan = honest.clone();
         nan[0].m = f64::NAN;
         assert_eq!(child_weights(&nan), None);
+        let mut zero = honest.clone();
+        zero.iter_mut().for_each(|p| p.o.iter_mut().for_each(|x| *x = 0.0));
+        assert_eq!(child_weights(&zero), Some(vec![1; honest.len()]));
+    }
+
+    #[test]
+    fn a_negligible_child_cannot_raise_the_floor() {
+        let k = case(0, 256, 16, 4);
+        let honest = k.decoded(&[], Arith::Exact);
+        let low = honest.iter().map(|p| p.m).fold(f64::INFINITY, f64::min);
+        let mut quiet = honest.clone();
+        quiet[0] = Partial { o: vec![0.0; honest[0].o.len()], m: low - 40.0, l: 1.0 };
+        let mut loud = quiet.clone();
+        loud[0].o.iter_mut().for_each(|x| *x = 65504.0);
+        assert_eq!(child_weights(&loud), child_weights(&quiet));
     }
 
     #[test]
