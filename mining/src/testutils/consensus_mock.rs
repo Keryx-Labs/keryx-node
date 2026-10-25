@@ -57,6 +57,10 @@ impl ConsensusMock {
         self.awaited_openings.write().insert(response_txid, escrow_pubkey);
     }
 
+    pub(crate) fn clear_awaited_opening(&self, response_txid: &[u8; 32]) {
+        self.awaited_openings.write().remove(response_txid);
+    }
+
     pub(crate) fn await_attention_path(&self, response_txid: [u8; 32], path: Vec<u64>) {
         self.awaited_paths.write().insert(response_txid, path);
     }
@@ -112,6 +116,10 @@ impl ConsensusApi for ConsensusMock {
 
     fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.awaited_seeds.read().get(response_txid).copied()
+    }
+
+    fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.awaited_openings.read().contains_key(response_txid).then_some(0)
     }
 
     fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {

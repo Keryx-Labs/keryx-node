@@ -13,6 +13,7 @@ use self::{
     tx::Priority,
 };
 use keryx_consensus_core::{
+    api::ConsensusApi,
     block::TemplateTransactionSelector,
     tx::{MutableTransaction, TransactionId},
 };
@@ -148,10 +149,14 @@ impl Mempool {
         self.transaction_pool.ready_transaction_total_mass()
     }
 
-    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
-    pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
+    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier,
+    /// led by an awaited opening if any
+    pub(crate) fn build_selector(&self, consensus: &dyn ConsensusApi) -> Box<dyn TemplateTransactionSelector> {
         let _sw = Stopwatch::<10>::with_threshold("build_selector op");
-        self.transaction_pool.build_selector()
+        match self.leading_opening(consensus) {
+            Some(lead) => self.transaction_pool.build_selector_leading(lead),
+            None => self.transaction_pool.build_selector(),
+        }
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier

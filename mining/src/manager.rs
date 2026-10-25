@@ -107,7 +107,7 @@ impl MiningManager {
         loop {
             attempts += 1;
 
-            let selector = self.build_selector();
+            let selector = self.build_selector(consensus);
             let block_template_builder = BlockTemplateBuilder::new();
             let build_mode = if attempts < self.config.maximum_build_block_template_attempts {
                 TemplateBuildMode::Standard
@@ -198,8 +198,8 @@ impl MiningManager {
     }
 
     /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
-    pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
-        self.mempool.read().build_selector()
+    pub(crate) fn build_selector(&self, consensus: &dyn ConsensusApi) -> Box<dyn TemplateTransactionSelector> {
+        self.mempool.read().build_selector(consensus)
     }
 
     /// Returns realtime feerate estimations based on internal mempool state

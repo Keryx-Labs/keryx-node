@@ -194,6 +194,12 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// The opening deadline of a response whose opening is awaited.
+    fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        let _ = response_txid;
+        None
+    }
+
     /// The path of the attention phase a response awaits.
     fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
         let _ = response_txid;

@@ -18,6 +18,10 @@ use keryx_consensus_core::{
 use keryx_core::{debug, info};
 use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
+use rand::Rng;
+
+/// Number of awaited openings with the nearest deadlines a template lead is drawn from.
+const LEADING_OPENING_SPREAD: usize = 4;
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -275,6 +279,25 @@ impl Mempool {
         let held = self.ai_opening_index.get(&key).filter(|id| **id != tx.id())?;
         let held = self.transaction_pool.get(held)?;
         self.opening_awaited(consensus, &held.mtx.tx).then_some(key)
+    }
+
+    /// An awaited opening to lead a template, drawn among those with the nearest deadlines.
+    pub(crate) fn leading_opening(&self, consensus: &dyn ConsensusApi) -> Option<&MempoolTransaction> {
+        let mut due: Vec<(u64, TransactionId)> = self
+            .ai_opening_index
+            .values()
+            .filter_map(|id| {
+                let tx = self.transaction_pool.get(id)?;
+                let txid = ai_opening_response_txid(&tx.mtx.tx.payload)?;
+                consensus.awaited_opening_deadline(&txid).map(|deadline| (deadline, *id))
+            })
+            .collect();
+        if due.is_empty() {
+            return None;
+        }
+        due.sort_unstable();
+        let pick = rand::thread_rng().gen_range(0..due.len().min(LEADING_OPENING_SPREAD));
+        self.transaction_pool.get(&due[pick].1)
     }
 
     /// Openings in the mempool the consensus no longer awaits.

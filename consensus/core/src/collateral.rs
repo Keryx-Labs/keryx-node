@@ -1832,6 +1832,11 @@ impl ServiceLedger {
         self.trace_audits.get(response_txid).and_then(|a| a.seed)
     }
 
+    /// Opening deadline of a drawn response still awaiting its opening.
+    pub fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.deadline_daa)
+    }
+
     /// Pieces a drawn response still owes, `required` giving the pieces of a tier at an
     /// acceptance DAA.
     pub fn awaited_opening_pieces(&self, response_txid: &[u8; 32], required: impl Fn(u8, u64) -> u8) -> Option<u8> {

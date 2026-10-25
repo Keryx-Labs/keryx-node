@@ -160,3 +160,41 @@ impl TemplateTransactionSelector for TakeAllSelector {
         true
     }
 }
+
+/// A selector that puts one transaction ahead of the selection of an inner selector, which
+/// must leave room for its mass.
+pub struct LeadingSelector {
+    lead: Option<Arc<Transaction>>,
+    lead_id: TransactionId,
+    inner: Box<dyn TemplateTransactionSelector>,
+}
+
+impl LeadingSelector {
+    pub fn new(lead: Arc<Transaction>, inner: Box<dyn TemplateTransactionSelector>) -> Self {
+        Self { lead_id: lead.id(), lead: Some(lead), inner }
+    }
+}
+
+impl TemplateTransactionSelector for LeadingSelector {
+    fn select_transactions(&mut self) -> Vec<Transaction> {
+        let mut txs: Vec<Transaction> = self.lead.take().map(|tx| tx.as_ref().clone()).into_iter().collect();
+        for tx in self.inner.select_transactions() {
+            if tx.id() == self.lead_id {
+                self.inner.reject_selection(tx.id());
+            } else {
+                txs.push(tx);
+            }
+        }
+        txs
+    }
+
+    fn reject_selection(&mut self, tx_id: TransactionId) {
+        if tx_id != self.lead_id {
+            self.inner.reject_selection(tx_id);
+        }
+    }
+
+    fn is_successful(&self) -> bool {
+        self.inner.is_successful()
+    }
+}

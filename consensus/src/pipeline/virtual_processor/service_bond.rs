@@ -494,6 +494,10 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_opening_seed(response_txid)
     }
 
+    pub(crate) fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.service_ledger.lock().ledger.awaited_opening_deadline(response_txid)
+    }
+
     pub(crate) fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
         self.service_ledger.lock().ledger.awaited_attention_path(response_txid)
     }

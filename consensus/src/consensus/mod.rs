@@ -746,6 +746,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.awaited_opening_seed(response_txid)
     }
 
+    fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.virtual_processor.awaited_opening_deadline(response_txid)
+    }
+
     fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
         self.virtual_processor.awaited_attention_path(response_txid)
     }
