@@ -227,7 +227,7 @@ pub fn residual_link(dst: &[f32], add: &[f64], src: &[f32], scale: f64) -> Resul
     for ((&d, &a), &s) in dst.iter().zip(add).zip(src) {
         let s = s as f64;
         let tol = EPS_RESID * scale.abs() * (a.abs() + s.abs()) + f32::MIN_POSITIVE as f64;
-        if !(d as f64 - scale * (a + s)).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
+        if !tol.is_finite() || !(d as f64 - scale * (a + s)).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
             return Err(Fail::Mismatch);
         }
     }
@@ -247,6 +247,12 @@ pub fn shape(tier: &TierCtx, ctx: &ChainCtx, tok: u32) -> PosShape {
 
 pub(crate) fn f32s(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+/// [`f32s`] of committed activations, which must all be finite.
+pub(crate) fn finite_f32s(b: &[u8]) -> Result<Vec<f32>, Fail> {
+    let v = f32s(b);
+    if v.iter().all(|x| x.is_finite()) { Ok(v) } else { Err(Fail::Mismatch) }
 }
 
 pub(crate) fn f32_weights(tier: &TierCtx, w: &(EntryOpening, ChunkRange), index: u32, k: u64, offset: u64, n: u64) -> Result<Vec<f32>, Fail> {
@@ -273,7 +279,7 @@ fn whole_leaf(pos_root: &Hash, shape: &PosShape, index: u64, l: &LeafBytes, len:
     if !b3_verify(pos_root, shape.n_leaves, index, blake3::hash(&l.bytes).as_bytes(), &l.leaf_path) {
         return Err(Fail::Trace);
     }
-    Ok(f32s(&l.bytes))
+    finite_f32s(&l.bytes)
 }
 
 fn chunk_leaf_raw(c: &ExpertIds, total_len: u64, index: u64) -> Result<Hash, Fail> {
@@ -292,7 +298,7 @@ pub(crate) fn leaf_chunk(pos_root: &Hash, shape: &PosShape, leaf: u64, c: &LeafC
     if !b3_verify(pos_root, shape.n_leaves, leaf, &h, &c.leaf_path) {
         return Err(Fail::Trace);
     }
-    Ok(f32s(&c.chunk))
+    finite_f32s(&c.chunk)
 }
 
 fn n_chunks(total_len: u64) -> u64 {
@@ -538,7 +544,7 @@ impl MoeCheck<'_> {
                 sum += ws * y[j] as f64;
                 mag += (ws * y[j] as f64).abs();
             }
-            if !(dst[j] as f64 - sum).abs().partial_cmp(&(EPS_MOE * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
+            if !mag.is_finite() || !(dst[j] as f64 - sum).abs().partial_cmp(&(EPS_MOE * mag + f32::MIN_POSITIVE as f64)).is_some_and(std::cmp::Ordering::is_le) {
                 return Err(Fail::Mismatch);
             }
         }
@@ -599,7 +605,7 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     {
         return Err(Fail::Trace);
     }
-    let dst = f32s(&p.dst.chunk);
+    let dst = finite_f32s(&p.dst.chunk)?;
     let (off, n) = (c as usize * B3_CHUNK / 4, dst.len());
 
     let src = match (kind, &p.src) {
@@ -767,6 +773,18 @@ mod tests {
         assert_eq!(glu_link(&x, q8::MMVQ, D, 4, &h[128..256]), Ok(()));
         assert_eq!(glu_link(&x, q8::MMVQ, D, 5, &h[128..256]), Err(Fail::Mismatch));
         assert_eq!(glu_link(&x, q8::MMVQ, D, 15, &h[128..256]), Err(Fail::Mismatch));
+    }
+
+    #[test]
+    fn an_infinite_activation_never_passes_a_link() {
+        assert_eq!(residual_link(&[f32::INFINITY], &[f64::NEG_INFINITY], &[0.0], 1.0), Err(Fail::Mismatch));
+        assert_eq!(residual_link(&[f32::NEG_INFINITY], &[0.0], &[f32::INFINITY], 1.0), Err(Fail::Mismatch));
+        let leaf: Vec<u8> = [1.0f32, f32::INFINITY, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(finite_f32s(&leaf), Err(Fail::Mismatch));
+        let leaf: Vec<u8> = [1.0f32, f32::NAN].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(finite_f32s(&leaf), Err(Fail::Mismatch));
+        let leaf: Vec<u8> = [1.0f32, -2.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(finite_f32s(&leaf), Ok(vec![1.0, -2.5]));
     }
 
     #[test]

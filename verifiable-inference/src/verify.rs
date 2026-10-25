@@ -347,7 +347,7 @@ pub(crate) fn verify_point_at(
         let eps_glu = if g_entry.glu_op == manifest::GLU_GEGLU { EPS_GEGLU } else { EPS };
         (h, EPS * ((df * ru.y_hat).abs() * rg.scale + f.abs() * ru.scale) + eps_glu * (rg.y_hat * ru.y_hat).abs())
     };
-    if !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
+    if !(y.is_finite() && y_hat.is_finite() && tol.is_finite()) || !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
         return Err(Fail::Mismatch);
     }
     Ok((Report { t, rank, row, y, y_hat, tol }, Opened { pos_root, input: g_entry, layout, slot, expert: exp }))
