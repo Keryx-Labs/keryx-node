@@ -7,8 +7,15 @@ use crate::merkle::{Hash, b3_path, b3_root, b3_verify};
 pub const BLOCK_BUDGET: usize = 96 * 1024;
 /// Largest difference of the log-sum-exp of two partials of the same positions.
 pub const LSE_TOL: f64 = 1.0 / 256.0;
+/// Largest difference of the outputs of two partials of the same positions, in Q8 steps.
+pub const PARTIAL_STEPS: f64 = 0.25;
+/// Difference of one output value left out of the steps of a leaf: one f16 rounding of the
+/// smallest values.
+const LEAF_FLOOR: f64 = 1.0 / (1u64 << 24) as f64;
+/// The same for a node, whose children and parent are rounded each.
+const NODE_FLOOR: f64 = 2.0 * LEAF_FLOOR;
 /// Largest difference between the log-sum-exp of the opened children and the committed one.
-pub const LSE_ROOT_TOL: f64 = 1.0 / 32.0;
+pub const LSE_ROOT_TOL: f64 = 1.0 / 64.0;
 
 #[cfg(test)]
 thread_local! {
@@ -164,15 +171,16 @@ pub fn combine(parts: &[Partial]) -> Option<Partial> {
     (m.is_finite() && l.is_finite() && o.iter().all(|a| a.is_finite())).then_some(Partial { o, m, l })
 }
 
-/// Largest difference between `a` and `b`, in Q8 steps of each block of 32 values of `b`.
-fn steps(a: &[f64], b: &[f64]) -> Option<f64> {
-    if a.len() != b.len() || !b.len().is_multiple_of(32) {
+/// Largest difference between `a` and `b` beyond `floor` per value, in Q8 steps of each block of
+/// 32 values of `scale`.
+fn steps_on(a: &[f64], b: &[f64], scale: &[f64], floor: f64) -> Option<f64> {
+    if a.len() != b.len() || a.len() != scale.len() || !b.len().is_multiple_of(32) {
         return None;
     }
     let mut dev = 0f64;
-    for (x, y) in a.chunks_exact(32).zip(b.chunks_exact(32)) {
-        let step = (y.iter().fold(0f64, |m, v| m.max(v.abs())) / 127.0).max(f64::MIN_POSITIVE);
-        dev = x.iter().zip(y).fold(dev, |m, (p, q)| m.max((p - q).abs() / step));
+    for ((x, y), z) in a.chunks_exact(32).zip(b.chunks_exact(32)).zip(scale.chunks_exact(32)) {
+        let step = (z.iter().fold(0f64, |m, v| m.max(v.abs())) / 127.0).max(f64::MIN_POSITIVE);
+        dev = x.iter().zip(y).fold(dev, |m, (p, q)| m.max(((p - q).abs() - floor).max(0.0) / step));
     }
     Some(dev)
 }
@@ -184,12 +192,17 @@ pub fn lse(p: &Partial) -> f64 {
 
 /// Whether `a` and `b`, two partials of the same positions, agree.
 pub fn same_partial(a: &Partial, b: &Partial) -> bool {
-    (lse(a) - lse(b)).abs() <= LSE_TOL && steps(&a.o, &b.o).is_some_and(|d| d <= ATTN_THRESHOLD)
+    (lse(a) - lse(b)).abs() <= LSE_TOL && steps_on(&a.o, &b.o, &b.o, LEAF_FLOOR).is_some_and(|d| d <= PARTIAL_STEPS)
 }
 
 /// Whether `children` combine into `parent`.
 pub fn check_node(parent: &Partial, children: &[Partial]) -> bool {
-    combine(children).is_some_and(|c| same_partial(&c, parent))
+    let Some(c) = combine(children) else { return false };
+    let w: Vec<f64> = children.iter().map(|p| p.l * libm::exp(p.m - c.m) / c.l).collect();
+    let scale: Vec<f64> = (0..c.o.len())
+        .map(|k| children.iter().zip(&w).map(|(p, wi)| wi * p.o[k].abs()).sum::<f64>().max(parent.o.get(k).map_or(0.0, |x| x.abs())))
+        .collect();
+    (lse(&c) - lse(parent)).abs() <= LSE_TOL && steps_on(&c.o, &parent.o, &scale, NODE_FLOOR).is_some_and(|d| d <= PARTIAL_STEPS)
 }
 
 /// Whether the committed attention-output input `x` (`n_out` values, Q8_1 in `layout`) carries
@@ -596,6 +609,50 @@ mod tests {
         let mut swapped = children.clone();
         swapped.swap(0, 3);
         assert!(check_node(parent, &swapped));
+    }
+
+    #[test]
+    fn a_leaf_off_by_less_than_a_step_is_refused() {
+        let k = case(0, 256, 16, 4);
+        let (kr, vr) = k.leaf_rows(&[1, 3]);
+        let leaf = &k.decoded(&[1], Arith::Exact)[3];
+        assert!(check_leaf(&k.q, SCALE, &kr, &vr, leaf));
+        let step = leaf.o[..32].iter().fold(0f64, |m, v| m.max(v.abs())) / 127.0;
+        let i = (0..32).min_by(|&a, &b| leaf.o[a].abs().total_cmp(&leaf.o[b].abs())).unwrap();
+        let mut off = leaf.clone();
+        off.o[i] += 0.4 * step;
+        let off = decode_partials(&encode_partial(&off), D).unwrap().remove(0);
+        assert!(!check_leaf(&k.q, SCALE, &kr, &vr, &off));
+    }
+
+    #[test]
+    fn honest_children_that_cancel_still_combine_into_their_parent() {
+        let small = |seed| vecf(seed, D).iter().map(|v| v * 0.5).collect::<Vec<f64>>();
+        let big: Vec<f64> = vecf(5, D).iter().map(|v| v * 40.0).collect();
+        let a = Partial { o: big.iter().zip(small(6)).map(|(x, y)| x + y).collect(), m: 3.0, l: 2.0 };
+        let b = Partial { o: big.iter().zip(small(7)).map(|(x, y)| y - x).collect(), m: 3.0, l: 2.0 };
+        let round = |p: &Partial| decode_partials(&encode_partial(p), D).unwrap().remove(0);
+        let parent = round(&combine(&[a.clone(), b.clone()]).unwrap());
+        let children = [round(&a), round(&b)];
+        assert!(steps_on(&combine(&children).unwrap().o, &parent.o, &parent.o, 0.0).unwrap() > PARTIAL_STEPS, "the parent scale alone would refuse it");
+        assert!(check_node(&parent, &children));
+        let mut shifted = children.clone();
+        shifted[0].o.iter_mut().for_each(|x| *x += 1.0);
+        assert!(!check_node(&parent, &shifted));
+    }
+
+    #[test]
+    fn honest_partials_of_tiny_values_still_pass() {
+        let round = |p: &Partial| decode_partials(&encode_partial(p), D).unwrap().remove(0);
+        for scale in [1e-5, 3e-6, 1e-7, 1e-9] {
+            let k = case(0, 256, 16, 4);
+            let tiny = |p: &Partial| Partial { o: p.o.iter().map(|x| x * scale).collect(), ..p.clone() };
+            let children: Vec<Partial> = k.children(&[], Arith::Exact).iter().map(tiny).collect();
+            let parent = round(&combine(&children).unwrap());
+            let rounded: Vec<Partial> = children.iter().map(round).collect();
+            assert!(rounded.iter().zip(&children).all(|(r, c)| same_partial(c, r)), "leaves at {scale}");
+            assert!(check_node(&parent, &rounded), "node at {scale}");
+        }
     }
 
     #[test]
