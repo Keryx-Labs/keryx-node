@@ -874,8 +874,22 @@ struct HeldDraw {
     reward: u64,
 }
 
+/// Opening deadline added per drawn audit still open across the network: the chain carries
+/// about one opening every this many DAA.
+pub const OPENING_BACKLOG_DAA: u64 = 2;
+/// Largest opening deadline extension from the network backlog.
+pub const OPENING_BACKLOG_CAP_DAA: u64 = 36_000;
+/// Replays of its response an open audit costs its responder (first opening and phases), in
+/// units of the response's serving work.
+const OPEN_AUDIT_WORK_PASSES: u64 = 3;
+
 /// Longest a held draw waits for the audits of its candidates, from its opening.
 const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA;
+
+/// Opening deadline extension for `backlog` drawn audits still open.
+fn backlog_daa(backlog: u64) -> u64 {
+    backlog.saturating_mul(OPENING_BACKLOG_DAA).min(OPENING_BACKLOG_CAP_DAA)
+}
 
 /// Whether a candidate of the draw of `rh` is in `awaiting`.
 fn draw_awaits_audit(awaiting: &std::collections::BTreeSet<([u8; 32], Hash)>, rh: &[u8; 32], draw: &RewardDraw) -> bool {
@@ -1054,7 +1068,8 @@ pub struct ServiceLedger {
     /// Shapes of traced responses whose request was not pending yet, by `(request hash,
     /// responder)`; judged when the request is admitted, dropped with `early_responses`.
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
-    /// Trace roots of a retired rule, with the daa of their response; kept until they expire.
+    /// Transaction ids of the traced responses already recorded, with the daa they were first
+    /// accepted at: a response accepted again is not audited again.
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
     held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
@@ -1499,7 +1514,12 @@ impl ServiceLedger {
                             continue;
                         }
                         let is_late = late.contains(miner);
-                        if excused && !is_late {
+                        let capped = audit
+                            .v3
+                            .as_ref()
+                            .and_then(|w| audit.cohort.binary_search(miner).ok().and_then(|i| w.queue.get(i)))
+                            .is_some_and(|(_, capped)| *capped);
+                        if (excused || capped) && !is_late {
                             outcome.excused.push((rh, *miner));
                             continue;
                         }
@@ -1656,7 +1676,10 @@ impl ServiceLedger {
         outcome: &mut FoldOutcome,
     ) {
         for ev in tr.responses {
-            if self.trace_audits.contains_key(&ev.response_txid) || misshaped.contains(&(ev.request_hash, ev.responder)) {
+            if self.trace_audits.contains_key(&ev.response_txid)
+                || self.trace_roots.contains_key(&ev.response_txid)
+                || misshaped.contains(&(ev.request_hash, ev.responder))
+            {
                 continue;
             }
             let mut a = TraceAudit {
@@ -1677,6 +1700,7 @@ impl ServiceLedger {
             };
             self.resolve_trace_audit(&mut a);
             self.trace_audits.insert(ev.response_txid, a);
+            self.trace_roots.insert(ev.response_txid, daa);
         }
 
         let ripe: Vec<[u8; 32]> = self
@@ -1685,15 +1709,23 @@ impl ServiceLedger {
             .filter(|(_, a)| a.seed.is_none() && daa >= a.accepted_daa + TRACE_SEED_DELAY_DAA)
             .map(|(k, _)| *k)
             .collect();
+        let mut backlog = self.trace_audits.values().filter(|a| a.seed.is_some()).count() as u64;
         for txid in ripe {
             let mut a = self.trace_audits.remove(&txid).unwrap();
             self.resolve_trace_audit(&mut a);
+            let unarmed = self.pending.get(&a.request_hash).is_none_or(|r| r.audit.is_none());
+            if a.identities.is_empty() && unarmed && daa < a.accepted_daa + SERVICE_EARLY_RESPONSE_HORIZON_DAA {
+                // An answer accepted before its request is drawn once the request arms.
+                self.trace_audits.insert(txid, a);
+                continue;
+            }
             let seed = trace_seed(&tr.chain_hash, &txid);
             let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
             if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
                 let prompt = if rules.as_ref().is_some_and(|r| r.attention) { attn_first_prompt_daa(a.n_prompt) } else { 0 };
-                a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt;
+                a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt + backlog_daa(backlog);
                 a.seed = Some(seed);
+                backlog += 1;
                 self.trace_audits.insert(txid, a);
             }
         }
@@ -1744,7 +1776,8 @@ impl ServiceLedger {
             if let Some((root, n, weights)) = next {
                 let path = a.attn.take().map(|p| p.path).unwrap_or_default();
                 a.attn = Some(AttnProgress { path, root, n, accepted_daa: daa, drawn: false, weights });
-                a.deadline_daa = a.deadline_daa.max(daa + TRACE_SEED_DELAY_DAA + attn_phase_window_daa(a.tier, a.max_tokens, a.n_prompt, a.n_pos));
+                a.deadline_daa =
+                    a.deadline_daa.max(daa + TRACE_SEED_DELAY_DAA + attn_phase_window_daa(a.tier, a.max_tokens, a.n_prompt, a.n_pos) + backlog_daa(backlog));
                 self.trace_audits.insert(op.response_txid, a);
                 continue;
             }
@@ -2111,7 +2144,13 @@ impl ServiceLedger {
                     })
                     .map(|(_, j)| j.reference_work())
                     .collect();
-                (ahead.iter().sum(), ahead.len() > SERVICE_QUEUE_CAP)
+                let audits: u64 = self
+                    .trace_audits
+                    .values()
+                    .filter(|a| a.identities.contains(m))
+                    .map(|a| OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt)))
+                    .sum();
+                (ahead.iter().sum::<u64>() + audits, ahead.len() > SERVICE_QUEUE_CAP)
             })
             .collect();
         let own = service_window_daa_v3(req.tier, req.prompt_len, req.max_tokens);
@@ -5307,7 +5346,8 @@ mod tests {
                 assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
                 assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
                 assert_eq!(run.ledger.trace_audits.len(), 2);
-                let deadline = run.deadline();
+                let deadline = run.ledger.trace_audits.values().map(|a| a.deadline_daa).max().unwrap();
+                assert_eq!(deadline, run.deadline() + super::super::OPENING_BACKLOG_DAA, "the second draw waits behind the first");
                 let misses = run.fold(deadline + 1, Hash::from_bytes([3u8; 32]), &[], &[]);
                 if sanction {
                     assert_eq!(misses, vec![(miner(), 1), (miner(), 2)]);
@@ -5373,8 +5413,25 @@ mod tests {
             assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
             assert_eq!(run.ledger.trace_audits.len(), 2);
             assert!(run.ledger.trace_audits.contains_key(&TXID) && run.ledger.trace_audits.contains_key(&TXID2));
-            assert!(run.ledger.trace_roots.is_empty());
+            assert_eq!(run.ledger.trace_roots.len(), 2);
             assert_eq!(run.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
+        }
+
+        #[test]
+        fn a_response_accepted_again_after_its_verdict_is_not_audited_again() {
+            let mut runs = [Run::sanctioned(), Run::sanctioned()];
+            let mut outcomes = Vec::new();
+            for (i, run) in runs.iter_mut().enumerate() {
+                let (deadline, body) = run.until_draw(true, true);
+                let ev = run.event(true).1;
+                assert!(run.fold(203, chain_hash(false), &[], &[opening(ESCROW_PK, body)]).is_empty());
+                assert!(!run.ledger.trace_audits.contains_key(&TXID), "the verdict closes the audit");
+                let replay = if i == 1 { vec![ev] } else { Vec::new() };
+                run.fold(300, chain_hash(false), &replay, &[]);
+                assert!(!run.ledger.trace_audits.contains_key(&TXID), "a replayed response opens no audit");
+                outcomes.push(run.fold(deadline + 2_000, chain_hash(true), &[], &[]));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "a replay strikes no one");
         }
 
         #[test]
@@ -5499,12 +5556,12 @@ mod tests {
             let h0 = Hash::from_bytes([0u8; 32]);
             assert!(run.fold(98, h0, &[ev], &[]).is_empty());
             let bytes = run.ledger.snapshot().to_bytes();
-            assert_eq!(bytes[0], 4);
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT);
             assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), run.ledger.snapshot());
             assert!(run.fold(100, h0, &[], &[]).is_empty());
             let snap = run.ledger.snapshot();
             let bytes = snap.to_bytes();
-            assert_eq!(bytes[0], 4);
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT);
             let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
             assert_eq!(parsed, snap);
             assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
@@ -5523,7 +5580,7 @@ mod tests {
             let (deadline, body) = run.until_draw(true, true);
             let snap = run.ledger.snapshot();
             let bytes = snap.to_bytes();
-            assert_eq!(bytes[0], 3);
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT);
             let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
             assert_eq!(parsed, snap);
             assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
@@ -5533,7 +5590,7 @@ mod tests {
             assert_eq!(restored.ledger.trace_audits.get(&TXID).unwrap().deadline_daa, deadline);
             let h = Hash::from_bytes([3u8; 32]);
             assert!(restored.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
-            assert_eq!(restored.ledger.snapshot().to_bytes()[0], 1);
+            assert_eq!(restored.ledger.snapshot().to_bytes()[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT, "the response stays remembered");
         }
     }
 
@@ -5854,6 +5911,24 @@ mod tests {
         }
 
         #[test]
+        fn an_answer_accepted_long_before_its_request_is_drawn_once_it_arms() {
+            let a = id(1);
+            let mut net = Net::new(true, true, vec![a]);
+            net.audit_all = true;
+            net.fold(0, chain(0), &[], &[(RH, a, Some((4, 20)))]);
+            for daa in 1..150 {
+                net.fold(daa, chain(0), &[], &[]);
+            }
+            assert_eq!(net.ledger.trace_audits.len(), 1, "the audit waits for its request");
+            net.fold(150, chain(0), &[(RH, 256)], &[]);
+            net.fold(151, chain(0), &[], &[]);
+            net.fold(152, chain(0), &[], &[]);
+            let audit = net.ledger.trace_audits.values().next().expect("the early answer is audited");
+            assert_eq!(audit.identities, vec![a]);
+            assert!(audit.seed.is_some());
+        }
+
+        #[test]
         fn a_held_draw_drops_the_candidates_still_unjudged_at_its_horizon() {
             let (a, b) = (id(1), id(2));
             let mut net = Net::new(true, true, vec![a, b]);
@@ -5965,6 +6040,21 @@ mod tests {
         }
 
         #[test]
+        fn open_audits_extend_the_queue_of_their_responder() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.audit_all = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, Some((0, 256)))]);
+            net.fold(103, chain(0), &[], &[]);
+            let replays = 3 * service_work_daa(0, 0, 256);
+            let w = net.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
+            assert_eq!(w.queue[1], (replays, false), "b's open audit is work ahead of the next request");
+            assert!(net.window_end(&RH2) >= 103 + replays);
+        }
+
+        #[test]
         fn the_queue_ahead_extends_the_deadline() {
             let (a, b) = (id(1), id(2));
             let mut net = Net::new(false, true, vec![a, b]);
@@ -5972,14 +6062,14 @@ mod tests {
             net.fold(101, chain(0), &[], &[]);
             let first_end = net.window_end(&RH);
             // b already served the first request: only a has it queued
-            net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, Some((0, 256)))]);
+            net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, None)]);
             net.fold(103, chain(0), &[], &[]);
             let queued = service_work_daa(0, 0, 256);
             assert_eq!(net.window_end(&RH2), 103 + 381 + queued);
             assert_eq!(net.window_end(&RH), first_end);
             let w = net.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
             assert_eq!(w.queue, vec![(queued, false), (0, false)]);
-            net.fold(300, chain(0), &[], &[(RH, a, Some((0, 256)))]);
+            net.fold(300, chain(0), &[], &[(RH, a, None)]);
             // past its own work, inside its own work plus the queue
             net.fold(103 + 381 + queued, chain(0), &[], &[(RH2, a, Some((0, 256))), (RH2, b, Some((0, 256)))]);
             assert!(!net.ledger.pending.contains_key(&RH));
