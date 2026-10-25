@@ -2629,6 +2629,8 @@ mod recur_tests {
         fused_dt: bool,
         /// One huge output column per head, the other columns forged, the output committed from them.
         spike_o: bool,
+        /// A huge write strength at the first position, the recurrence following it.
+        big_beta: bool,
     }
 
     struct Rt {
@@ -2787,7 +2789,7 @@ mod recur_tests {
                 let v: Vec<f64> = (0..HD).map(|i| conv(2, t, vo + i)).collect();
                 l2(&mut q);
                 l2(&mut k);
-                let beta = sig(y_t[beta_r as usize][h] as f64);
+                let beta = if cfg.big_beta && t == 0 { 4.0 } else { sig(y_t[beta_r as usize][h] as f64) };
                 let g: Vec<f64> = (0..gw).map(|i| a[h] as f64 * {
                     let x = y_t[decay_r as usize][h * gw + i] as f64 + if cfg.fused_dt { 0.0 } else { dt[h * gw + i] as f64 };
                     if x > 20.0 { x } else { libm::log1p(libm::exp(x)) }
@@ -2949,7 +2951,7 @@ mod recur_tests {
         (0..64u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
     }
 
-    const GDA: Cfg = Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false, fused_dt: false, spike_o: false };
+    const GDA: Cfg = Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false, fused_dt: false, spike_o: false, big_beta: false };
     const KINDS: [Cfg; 3] = [GDA, Cfg { kda: true, ..GDA }, Cfg { kda: true, fused_dt: true, ..GDA }];
 
     #[test]
@@ -3012,6 +3014,22 @@ mod recur_tests {
             for s in seeds() {
                 assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {} fused {}", c.kda, c.fused_dt);
             }
+        }
+    }
+
+    #[test]
+    fn a_write_strength_beyond_the_sigmoid_is_refused() {
+        for c in KINDS {
+            let rt = build(Cfg { big_beta: true, ..c });
+            let mut first = 0;
+            for s in seeds() {
+                let segment = draw::point(&s, crate::recur::RECUR_POINT)[0] % (N_POS as u64).div_ceil(IV as u64);
+                if segment == 0 {
+                    first += 1;
+                    assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
+                }
+            }
+            assert!(first > 0);
         }
     }
 

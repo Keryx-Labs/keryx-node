@@ -118,7 +118,9 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     for rec in &recs {
         let g: Vec<f64> = if kda { rec.g.iter().map(|&x| libm::exp(x as f64)).collect() } else { vec![libm::exp(rec.g[0] as f64); hd] };
         let q_norm = libm::sqrt(rec.q.iter().map(|&x| x as f64 * x as f64).sum::<f64>());
-        if q_norm > 1.0 + RECUR_TOL {
+        let k_norm = libm::sqrt(rec.k.iter().map(|&x| x as f64 * x as f64).sum::<f64>());
+        let beta = rec.beta as f64;
+        if q_norm > 1.0 + RECUR_TOL || k_norm > 1.0 + RECUR_TOL || !(0.0..=1.0 + RECUR_TOL).contains(&beta) || rec.g.iter().any(|&x| x as f64 > RECUR_TOL) {
             return Err(Fail::Mismatch);
         }
         for (ri, row) in state.iter_mut().enumerate() {
