@@ -884,7 +884,10 @@ pub const OPENING_BACKLOG_CAP_DAA: u64 = 36_000;
 const OPEN_AUDIT_WORK_PASSES: u64 = 3;
 
 /// Longest a held draw waits for the audits of its candidates, from its opening.
-const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA;
+const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA + OPENING_BACKLOG_CAP_DAA;
+/// How long a drawn response is remembered so that accepting it again opens no new audit: past
+/// it, its request can no longer be pending.
+const TRACE_REPLAY_MEMORY_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA + SERVICE_EARLY_RESPONSE_HORIZON_DAA;
 
 /// Opening deadline extension for `backlog` drawn audits still open.
 fn backlog_daa(backlog: u64) -> u64 {
@@ -1068,8 +1071,8 @@ pub struct ServiceLedger {
     /// Shapes of traced responses whose request was not pending yet, by `(request hash,
     /// responder)`; judged when the request is admitted, dropped with `early_responses`.
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
-    /// Transaction ids of the traced responses already recorded, with the daa they were first
-    /// accepted at: a response accepted again is not audited again.
+    /// Transaction ids of the drawn traced responses, with the daa of their draw: a response
+    /// accepted again is not audited again.
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
     held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
@@ -1363,7 +1366,7 @@ impl ServiceLedger {
             }
         }
 
-        self.trace_roots.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
+        self.trace_roots.retain(|_, seen| *seen + TRACE_REPLAY_MEMORY_DAA > daa);
 
         // An authenticated response (signed by a delegated escrow key) marks every cohort
         // identity that delegated to it as having served this audit and resets their streak.
@@ -1514,12 +1517,7 @@ impl ServiceLedger {
                             continue;
                         }
                         let is_late = late.contains(miner);
-                        let capped = audit
-                            .v3
-                            .as_ref()
-                            .and_then(|w| audit.cohort.binary_search(miner).ok().and_then(|i| w.queue.get(i)))
-                            .is_some_and(|(_, capped)| *capped);
-                        if (excused || capped) && !is_late {
+                        if excused && !is_late {
                             outcome.excused.push((rh, *miner));
                             continue;
                         }
@@ -1600,7 +1598,8 @@ impl ServiceLedger {
                                 if ids.binary_search(identity).is_ok() && !responded.contains(identity) {
                                     responded.push(*identity);
                                     answers.push((*identity, daa, shape));
-                                    if !audit_rule || shape.is_some() {
+                                    let audited = self.trace_audits.values().any(|a| a.request_hash == rh && a.responder == *key);
+                                    if !audit_rule || (shape.is_some() && audited) {
                                         drawable.push(*identity);
                                     }
                                     member = true;
@@ -1700,7 +1699,6 @@ impl ServiceLedger {
             };
             self.resolve_trace_audit(&mut a);
             self.trace_audits.insert(ev.response_txid, a);
-            self.trace_roots.insert(ev.response_txid, daa);
         }
 
         let ripe: Vec<[u8; 32]> = self
@@ -1713,12 +1711,6 @@ impl ServiceLedger {
         for txid in ripe {
             let mut a = self.trace_audits.remove(&txid).unwrap();
             self.resolve_trace_audit(&mut a);
-            let unarmed = self.pending.get(&a.request_hash).is_none_or(|r| r.audit.is_none());
-            if a.identities.is_empty() && unarmed && daa < a.accepted_daa + SERVICE_EARLY_RESPONSE_HORIZON_DAA {
-                // An answer accepted before its request is drawn once the request arms.
-                self.trace_audits.insert(txid, a);
-                continue;
-            }
             let seed = trace_seed(&tr.chain_hash, &txid);
             let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
             if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
@@ -1726,6 +1718,7 @@ impl ServiceLedger {
                 a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt + backlog_daa(backlog);
                 a.seed = Some(seed);
                 backlog += 1;
+                self.trace_roots.insert(txid, daa);
                 self.trace_audits.insert(txid, a);
             }
         }
@@ -5413,7 +5406,7 @@ mod tests {
             assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
             assert_eq!(run.ledger.trace_audits.len(), 2);
             assert!(run.ledger.trace_audits.contains_key(&TXID) && run.ledger.trace_audits.contains_key(&TXID2));
-            assert_eq!(run.ledger.trace_roots.len(), 2);
+            assert!(run.ledger.trace_roots.is_empty(), "remembered once drawn");
             assert_eq!(run.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
         }
 
@@ -5556,12 +5549,12 @@ mod tests {
             let h0 = Hash::from_bytes([0u8; 32]);
             assert!(run.fold(98, h0, &[ev], &[]).is_empty());
             let bytes = run.ledger.snapshot().to_bytes();
-            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT);
+            assert_eq!(bytes[0], 4);
             assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), run.ledger.snapshot());
             assert!(run.fold(100, h0, &[], &[]).is_empty());
             let snap = run.ledger.snapshot();
             let bytes = snap.to_bytes();
-            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT);
+            assert_eq!(bytes[0], 4);
             let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
             assert_eq!(parsed, snap);
             assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
@@ -5911,7 +5904,7 @@ mod tests {
         }
 
         #[test]
-        fn an_answer_accepted_long_before_its_request_is_drawn_once_it_arms() {
+        fn an_answer_accepted_long_before_its_request_is_credited_but_not_drawn() {
             let a = id(1);
             let mut net = Net::new(true, true, vec![a]);
             net.audit_all = true;
@@ -5919,13 +5912,12 @@ mod tests {
             for daa in 1..150 {
                 net.fold(daa, chain(0), &[], &[]);
             }
-            assert_eq!(net.ledger.trace_audits.len(), 1, "the audit waits for its request");
+            assert!(net.ledger.trace_audits.is_empty(), "no request to bind the audit to");
             net.fold(150, chain(0), &[(RH, 256)], &[]);
             net.fold(151, chain(0), &[], &[]);
-            net.fold(152, chain(0), &[], &[]);
-            let audit = net.ledger.trace_audits.values().next().expect("the early answer is audited");
-            assert_eq!(audit.identities, vec![a]);
-            assert!(audit.seed.is_some());
+            let req = net.ledger.pending.get(&RH).unwrap();
+            assert_eq!(req.audit.as_ref().unwrap().responded, vec![a], "the answer still counts for the cohort");
+            assert!(req.draw.is_none(), "an answer that escaped its audit draws nothing");
         }
 
         #[test]
