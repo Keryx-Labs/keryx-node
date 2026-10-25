@@ -694,6 +694,9 @@ pub const SERVICE_EARLY_RESPONSE_HORIZON_DAA: u64 = 36_000;
 /// Ceiling on distinct request hashes held by the above. Eviction takes the oldest first and only
 /// returns an inversion to the behaviour it had before it was handled — it never creates a miss.
 const MAX_EARLY_RESPONSE_HASHES: usize = 4_096;
+/// Responders kept per request not accepted yet under the sanction rule: the most keys a private
+/// request can be sealed to.
+const EARLY_KEYS_PER_REQUEST: usize = 128;
 
 /// Penalty applied to a miner for a missed service assignment, by consecutive-miss count.
 /// A successful serve resets the count.
@@ -874,8 +877,8 @@ struct HeldDraw {
     reward: u64,
 }
 
-/// Opening deadline added per drawn audit still open across the network: the chain carries
-/// about one opening every this many DAA.
+/// Opening deadline added per piece still owed by the drawn audits open across the network:
+/// the chain carries about one opening every this many DAA.
 pub const OPENING_BACKLOG_DAA: u64 = 2;
 /// Largest opening deadline extension from the network backlog.
 pub const OPENING_BACKLOG_CAP_DAA: u64 = 36_000;
@@ -889,7 +892,7 @@ const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA + OPENING_BACKLOG_
 /// it, its request can no longer be pending.
 const TRACE_REPLAY_MEMORY_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA + SERVICE_EARLY_RESPONSE_HORIZON_DAA;
 
-/// Opening deadline extension for `backlog` drawn audits still open.
+/// Opening deadline extension for `backlog` pieces still owed.
 fn backlog_daa(backlog: u64) -> u64 {
     backlog.saturating_mul(OPENING_BACKLOG_DAA).min(OPENING_BACKLOG_CAP_DAA)
 }
@@ -1323,6 +1326,9 @@ impl ServiceLedger {
                 let keep = tr.context || tr.window_v3;
                 self.early_shapes.retain(|(h, key), _| h != rh || (keep && early.contains(key)));
             }
+            if sanction && !entry.recipients.is_empty() {
+                early.retain(|key| entry.recipients.contains(key));
+            }
             // Answers that beat their own request to acceptance.
             if entry.audit.is_none() {
                 for key in early {
@@ -1384,11 +1390,14 @@ impl ServiceLedger {
             {
                 let Some(req) = self.pending.get_mut(rh) else {
                     let entry = self.early_responses.entry(*rh).or_insert((daa, Vec::new()));
-                    if !entry.1.contains(r) {
+                    if !entry.1.contains(r) && !(sanction && entry.1.len() >= EARLY_KEYS_PER_REQUEST) {
                         entry.1.push(*r);
                     }
                     continue;
                 };
+                if sanction && !req.recipients.is_empty() && !req.recipients.contains(r) {
+                    continue;
+                }
                 req_tier = req.tier;
                 let req_max_tokens = req.max_tokens;
                 req_accepted = req.accepted_daa;
@@ -1688,6 +1697,7 @@ impl ServiceLedger {
             if self.trace_audits.contains_key(&ev.response_txid)
                 || self.trace_roots.contains_key(&ev.response_txid)
                 || misshaped.contains(&(ev.request_hash, ev.responder))
+                || (tr.sanction && !self.trace_response_known(ev))
                 || (tr.sanction && !audited.insert((ev.request_hash, ev.responder)))
             {
                 continue;
@@ -1718,7 +1728,13 @@ impl ServiceLedger {
             .filter(|(_, a)| a.seed.is_none() && daa >= a.accepted_daa + TRACE_SEED_DELAY_DAA)
             .map(|(k, _)| *k)
             .collect();
-        let mut backlog = self.trace_audits.values().filter(|a| a.seed.is_some()).count() as u64;
+        let owed = |a: &TraceAudit| (required_pieces((tr.tier)(a.tier, a.accepted_daa).as_ref()) & !a.pieces).count_ones() as u64;
+        let mut backlog: u64 = self.trace_audits.values().filter(|a| a.seed.is_some()).map(owed).sum();
+        let mut chain_end: std::collections::BTreeMap<[u8; 32], u64> = std::collections::BTreeMap::new();
+        for a in self.trace_audits.values().filter(|a| a.seed.is_some()) {
+            let end = chain_end.entry(a.escrow_pubkey).or_insert(0);
+            *end = (*end).max(a.deadline_daa);
+        }
         for txid in ripe {
             let mut a = self.trace_audits.remove(&txid).unwrap();
             self.resolve_trace_audit(&mut a);
@@ -1726,10 +1742,18 @@ impl ServiceLedger {
             let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
             if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
                 let prompt = if rules.as_ref().is_some_and(|r| r.attention) { attn_first_prompt_daa(a.n_prompt) } else { 0 };
-                a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt + backlog_daa(backlog);
-                a.seed = Some(seed);
-                backlog += 1;
+                let own = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt;
+                let work = OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt));
+                let start = chain_end.get(&a.escrow_pubkey).map_or(own, |&end| own.max(end + work));
                 self.trace_roots.insert(txid, daa);
+                if start - own > OPENING_BACKLOG_CAP_DAA {
+                    self.drop_draw_candidates(&a.request_hash, &a.identities);
+                    continue;
+                }
+                a.deadline_daa = start + backlog_daa(backlog);
+                a.seed = Some(seed);
+                backlog += owed(&a);
+                chain_end.insert(a.escrow_pubkey, a.deadline_daa);
                 self.trace_audits.insert(txid, a);
             }
         }
@@ -2236,6 +2260,11 @@ impl ServiceLedger {
     }
 
     /// The miner's strike state: the folded delta, falling back to the persisted baseline.
+    /// Whether a traced response answers a request the ledger holds, from one of its recipients.
+    fn trace_response_known(&self, ev: &TraceResponseEvent) -> bool {
+        self.pending.get(&ev.request_hash).is_some_and(|r| r.recipients.is_empty() || r.recipients.contains(&ev.responder))
+    }
+
     /// Whether the miner already took a strike in the block at `daa`: under the sanction rule a
     /// miner takes at most one strike and no reset per block.
     fn struck_at(&self, miner: &Hash, daa: u64) -> bool {
@@ -5366,9 +5395,11 @@ mod tests {
             assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
             assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
             assert_eq!(run.ledger.trace_audits.len(), 2);
-            let first = run.deadline();
-            let last = run.ledger.trace_audits.values().map(|a| a.deadline_daa).max().unwrap();
-            assert_eq!(last, first + super::super::OPENING_BACKLOG_DAA, "the second draw waits behind the first");
+            let first = run.ledger.trace_audits.values().map(|a| a.deadline_daa).min().unwrap();
+            let second = run.ledger.trace_audits.values().max_by_key(|a| a.deadline_daa).unwrap();
+            let work = super::super::OPEN_AUDIT_WORK_PASSES * super::super::service_work_daa(0, second.n_prompt, second.n_pos - second.n_prompt);
+            let last = second.deadline_daa;
+            assert_eq!(last, first + work + super::super::OPENING_BACKLOG_DAA, "the second draw of one key chains behind the first");
             (run, first, last)
         }
 
@@ -5726,6 +5757,8 @@ mod tests {
             audit_all: bool,
             /// Sanction rule.
             sanction: bool,
+            /// Keys every request of the run is sealed to; empty for a public request.
+            recipients: Vec<Hash>,
         }
 
         impl Net {
@@ -5733,7 +5766,7 @@ mod tests {
                 let mut ledger = ServiceLedger::default();
                 ledger.set_window_v2_activation(0);
                 ledger.set_reward_routing_activation(0);
-                Self { ledger, cohort, draw, window_v3, same_root: false, dedup: false, audit_all: false, sanction: false }
+                Self { ledger, cohort, draw, window_v3, same_root: false, dedup: false, audit_all: false, sanction: false, recipients: Vec::new() }
             }
 
             /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
@@ -5786,13 +5819,18 @@ mod tests {
                 };
                 let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
                 let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
+                let sealed: Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)> = if self.recipients.is_empty() {
+                    Vec::new()
+                } else {
+                    requests.iter().map(|(h, _)| (*h, [0u8; 36], self.recipients.clone())).collect()
+                };
                 let resp: Vec<([u8; 32], Option<Hash>)> = answers.iter().map(|(rh, r, _)| (*rh, Some(*r))).collect();
                 let set = self.cohort.clone();
                 self.ledger.on_chain_block_with_traces(
                     daa,
                     &reqs,
                     &rewards,
-                    &[],
+                    &sealed,
                     &resp,
                     &[],
                     &[],
@@ -6076,6 +6114,73 @@ mod tests {
             let out = net.fold(ripe, chain(9), &[], &[]);
             assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
             assert!(net.ledger.held_draws.is_empty());
+        }
+
+        #[test]
+        fn a_response_from_outside_the_recipients_counts_for_nothing_under_the_sanction_rule() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.recipients = vec![a];
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((0, 10))), (RH, b, Some((0, 10)))]);
+            let audit = net.ledger.pending.get(&RH).unwrap().audit.clone().unwrap();
+            assert_eq!(audit.responded, vec![a]);
+            assert_eq!(net.ledger.trace_audits.values().map(|t| t.responder).collect::<Vec<_>>(), vec![a]);
+        }
+
+        #[test]
+        fn a_traced_response_to_a_request_not_accepted_opens_no_audit_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let a = id(1);
+                let mut net = Net::new(false, true, vec![a]);
+                net.audit_all = true;
+                net.sanction = sanction;
+                net.fold(100, chain(0), &[], &[(RH, a, Some((0, 10)))]);
+                assert_eq!(net.ledger.trace_audits.len(), if sanction { 0 } else { 1 });
+                assert_eq!(net.ledger.early_responses.get(&RH).unwrap().1, vec![a], "the answer is still credited at the arming");
+            }
+        }
+
+        #[test]
+        fn early_responders_are_capped_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let mut net = Net::new(false, true, vec![id(1)]);
+                net.sanction = sanction;
+                let answers: Vec<Answer> = (0..=EARLY_KEYS_PER_REQUEST as u32).map(|i| {
+                    let mut k = [0u8; 32];
+                    k[..4].copy_from_slice(&i.to_le_bytes());
+                    k[31] = 0xAB;
+                    (RH, Hash::from_bytes(k), None)
+                }).collect();
+                net.fold(100, chain(0), &[], &answers);
+                let kept = net.ledger.early_responses.get(&RH).unwrap().1.len();
+                assert_eq!(kept, if sanction { EARLY_KEYS_PER_REQUEST } else { EARLY_KEYS_PER_REQUEST + 1 });
+            }
+        }
+
+        #[test]
+        fn audits_beyond_the_chain_cap_of_one_key_are_not_opened() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            let requests: Vec<([u8; 32], u32)> = (0..6u8).map(|i| ([i + 10; 32], 4_096)).collect();
+            net.fold(100, chain(0), &requests, &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let answers: Vec<Answer> = requests.iter().map(|(h, _)| (*h, a, Some((0, 4_096)))).collect();
+            net.fold(102, chain(0), &[], &answers);
+            assert_eq!(net.ledger.trace_audits.len(), 6);
+            net.fold(102 + TRACE_SEED_DELAY_DAA, chain(0), &[], &[]);
+            let work = super::super::OPEN_AUDIT_WORK_PASSES * service_work_daa(0, 0, 4_096);
+            let opened = (super::super::OPENING_BACKLOG_CAP_DAA / work + 1) as usize;
+            assert!(opened < 6);
+            assert_eq!(net.ledger.trace_audits.len(), opened);
+            assert_eq!(net.ledger.trace_roots.len(), 6, "every answer stays remembered");
+            let mut deadlines: Vec<u64> = net.ledger.trace_audits.values().map(|a| a.deadline_daa).collect();
+            deadlines.sort_unstable();
+            assert!(deadlines.windows(2).all(|w| w[1] >= w[0] + work));
         }
 
         #[test]
