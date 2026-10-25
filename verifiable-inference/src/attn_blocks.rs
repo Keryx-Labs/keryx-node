@@ -229,7 +229,7 @@ pub fn check_root_lse(x: &[u8], layout: u8, n_out: usize, head: usize, children:
 }
 
 /// Share of the uniform draw among children, out of 8.
-const UNIFORM_EIGHTHS: u8 = 1;
+const UNIFORM_EIGHTHS: u8 = 4;
 
 /// Draw weights of `parts`: each child's mass times its largest output value, floored at
 /// `2^-10` of the mass-weighted mean of those values, quantized to `u16` with every weight at
@@ -545,8 +545,9 @@ mod tests {
         let n = 10_000u32;
         let count = |w: &[u16], i: u64| (0..n).filter(|s| draw_weighted_child(blake3::hash(&s.to_le_bytes()).as_bytes(), w) == i).count() as f64 / n as f64;
         let heavy = [1u16, 1, 65533];
-        assert!((count(&heavy, 2) - (7.0 / 8.0 + 1.0 / 24.0)).abs() < 0.02);
-        assert!((count(&heavy, 0) - 1.0 / 24.0).abs() < 0.01, "the uniform share reaches a near-zero child");
+        let u = UNIFORM_EIGHTHS as f64 / 8.0;
+        assert!((count(&heavy, 2) - (1.0 - u + u / 3.0)).abs() < 0.02);
+        assert!((count(&heavy, 0) - u / 3.0).abs() < 0.015, "the uniform share reaches a near-zero child");
         let even = [100u16; 4];
         for i in 0..4 {
             assert!((count(&even, i) - 0.25).abs() < 0.02);
