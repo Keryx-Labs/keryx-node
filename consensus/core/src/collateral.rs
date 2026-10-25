@@ -151,6 +151,9 @@ pub const TRACE_SEED_DELAY_DAA: u64 = 100;
 pub const TRACE_DRAW_DOMAIN: &[u8] = b"KeryxTraceDrawV1";
 /// Base of the window to open the next phase of an attention opening.
 pub const ATTN_PHASE_BASE_DAA: u64 = 3_000;
+/// Prompt positions counted in the window of an attention phase, at most: the largest context a
+/// responder runs.
+pub const ATTN_PHASE_MAX_PROMPT: u32 = 131_072;
 
 /// Window to open the next phase of an attention opening once its child is drawn: a base plus
 /// the replay of the response, its prompt at a floor of 100 positions per second and each
@@ -161,7 +164,7 @@ pub fn attn_phase_window_daa(tier: u8, max_tokens: u32, n_prompt: u32, n_pos: u3
         3 => 3,
         _ => 4,
     };
-    ATTN_PHASE_BASE_DAA + n_prompt as u64 / 10 + n_pos.saturating_sub(n_prompt).min(max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP)) as u64 * per_token
+    ATTN_PHASE_BASE_DAA + n_prompt.min(ATTN_PHASE_MAX_PROMPT) as u64 / 10 + n_pos.saturating_sub(n_prompt).min(max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP)) as u64 * per_token
 }
 /// Domain separator of the child drawn after an attention phase.
 pub const ATTN_CHILD_DOMAIN: &[u8] = b"KeryxAttnChildV1";
@@ -4831,6 +4834,7 @@ mod tests {
             assert_eq!(crate::collateral::attn_phase_window_daa(2, 1_000, 30_000, 30_900), 7_800);
             assert_eq!(crate::collateral::attn_phase_window_daa(4, 8_000, 0, 5_000), 19_384);
             assert_eq!(crate::collateral::attn_phase_window_daa(3, 100, 2_000, 9_000), 3_500);
+            assert_eq!(crate::collateral::attn_phase_window_daa(4, u32::MAX, u32::MAX, u32::MAX), 16_107);
         }
 
         #[test]
