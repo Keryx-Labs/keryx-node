@@ -25,6 +25,9 @@ use std::sync::Arc;
 /// Number of awaited openings with the nearest deadlines a template lead is drawn from.
 const LEADING_OPENING_SPREAD: usize = 16;
 
+/// Margin below which the nearest opening deadline leads a template without a draw.
+const LEADING_OPENING_DUE_DAA: u64 = 100;
+
 /// Awaited responses lead a template with at most the block mass over this divisor.
 const LEADING_RESPONSE_MASS_DIVISOR: u64 = 2;
 
@@ -290,13 +293,11 @@ impl Mempool {
         self.opening_awaited(consensus, &held.mtx.tx).then_some(key)
     }
 
-    /// Transactions to lead a template, with their total mass: an awaited opening, then awaited
-    /// responses by deadline within a share of the block mass.
+    /// Transactions to lead a template, with their total mass: awaited responses by deadline
+    /// within a share of the block mass, ahead of them an awaited opening that fits beside the
+    /// more urgent ones.
     pub(crate) fn leading_transactions(&self, consensus: &dyn ConsensusApi) -> (Vec<Arc<Transaction>>, u64) {
         let max_mass = self.config.maximum_mass_per_block;
-        let mut leads = Vec::new();
-        let mut mass = 0;
-        let opening = self.leading_opening(consensus);
         let entries: Vec<(([u8; 32], [u8; 32]), TransactionId)> = self
             .ai_response_index
             .iter()
@@ -307,31 +308,42 @@ impl Mempool {
             consensus.awaited_response_deadlines(&keys).into_iter().zip(&entries).filter_map(|(d, (_, id))| Some((d?, *id))).collect();
         due.shuffle(&mut rand::thread_rng());
         due.sort_by_key(|(deadline, _)| *deadline);
-        let response_mass = |id: &TransactionId| self.transaction_pool.get(id).map(|tx| FeerateTransactionKey::from(tx).mass);
-        if let Some((tx, deadline)) = opening {
-            let opening_mass = FeerateTransactionKey::from(tx).mass;
-            // A more urgent response that cannot share the block with the opening goes first.
-            let yields = due.iter().take_while(|(d, _)| *d < deadline).any(|(_, id)| response_mass(id).is_some_and(|m| opening_mass + m > max_mass));
-            if !yields {
-                mass += opening_mass;
-                leads.push(tx.mtx.tx.clone());
-            }
-        }
-        let budget = max_mass.min(mass + max_mass / LEADING_RESPONSE_MASS_DIVISOR);
-        for (_, id) in due {
+        let mut responses: Vec<(u64, &MempoolTransaction, u64)> = Vec::new();
+        let mut response_mass = 0;
+        for (deadline, id) in due {
             let Some(tx) = self.transaction_pool.get(&id).filter(|tx| tx.mtx.tx.inputs.is_empty()) else { continue };
             let tx_mass = FeerateTransactionKey::from(tx).mass;
-            if mass + tx_mass <= budget {
-                mass += tx_mass;
+            if response_mass + tx_mass <= max_mass / LEADING_RESPONSE_MASS_DIVISOR {
+                response_mass += tx_mass;
+                responses.push((deadline, tx, tx_mass));
+            }
+        }
+        let fits = |opening_mass: u64, deadline: u64| {
+            opening_mass + responses.iter().filter(|(d, _, _)| *d < deadline).map(|(_, _, m)| m).sum::<u64>() <= max_mass
+        };
+        let opening = self
+            .leading_openings(consensus)
+            .into_iter()
+            .map(|(tx, deadline)| (tx, deadline, FeerateTransactionKey::from(tx).mass))
+            .find(|(_, deadline, m)| fits(*m, *deadline));
+        let mut leads = Vec::new();
+        let mut mass = 0;
+        if let Some((tx, _, m)) = opening {
+            leads.push(tx.mtx.tx.clone());
+            mass += m;
+        }
+        for (_, tx, m) in responses {
+            if mass + m <= max_mass {
                 leads.push(tx.mtx.tx.clone());
+                mass += m;
             }
         }
         (leads, mass)
     }
 
-    /// An awaited opening to lead a template and its deadline, drawn among those with the nearest
-    /// deadlines.
-    fn leading_opening(&self, consensus: &dyn ConsensusApi) -> Option<(&MempoolTransaction, u64)> {
+    /// Awaited openings to lead a template with their deadlines: first the one drawn among the
+    /// nearest deadlines (the nearest itself when it is about due), then the others by deadline.
+    fn leading_openings(&self, consensus: &dyn ConsensusApi) -> Vec<(&MempoolTransaction, u64)> {
         let mut due: Vec<(u64, TransactionId)> = self
             .ai_opening_index
             .values()
@@ -341,12 +353,14 @@ impl Mempool {
                 consensus.awaited_opening_deadline(&txid).map(|deadline| (deadline, *id))
             })
             .collect();
-        if due.is_empty() {
-            return None;
-        }
         due.sort_unstable();
-        let (deadline, id) = due[rand::thread_rng().gen_range(0..due.len().min(LEADING_OPENING_SPREAD))];
-        self.transaction_pool.get(&id).map(|tx| (tx, deadline))
+        if let Some(&(nearest, _)) = due.first()
+            && nearest > consensus.get_virtual_daa_score() + LEADING_OPENING_DUE_DAA
+        {
+            let pick = rand::thread_rng().gen_range(0..due.len().min(LEADING_OPENING_SPREAD));
+            due[..=pick].rotate_right(1);
+        }
+        due.into_iter().filter_map(|(deadline, id)| self.transaction_pool.get(&id).map(|tx| (tx, deadline))).collect()
     }
 
     /// Whether `tx` is an opening or a response the consensus awaits.

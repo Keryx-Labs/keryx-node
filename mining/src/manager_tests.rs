@@ -482,6 +482,19 @@ mod tests {
         let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
         assert_eq!(selected[0].id(), response.id(), "the urgent response that cannot share the block leads");
         assert!(!selected.iter().any(|tx| tx.id() == opening.id()));
+
+        let light_hash = [0x5Bu8; 32];
+        let mut light = AiResponsePayload::new(light_hash, 1, [0x12u8; 34], 1).with_private_body(vec![7u8; 500]);
+        let sig = miner.sign_schnorr(Message::from_digest(responder_signature_message(&light.signed_bytes())));
+        light.responder = Some(AiResponder { escrow_pubkey: key, signature: *sig.as_ref() });
+        let light = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, light.serialize());
+        consensus.set_private_recipients(light_hash, vec![key]);
+        insert(light.clone()).unwrap();
+        consensus.clear_awaited_response(request_hash, key);
+        consensus.await_response(light_hash, key, 100);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), opening.id(), "an urgent response that fits beside the opening does not displace it");
+        assert!(selected.iter().any(|tx| tx.id() == light.id()));
     }
 
     /// A full mempool admits openings and responses and never evicts them for a paying transaction.
