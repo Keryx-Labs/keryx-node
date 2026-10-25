@@ -724,6 +724,37 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_or_huge_residual_fails_the_norm_links_reading_it() {
+        for scale in [0.0f32, 1e6] {
+            let (tier, mut trace) = honest();
+            let leaf = chain::resid_leaf(N_PRODUCTS as u64, 0, Resid::Out) as usize;
+            for pos in &mut trace.positions {
+                let v: Vec<u8> = pos.leaves[leaf].chunks_exact(4).flat_map(|b| (f32::from_le_bytes(b.try_into().unwrap()) * scale).to_le_bytes()).collect();
+                pos.leaves[leaf] = v;
+                pos.hashes[leaf] = *blake3::hash(&pos.leaves[leaf]).as_bytes();
+            }
+            trace.pos_roots = trace.positions.iter().map(|p| b3_root(&p.hashes)).collect();
+            trace.trace_root = b3_root(&trace.pos_roots);
+            let (tc, cc, rc) = (tier.tier(), tier.chain_ctx(), resp(&trace));
+            let mut refused = 0;
+            for s in 0..64u32 {
+                let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+                for i in 0..draw::POINTS {
+                    let (p, tok, link) = tier.open_point(&trace, &seed, i);
+                    if let LinkOpening::Norm { src, .. } = &link {
+                        if src.bytes.chunks_exact(4).all(|b| f32::from_le_bytes(b.try_into().unwrap()) == 0.0) || scale > 1.0 {
+                            if matches!(verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None), Err(crate::verify::Fail::Mismatch)) {
+                                refused += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(refused > 0, "scale {scale}");
+        }
+    }
+
+    #[test]
     fn a_changed_residual_is_refused() {
         let (tier, mut trace) = honest();
         let leaf = chain::resid_leaf(N_PRODUCTS as u64, 0, Resid::Attn) as usize;
@@ -2631,6 +2662,10 @@ mod recur_tests {
         spike_o: bool,
         /// A huge write strength at the first position, the recurrence following it.
         big_beta: bool,
+        /// A growing decay at the first position, the recurrence following it.
+        growing_decay: bool,
+        /// A huge value at the first position, the recurrence following it.
+        huge_v: bool,
     }
 
     struct Rt {
@@ -2786,14 +2821,20 @@ mod recur_tests {
                 let (qo, ko, vo) = if kda { (h * HD, h * HD, h * HD) } else { (hk * HD, (nk + hk) * HD, 2 * nk * HD + h * HD) };
                 let mut q: Vec<f64> = (0..HD).map(|i| conv(0, t, qo + i)).collect();
                 let mut k: Vec<f64> = if cfg.fake_k { vals(7000 + t as u64 * 31 + h as u64, HD, 1.0).iter().map(|&x| x as f64).collect() } else { (0..HD).map(|i| conv(1, t, ko + i)).collect() };
-                let v: Vec<f64> = (0..HD).map(|i| conv(2, t, vo + i)).collect();
+                let mut v: Vec<f64> = (0..HD).map(|i| conv(2, t, vo + i)).collect();
+                if cfg.huge_v && t == 0 {
+                    v[0] = 2.0 * crate::recur::RECUR_V_MAX;
+                }
                 l2(&mut q);
                 l2(&mut k);
                 let beta = if cfg.big_beta && t == 0 { 4.0 } else { sig(y_t[beta_r as usize][h] as f64) };
-                let g: Vec<f64> = (0..gw).map(|i| a[h] as f64 * {
+                let mut g: Vec<f64> = (0..gw).map(|i| a[h] as f64 * {
                     let x = y_t[decay_r as usize][h * gw + i] as f64 + if cfg.fused_dt { 0.0 } else { dt[h * gw + i] as f64 };
                     if x > 20.0 { x } else { libm::log1p(libm::exp(x)) }
                 }).collect();
+                if cfg.growing_decay && t == 0 {
+                    g.iter_mut().for_each(|x| *x = 1.0 / 128.0);
+                }
                 let eg = |i: usize| libm::exp(if kda { g[i] } else { g[0] });
                 let s = &mut state[h];
                 if cfg.reset {
@@ -2951,7 +2992,7 @@ mod recur_tests {
         (0..64u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
     }
 
-    const GDA: Cfg = Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false, fused_dt: false, spike_o: false, big_beta: false };
+    const GDA: Cfg = Cfg { kda: false, reset: false, fake_k: false, zero_out: false, bad_ckpt: false, fused_dt: false, spike_o: false, big_beta: false, growing_decay: false, huge_v: false };
     const KINDS: [Cfg; 3] = [GDA, Cfg { kda: true, ..GDA }, Cfg { kda: true, fused_dt: true, ..GDA }];
 
     #[test]
@@ -3030,6 +3071,23 @@ mod recur_tests {
                 }
             }
             assert!(first > 0);
+        }
+    }
+
+    #[test]
+    fn a_growing_decay_or_a_huge_value_is_refused() {
+        for c in KINDS {
+            for cfg in [Cfg { growing_decay: true, ..c }, Cfg { huge_v: true, ..c }] {
+                let rt = build(cfg);
+                let mut first = 0;
+                for s in seeds() {
+                    if draw::point(&s, crate::recur::RECUR_POINT)[0] % (N_POS as u64).div_ceil(IV as u64) == 0 {
+                        first += 1;
+                        assert_eq!(rt.check(&s), Err(Fail::Mismatch), "kda {}", c.kda);
+                    }
+                }
+                assert!(first > 0);
+            }
         }
     }
 

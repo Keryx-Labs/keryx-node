@@ -149,6 +149,17 @@ pub fn peak_bounded(x: &[u8], layout: u8, k: u64, slot: u64) -> bool {
 }
 
 /// `v / rms(v)` in f64.
+/// RMS range of a whole residual vector past the embedding.
+pub const RESID_RMS_MIN: f64 = 1e-3;
+pub const RESID_RMS_MAX: f64 = 1024.0;
+/// Lower RMS bound of one chunk of a residual vector.
+pub const RESID_CHUNK_RMS_MIN: f64 = 1e-4;
+
+/// RMS of `v`, in f64.
+fn rms(v: &[f32]) -> f64 {
+    libm::sqrt(v.iter().map(|&a| a as f64 * a as f64).sum::<f64>() / v.len().max(1) as f64)
+}
+
 pub fn rms_scaled(v: &[f32], eps: f64, scale: f64) -> Vec<f64> {
     let e: Vec<f64> = v.iter().map(|&a| a as f64 * scale).collect();
     let inv = 1.0 / libm::sqrt(e.iter().map(|a| a * a).sum::<f64>() / e.len() as f64 + eps);
@@ -348,6 +359,9 @@ pub fn verify_chain_point(
                 _ => return Err(Fail::Shape),
             };
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
+            if !(RESID_RMS_MIN..=RESID_RMS_MAX).contains(&rms(&h)) {
+                return Err(Fail::Mismatch);
+            }
             let x_one = crate::verify::x_len(k, o.layout) as usize;
             let xs = if p.x.len() == x_one { &p.x[..] } else { p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)? };
             let (b0, n) = norm_fragment(link_block(seed, i, xs, o.layout, k).ok_or(Fail::Shape)?, k);
@@ -606,6 +620,9 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         return Err(Fail::Trace);
     }
     let dst = finite_f32s(&p.dst.chunk)?;
+    if !(RESID_CHUNK_RMS_MIN..=RESID_RMS_MAX).contains(&rms(&dst)) {
+        return Err(Fail::Mismatch);
+    }
     let (off, n) = (c as usize * B3_CHUNK / 4, dst.len());
 
     let src = match (kind, &p.src) {

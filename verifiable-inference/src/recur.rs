@@ -15,6 +15,8 @@ pub const RECUR_ROWS: u64 = 16;
 /// Tolerance of a recomputed value against its record, relative to the value plus the scale of
 /// its vector.
 pub const RECUR_TOL: f64 = 1.0 / 64.0;
+/// Largest `|v|` of a record.
+pub const RECUR_V_MAX: f64 = 1024.0;
 
 /// Smallest step of a recorded f16 value.
 const F16_MIN_STEP: f64 = 1.0 / 16_777_216.0;
@@ -104,7 +106,12 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
     let rows_at = |m: u64, span: &SeqSpan| -> Result<Vec<Vec<f64>>, Fail> {
         let (lo, hi) = seq::checkpoint_rows(hd as u64, m, r0, RECUR_ROWS);
         let b = seq::open_span(&op.seq_root, &layout, ck_leaf, ck_len, lo, hi, span).ok_or(Fail::Trace)?;
-        Ok(f32s(b).chunks(hd).map(|row| row.iter().map(|&x| x as f64).collect()).collect())
+        let rows: Vec<Vec<f64>> = f32s(b).chunks(hd).map(|row| row.iter().map(|&x| x as f64).collect()).collect();
+        let row_max = RECUR_V_MAX * libm::sqrt(hd as f64);
+        if rows.iter().any(|row| row.iter().any(|x| !x.is_finite()) || libm::sqrt(row.iter().map(|x| x * x).sum::<f64>()) > row_max) {
+            return Err(Fail::Mismatch);
+        }
+        Ok(rows)
     };
     let mut state = if s == 0 {
         if op.start_rows != SeqSpan::default() {
@@ -120,7 +127,10 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         let q_norm = libm::sqrt(rec.q.iter().map(|&x| x as f64 * x as f64).sum::<f64>());
         let k_norm = libm::sqrt(rec.k.iter().map(|&x| x as f64 * x as f64).sum::<f64>());
         let beta = rec.beta as f64;
-        if q_norm > 1.0 + RECUR_TOL || k_norm > 1.0 + RECUR_TOL || !(0.0..=1.0 + RECUR_TOL).contains(&beta) || rec.g.iter().any(|&x| x as f64 > RECUR_TOL) {
+        if q_norm > 1.0 + RECUR_TOL || k_norm > 1.0 + RECUR_TOL || !(0.0..=1.0 + RECUR_TOL).contains(&beta)
+            || rec.g.iter().any(|&x| !(x <= 0.0))
+            || rec.v.iter().any(|&x| !(x.abs() as f64 <= RECUR_V_MAX))
+        {
             return Err(Fail::Mismatch);
         }
         for (ri, row) in state.iter_mut().enumerate() {
