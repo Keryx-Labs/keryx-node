@@ -513,8 +513,8 @@ impl VirtualStateProcessor {
             info!("    Trace         — every AiResponse commits the trace of its inference; untraced answers are not credited");
             info!("    Audit         — every traced response is audited: the responder opens the drawn points in an opening transaction");
             info!("    Trace chain   — openings are chained layer to layer, from the request-bound prompt prefix to the generated tokens");
-            info!("    Block task    — each block commits and opens the task of its window; header format changes");
-            info!("    Sanctions     — a missing or failed opening is struck; a trace root is admitted only once");
+            info!("    Attention     — openings also prove the attention of a drawn layer over the whole context");
+            info!("    Sanctions     — a missing or failed opening is struck");
             info!("    Answers       — sealed answer bodies capped at {} KiB", keryx_inference::ai_payload::MAX_AI_RESPONSE_PRIVATE_BODY_LEN / 1024);
             info!("    Service       — answer deadlines follow the measured work of each request and the queue of each miner");
             info!("    Context       — a silent miner is not struck on a prompt beyond its tier context unless another proved it fit");

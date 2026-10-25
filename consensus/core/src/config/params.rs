@@ -221,7 +221,7 @@ pub const H13_ACTIVATION_DAA: u64 = 93_550_000;
 /// Targets 2026-10-09 ~14:00 UTC (from daa 117_774_522 at 2026-10-04 18:37 UTC, ~10.13 daa/s).
 pub const H14_ACTIVATION_DAA: u64 = 121_985_000;
 
-/// Mainnet H15 gate: every verifiable-inference, audit, block task, PoM v5 and holder-reward v3 rule. Node and miner.
+/// Mainnet H15 gate: every verifiable-inference, audit, attention, PoM v5 and holder-reward v3 rule. Node and miner.
 pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 
 /// Testnet H15 gate: every verifiable-inference, audit and holder-reward v3 rule. Node and miner.
@@ -2506,7 +2506,7 @@ pub const MAINNET_PARAMS: Params = Params {
     trace_chain_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     block_task_activation: ForkActivation::never(),
     trace_seed_bind_activation: ForkActivation::new(H15_ACTIVATION_DAA),
-    attention_activation: ForkActivation::never(),
+    attention_activation: ForkActivation::new(H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
@@ -2964,6 +2964,7 @@ mod h15_gate_tests {
             p.ratio_reward_v3_activation,
             p.trace_chain_activation,
             p.trace_seed_bind_activation,
+            p.attention_activation,
         ];
         for g in gates {
             assert_eq!(g.daa_score(), H15_ACTIVATION_DAA);
