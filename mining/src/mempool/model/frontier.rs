@@ -5,7 +5,10 @@ use crate::{
 };
 
 use feerate_key::FeerateTransactionKey;
-use keryx_consensus_core::{block::TemplateTransactionSelector, tx::Transaction};
+use keryx_consensus_core::{
+    block::TemplateTransactionSelector,
+    tx::{Transaction, TransactionId},
+};
 use keryx_core::trace;
 use rand::{Rng, distributions::Uniform, prelude::Distribution};
 use search_tree::SearchTree;
@@ -131,6 +134,14 @@ impl Frontier {
     where
         R: Rng + ?Sized,
     {
+        self.sample_inplace_excluding(rng, policy, _collisions, &HashSet::new())
+    }
+
+    /// [`Self::sample_inplace`] leaving out the transactions of `exclude`.
+    fn sample_inplace_excluding<R>(&self, rng: &mut R, policy: &Policy, _collisions: &mut u64, exclude: &HashSet<TransactionId>) -> SequenceSelectorInput
+    where
+        R: Rng + ?Sized,
+    {
         debug_assert!(!self.search_tree.is_empty(), "expected to be called only if not empty");
 
         // Sample 20% more than the hard limit in order to allow the SequenceSelector to
@@ -141,7 +152,7 @@ impl Frontier {
 
         let mut down_iter = self.search_tree.descending_iter();
         let mut top = down_iter.next().unwrap();
-        let mut cache = HashSet::new();
+        let mut cache = exclude.clone();
         let mut sequence = SequenceSelectorInput::default();
         let mut total_selected_mass: u64 = 0;
         let mut collisions = 0;
@@ -149,7 +160,7 @@ impl Frontier {
         // Feeless transactions carry zero weight and cannot be sampled
         let total_weight = self.total_weight();
         if !(total_weight > 0.0) {
-            for key in std::iter::once(top).chain(down_iter) {
+            for key in std::iter::once(top).chain(down_iter).filter(|key| !exclude.contains(&key.tx.id())) {
                 if total_selected_mass > desired_mass {
                     break;
                 }
@@ -222,15 +233,21 @@ impl Frontier {
     /// full transaction selection in less than 150 µs even if the frontier has 1M entries (!!). See mining/benches
     /// for more details.  
     pub fn build_selector(&self, policy: &Policy) -> Box<dyn TemplateTransactionSelector> {
+        self.build_selector_excluding(policy, &HashSet::new())
+    }
+
+    /// [`Self::build_selector`] over the frontier without the transactions of `exclude`.
+    pub fn build_selector_excluding(&self, policy: &Policy, exclude: &HashSet<TransactionId>) -> Box<dyn TemplateTransactionSelector> {
+        let kept = |k: &&FeerateTransactionKey| !exclude.contains(&k.tx.id());
         if self.total_mass <= policy.max_block_mass {
-            Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().map(|k| k.tx.clone()).collect()))
+            Box::new(TakeAllSelector::new(self.search_tree.ascending_iter().filter(kept).map(|k| k.tx.clone()).collect()))
         } else if self.total_mass > policy.max_block_mass * COLLISION_FACTOR {
             let mut rng = rand::thread_rng();
-            Box::new(SequenceSelector::new(self.sample_inplace(&mut rng, policy, &mut 0), policy.clone()))
+            Box::new(SequenceSelector::new(self.sample_inplace_excluding(&mut rng, policy, &mut 0, exclude), policy.clone()))
         } else {
             Box::new(RebalancingWeightedTransactionSelector::new(
                 policy.clone(),
-                self.search_tree.ascending_iter().cloned().map(CandidateTransaction::from_key).collect(),
+                self.search_tree.ascending_iter().filter(kept).cloned().map(CandidateTransaction::from_key).collect(),
             ))
         }
     }
@@ -351,6 +368,29 @@ mod tests {
             let ids = frontier.build_selector(&policy).select_transactions().iter().map(|tx| tx.id()).collect_vec();
             assert_eq!(ids.len(), ids.iter().unique().count());
             assert!(ids.len() as u64 > paid, "feeless transactions must still be selected");
+        }
+    }
+
+    #[test]
+    pub fn test_leading_selector_excludes_and_reports_its_leads() {
+        use selectors::LeadingSelector;
+        let mut rng = thread_rng();
+        let policy = Policy::new(500_000);
+        for paid in [10u64, 400, 2_000] {
+            let mut frontier = Frontier::new(1.0);
+            for i in 0..paid {
+                frontier.insert(build_feerate_key(rng.gen_range(1..1_000_000), 1650, i)).then_some(()).unwrap();
+            }
+            let lead = build_feerate_key(0, 1650, paid);
+            frontier.insert(lead.clone()).then_some(()).unwrap();
+            let exclude: HashSet<TransactionId> = [lead.tx.id()].into();
+            let mut selector = LeadingSelector::new(vec![lead.tx.clone()], frontier.build_selector_excluding(&policy, &exclude));
+            let selected = selector.select_transactions();
+            assert_eq!(selected[0].id(), lead.tx.id());
+            assert_eq!(selected.iter().filter(|tx| tx.id() == lead.tx.id()).count(), 1);
+            assert!(selector.is_successful());
+            selector.reject_selection(lead.tx.id());
+            assert!(!selector.is_successful(), "a lead the consensus rejects fails the build");
         }
     }
 

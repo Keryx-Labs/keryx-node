@@ -109,7 +109,9 @@ impl Mempool {
 
         // Before adding the transaction, check if there is room in the pool
         let transaction_size = transaction.mempool_estimated_bytes();
-        let txs_to_remove = self.transaction_pool.limit_transaction_count(&transaction, transaction_size)?;
+        let awaited = self.ai_tx_awaited(consensus, &transaction.tx);
+        let txs_to_remove =
+            self.transaction_pool.limit_transaction_count(&transaction, transaction_size, awaited, |mtx| self.ai_tx_awaited(consensus, &mtx.mtx.tx))?;
         if !txs_to_remove.is_empty() {
             let transaction_pool_len_before = self.transaction_pool.len();
             for x in txs_to_remove.iter() {
@@ -296,13 +298,14 @@ impl Mempool {
             mass += FeerateTransactionKey::from(opening).mass;
             leads.push(opening.mtx.tx.clone());
         }
-        let mut due: Vec<(u64, TransactionId)> = self
+        let entries: Vec<(([u8; 32], [u8; 32]), TransactionId)> = self
             .ai_response_index
             .iter()
-            .flat_map(|(request_hash, entries)| {
-                entries.iter().filter_map(move |(escrow, id)| Some((consensus.awaited_response_deadline(request_hash, escrow.as_ref()?)?, *id)))
-            })
+            .flat_map(|(request_hash, entries)| entries.iter().filter_map(move |(escrow, id)| Some(((*request_hash, (*escrow)?), *id))))
             .collect();
+        let keys: Vec<([u8; 32], [u8; 32])> = entries.iter().map(|(k, _)| *k).collect();
+        let mut due: Vec<(u64, TransactionId)> =
+            consensus.awaited_response_deadlines(&keys).into_iter().zip(&entries).filter_map(|(d, (_, id))| Some((d?, *id))).collect();
         due.shuffle(&mut rand::thread_rng());
         due.sort_by_key(|(deadline, _)| *deadline);
         let budget = max_mass.min(mass + max_mass / LEADING_RESPONSE_MASS_DIVISOR);
@@ -323,7 +326,7 @@ impl Mempool {
             .ai_opening_index
             .values()
             .filter_map(|id| {
-                let tx = self.transaction_pool.get(id)?;
+                let tx = self.transaction_pool.get(id).filter(|tx| tx.mtx.tx.inputs.is_empty() && self.opening_awaited(consensus, &tx.mtx.tx))?;
                 let txid = ai_opening_response_txid(&tx.mtx.tx.payload)?;
                 consensus.awaited_opening_deadline(&txid).map(|deadline| (deadline, *id))
             })
@@ -333,7 +336,20 @@ impl Mempool {
         }
         due.sort_unstable();
         let pick = rand::thread_rng().gen_range(0..due.len().min(LEADING_OPENING_SPREAD));
-        self.transaction_pool.get(&due[pick].1).filter(|tx| tx.mtx.tx.inputs.is_empty())
+        self.transaction_pool.get(&due[pick].1)
+    }
+
+    /// Whether `tx` is an opening or a response the consensus awaits.
+    fn ai_tx_awaited(&self, consensus: &dyn ConsensusApi, tx: &Transaction) -> bool {
+        if tx.is_ai_opening() {
+            return self.opening_awaited(consensus, tx);
+        }
+        if !tx.is_ai_response() {
+            return false;
+        }
+        AiResponsePayload::deserialize(&tx.payload)
+            .and_then(|r| Some((r.request_hash, r.responder?.escrow_pubkey)))
+            .is_some_and(|(rh, escrow)| consensus.awaited_response_deadline(&rh, &escrow).is_some())
     }
 
     /// Openings in the mempool the consensus no longer awaits.

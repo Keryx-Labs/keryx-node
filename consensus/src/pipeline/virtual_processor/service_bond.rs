@@ -498,6 +498,11 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_response_deadline(request_hash, escrow_pubkey)
     }
 
+    pub(crate) fn awaited_response_deadlines(&self, keys: &[([u8; 32], [u8; 32])]) -> Vec<Option<u64>> {
+        let sync = self.service_ledger.lock();
+        keys.iter().map(|(rh, e)| sync.ledger.awaited_response_deadline(rh, e)).collect()
+    }
+
     pub(crate) fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
         self.service_ledger.lock().ledger.awaited_opening_deadline(response_txid)
     }

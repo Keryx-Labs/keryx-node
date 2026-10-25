@@ -167,11 +167,12 @@ pub struct LeadingSelector {
     leads: Vec<Arc<Transaction>>,
     lead_ids: HashSet<TransactionId>,
     inner: Box<dyn TemplateTransactionSelector>,
+    rejected_leads: usize,
 }
 
 impl LeadingSelector {
     pub fn new(leads: Vec<Arc<Transaction>>, inner: Box<dyn TemplateTransactionSelector>) -> Self {
-        Self { lead_ids: leads.iter().map(|tx| tx.id()).collect(), leads, inner }
+        Self { lead_ids: leads.iter().map(|tx| tx.id()).collect(), leads, inner, rejected_leads: 0 }
     }
 }
 
@@ -189,12 +190,14 @@ impl TemplateTransactionSelector for LeadingSelector {
     }
 
     fn reject_selection(&mut self, tx_id: TransactionId) {
-        if !self.lead_ids.contains(&tx_id) {
+        if self.lead_ids.contains(&tx_id) {
+            self.rejected_leads += 1;
+        } else {
             self.inner.reject_selection(tx_id);
         }
     }
 
     fn is_successful(&self) -> bool {
-        self.inner.is_successful()
+        self.rejected_leads == 0 && self.inner.is_successful()
     }
 }

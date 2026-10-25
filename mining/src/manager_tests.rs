@@ -475,6 +475,12 @@ mod tests {
         let sig = miner.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
         resp.responder = Some(AiResponder { escrow_pubkey: miner.x_only_public_key().0.serialize(), signature: *sig.as_ref() });
         let response = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize());
+        consensus.await_response([0x5Au8; 32], miner.x_only_public_key().0.serialize(), 0);
+        let stranger = Keypair::from_seckey_slice(SECP256K1, &[3u8; 32]).unwrap();
+        let mut idle = AiResponsePayload::new([0x5Au8; 32], 1, [0x12u8; 34], 1);
+        let sig = stranger.sign_schnorr(Message::from_digest(responder_signature_message(&idle.signed_bytes())));
+        idle.responder = Some(AiResponder { escrow_pubkey: stranger.x_only_public_key().0.serialize(), signature: *sig.as_ref() });
+        let idle = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, idle.serialize());
 
         insert(paid.next().unwrap()).unwrap();
         insert(paid.next().unwrap()).unwrap();
@@ -483,6 +489,7 @@ mod tests {
         for tx in paid {
             insert(tx).unwrap();
         }
+        assert_eq!(insert(idle), Err(RuleError::RejectMempoolIsFull), "a response no audit awaits does not outbid paying transactions");
         let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
         assert!(contained_by(opening.id(), &selected));
         assert!(contained_by(response.id(), &selected));

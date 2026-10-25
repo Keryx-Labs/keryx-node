@@ -750,6 +750,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.awaited_response_deadline(request_hash, escrow_pubkey)
     }
 
+    fn awaited_response_deadlines(&self, keys: &[([u8; 32], [u8; 32])]) -> Vec<Option<u64>> {
+        self.virtual_processor.awaited_response_deadlines(keys)
+    }
+
     fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
         self.virtual_processor.awaited_opening_deadline(response_txid)
     }
