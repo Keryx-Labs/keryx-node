@@ -212,8 +212,6 @@ pub struct TraceInputs<'a> {
     pub prompt_lens: &'a [([u8; 32], u32)],
     /// Whether the shape rule is active at this block.
     pub shape: bool,
-    /// Whether a trace root is admitted once at this block.
-    pub unique_root: bool,
     /// Whether the sanction rule is active at this block: a missing opening strikes without the
     /// interval guard, and a response under the audit rule resets the streak at its opening.
     pub sanction: bool,
@@ -1039,8 +1037,7 @@ pub struct ServiceLedger {
     /// Shapes of traced responses whose request was not pending yet, by `(request hash,
     /// responder)`; judged when the request is admitted, dropped with `early_responses`.
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
-    /// Trace roots admitted under the root rule, with the daa of their response; a repeat
-    /// within [`SERVICE_AUDITED_MEMORY_DAA`] is not an answer.
+    /// Trace roots of a retired rule, with the daa of their response; kept until they expire.
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
 }
 
@@ -1333,19 +1330,7 @@ impl ServiceLedger {
             }
         }
 
-        if traces.is_some_and(|tr| tr.unique_root) {
-            self.trace_roots.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
-            for ev in trace_responses.iter() {
-                if misshaped.contains(&(ev.request_hash, ev.responder)) {
-                    continue;
-                }
-                if let std::collections::btree_map::Entry::Vacant(e) = self.trace_roots.entry(ev.trace_root) {
-                    e.insert(daa);
-                } else {
-                    misshaped.push((ev.request_hash, ev.responder));
-                }
-            }
-        }
+        self.trace_roots.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
 
         // An authenticated response (signed by a delegated escrow key) marks every cohort
         // identity that delegated to it as having served this audit and resets their streak.
@@ -4469,7 +4454,6 @@ mod tests {
                     tier: &tier,
                     prompt_lens: &lens,
                     shape: self.shape.is_some(),
-                    unique_root: self.audit_all,
                     sanction: self.sanction,
                     context: self.context,
                     draw: false,
@@ -5223,46 +5207,17 @@ mod tests {
         }
 
         #[test]
-        fn reused_trace_root_is_not_an_answer_under_the_root_rule() {
+        fn a_reused_trace_root_is_audited_on_each_response() {
             let mut run = Run::audited_all();
             let (_, ev) = run.event(true);
             let ev2 = TraceResponseEvent { response_txid: TXID2, request_hash: RH2, ..ev.clone() };
             let h0 = Hash::from_bytes([0u8; 32]);
             assert!(run.fold(100, h0, &[], &[]).is_empty());
             assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
-            assert_eq!(run.ledger.trace_audits.len(), 1);
-            assert!(run.ledger.trace_audits.contains_key(&TXID));
-            assert_eq!(run.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
-            assert!(run.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().responded.is_empty());
-            assert_eq!(run.ledger.trace_roots.len(), 1);
-
-            let snap = run.ledger.snapshot();
-            let bytes = snap.to_bytes();
-            assert_eq!(bytes[0], 5);
-            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
-            assert_eq!(parsed, snap);
-            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
-            let mut restored = Run::audited_all();
-            restored.ledger.restore_snapshot(&parsed);
-            assert_eq!(restored.ledger.trace_roots.len(), 1);
-            // The unanswered second request strikes at its deadline; the served one does not.
-            let end = restored.window_end();
-            assert_eq!(restored.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
-        }
-
-        #[test]
-        fn root_memory_expires() {
-            let mut run = Run::audited_all();
-            let (_, ev) = run.event(true);
-            let h0 = Hash::from_bytes([0u8; 32]);
-            assert!(run.fold(100, h0, &[], &[]).is_empty());
-            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
-            assert_eq!(run.ledger.trace_roots.len(), 1);
-            let later = 102 + super::super::SERVICE_AUDITED_MEMORY_DAA;
-            run.fold(later - 1, h0, &[], &[]);
-            assert_eq!(run.ledger.trace_roots.len(), 1);
-            run.fold(later, h0, &[], &[]);
+            assert_eq!(run.ledger.trace_audits.len(), 2);
+            assert!(run.ledger.trace_audits.contains_key(&TXID) && run.ledger.trace_audits.contains_key(&TXID2));
             assert!(run.ledger.trace_roots.is_empty());
+            assert_eq!(run.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
         }
 
         #[test]
@@ -5449,8 +5404,6 @@ mod tests {
             cohort: Vec<Hash>,
             draw: bool,
             window_v3: bool,
-            /// Root rule: a trace root is admitted once.
-            unique_root: bool,
             /// Every traced answer carries the same trace root.
             same_root: bool,
             /// Dedup rule: a response accepted twice by one block is judged once.
@@ -5462,7 +5415,7 @@ mod tests {
                 let mut ledger = ServiceLedger::default();
                 ledger.set_window_v2_activation(0);
                 ledger.set_reward_routing_activation(0);
-                Self { ledger, cohort, draw, window_v3, unique_root: false, same_root: false, dedup: false }
+                Self { ledger, cohort, draw, window_v3, same_root: false, dedup: false }
             }
 
             /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
@@ -5497,7 +5450,6 @@ mod tests {
                     tier: &tier,
                     prompt_lens: &[],
                     shape: false,
-                    unique_root: self.unique_root,
                     sanction: false,
                     context: false,
                     draw: self.draw,
@@ -5544,7 +5496,6 @@ mod tests {
         fn a_response_accepted_twice_after_the_arming_is_credited_once() {
             let a = id(1);
             let mut net = Net::new(false, false, vec![a]);
-            net.unique_root = true;
             net.dedup = true;
             net.fold(100, chain(0), &[(RH, 256)], &[]);
             net.fold(101, chain(0), &[], &[]);
@@ -5559,7 +5510,6 @@ mod tests {
         fn a_response_accepted_twice_with_its_request_is_credited_at_the_arming() {
             let a = id(1);
             let mut net = Net::new(false, false, vec![a]);
-            net.unique_root = true;
             net.dedup = true;
             net.fold(100, chain(0), &[(RH, 256)], &twice(a));
             net.fold(101, chain(0), &[], &[]);
@@ -5569,29 +5519,16 @@ mod tests {
         }
 
         #[test]
-        fn before_the_dedup_rule_a_response_accepted_twice_is_not_credited() {
-            let a = id(1);
-            let mut net = Net::new(false, false, vec![a]);
-            net.unique_root = true;
-            net.fold(100, chain(0), &[(RH, 256)], &[]);
-            net.fold(101, chain(0), &[], &[]);
-            net.fold(102, chain(0), &[], &twice(a));
-            let end = net.window_end(&RH);
-            assert_eq!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])), vec![a]);
-        }
-
-        #[test]
-        fn a_repeated_root_from_another_response_is_still_refused() {
+        fn responders_with_the_same_trace_root_are_both_credited() {
             let (a, b) = (id(1), id(2));
             let mut net = Net::new(false, false, vec![a, b]);
-            net.unique_root = true;
             net.same_root = true;
             net.fold(100, chain(0), &[(RH, 256)], &[]);
             net.fold(101, chain(0), &[], &[]);
             net.fold(102, chain(0), &[], &[(RH, a, Some((100, 300)))]);
             net.fold(103, chain(0), &[], &[(RH, b, Some((100, 300)))]);
             let end = net.window_end(&RH);
-            assert_eq!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])), vec![b]);
+            assert!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])).is_empty());
         }
 
         #[test]

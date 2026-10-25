@@ -711,7 +711,6 @@ impl VirtualStateProcessor {
                 tier: &tier,
                 prompt_lens: &request_prompt_lens,
                 shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa) || chain_at(daa),
-                unique_root: audit_at(daa),
                 sanction: self.trace_sanction_activation.is_active(daa),
                 context: self.trace_context_activation.is_active(daa),
                 draw: self.reward_draw_activation.is_active(daa),
