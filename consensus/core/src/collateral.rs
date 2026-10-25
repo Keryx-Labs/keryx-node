@@ -877,6 +877,11 @@ struct HeldDraw {
 /// Longest a held draw waits for the audits of its candidates, from its opening.
 const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA;
 
+/// Whether a candidate of the draw of `rh` is in `awaiting`.
+fn draw_awaits_audit(awaiting: &std::collections::BTreeSet<([u8; 32], Hash)>, rh: &[u8; 32], draw: &RewardDraw) -> bool {
+    draw.candidates.iter().any(|(id, _)| awaiting.contains(&(*rh, *id)))
+}
+
 /// A reward draw: opened by the first credited response, closed `W` DAA later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RewardDraw {
@@ -1356,6 +1361,7 @@ impl ServiceLedger {
             }
             let mut served: Vec<Hash> = Vec::new();
             let req_tier: u8;
+            let req_accepted: u64;
             {
                 let Some(req) = self.pending.get_mut(rh) else {
                     let entry = self.early_responses.entry(*rh).or_insert((daa, Vec::new()));
@@ -1366,6 +1372,7 @@ impl ServiceLedger {
                 };
                 req_tier = req.tier;
                 let req_max_tokens = req.max_tokens;
+                req_accepted = req.accepted_daa;
                 let Some(audit) = req.audit.as_mut() else {
                     if !req.early_responders.contains(r) {
                         req.early_responders.push(*r);
@@ -1398,7 +1405,11 @@ impl ServiceLedger {
                     req.fit_proven = true;
                 }
             }
-            self.credit_reward(rh, &served, daa, draw_rule, warmup, &mut outcome);
+            let untraced = traces.is_some_and(|tr| {
+                (tr.tier)(req_tier, req_accepted).is_some_and(|rules| rules.audit_all)
+                    && !tr.responses.iter().any(|ev| ev.request_hash == *rh && ev.responder == *r)
+            });
+            self.credit_reward(rh, if untraced { &[] } else { &served }, daa, draw_rule, warmup, &mut outcome);
             // Under the sanction rule a traced response that will be audited resets the streak at
             // its accepted opening, not here.
             let reset_at_opening = self.reset_waits_for_opening(traces, rh, r, req_tier, daa);
@@ -1419,12 +1430,15 @@ impl ServiceLedger {
             self.early_shapes.retain(|(rh, _), _| *rh != victim);
         }
 
+        let mut awaiting = std::collections::BTreeSet::new();
         if let Some(tr) = traces {
             self.fold_traces(daa, tr, &misshaped, warmup, &is_established, &mut outcome);
+            self.resolve_trace_audits();
+            awaiting = self.audits_awaiting();
             let closing: Vec<[u8; 32]> = self
                 .pending
                 .iter()
-                .filter(|(h, r)| r.draw.as_ref().is_some_and(|d| daa >= d.close_daa && !self.draw_awaits_audit(h, d)))
+                .filter(|(h, r)| r.draw.as_ref().is_some_and(|d| daa >= d.close_daa && !draw_awaits_audit(&awaiting, h, d)))
                 .map(|(h, _)| *h)
                 .collect();
             for rh in closing {
@@ -1433,12 +1447,12 @@ impl ServiceLedger {
             let released: Vec<[u8; 32]> = self
                 .held_draws
                 .iter()
-                .filter(|(rh, h)| daa >= h.draw.open_daa + HELD_DRAW_HORIZON_DAA || !self.draw_awaits_audit(rh, &h.draw))
+                .filter(|(rh, h)| daa >= h.draw.open_daa + HELD_DRAW_HORIZON_DAA || !draw_awaits_audit(&awaiting, rh, &h.draw))
                 .map(|(rh, _)| *rh)
                 .collect();
             for rh in released {
                 let HeldDraw { mut draw, reward } = self.held_draws.remove(&rh).unwrap();
-                let judged: Vec<Hash> = draw.candidates.iter().map(|(id, _)| *id).filter(|id| !self.audit_pending_for(&rh, id)).collect();
+                let judged: Vec<Hash> = draw.candidates.iter().map(|(id, _)| *id).filter(|id| !awaiting.contains(&(rh, *id))).collect();
                 draw.candidates.retain(|(id, _)| judged.contains(id));
                 self.award_draw(&rh, &draw, reward, &tr.chain_hash, warmup, &mut outcome);
             }
@@ -1476,7 +1490,7 @@ impl ServiceLedger {
                         && crate::config::params::safe_prompt_len(req.tier, req.max_tokens).is_some_and(|safe| req.prompt_len > safe);
                     self.drop_draw_candidates(&rh, &late);
                     if let Some(tr) = traces {
-                        self.close_or_hold_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
+                        self.close_or_hold_draw(&rh, &tr.chain_hash, &awaiting, warmup, &mut outcome);
                     }
                     for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)) {
                         if warmup {
@@ -1552,7 +1566,9 @@ impl ServiceLedger {
                         // as the live path, so an early answer and a late one are worth the same.
                         let req_tier = req.tier;
                         let req_max_tokens = req.max_tokens;
+                        let audit_rule = traces.is_some_and(|tr| (tr.tier)(req_tier, req.accepted_daa).is_some_and(|rules| rules.audit_all));
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
+                        let mut drawable: Vec<Hash> = Vec::new();
                         let mut responded: Vec<Hash> = Vec::new();
                         let mut answers: Vec<Answer> = Vec::new();
                         let mut fit = false;
@@ -1564,6 +1580,9 @@ impl ServiceLedger {
                                 if ids.binary_search(identity).is_ok() && !responded.contains(identity) {
                                     responded.push(*identity);
                                     answers.push((*identity, daa, shape));
+                                    if !audit_rule || shape.is_some() {
+                                        drawable.push(*identity);
+                                    }
                                     member = true;
                                     if !waits {
                                         served_at_arm.push(*identity);
@@ -1575,7 +1594,6 @@ impl ServiceLedger {
                             }
                         }
                         self.early_shapes.retain(|(h, _), _| *h != rh);
-                        let credited = responded.clone();
                         let req = self.pending.get_mut(&rh).unwrap();
                         if fit && traces.is_some_and(|tr| tr.context) {
                             req.fit_proven = true;
@@ -1585,7 +1603,7 @@ impl ServiceLedger {
                             QueuedWindow { arm_daa: daa, queue: Vec::new(), answers }
                         });
                         req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window, v3 });
-                        self.credit_reward(&rh, &credited, daa, draw_rule, warmup, &mut outcome);
+                        self.credit_reward(&rh, &drawable, daa, draw_rule, warmup, &mut outcome);
                     }
                 }
                 None => {}
@@ -2001,14 +2019,19 @@ impl ServiceLedger {
         self.maybe_award(rh, first, warmup, outcome);
     }
 
-    /// Whether identity `id` still awaits the verdict of a trace audit on `rh`.
-    fn audit_pending_for(&self, rh: &[u8; 32], id: &Hash) -> bool {
-        self.trace_audits.values().any(|a| a.request_hash == *rh && a.identities.contains(id))
+    /// Binds every trace audit whose request is now armed to the cohort identities it serves.
+    fn resolve_trace_audits(&mut self) {
+        let unresolved: Vec<[u8; 32]> = self.trace_audits.iter().filter(|(_, a)| a.identities.is_empty()).map(|(k, _)| *k).collect();
+        for k in unresolved {
+            let mut a = self.trace_audits.remove(&k).unwrap();
+            self.resolve_trace_audit(&mut a);
+            self.trace_audits.insert(k, a);
+        }
     }
 
-    /// Whether a candidate of the draw of `rh` still awaits the verdict of a trace audit on it.
-    fn draw_awaits_audit(&self, rh: &[u8; 32], draw: &RewardDraw) -> bool {
-        draw.candidates.iter().any(|(id, _)| self.audit_pending_for(rh, id))
+    /// `(request hash, identity)` of every identity still awaiting the verdict of a trace audit.
+    fn audits_awaiting(&self) -> std::collections::BTreeSet<([u8; 32], Hash)> {
+        self.trace_audits.values().flat_map(|a| a.identities.iter().map(move |id| (a.request_hash, *id))).collect()
     }
 
     /// Removes identities the audit sanctioned on `rh` from its open or held draw.
@@ -2026,8 +2049,15 @@ impl ServiceLedger {
 
     /// Closes the draw of `rh` at the end of its request's window, or holds it while a
     /// candidate awaits the verdict of its audit.
-    fn close_or_hold_draw(&mut self, rh: &[u8; 32], chain_hash: &Hash, warmup: bool, outcome: &mut FoldOutcome) {
-        let held = self.pending.get(rh).and_then(|r| r.draw.as_ref()).is_some_and(|d| self.draw_awaits_audit(rh, d));
+    fn close_or_hold_draw(
+        &mut self,
+        rh: &[u8; 32],
+        chain_hash: &Hash,
+        awaiting: &std::collections::BTreeSet<([u8; 32], Hash)>,
+        warmup: bool,
+        outcome: &mut FoldOutcome,
+    ) {
+        let held = self.pending.get(rh).and_then(|r| r.draw.as_ref()).is_some_and(|d| draw_awaits_audit(awaiting, rh, d));
         if !held {
             self.close_draw(rh, chain_hash, warmup, outcome);
             return;
@@ -5535,6 +5565,8 @@ mod tests {
             same_root: bool,
             /// Dedup rule: a response accepted twice by one block is judged once.
             dedup: bool,
+            /// Audit rule: every traced response is audited.
+            audit_all: bool,
         }
 
         impl Net {
@@ -5542,13 +5574,22 @@ mod tests {
                 let mut ledger = ServiceLedger::default();
                 ledger.set_window_v2_activation(0);
                 ledger.set_reward_routing_activation(0);
-                Self { ledger, cohort, draw, window_v3, same_root: false, dedup: false }
+                Self { ledger, cohort, draw, window_v3, same_root: false, dedup: false, audit_all: false }
             }
 
             /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
             /// `answers`.
             fn fold(&mut self, daa: u64, chain: Hash, requests: &[([u8; 32], u32)], answers: &[Answer]) -> FoldOutcome {
-                let tier = |_: u8, _: u64| -> Option<crate::config::params::TraceRules> { None };
+                let audit_all = self.audit_all;
+                let tier = |_: u8, _: u64| -> Option<crate::config::params::TraceRules> {
+                    audit_all.then(|| crate::config::params::TraceRules {
+                        ctx: keryx_verifiable_inference::verify::TierCtx { r_t: [0; 32], n_chunks: 0, m_t: [0; 32], n_entries: 0, n_products: 0 },
+                        prefix: None,
+                        chain: None,
+                        audit_all: true,
+                        attention: false,
+                    })
+                };
                 let events: Vec<TraceResponseEvent> = answers
                     .iter()
                     .filter_map(|(rh, r, s)| {
@@ -5783,6 +5824,33 @@ mod tests {
             assert_eq!(out.rewards.iter().map(|r| (r.winner, r.amount)).collect::<Vec<_>>(), vec![(b, REWARD)]);
             assert!(net.ledger.held_draws.is_empty());
             assert_ne!(net.ledger.snapshot().to_bytes()[0], super::super::SNAPSHOT_ENCODING_VERSION_HELD);
+        }
+
+        #[test]
+        fn a_traced_answer_with_its_request_holds_a_short_draw_until_drawn() {
+            let a = id(1);
+            let mut net = Net::new(true, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 16)], &[(RH, a, Some((4, 20)))]);
+            net.fold(101, chain(0), &[], &[]);
+            let close = net.ledger.pending.get(&RH).unwrap().draw.as_ref().unwrap().close_daa;
+            assert!(close < 100 + TRACE_SEED_DELAY_DAA);
+            for daa in 102..100 + TRACE_SEED_DELAY_DAA {
+                assert!(net.fold(daa, chain(9), &[], &[]).rewards.is_empty(), "paid at {daa} before its audit is drawn");
+            }
+            let out = net.fold(100 + TRACE_SEED_DELAY_DAA, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
+        }
+
+        #[test]
+        fn an_untraced_answer_under_the_audit_rule_is_no_draw_candidate() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, true, vec![a, b]);
+            net.audit_all = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[(RH, a, None)]);
+            net.fold(101, chain(0), &[], &[]);
+            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_none(), "an early untraced answer opens no draw");
+            net.fold(102, chain(0), &[], &[(RH, b, None)]);
+            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_none(), "nor a later one");
         }
 
         #[test]
