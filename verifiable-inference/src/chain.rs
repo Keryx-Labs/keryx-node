@@ -84,13 +84,58 @@ pub fn meta(t: u32, n_ubatch: u32, tok: u32) -> [u8; 12] {
 
 /// Blocks of 32 values covered by a norm weight fragment.
 pub const NORM_FRAGMENT_BLOCKS: u64 = 8;
+/// Blocks of 32 `f32` values in a leaf chunk.
+pub const CHUNK_BLOCKS: u64 = (B3_CHUNK / 128) as u64;
 const FRAGMENT_DRAW: u32 = 64;
 
-/// First block and block count of the norm weight fragment drawn for point `i` over `k` values.
-pub fn norm_fragment(seed: &Hash, i: u32, k: u64) -> (u64, u64) {
+/// First block and block count of the norm weight fragment covering `block` over `k` values.
+pub fn norm_fragment(block: u64, k: u64) -> (u64, u64) {
     let blocks = k.div_ceil(32);
     let n = NORM_FRAGMENT_BLOCKS.min(blocks);
-    (draw::point(seed, FRAGMENT_DRAW + i)[0] % (blocks - n + 1), n)
+    (block.min(blocks - n), n)
+}
+
+/// Block of the product input `x` (`k` values in `layout`) that the link of point `i` checks:
+/// drawn uniformly, or on even odds by block scale.
+pub fn link_block(seed: &Hash, i: u32, x: &[u8], layout: u8, k: u64) -> Option<u64> {
+    let blocks = q8::blocks(x, layout, k as usize)?;
+    let n = blocks.len() as u64;
+    if n == 0 {
+        return None;
+    }
+    let r = draw::point(seed, FRAGMENT_DRAW + i);
+    if r[1] & 1 == 0 {
+        return Some(r[0] % n);
+    }
+    let peak = blocks.iter().fold(0f32, |m, (d, _)| m.max(d.abs()));
+    if !peak.is_finite() {
+        return None;
+    }
+    let w: Vec<u64> = blocks.iter().map(|(d, _)| 1 + if peak > 0.0 { (d.abs() as f64 / peak as f64 * 65535.0) as u64 } else { 0 }).collect();
+    let mut target = r[2] % w.iter().sum::<u64>();
+    for (b, &wb) in w.iter().enumerate() {
+        if target < wb {
+            return Some(b as u64);
+        }
+        target -= wb;
+    }
+    None
+}
+
+/// Largest block scale of an unlinked product input over its median block scale.
+const PEAK_OVER_MEDIAN: f32 = 1024.0;
+
+/// Whether no block scale of `x` exceeds [`PEAK_OVER_MEDIAN`] times the median one.
+pub fn peak_bounded(x: &[u8], layout: u8, k: u64) -> bool {
+    let Some(blocks) = q8::blocks(x, layout, k as usize) else { return false };
+    let mut d: Vec<f32> = blocks.iter().map(|(d, _)| d.abs()).collect();
+    if d.is_empty() || d.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let peak = d.iter().fold(0f32, |m, &v| m.max(v));
+    let mid = d.len() / 2;
+    let median = *d.select_nth_unstable_by(mid, f32::total_cmp).1;
+    median == 0.0 || peak <= PEAK_OVER_MEDIAN * median
 }
 
 /// `v / rms(v)` in f64.
@@ -268,9 +313,13 @@ pub fn verify_chain_point(
         return Err(Fail::Manifest);
     }
     match (pl.link, link) {
-        (manifest::LINK_NONE, LinkOpening::None) => {}
+        (manifest::LINK_NONE, LinkOpening::None) => {
+            if !peak_bounded(&p.x, o.layout, k) {
+                return Err(Fail::Mismatch);
+            }
+        }
         (manifest::LINK_ATTN_IN, LinkOpening::Token { embd, norm }) if layer == 0 => {
-            let (b0, n) = norm_fragment(seed, i, k);
+            let (b0, n) = norm_fragment(link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)?, k);
             let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
             let scaled = rms_scaled(&embedding(tier, ctx, embd, tok, k)?, ctx.eps, ctx.embd_scale);
             fragment_link(&p.x, o.layout, k as usize, &scaled, &w, b0, n)?;
@@ -283,10 +332,10 @@ pub fn verify_chain_point(
                 _ => return Err(Fail::Shape),
             };
             let h = whole_leaf(&o.pos_root, &shape, leaf, src, 4 * k)?;
-            let (b0, n) = norm_fragment(seed, i, k);
-            let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
             let x_one = crate::verify::x_len(k, o.layout) as usize;
             let xs = if p.x.len() == x_one { &p.x[..] } else { p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)? };
+            let (b0, n) = norm_fragment(link_block(seed, i, xs, o.layout, k).ok_or(Fail::Shape)?, k);
+            let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
             fragment_link(xs, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
         }
         (manifest::LINK_GLU, LinkOpening::Source { src, y, ids: Some(ids) }) if o.input.n_exp > 1 => {
@@ -311,10 +360,10 @@ pub fn verify_chain_point(
             if u32::from_le_bytes(id.try_into().unwrap()) as u64 != o.expert {
                 return Err(Fail::Mismatch);
             }
-            let c = o.slot * per_slot + draw::point(seed, i)[3] % per_slot;
-            let h = leaf_chunk(&o.pos_root, &shape, gate_y, y, total, c)?;
             let x_one = crate::verify::x_len(k, o.layout) as usize;
             let xs = p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)?;
+            let c = o.slot * per_slot + link_block(seed, i, xs, o.layout, k).ok_or(Fail::Shape)? / CHUNK_BLOCKS;
+            let h = leaf_chunk(&o.pos_root, &shape, gate_y, y, total, c)?;
             glu_link(xs, o.layout, k as usize, ((c - o.slot * per_slot) * B3_CHUNK as u64 / 128) as usize, &h)?;
         }
         (manifest::LINK_GLU | manifest::LINK_DIRECT, LinkOpening::Source { src, y, ids: None }) if o.input.n_exp == 1 => {
@@ -330,7 +379,7 @@ pub fn verify_chain_point(
                 return Err(Fail::Manifest);
             }
             let total = 4 * m_out;
-            let c = draw::point(seed, i)[3] % n_chunks(total);
+            let c = link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)? / CHUNK_BLOCKS;
             let h = leaf_chunk(&o.pos_root, &shape, 2 * pl.src as u64 + 1, y, total, c)?;
             glu_link(&p.x, o.layout, k as usize, (c * B3_CHUNK as u64 / 128) as usize, &h)?;
         }
@@ -346,12 +395,12 @@ pub fn verify_chain_point(
             }
             let per_chunk = (B3_CHUNK / 4) as u64;
             let start = o.slot * stride;
-            let c = (start + draw::point(seed, i)[3] % (k / 32) * 32) / per_chunk;
+            let x_one = crate::verify::x_len(k, o.layout) as usize;
+            let xs = p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)?;
+            let c = (start + link_block(seed, i, xs, o.layout, k).ok_or(Fail::Shape)? * 32) / per_chunk;
             let h = leaf_chunk(&o.pos_root, &shape, 2 * pl.src as u64 + 1, y, 4 * se.m, c)?;
             let (lo, hi) = ((c * per_chunk).max(start), ((c + 1) * per_chunk).min(start + k));
             let vals = h.get((lo - c * per_chunk) as usize..(hi - c * per_chunk) as usize).ok_or(Fail::Shape)?;
-            let x_one = crate::verify::x_len(k, o.layout) as usize;
-            let xs = p.x.get(o.slot as usize * x_one..(o.slot as usize + 1) * x_one).ok_or(Fail::Shape)?;
             glu_link(xs, o.layout, k as usize, ((lo - start) / 32) as usize, vals)?;
         }
         _ => return Err(Fail::Shape),
@@ -664,6 +713,33 @@ mod tests {
         let h = vec_of(1, 3.0);
         let w2: Vec<f32> = (0..D).map(|i| 1.0 + 0.05 * (i % 13) as f32).collect();
         assert_eq!(norm_link(&honest_input(&h), q8::MMVQ, &h, &w2, EPS), Err(Fail::Mismatch));
+    }
+
+    fn spiked_row(spike: f64) -> Vec<u8> {
+        let mut h: Vec<f64> = vec_of(5, 0.5).iter().map(|&a| a as f64).collect();
+        for v in h[7 * 32..8 * 32].iter_mut() {
+            *v *= spike;
+        }
+        q8_1_row(&h)
+    }
+
+    #[test]
+    fn the_link_draw_lands_on_a_spiked_block() {
+        let x = spiked_row(1e4);
+        let seeds = 0..400u32;
+        let hits = seeds.clone().filter(|s| link_block(blake3::hash(&s.to_le_bytes()).as_bytes(), 0, &x, q8::MMVQ, D as u64) == Some(7)).count();
+        assert!(hits > 400 / 3, "{hits}");
+        let flat = spiked_row(1.0);
+        let n = (D / 32) as u64;
+        assert!(seeds.map(|s| link_block(blake3::hash(&s.to_le_bytes()).as_bytes(), 0, &flat, q8::MMVQ, D as u64).unwrap()).all(|b| b < n));
+    }
+
+    #[test]
+    fn an_unlinked_input_is_bounded_by_its_median_block() {
+        assert!(peak_bounded(&spiked_row(1.0), q8::MMVQ, D as u64));
+        assert!(peak_bounded(&spiked_row(1000.0), q8::MMVQ, D as u64));
+        assert!(!peak_bounded(&spiked_row(2000.0), q8::MMVQ, D as u64));
+        assert!(peak_bounded(&q8_1_row(&vec![0.0; D]), q8::MMVQ, D as u64));
     }
 
     #[test]

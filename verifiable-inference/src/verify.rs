@@ -142,6 +142,11 @@ pub fn expected_ubatch(t: u64, n_prompt: u32) -> u32 {
     UBATCH.min(n_prompt - start as u32)
 }
 
+/// Q8_1 layout of the input of a product of `role` and weight type `wtype` in a batch of `n_ubatch`.
+pub fn input_layout(role: u8, n_ubatch: u32, wtype: u32) -> u8 {
+    if role == manifest::ROLE_OUTPUT { q8::MMVQ } else { layout_for(n_ubatch, wtype) }
+}
+
 pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
     if n_ubatch <= MMVQ_MAX_BATCH {
         q8::MMVQ
@@ -152,7 +157,7 @@ pub(crate) fn layout_for(n_ubatch: u32, wtype: u32) -> u8 {
     }
 }
 
-pub(crate) fn x_len(k: u64, layout: u8) -> u64 {
+pub fn x_len(k: u64, layout: u8) -> u64 {
     let kp = k.div_ceil(MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
     if layout == q8::MMVQ { kp / 32 * 36 } else { kp / 128 * 144 }
 }
@@ -253,7 +258,7 @@ pub(crate) fn verify_point_at(
     let row = d[2] % m_out;
 
     let n_pos_leaves = shape.n_leaves;
-    let layout = if output_only { q8::MMVQ } else { layout_for(p.n_ubatch, g_entry.wtype) };
+    let layout = input_layout(first.role, p.n_ubatch, g_entry.wtype);
     let x_one = x_len(g_entry.k, layout);
     let x = match p.x.len() as u64 {
         n if n == x_one => &p.x[..],

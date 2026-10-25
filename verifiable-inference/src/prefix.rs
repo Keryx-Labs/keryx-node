@@ -143,7 +143,11 @@ pub(crate) fn verify_prefix_point_at(
     let k = first.k as usize;
     let row = open_row(tier, &embd, &p.embd.1, tok as u64)?;
     let e = quant::dequant_row(embd.wtype, &row, k).ok_or(Fail::Unsupported)?;
-    let (b0, nb) = if fragment { crate::chain::norm_fragment(seed, PREFIX_POINT, k as u64) } else { (0, (k as u64).div_ceil(32)) };
+    let (b0, nb) = if fragment {
+        crate::chain::norm_fragment(crate::chain::link_block(seed, PREFIX_POINT, &p.x, layout, k as u64).ok_or(Fail::Shape)?, k as u64)
+    } else {
+        (0, (k as u64).div_ceil(32))
+    };
     let (lo, len) = (b0 * 32, (nb * 32).min(k as u64 - b0 * 32));
     let w_bytes = open_bytes(tier, &norm, &p.norm.1, 4 * lo, 4 * len)?;
     let w: Vec<f32> = w_bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();

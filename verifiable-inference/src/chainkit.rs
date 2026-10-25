@@ -410,9 +410,9 @@ impl Tier {
     }
 
 
-    fn norm_fragment_of(&self, i: usize, seed: &Hash, point: u32) -> (EntryOpening, ChunkRange) {
+    fn norm_fragment_of(&self, i: usize, block: u64) -> (EntryOpening, ChunkRange) {
         let k = self.entry(i).k;
-        let (b0, n) = chain::norm_fragment(seed, point, k);
+        let (b0, n) = chain::norm_fragment(block, k);
         let len = (n * 32).min(k - b0 * 32);
         (self.entry_opening(i), self.bytes_range(i, 4 * b0 * 32, 4 * len))
     }
@@ -489,14 +489,16 @@ impl Tier {
 
         let Chain::Product(pl) = ge.chain else { panic!("product without link") };
         let layer = pl.layer as u64;
+        let layout = crate::verify::input_layout(self.entry(drawn).role, point.n_ubatch, ge.wtype);
+        let block = || chain::link_block(seed, i, &point.x, layout, ge.k).expect("link block");
         let link = match pl.link {
             manifest::LINK_NONE => LinkOpening::None,
             manifest::LINK_ATTN_IN if layer == 0 => {
-                LinkOpening::Token { embd: self.row_of(EMBD, pos.tok as u64), norm: self.norm_fragment_of(pl.norm as usize, seed, i) }
+                LinkOpening::Token { embd: self.row_of(EMBD, pos.tok as u64), norm: self.norm_fragment_of(pl.norm as usize, block()) }
             }
             manifest::LINK_GLU | manifest::LINK_DIRECT => {
                 let src = pl.src as u64;
-                let c = d[3] % n_chunks(pos.leaves[2 * src as usize + 1].len());
+                let c = block() / chain::CHUNK_BLOCKS;
                 LinkOpening::Source { src: self.entry_opening(src as usize), y: leaf_chunk(pos, 2 * src + 1, c), ids: None }
             }
             link => {
@@ -505,7 +507,7 @@ impl Tier {
                     manifest::LINK_FFN_IN => chain::resid_leaf(np, layer, Resid::Attn),
                     _ => chain::resid_leaf(np, N_LAYERS as u64 - 1, Resid::Out),
                 };
-                LinkOpening::Norm { src: leaf_bytes(pos, leaf), norm: self.norm_fragment_of(pl.norm as usize, seed, i) }
+                LinkOpening::Norm { src: leaf_bytes(pos, leaf), norm: self.norm_fragment_of(pl.norm as usize, block()) }
             }
         };
         (point, pos.tok, link)
@@ -531,7 +533,9 @@ impl Tier {
         let t = prefix::position(seed, offset) as usize;
         let pos = &trace.positions[t];
         let k = self.entry(attn_norm(0)).k;
-        let (b0, n) = chain::norm_fragment(seed, prefix::PREFIX_POINT, k);
+        let layout = crate::verify::input_layout(self.entry(0).role, trace.layout(t as u64).0, self.entry(0).wtype);
+        let block = chain::link_block(seed, prefix::PREFIX_POINT, &pos.leaves[0], layout, k).expect("link block");
+        let (b0, n) = chain::norm_fragment(block, k);
         PrefixPoint {
             n_ubatch: trace.layout(t as u64).0,
             pos_path: b3_path(&trace.pos_roots, t),
@@ -903,6 +907,11 @@ mod head_link_tests {
 
     /// `shift`: each head reads its slice 32 values late; `zero_out`: the output projection reads zeros.
     fn build(shift: bool, zero_out: bool) -> H {
+        build_with(shift, zero_out, 1.0)
+    }
+
+    /// The harness with the fourth input block of the unlinked product scaled by `spike`.
+    fn build_with(shift: bool, zero_out: bool, spike: f64) -> H {
         let none = manifest::NONE;
         let weights = vec![q8_0_rows(11, NH * STRIDE, 0.0004), q8_0_rows(12, NH * M1, 0.0004), q8_0_rows(13, D, 0.0004)];
         let mut all = Vec::new();
@@ -948,7 +957,7 @@ mod head_link_tests {
             n_products: NP,
         };
         let ctx = ChainCtx { n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
-        let x0 = q8_1_row(&(0..D).map(|i| ((i * 7) % 23) as f64 * 0.01 - 0.1).collect::<Vec<_>>());
+        let x0 = q8_1_row(&(0..D).map(|i| (((i * 7) % 23) as f64 * 0.01 - 0.1) * if i / 32 == 3 { spike } else { 1.0 }).collect::<Vec<_>>());
         let y0 = dot_rows(&weights[0], 0..NH * STRIDE, &x0);
         let off = if shift { 32 } else { 0 };
         let xs: Vec<Vec<u8>> = (0..NH).map(|h| q8_1_row(&y0[h * STRIDE + off..h * STRIDE + off + D].iter().map(|&a| a as f64).collect::<Vec<_>>())).collect();
@@ -1006,14 +1015,17 @@ mod head_link_tests {
                 y_chunk_path: yc.chunk_path,
                 y_path: b3_path(&self.pos.hashes, 2 * rank + 1),
             };
+            let x_one = crate::verify::x_len(D as u64, crate::q8::MMVQ) as usize;
+            let xs = &p.x[slot * x_one..(slot + 1) * x_one];
+            let block = chain::link_block(seed, 0, xs, crate::q8::MMVQ, D as u64).expect("link block") as usize;
             let link = match rank {
                 0 => LinkOpening::None,
                 1 => {
-                    let c = (slot * STRIDE + (d[3] % (D as u64 / 32)) as usize * 32) * 4 / B3_CHUNK;
+                    let c = (slot * STRIDE + block * 32) * 4 / B3_CHUNK;
                     LinkOpening::Source { src: self.eo(0), y: leaf_chunk(&self.pos, 1, c as u64), ids: None }
                 }
                 _ => {
-                    let c = d[3] % n_chunks(self.pos.leaves[3].len());
+                    let c = block as u64 / chain::CHUNK_BLOCKS;
                     LinkOpening::Source { src: self.eo(1), y: leaf_chunk(&self.pos, 3, c), ids: None }
                 }
             };
@@ -1050,6 +1062,22 @@ mod head_link_tests {
         for s in seeds() {
             let (rank, r) = h.check(&s);
             assert_eq!(r.is_err(), rank == 1, "rank {rank}");
+        }
+    }
+
+    #[test]
+    fn an_unlinked_input_with_a_spiked_block_is_refused() {
+        for (spike, refused) in [(500.0, false), (4000.0, true)] {
+            let h = build_with(false, false, spike);
+            let mut seen = false;
+            for s in seeds() {
+                let (rank, r) = h.check(&s);
+                if rank == 0 {
+                    seen = true;
+                    assert_eq!(r.is_err(), refused, "spike {spike}");
+                }
+            }
+            assert!(seen);
         }
     }
 
