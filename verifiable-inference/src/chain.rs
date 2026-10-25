@@ -98,6 +98,9 @@ pub fn norm_fragment(block: u64, k: u64) -> (u64, u64) {
 /// Block of the product input `x` (`k` values in `layout`) that the link of point `i` checks:
 /// drawn uniformly, or on even odds by block scale.
 pub fn link_block(seed: &Hash, i: u32, x: &[u8], layout: u8, k: u64) -> Option<u64> {
+    if !k.is_multiple_of(32) {
+        return None;
+    }
     let blocks = q8::blocks(x, layout, k as usize)?;
     let n = blocks.len() as u64;
     if n == 0 {
@@ -125,14 +128,27 @@ pub fn link_block(seed: &Hash, i: u32, x: &[u8], layout: u8, k: u64) -> Option<u
 /// Largest block scale of an unlinked product input over its median block scale.
 const PEAK_OVER_MEDIAN: f32 = 1024.0;
 
-/// Whether no block scale of `x` exceeds [`PEAK_OVER_MEDIAN`] times the median one.
-pub fn peak_bounded(x: &[u8], layout: u8, k: u64) -> bool {
-    let Some(blocks) = q8::blocks(x, layout, k as usize) else { return false };
-    let mut d: Vec<f32> = blocks.iter().map(|(d, _)| d.abs()).collect();
-    if d.is_empty() || d.iter().any(|v| !v.is_finite()) {
+/// Whether no block scale of slot `slot` of `x` (rows of `k` values) exceeds
+/// [`PEAK_OVER_MEDIAN`] times the median block scale over every slot.
+pub fn peak_bounded(x: &[u8], layout: u8, k: u64, slot: u64) -> bool {
+    let x_one = crate::verify::x_len(k, layout) as usize;
+    if !k.is_multiple_of(32) || x_one == 0 || x.is_empty() || !x.len().is_multiple_of(x_one) || slot as usize >= x.len() / x_one {
         return false;
     }
-    let peak = d.iter().fold(0f32, |m, &v| m.max(v));
+    let mut d: Vec<f32> = Vec::with_capacity(x.len() / x_one * k as usize / 32);
+    let mut peak = 0f32;
+    for (s, row) in x.chunks_exact(x_one).enumerate() {
+        let Some(blocks) = q8::blocks(row, layout, k as usize) else { return false };
+        for (b, _) in blocks {
+            if !b.is_finite() {
+                return false;
+            }
+            if s as u64 == slot {
+                peak = peak.max(b.abs());
+            }
+            d.push(b.abs());
+        }
+    }
     let mid = d.len() / 2;
     let median = *d.select_nth_unstable_by(mid, f32::total_cmp).1;
     median == 0.0 || peak <= PEAK_OVER_MEDIAN * median
@@ -314,7 +330,7 @@ pub fn verify_chain_point(
     }
     match (pl.link, link) {
         (manifest::LINK_NONE, LinkOpening::None) => {
-            if !peak_bounded(&p.x, o.layout, k) {
+            if !peak_bounded(&p.x, o.layout, k, o.slot) {
                 return Err(Fail::Mismatch);
             }
         }
@@ -736,10 +752,14 @@ mod tests {
 
     #[test]
     fn an_unlinked_input_is_bounded_by_its_median_block() {
-        assert!(peak_bounded(&spiked_row(1.0), q8::MMVQ, D as u64));
-        assert!(peak_bounded(&spiked_row(1000.0), q8::MMVQ, D as u64));
-        assert!(!peak_bounded(&spiked_row(2000.0), q8::MMVQ, D as u64));
-        assert!(peak_bounded(&q8_1_row(&vec![0.0; D]), q8::MMVQ, D as u64));
+        assert!(peak_bounded(&spiked_row(1.0), q8::MMVQ, D as u64, 0));
+        assert!(peak_bounded(&spiked_row(1000.0), q8::MMVQ, D as u64, 0));
+        assert!(!peak_bounded(&spiked_row(2000.0), q8::MMVQ, D as u64, 0));
+        assert!(peak_bounded(&q8_1_row(&vec![0.0; D]), q8::MMVQ, D as u64, 0));
+        let heads = [spiked_row(1.0), spiked_row(1.0), spiked_row(2000.0)].concat();
+        assert!(peak_bounded(&heads, q8::MMVQ, D as u64, 1));
+        assert!(!peak_bounded(&heads, q8::MMVQ, D as u64, 2), "the drawn slot is the one bounded");
+        assert!(!peak_bounded(&heads, q8::MMVQ, D as u64, 3));
     }
 
     #[test]
