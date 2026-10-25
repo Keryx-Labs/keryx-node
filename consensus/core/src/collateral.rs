@@ -866,6 +866,17 @@ impl PendingRequest {
     }
 }
 
+/// A reward draw kept past the end of its request's window while a candidate awaits the verdict
+/// of its audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldDraw {
+    draw: RewardDraw,
+    reward: u64,
+}
+
+/// Longest a held draw waits for the audits of its candidates, from its opening.
+const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA;
+
 /// A reward draw: opened by the first credited response, closed `W` DAA later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RewardDraw {
@@ -992,6 +1003,7 @@ pub struct LightSnapshot {
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
+    held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -1039,6 +1051,7 @@ pub struct ServiceLedger {
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
     /// Trace roots of a retired rule, with the daa of their response; kept until they expire.
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
+    held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
 
 impl ServiceLedger {
@@ -1417,6 +1430,18 @@ impl ServiceLedger {
             for rh in closing {
                 self.close_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
             }
+            let released: Vec<[u8; 32]> = self
+                .held_draws
+                .iter()
+                .filter(|(rh, h)| daa >= h.draw.open_daa + HELD_DRAW_HORIZON_DAA || !self.draw_awaits_audit(rh, &h.draw))
+                .map(|(rh, _)| *rh)
+                .collect();
+            for rh in released {
+                let HeldDraw { mut draw, reward } = self.held_draws.remove(&rh).unwrap();
+                let judged: Vec<Hash> = draw.candidates.iter().map(|(id, _)| *id).filter(|id| !self.audit_pending_for(&rh, id)).collect();
+                draw.candidates.retain(|(id, _)| judged.contains(id));
+                self.award_draw(&rh, &draw, reward, &tr.chain_hash, warmup, &mut outcome);
+            }
         }
 
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
@@ -1451,7 +1476,7 @@ impl ServiceLedger {
                         && crate::config::params::safe_prompt_len(req.tier, req.max_tokens).is_some_and(|safe| req.prompt_len > safe);
                     self.drop_draw_candidates(&rh, &late);
                     if let Some(tr) = traces {
-                        self.close_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
+                        self.close_or_hold_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
                     }
                     for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)) {
                         if warmup {
@@ -1976,14 +2001,17 @@ impl ServiceLedger {
         self.maybe_award(rh, first, warmup, outcome);
     }
 
-    /// Whether a candidate of the draw of `rh` still awaits the verdict of a trace audit on it.
-    fn draw_awaits_audit(&self, rh: &[u8; 32], draw: &RewardDraw) -> bool {
-        self.trace_audits
-            .values()
-            .any(|a| a.request_hash == *rh && a.identities.iter().any(|id| draw.candidates.iter().any(|(c, _)| c == id)))
+    /// Whether identity `id` still awaits the verdict of a trace audit on `rh`.
+    fn audit_pending_for(&self, rh: &[u8; 32], id: &Hash) -> bool {
+        self.trace_audits.values().any(|a| a.request_hash == *rh && a.identities.contains(id))
     }
 
-    /// Removes identities the audit sanctioned on `rh` from its open draw.
+    /// Whether a candidate of the draw of `rh` still awaits the verdict of a trace audit on it.
+    fn draw_awaits_audit(&self, rh: &[u8; 32], draw: &RewardDraw) -> bool {
+        draw.candidates.iter().any(|(id, _)| self.audit_pending_for(rh, id))
+    }
+
+    /// Removes identities the audit sanctioned on `rh` from its open or held draw.
     fn drop_draw_candidates(&mut self, rh: &[u8; 32], identities: &[Hash]) {
         if identities.is_empty() {
             return;
@@ -1991,6 +2019,22 @@ impl ServiceLedger {
         if let Some(draw) = self.pending.get_mut(rh).and_then(|r| r.draw.as_mut()) {
             draw.candidates.retain(|(id, _)| !identities.contains(id));
         }
+        if let Some(h) = self.held_draws.get_mut(rh) {
+            h.draw.candidates.retain(|(id, _)| !identities.contains(id));
+        }
+    }
+
+    /// Closes the draw of `rh` at the end of its request's window, or holds it while a
+    /// candidate awaits the verdict of its audit.
+    fn close_or_hold_draw(&mut self, rh: &[u8; 32], chain_hash: &Hash, warmup: bool, outcome: &mut FoldOutcome) {
+        let held = self.pending.get(rh).and_then(|r| r.draw.as_ref()).is_some_and(|d| self.draw_awaits_audit(rh, d));
+        if !held {
+            self.close_draw(rh, chain_hash, warmup, outcome);
+            return;
+        }
+        let req = self.pending.get_mut(rh).unwrap();
+        let draw = req.draw.take().unwrap();
+        self.held_draws.insert(*rh, HeldDraw { draw, reward: req.reward });
     }
 
     /// Draws the winner of `rh` among its remaining candidates, seeded by the closing chain
@@ -1998,19 +2042,26 @@ impl ServiceLedger {
     fn close_draw(&mut self, rh: &[u8; 32], chain_hash: &Hash, warmup: bool, outcome: &mut FoldOutcome) {
         let Some(req) = self.pending.get_mut(rh) else { return };
         let Some(draw) = req.draw.take() else { return };
+        let reward = req.reward;
+        let winner = self.award_draw(rh, &draw, reward, chain_hash, warmup, outcome);
+        let req = self.pending.get_mut(rh).unwrap();
+        match winner {
+            Some(w) => req.winner = Some(w),
+            None => req.reward = 0,
+        }
+    }
+
+    /// Draws and pays the winner of `draw` for `reward`; `None` when no candidate is left.
+    fn award_draw(&mut self, rh: &[u8; 32], draw: &RewardDraw, reward: u64, chain_hash: &Hash, warmup: bool, outcome: &mut FoldOutcome) -> Option<Hash> {
         let mut candidates: Vec<Hash> = draw.candidates.iter().map(|(id, _)| *id).collect();
         candidates.sort_unstable();
         candidates.dedup();
-        let Some(i) = assign_index(&reward_draw_seed(chain_hash, rh), candidates.len()) else {
-            req.reward = 0;
-            return;
-        };
-        let winner = candidates[i];
-        req.winner = Some(winner);
+        let winner = candidates[assign_index(&reward_draw_seed(chain_hash, rh), candidates.len())?];
         if !warmup {
             let spk = self.producer_spk.get(&winner).cloned();
-            outcome.rewards.push(ServiceReward { request_hash: *rh, winner, amount: req.reward, spk });
+            outcome.rewards.push(ServiceReward { request_hash: *rh, winner, amount: reward, spk });
         }
+        Some(winner)
     }
 
     /// Sets the per-member queue and the deadline of an audit just armed under the v3 window:
@@ -2058,6 +2109,7 @@ impl ServiceLedger {
             trace_audits: self.trace_audits.clone(),
             early_shapes: self.early_shapes.clone(),
             trace_roots: self.trace_roots.clone(),
+            held_draws: self.held_draws.clone(),
         }
     }
 
@@ -2074,6 +2126,7 @@ impl ServiceLedger {
         self.trace_audits = snap.trace_audits.clone();
         self.early_shapes = snap.early_shapes.clone();
         self.trace_roots = snap.trace_roots.clone();
+        self.held_draws = snap.held_draws.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -2144,6 +2197,7 @@ pub struct ServiceLedgerSnapshot {
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
     early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
+    held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
@@ -2179,6 +2233,10 @@ const SNAPSHOT_ENCODING_VERSION_ATTN: u8 = 8;
 /// last phase (`[n: u32] n × [response_txid: 32] [k: u8] k × [child: u64] [root: 32]
 /// [children: u64] [accepted_daa: u64] [drawn: u8] children × [weight: u16]`, key order).
 const SNAPSHOT_ENCODING_VERSION_PHASES: u8 = 10;
+/// Sections of version 10 (possibly empty) followed by the draws held past their request's
+/// window (`[n: u32] n × [request_hash: 32] [reward: u64] [open_daa: u64] [close_daa: u64]
+/// [k: u32] k × [identity: 32] [daa: u64]`, key order).
+const SNAPSHOT_ENCODING_VERSION_HELD: u8 = 11;
 /// Children an attention phase may commit.
 const MAX_ATTN_CHILDREN: u64 = 1 << 16;
 
@@ -2265,7 +2323,9 @@ impl ServiceLedgerSnapshot {
             self.pending.iter().filter_map(|(rh, r)| r.audit.as_ref().and_then(|a| a.v3.as_ref()).map(|w| (rh, w))).collect();
         let halves: Vec<(&[u8; 32], u8)> = self.trace_audits.iter().filter(|(_, a)| a.pieces != 0).map(|(k, a)| (k, a.pieces)).collect();
         let phased: Vec<(&[u8; 32], &AttnProgress)> = self.trace_audits.iter().filter_map(|(k, a)| a.attn.as_ref().map(|p| (k, p))).collect();
-        let version = if !phased.is_empty() {
+        let version = if !self.held_draws.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_HELD
+        } else if !phased.is_empty() {
             SNAPSHOT_ENCODING_VERSION_PHASES
         } else if !halves.is_empty() {
             SNAPSHOT_ENCODING_VERSION_ATTN
@@ -2483,6 +2543,20 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
+        if version >= SNAPSHOT_ENCODING_VERSION_HELD {
+            out.extend_from_slice(&(self.held_draws.len() as u32).to_le_bytes());
+            for (rh, h) in self.held_draws.iter() {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&h.reward.to_le_bytes());
+                out.extend_from_slice(&h.draw.open_daa.to_le_bytes());
+                out.extend_from_slice(&h.draw.close_daa.to_le_bytes());
+                out.extend_from_slice(&(h.draw.candidates.len() as u32).to_le_bytes());
+                for (id, at) in h.draw.candidates.iter() {
+                    out.extend_from_slice(&id.as_bytes());
+                    out.extend_from_slice(&at.to_le_bytes());
+                }
+            }
+        }
         out
     }
 
@@ -2501,6 +2575,7 @@ impl ServiceLedgerSnapshot {
                 | SNAPSHOT_ENCODING_VERSION_QUEUE
                 | SNAPSHOT_ENCODING_VERSION_ATTN
                 | SNAPSHOT_ENCODING_VERSION_PHASES
+                | SNAPSHOT_ENCODING_VERSION_HELD
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -2794,7 +2869,7 @@ impl ServiceLedgerSnapshot {
         }
         if version >= SNAPSHOT_ENCODING_VERSION_PHASES {
             let n = r.u32()?;
-            if n == 0 {
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_PHASES {
                 return Err("empty phase section".into());
             }
             for _ in 0..n {
@@ -2819,6 +2894,28 @@ impl ServiceLedgerSnapshot {
                         a.attn = Some(AttnProgress { path, root, n: children, accepted_daa, drawn, weights })
                     }
                     _ => return Err("malformed phase section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_HELD {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty held draw section".into());
+            }
+            for _ in 0..n {
+                let rh = r.key()?;
+                let reward = r.u64()?;
+                let open_daa = r.u64()?;
+                let close_daa = r.u64()?;
+                let k = r.u32()? as usize;
+                let mut candidates = Vec::with_capacity(k.min(1 << 16));
+                for _ in 0..k {
+                    let id = r.hash()?;
+                    let at = r.u64()?;
+                    candidates.push((id, at));
+                }
+                if snap.held_draws.insert(rh, HeldDraw { draw: RewardDraw { open_daa, close_daa, candidates }, reward }).is_some() {
+                    return Err("malformed held draw section".into());
                 }
             }
         }
@@ -3085,6 +3182,7 @@ impl ServiceLedger {
             trace_audits: self.trace_audits.clone(),
             early_shapes: self.early_shapes.clone(),
             trace_roots: self.trace_roots.clone(),
+            held_draws: self.held_draws.clone(),
         }
     }
 
@@ -3102,6 +3200,7 @@ impl ServiceLedger {
         self.trace_audits = snap.trace_audits.clone();
         self.early_shapes = snap.early_shapes.clone();
         self.trace_roots = snap.trace_roots.clone();
+        self.held_draws = snap.held_draws.clone();
     }
 }
 
@@ -5638,16 +5737,10 @@ mod tests {
             assert_eq!(draw.candidates.len(), 2);
         }
 
-        #[test]
-        fn a_draw_waits_for_the_audit_of_its_candidates() {
-            let (a, b) = (id(1), id(2));
-            let mut net = Net::new(true, false, vec![a, b]);
-            net.fold(100, chain(0), &[(RH, 256)], &[]);
-            net.fold(101, chain(0), &[], &[]);
-            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, b, None)]);
+        fn open_audit(net: &mut Net, key: u8, responder: Hash, deadline_daa: u64) {
             let audit = super::super::TraceAudit {
                 request_hash: RH,
-                responder: a,
+                responder,
                 escrow_pubkey: [0u8; 32],
                 trace_root: [0u8; 32],
                 n_prompt: 4,
@@ -5655,20 +5748,56 @@ mod tests {
                 accepted_daa: 102,
                 tier: 0,
                 max_tokens: 256,
-                identities: vec![a],
+                identities: vec![responder],
                 seed: Some([9; 32]),
-                deadline_daa: 9_999,
+                deadline_daa,
                 pieces: 0,
                 attn: None,
             };
-            net.ledger.trace_audits.insert([0xAAu8; 32], audit);
-            let close = 102 + reward_draw_window_daa(0, 0, 256);
-            assert!(net.fold(close, chain(9), &[], &[]).rewards.is_empty());
-            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_some(), "an audit still open keeps the draw open");
+            net.ledger.trace_audits.insert([key; 32], audit);
+        }
+
+        #[test]
+        fn a_draw_waits_for_the_audit_of_its_candidates() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, b, None)]);
+            open_audit(&mut net, 0xAA, a, 9_999);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end + 1, chain(9), &[], &[]).rewards.is_empty());
+            assert!(!net.ledger.pending.contains_key(&RH), "the request leaves at the end of its window");
+            assert_eq!(net.ledger.held_draws.len(), 1, "an audit still open holds the draw");
+
+            let snap = net.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_HELD);
+            assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), snap);
+            assert!(net.fold(end + 2, chain(9), &[], &[]).rewards.is_empty());
+
             // The audit sanctions its responder: only the other candidate remains.
             net.ledger.trace_audits.clear();
             net.ledger.drop_draw_candidates(&RH, &[a]);
-            let out = net.fold(close + 1, chain(9), &[], &[]);
+            let out = net.fold(end + 3, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| (r.winner, r.amount)).collect::<Vec<_>>(), vec![(b, REWARD)]);
+            assert!(net.ledger.held_draws.is_empty());
+            assert_ne!(net.ledger.snapshot().to_bytes()[0], super::super::SNAPSHOT_ENCODING_VERSION_HELD);
+        }
+
+        #[test]
+        fn a_held_draw_drops_the_candidates_still_unjudged_at_its_horizon() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, b, None)]);
+            open_audit(&mut net, 0xAA, a, u64::MAX / 2);
+            let end = net.window_end(&RH);
+            net.fold(end + 1, chain(9), &[], &[]);
+            let open = net.ledger.held_draws.get(&RH).unwrap().draw.open_daa;
+            assert!(net.fold(open + super::super::HELD_DRAW_HORIZON_DAA - 1, chain(9), &[], &[]).rewards.is_empty());
+            let out = net.fold(open + super::super::HELD_DRAW_HORIZON_DAA, chain(9), &[], &[]);
             assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![b]);
         }
 
@@ -5695,9 +5824,13 @@ mod tests {
             net.fold(101, chain(0), &[], &[]);
             let end = net.window_end(&RH);
             net.fold(end, chain(0), &[], &[(RH, a, Some((0, 256)))]);
-            let out = net.fold(end + 1, chain(9), &[], &[]);
-            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
+            assert!(net.fold(end + 1, chain(9), &[], &[]).rewards.is_empty(), "the traced answer is not drawn yet");
             assert!(net.ledger.pending.is_empty());
+            let ripe = end + TRACE_SEED_DELAY_DAA;
+            assert!(net.fold(ripe - 1, chain(9), &[], &[]).rewards.is_empty());
+            let out = net.fold(ripe, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
+            assert!(net.ledger.held_draws.is_empty());
         }
 
         #[test]
