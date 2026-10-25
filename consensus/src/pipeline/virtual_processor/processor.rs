@@ -1685,6 +1685,18 @@ impl VirtualStateProcessor {
             virtual_state.daa_score,
             virtual_state.past_median_time,
         )?;
+        // The block era rules move with the score, past the admission of the transaction.
+        check_private_inference_era(tx, virtual_state.daa_score, self.private_inference_activation)
+            .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
+        check_verifiable_inference_era(
+            tx,
+            virtual_state.daa_score,
+            self.verifiable_inference_activation,
+            self.trace_chain_activation,
+            self.trace_seed_bind_activation,
+            self.attention_activation,
+        )
+        .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         let ValidatedTransaction { calculated_fee, .. } =
             self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full)?;
         Ok(calculated_fee)

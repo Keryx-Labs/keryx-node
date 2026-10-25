@@ -447,10 +447,13 @@ async fn private_response_body_invalidates_the_block_before_the_gate() {
         let payload = AiResponsePayload::new_v2([7u8; 32], 1, [0x12u8; 34], 1, responder).with_private_body(vec![0xAB; 64]).serialize();
         let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload);
         let block: Hash = 1u64.into();
-        let result = tc.add_utxo_valid_block_with_parents(block, vec![config.genesis.hash], vec![tx]).await;
         if accepted {
+            let result = tc.add_utxo_valid_block_with_parents(block, vec![config.genesis.hash], vec![tx]).await;
             assert_eq!(result.unwrap(), BlockStatus::StatusUTXOValid);
         } else {
+            // A template no longer takes it: the block is built by hand.
+            let raw = tc.build_block_with_parents_and_transactions(block, vec![config.genesis.hash], vec![tx]);
+            let result = tc.validate_and_insert_block(raw.to_immutable()).block_task.await;
             assert!(matches!(result, Err(RuleError::AiResponseBodyBeforeActivation(_))), "{result:?}");
             assert_eq!(tc.get_block_status(block), Some(BlockStatus::StatusInvalid));
         }
@@ -1918,4 +1921,43 @@ async fn fresh_node_import_rebases_and_verifies_exactly() {
     assert!(vp.install_production_index_snapshot(sample, legacy.to_bytes(), legacy).is_err());
 
     tc.shutdown(handles);
+}
+
+/// A selector handing out its transactions once and failing once any is rejected.
+struct RejectAwareSelector {
+    txs: Option<Vec<Transaction>>,
+    rejected: usize,
+}
+
+impl TemplateTransactionSelector for RejectAwareSelector {
+    fn select_transactions(&mut self) -> Vec<Transaction> {
+        self.txs.take().unwrap_or_default()
+    }
+
+    fn reject_selection(&mut self, _tx_id: keryx_consensus_core::tx::TransactionId) {
+        self.rejected += 1;
+    }
+
+    fn is_successful(&self) -> bool {
+        self.rejected == 0
+    }
+}
+
+#[tokio::test]
+async fn a_template_refuses_a_transaction_its_era_rules_refuse() {
+    use keryx_consensus_core::{config::params::ForkActivation, errors::block::RuleError, subnets::SUBNETWORK_ID_AI_OPENING};
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.verifiable_inference_activation = ForkActivation::new(0);
+            p.trace_seed_bind_activation = ForkActivation::new(0);
+        })
+        .build();
+    let ctx = TestContext::new(TestConsensus::new(&config));
+    let opening = Transaction::new(0, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, vec![0u8; 200]);
+    let selector = RejectAwareSelector { txs: Some(vec![opening.clone()]), rejected: 0 };
+    match ctx.consensus.build_block_template(ctx.miner_data.clone(), Box::new(selector), TemplateBuildMode::Standard) {
+        Err(RuleError::InvalidTransactionsInNewBlock(invalid)) => assert!(invalid.contains_key(&opening.id())),
+        other => panic!("the template took a transaction the block rules refuse: {:?}", other.map(|t| t.block.transactions.len())),
+    }
 }
