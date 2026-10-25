@@ -153,9 +153,11 @@ impl Mempool {
     /// led by an awaited opening if any
     pub(crate) fn build_selector(&self, consensus: &dyn ConsensusApi) -> Box<dyn TemplateTransactionSelector> {
         let _sw = Stopwatch::<10>::with_threshold("build_selector op");
-        match self.leading_opening(consensus) {
-            Some(lead) => self.transaction_pool.build_selector_leading(lead),
-            None => self.transaction_pool.build_selector(),
+        let (leads, mass) = self.leading_transactions(consensus);
+        if leads.is_empty() {
+            self.transaction_pool.build_selector()
+        } else {
+            self.transaction_pool.build_selector_leading(leads, mass)
         }
     }
 

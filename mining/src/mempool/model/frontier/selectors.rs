@@ -4,7 +4,7 @@ use keryx_consensus_core::{
     tx::{Transaction, TransactionId},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -161,25 +161,25 @@ impl TemplateTransactionSelector for TakeAllSelector {
     }
 }
 
-/// A selector that puts one transaction ahead of the selection of an inner selector, which
-/// must leave room for its mass.
+/// A selector that puts some transactions ahead of the selection of an inner selector, which
+/// must leave room for their mass.
 pub struct LeadingSelector {
-    lead: Option<Arc<Transaction>>,
-    lead_id: TransactionId,
+    leads: Vec<Arc<Transaction>>,
+    lead_ids: HashSet<TransactionId>,
     inner: Box<dyn TemplateTransactionSelector>,
 }
 
 impl LeadingSelector {
-    pub fn new(lead: Arc<Transaction>, inner: Box<dyn TemplateTransactionSelector>) -> Self {
-        Self { lead_id: lead.id(), lead: Some(lead), inner }
+    pub fn new(leads: Vec<Arc<Transaction>>, inner: Box<dyn TemplateTransactionSelector>) -> Self {
+        Self { lead_ids: leads.iter().map(|tx| tx.id()).collect(), leads, inner }
     }
 }
 
 impl TemplateTransactionSelector for LeadingSelector {
     fn select_transactions(&mut self) -> Vec<Transaction> {
-        let mut txs: Vec<Transaction> = self.lead.take().map(|tx| tx.as_ref().clone()).into_iter().collect();
+        let mut txs: Vec<Transaction> = self.leads.drain(..).map(|tx| tx.as_ref().clone()).collect();
         for tx in self.inner.select_transactions() {
-            if tx.id() == self.lead_id {
+            if self.lead_ids.contains(&tx.id()) {
                 self.inner.reject_selection(tx.id());
             } else {
                 txs.push(tx);
@@ -189,7 +189,7 @@ impl TemplateTransactionSelector for LeadingSelector {
     }
 
     fn reject_selection(&mut self, tx_id: TransactionId) {
-        if tx_id != self.lead_id {
+        if !self.lead_ids.contains(&tx_id) {
             self.inner.reject_selection(tx_id);
         }
     }

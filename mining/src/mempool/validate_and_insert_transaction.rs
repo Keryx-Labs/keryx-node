@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use crate::mempool::{
     Mempool,
+    model::frontier::feerate_key::FeerateTransactionKey,
     errors::{RuleError, RuleResult},
     model::{
         pool::Pool,
@@ -18,10 +19,14 @@ use keryx_consensus_core::{
 use keryx_core::{debug, info};
 use keryx_inference::{AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
-use rand::Rng;
+use rand::{Rng, seq::SliceRandom};
+use std::sync::Arc;
 
 /// Number of awaited openings with the nearest deadlines a template lead is drawn from.
 const LEADING_OPENING_SPREAD: usize = 4;
+
+/// Awaited responses lead a template with at most the block mass over this divisor.
+const LEADING_RESPONSE_MASS_DIVISOR: u64 = 2;
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -281,8 +286,39 @@ impl Mempool {
         self.opening_awaited(consensus, &held.mtx.tx).then_some(key)
     }
 
+    /// Transactions to lead a template, with their total mass: an awaited opening, then awaited
+    /// responses by deadline within a share of the block mass.
+    pub(crate) fn leading_transactions(&self, consensus: &dyn ConsensusApi) -> (Vec<Arc<Transaction>>, u64) {
+        let max_mass = self.config.maximum_mass_per_block;
+        let mut leads = Vec::new();
+        let mut mass = 0;
+        if let Some(opening) = self.leading_opening(consensus) {
+            mass += FeerateTransactionKey::from(opening).mass;
+            leads.push(opening.mtx.tx.clone());
+        }
+        let mut due: Vec<(u64, TransactionId)> = self
+            .ai_response_index
+            .iter()
+            .flat_map(|(request_hash, entries)| {
+                entries.iter().filter_map(move |(escrow, id)| Some((consensus.awaited_response_deadline(request_hash, escrow.as_ref()?)?, *id)))
+            })
+            .collect();
+        due.shuffle(&mut rand::thread_rng());
+        due.sort_by_key(|(deadline, _)| *deadline);
+        let budget = max_mass.min(mass + max_mass / LEADING_RESPONSE_MASS_DIVISOR);
+        for (_, id) in due {
+            let Some(tx) = self.transaction_pool.get(&id).filter(|tx| tx.mtx.tx.inputs.is_empty()) else { continue };
+            let tx_mass = FeerateTransactionKey::from(tx).mass;
+            if mass + tx_mass <= budget {
+                mass += tx_mass;
+                leads.push(tx.mtx.tx.clone());
+            }
+        }
+        (leads, mass)
+    }
+
     /// An awaited opening to lead a template, drawn among those with the nearest deadlines.
-    pub(crate) fn leading_opening(&self, consensus: &dyn ConsensusApi) -> Option<&MempoolTransaction> {
+    fn leading_opening(&self, consensus: &dyn ConsensusApi) -> Option<&MempoolTransaction> {
         let mut due: Vec<(u64, TransactionId)> = self
             .ai_opening_index
             .values()
@@ -297,7 +333,7 @@ impl Mempool {
         }
         due.sort_unstable();
         let pick = rand::thread_rng().gen_range(0..due.len().min(LEADING_OPENING_SPREAD));
-        self.transaction_pool.get(&due[pick].1)
+        self.transaction_pool.get(&due[pick].1).filter(|tx| tx.mtx.tx.inputs.is_empty())
     }
 
     /// Openings in the mempool the consensus no longer awaits.

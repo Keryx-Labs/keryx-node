@@ -746,6 +746,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.awaited_opening_seed(response_txid)
     }
 
+    fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        self.virtual_processor.awaited_response_deadline(request_hash, escrow_pubkey)
+    }
+
     fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
         self.virtual_processor.awaited_opening_deadline(response_txid)
     }

@@ -194,6 +194,12 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// The window end of an armed audit still awaiting a response signed by `escrow_pubkey`.
+    fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        let _ = (request_hash, escrow_pubkey);
+        None
+    }
+
     /// The opening deadline of a response whose opening is awaited.
     fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
         let _ = response_txid;

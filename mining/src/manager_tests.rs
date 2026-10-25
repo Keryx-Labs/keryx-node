@@ -375,18 +375,74 @@ mod tests {
         assert!(!contained_by(opening.id(), &selected), "fee selection alone leaves the opening out");
     }
 
-    /// A full mempool admits an awaited opening and never evicts it for a paying transaction.
+    /// Awaited responses lead the template by deadline, within their share of the block mass.
     #[test]
-    fn test_full_mempool_keeps_awaited_openings() {
-        use keryx_consensus_core::collateral::opening_signature_message;
-        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+    fn test_awaited_responses_lead_the_template() {
+        use keryx_consensus_core::collateral::responder_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_RESPONSE;
+        use keryx_inference::{AiResponder, AiResponsePayload};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let response = |seed: u8, request_hash: [u8; 32]| {
+            let keypair = Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap();
+            let mut resp = AiResponsePayload::new(request_hash, 1, [0x12u8; 34], 1);
+            let sig = keypair.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+            let escrow_pubkey = keypair.x_only_public_key().0.serialize();
+            resp.responder = Some(AiResponder { escrow_pubkey, signature: *sig.as_ref() });
+            (Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize()), escrow_pubkey)
+        };
+
+        let request_hash = [0x5Au8; 32];
+        let (late, late_key) = response(1, request_hash);
+        let (soon, soon_key) = response(2, request_hash);
+        let (idle, _) = response(3, request_hash);
+        for tx in [late.clone(), soon.clone(), idle.clone()] {
+            insert(tx).unwrap();
+        }
+        consensus.await_response(request_hash, late_key, 50);
+        consensus.await_response(request_hash, soon_key, 10);
+
+        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 4000);
+        for tx in parent_txs {
+            insert(tx).unwrap();
+        }
+
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), soon.id());
+        assert_eq!(selected[1].id(), late.id());
+        assert!(!contained_by(idle.id(), &selected), "a response no audit awaits gets no room");
+
+        consensus.clear_awaited_response(request_hash, soon_key);
+        consensus.clear_awaited_response(request_hash, late_key);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert!(!contained_by(soon.id(), &selected) && !contained_by(late.id(), &selected), "fee selection alone leaves them out");
+    }
+
+    /// A full mempool admits openings and responses and never evicts them for a paying transaction.
+    #[test]
+    fn test_full_mempool_keeps_openings_and_responses() {
+        use keryx_consensus_core::collateral::{opening_signature_message, responder_signature_message};
+        use keryx_consensus_core::subnets::{SUBNETWORK_ID_AI_OPENING, SUBNETWORK_ID_AI_RESPONSE};
+        use keryx_inference::{AiResponder, AiResponsePayload};
         use keryx_verifiable_inference::opening::VERSION;
         use secp256k1::{Keypair, Message, SECP256K1};
 
         let consensus = Arc::new(ConsensusMock::new());
         let counters = Arc::new(MiningCounters::default());
         let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
-        config.maximum_transaction_count = 10;
+        config.maximum_transaction_count = 11;
         let mining_manager = MiningManager::with_config(config, None, counters);
         let insert = |tx: Transaction| {
             into_mempool_result(mining_manager.validate_and_insert_transaction(
@@ -415,14 +471,21 @@ mod tests {
         payload.extend_from_slice(&miner.x_only_public_key().0.serialize());
         payload.extend_from_slice(sig.as_ref());
         let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+        let mut resp = AiResponsePayload::new([0x5Au8; 32], 1, [0x12u8; 34], 1);
+        let sig = miner.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+        resp.responder = Some(AiResponder { escrow_pubkey: miner.x_only_public_key().0.serialize(), signature: *sig.as_ref() });
+        let response = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize());
 
         insert(paid.next().unwrap()).unwrap();
+        insert(paid.next().unwrap()).unwrap();
         insert(opening.clone()).unwrap();
+        insert(response.clone()).unwrap();
         for tx in paid {
             insert(tx).unwrap();
         }
         let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
         assert!(contained_by(opening.id(), &selected));
+        assert!(contained_by(response.id(), &selected));
     }
 
     /// An opening naming its seed block is admitted only when that block gives the awaited draw seed.

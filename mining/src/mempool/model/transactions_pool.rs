@@ -16,7 +16,7 @@ use crate::{
 };
 use keryx_consensus_core::{
     block::TemplateTransactionSelector,
-    tx::{MutableTransaction, TransactionId, TransactionOutpoint},
+    tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint},
 };
 use keryx_core::{debug, time::unix_now, trace};
 use std::{
@@ -25,7 +25,7 @@ use std::{
     sync::Arc,
 };
 
-use super::frontier::{Frontier, feerate_key::FeerateTransactionKey, selectors::LeadingSelector};
+use super::frontier::{Frontier, selectors::LeadingSelector};
 
 /// Pool of transactions to be included in a block template
 ///
@@ -208,11 +208,10 @@ impl TransactionsPool {
         self.ready_transactions.build_selector(&Policy::new(self.config.maximum_mass_per_block))
     }
 
-    /// Builds a transaction selector that puts `lead` first and leaves room for its mass
-    pub(crate) fn build_selector_leading(&self, lead: &MempoolTransaction) -> Box<dyn TemplateTransactionSelector> {
-        let mass = FeerateTransactionKey::from(lead).mass;
+    /// Builds a transaction selector that puts `leads` first and leaves room for their `mass`
+    pub(crate) fn build_selector_leading(&self, leads: Vec<Arc<Transaction>>, mass: u64) -> Box<dyn TemplateTransactionSelector> {
         let inner = self.ready_transactions.build_selector(&Policy::new(self.config.maximum_mass_per_block.saturating_sub(mass)));
-        Box::new(LeadingSelector::new(lead.mtx.tx.clone(), inner))
+        Box::new(LeadingSelector::new(leads, inner))
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier
@@ -240,15 +239,16 @@ impl TransactionsPool {
         }
 
         // Returns a vector of transactions to be removed (the caller has to actually remove)
-        // An awaited opening carries no fee and is never outbid
-        let feerate_threshold = if transaction.tx.is_ai_opening() { f64::INFINITY } else { transaction.calculated_feerate().unwrap() };
+        // Openings and responses carry no fee and are never outbid
+        let feeless = transaction.tx.is_ai_opening() || transaction.tx.is_ai_response();
+        let feerate_threshold = if feeless { f64::INFINITY } else { transaction.calculated_feerate().unwrap() };
         let mut txs_to_remove = Vec::with_capacity(1); // Normally we expect a single removal
         let mut selection_overall_size = 0;
         for tx in self
             .ready_transactions
             .ascending_iter()
             .map(|tx| self.all_transactions.get(&tx.id()).unwrap())
-            .filter(|mtx| mtx.priority == Priority::Low && !mtx.mtx.tx.is_ai_opening())
+            .filter(|mtx| mtx.priority == Priority::Low && !mtx.mtx.tx.is_ai_opening() && !mtx.mtx.tx.is_ai_response())
         {
             // TODO (optimization): inline the `has_parent_in_set` check within the redeemer traversal and exit early if possible
             let redeemers = self.get_redeemer_ids_in_pool(&tx.id()).into_iter().chain(once(tx.id())).collect::<TransactionIdSet>();

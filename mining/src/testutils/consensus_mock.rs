@@ -33,6 +33,7 @@ pub(crate) struct ConsensusMock {
     awaited_seeds: RwLock<HashMap<[u8; 32], [u8; 32]>>,
     awaited_paths: RwLock<HashMap<[u8; 32], Vec<u64>>>,
     awaited_pieces: RwLock<HashMap<[u8; 32], u8>>,
+    awaited_responses: RwLock<HashMap<([u8; 32], [u8; 32]), u64>>,
 }
 
 impl ConsensusMock {
@@ -46,6 +47,7 @@ impl ConsensusMock {
             awaited_seeds: RwLock::new(HashMap::default()),
             awaited_paths: RwLock::new(HashMap::default()),
             awaited_pieces: RwLock::new(HashMap::default()),
+            awaited_responses: RwLock::new(HashMap::default()),
         }
     }
 
@@ -55,6 +57,14 @@ impl ConsensusMock {
 
     pub(crate) fn await_opening(&self, response_txid: [u8; 32], escrow_pubkey: [u8; 32]) {
         self.awaited_openings.write().insert(response_txid, escrow_pubkey);
+    }
+
+    pub(crate) fn await_response(&self, request_hash: [u8; 32], escrow_pubkey: [u8; 32], deadline: u64) {
+        self.awaited_responses.write().insert((request_hash, escrow_pubkey), deadline);
+    }
+
+    pub(crate) fn clear_awaited_response(&self, request_hash: [u8; 32], escrow_pubkey: [u8; 32]) {
+        self.awaited_responses.write().remove(&(request_hash, escrow_pubkey));
     }
 
     pub(crate) fn clear_awaited_opening(&self, response_txid: &[u8; 32]) {
@@ -116,6 +126,10 @@ impl ConsensusApi for ConsensusMock {
 
     fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.awaited_seeds.read().get(response_txid).copied()
+    }
+
+    fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        self.awaited_responses.read().get(&(*request_hash, *escrow_pubkey)).copied()
     }
 
     fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {

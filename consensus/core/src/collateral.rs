@@ -1832,6 +1832,18 @@ impl ServiceLedger {
         self.trace_audits.get(response_txid).and_then(|a| a.seed)
     }
 
+    /// Window end of the armed audit of `request_hash` while a cohort identity delegating to
+    /// `escrow_pubkey` has not responded yet.
+    pub fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        let audit = self.pending.get(request_hash)?.audit.as_ref()?;
+        let escrow = escrow_miner_key(escrow_pubkey);
+        audit
+            .delegations
+            .iter()
+            .any(|(e, id)| *e == escrow && audit.cohort.binary_search(id).is_ok() && !audit.responded.contains(id))
+            .then_some(audit.window_end_daa)
+    }
+
     /// Opening deadline of a drawn response still awaiting its opening.
     pub fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
         self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.deadline_daa)
@@ -5521,6 +5533,21 @@ mod tests {
             assert_eq!(net.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![a]);
             let end = net.window_end(&RH);
             assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn a_response_is_awaited_until_its_member_is_credited() {
+            let pk = [0x5Bu8; 32];
+            let a = escrow_miner_key(&pk);
+            let mut net = Net::new(false, false, vec![a]);
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &pk), None);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &pk), Some(end));
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &[0x5Cu8; 32]), None);
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &pk), None);
         }
 
         #[test]
