@@ -166,6 +166,14 @@ pub fn attn_phase_window_daa(tier: u8, max_tokens: u32, n_prompt: u32, n_pos: u3
     };
     ATTN_PHASE_BASE_DAA + n_prompt.min(ATTN_PHASE_MAX_PROMPT) as u64 / 10 + n_pos.saturating_sub(n_prompt).min(max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP)) as u64 * per_token
 }
+/// Replays of the prompt the first opening of an attention audit takes, at most.
+pub const ATTN_FIRST_PROMPT_REPLAYS: u64 = 3;
+
+/// Window the first opening of an attention audit adds for its prompt: its replays at a floor of
+/// 100 positions per second.
+pub fn attn_first_prompt_daa(n_prompt: u32) -> u64 {
+    ATTN_FIRST_PROMPT_REPLAYS * (n_prompt.min(ATTN_PHASE_MAX_PROMPT) as u64 / 10)
+}
 /// Domain separator of the child drawn after an attention phase.
 pub const ATTN_CHILD_DOMAIN: &[u8] = b"KeryxAttnChildV1";
 
@@ -1650,8 +1658,9 @@ impl ServiceLedger {
             self.resolve_trace_audit(&mut a);
             let seed = trace_seed(&tr.chain_hash, &txid);
             let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
-            if rules.is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
-                a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa));
+            if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
+                let prompt = if rules.as_ref().is_some_and(|r| r.attention) { attn_first_prompt_daa(a.n_prompt) } else { 0 };
+                a.deadline_daa = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt;
                 a.seed = Some(seed);
                 self.trace_audits.insert(txid, a);
             }
@@ -4835,6 +4844,8 @@ mod tests {
             assert_eq!(crate::collateral::attn_phase_window_daa(4, 8_000, 0, 5_000), 19_384);
             assert_eq!(crate::collateral::attn_phase_window_daa(3, 100, 2_000, 9_000), 3_500);
             assert_eq!(crate::collateral::attn_phase_window_daa(4, u32::MAX, u32::MAX, u32::MAX), 16_107);
+            assert_eq!(crate::collateral::attn_first_prompt_daa(30_000), 9_000);
+            assert_eq!(crate::collateral::attn_first_prompt_daa(u32::MAX), 39_321);
         }
 
         #[test]
