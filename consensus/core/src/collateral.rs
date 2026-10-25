@@ -851,12 +851,12 @@ struct PendingRequest {
 
 impl PendingRequest {
     /// `(prompt tokens, generated tokens)` the request is judged on: the upper medians of its
-    /// traced member answers, else the sealed prompt length and the full budget.
+    /// traced member answers, bounded by the sealed prompt length and the budget, else those.
     fn reference_shape(&self) -> (u32, u32) {
         let shapes: Vec<(u32, u32)> =
             self.audit.as_ref().and_then(|a| a.v3.as_ref()).map(|w| w.answers.iter().filter_map(|(_, _, s)| *s).collect()).unwrap_or_default();
-        let p = upper_median(shapes.iter().map(|(p, _)| *p).collect()).unwrap_or(self.prompt_len);
-        let g = upper_median(shapes.iter().map(|(_, g)| *g).collect()).unwrap_or(self.max_tokens);
+        let p = upper_median(shapes.iter().map(|(p, _)| *p).collect()).map_or(self.prompt_len, |p| if self.prompt_len > 0 { p.min(self.prompt_len) } else { p });
+        let g = upper_median(shapes.iter().map(|(_, g)| *g).collect()).map_or(self.max_tokens, |g| g.min(self.max_tokens));
         (p, g)
     }
 
@@ -1429,8 +1429,8 @@ impl ServiceLedger {
                     && !tr.responses.iter().any(|ev| ev.request_hash == *rh && ev.responder == *r)
             });
             self.credit_reward(rh, if untraced { &[] } else { &served }, daa, draw_rule, warmup, &mut outcome);
-            // Under the sanction rule a traced response that will be audited resets the streak at
-            // its accepted opening, not here.
+            // Under the sanction rule a response on an audited tier resets the streak at its
+            // accepted opening, not here.
             let reset_at_opening = self.reset_waits_for_opening(traces, rh, r, req_tier, daa);
             for identity in served {
                 // A warmup fold leaves strikes alone: the baseline already carries this reset.
@@ -1461,7 +1461,10 @@ impl ServiceLedger {
             let closing: Vec<[u8; 32]> = self
                 .pending
                 .iter()
-                .filter(|(h, r)| r.draw.as_ref().is_some_and(|d| daa >= d.close_daa && !draw_awaits_audit(&awaiting, h, d)))
+                .filter(|(h, r)| {
+                    r.draw.as_ref().is_some_and(|d| daa >= d.close_daa && !draw_awaits_audit(&awaiting, h, d))
+                        && !r.audit.as_ref().is_some_and(|a| a.v3.is_some())
+                })
                 .map(|(h, _)| *h)
                 .collect();
             for rh in closing {
@@ -1990,12 +1993,12 @@ impl ServiceLedger {
     }
 
     /// Whether `service_bond_v2_activation` is live at `daa`.
-    /// Under the sanction rule a traced response headed for an audit resets the streak at its
+    /// Under the sanction rule a response on an audited tier resets the streak only at an
     /// accepted opening, not when it is credited.
     fn reset_waits_for_opening(&self, traces: Option<&TraceInputs>, request_hash: &[u8; 32], responder: &Hash, tier: u8, daa: u64) -> bool {
         let Some(tr) = traces.filter(|tr| tr.sanction) else { return false };
         let audited = |at: u64| (tr.tier)(tier, at).is_some_and(|rules| rules.audit_all);
-        tr.responses.iter().any(|ev| ev.request_hash == *request_hash && ev.responder == *responder) && audited(daa)
+        audited(daa)
             || self.trace_audits.values().any(|a| a.request_hash == *request_hash && a.responder == *responder && audited(a.accepted_daa))
     }
 
@@ -5721,6 +5724,8 @@ mod tests {
             dedup: bool,
             /// Audit rule: every traced response is audited.
             audit_all: bool,
+            /// Sanction rule.
+            sanction: bool,
         }
 
         impl Net {
@@ -5728,7 +5733,7 @@ mod tests {
                 let mut ledger = ServiceLedger::default();
                 ledger.set_window_v2_activation(0);
                 ledger.set_reward_routing_activation(0);
-                Self { ledger, cohort, draw, window_v3, same_root: false, dedup: false, audit_all: false }
+                Self { ledger, cohort, draw, window_v3, same_root: false, dedup: false, audit_all: false, sanction: false }
             }
 
             /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
@@ -5772,7 +5777,7 @@ mod tests {
                     tier: &tier,
                     prompt_lens: &[],
                     shape: false,
-                    sanction: false,
+                    sanction: self.sanction,
                     context: false,
                     draw: self.draw,
                     window_v3: self.window_v3,
@@ -5988,10 +5993,11 @@ mod tests {
             net.fold(101, chain(0), &[], &[]);
             let close = net.ledger.pending.get(&RH).unwrap().draw.as_ref().unwrap().close_daa;
             assert!(close < 100 + TRACE_SEED_DELAY_DAA);
-            for daa in 102..100 + TRACE_SEED_DELAY_DAA {
-                assert!(net.fold(daa, chain(9), &[], &[]).rewards.is_empty(), "paid at {daa} before its audit is drawn");
+            let paid = (net.window_end(&RH) + 1).max(100 + TRACE_SEED_DELAY_DAA);
+            for daa in 102..paid {
+                assert!(net.fold(daa, chain(9), &[], &[]).rewards.is_empty(), "paid at {daa} before its window ends and its audit is drawn");
             }
-            let out = net.fold(100 + TRACE_SEED_DELAY_DAA, chain(9), &[], &[]);
+            let out = net.fold(paid, chain(9), &[], &[]);
             assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
         }
 
@@ -6070,6 +6076,58 @@ mod tests {
             let out = net.fold(ripe, chain(9), &[], &[]);
             assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
             assert!(net.ledger.held_draws.is_empty());
+        }
+
+        #[test]
+        fn an_inflated_shape_is_bounded_by_the_budget() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((10, 100_000))), (RH, b, Some((10, 110)))]);
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().reference_shape(), (10, 256));
+        }
+
+        /// One member with a strike, audit rule on: `(answer with the request, answer later)`.
+        fn streak_after(sanction: bool, early: bool) -> u32 {
+            let a = id(1);
+            let mut net = Net::new(false, false, vec![a]);
+            net.audit_all = true;
+            net.sanction = sanction;
+            net.ledger.strikes.insert(a, StrikeEntry { count: 1, last_daa: 99 });
+            let answer = [(RH, a, None)];
+            net.fold(100, chain(0), &[(RH, 256)], if early { &answer } else { &[] });
+            net.fold(101, chain(0), &[], &[]);
+            if !early {
+                net.fold(102, chain(0), &[], &answer);
+            }
+            net.ledger.consecutive_misses(&a)
+        }
+
+        #[test]
+        fn an_answer_without_its_opening_keeps_the_streak_under_the_sanction_rule() {
+            for early in [false, true] {
+                assert_eq!(streak_after(false, early), 0);
+                assert_eq!(streak_after(true, early), 1);
+            }
+        }
+
+        #[test]
+        fn a_late_member_is_no_candidate_under_the_v3_window() {
+            let (a, b, c) = (id(1), id(2), id(3));
+            let mut net = Net::new(true, true, vec![a, b, c]);
+            net.fold(100, chain(0), &[(RH, 4_096)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, c, None)]);
+            let close = 102 + reward_draw_window_daa(0, 0, 4_096);
+            let allowed = 101 + service_window_daa_v3(0, 0, 1);
+            assert!(allowed + 1 < close);
+            net.fold(allowed - 1, chain(0), &[], &[(RH, a, Some((0, 1))), (RH, c, Some((0, 1)))]);
+            net.fold(allowed + 1, chain(0), &[], &[(RH, b, Some((0, 1)))]);
+            assert!(net.fold(close, chain(9), &[], &[]).rewards.is_empty(), "the draw waits for the window end");
+            let out = net.fold(net.window_end(&RH) + 1, chain(9), &[], &[]);
+            assert_eq!(out.late, vec![(RH, b)]);
+            assert!(out.rewards.iter().all(|r| r.winner != b));
         }
 
         #[test]

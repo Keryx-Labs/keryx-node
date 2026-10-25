@@ -35,10 +35,10 @@ pub fn blocks(leaf: &[u8], layout: u8, k: usize) -> Option<Vec<(f32, [i8; 32])>>
     Some(out)
 }
 
-/// Whether a block is one the quantizer writes: a zero scale, or a positive scale with a value at
-/// full magnitude.
+/// Whether a block is one the quantizer writes: a zero scale with zero values, or a positive
+/// scale with a value at full magnitude.
 pub fn canonical(d: f32, q: &[i8; 32]) -> bool {
-    d == 0.0 || (d > 0.0 && q.iter().any(|&v| v.unsigned_abs() == 127))
+    (d == 0.0 && q.iter().all(|&v| v == 0)) || (d > 0.0 && q.iter().any(|&v| v.unsigned_abs() == 127))
 }
 
 /// Largest `|s - d * sum(q)|` of a block, in units of its scale.
@@ -119,6 +119,16 @@ mod tests {
 
     fn set_sum(x: &mut [u8], block: usize, s: f32) {
         x[block * 36 + 2..block * 36 + 4].copy_from_slice(&f16::from_f32(s).to_le_bytes());
+    }
+
+    #[test]
+    fn a_zero_scale_needs_zero_values() {
+        let mut q = [0i8; 32];
+        assert!(canonical(0.0, &q));
+        q[3] = 5;
+        assert!(!canonical(0.0, &q));
+        q[3] = 127;
+        assert!(canonical(0.5, &q));
     }
 
     #[test]
