@@ -73,6 +73,11 @@ impl Mempool {
             ));
         }
 
+        let tx = &transaction.tx;
+        if tx.is_ai_opening() && (tx.version != 0 || !tx.inputs.is_empty() || !tx.outputs.is_empty() || tx.lock_time != 0 || tx.gas != 0) {
+            return Err(NonStandardError::RejectAiOpeningForm(transaction_id));
+        }
+
         // Since extremely large transactions with a lot of inputs can cost
         // almost as much to process as the sender fees, limit the maximum
         // size of a transaction. This also helps mitigate CPU exhaustion

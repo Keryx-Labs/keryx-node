@@ -609,6 +609,18 @@ impl MiningManager {
         // accepted transaction cache
         self.mempool.write().expire_accepted_transactions(consensus);
 
+        // openings no longer awaited, whatever their priority
+        let stale_openings = self.mempool.read().collect_stale_openings(consensus);
+        if !stale_openings.is_empty() {
+            let mut mempool = self.mempool.write();
+            for tx in stale_openings.iter() {
+                if let Err(err) = mempool.remove_transaction(tx, true, TxRemovalReason::Muted, "") {
+                    warn!("Failed to remove stale opening {} from mempool: {}", tx, err);
+                }
+            }
+            debug!("Removed {} openings no longer awaited", stale_openings.len());
+        }
+
         // mempool
         let expired_low_priority_transactions = self.mempool.write().collect_expired_low_priority_transactions(consensus);
         for chunk in &expired_low_priority_transactions.iter().chunks(24) {

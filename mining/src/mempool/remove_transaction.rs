@@ -54,6 +54,7 @@ impl Mempool {
             }
             if tx.mtx.tx.is_ai_opening()
                 && let Some(key) = super::validate_and_insert_transaction::ai_opening_key(&tx.mtx.tx.payload)
+                && self.ai_opening_index.get(&key) == Some(tx_id)
             {
                 self.ai_opening_index.remove(&key);
             }

@@ -373,8 +373,25 @@ mod tests {
         }
 
         assert_eq!(insert(opening(&miner, a, Some(other_block), 1)), not_awaited(a));
-        insert(opening(&miner, a, Some(drawn_block), 2)).unwrap();
+        let first = opening(&miner, a, Some(drawn_block), 2);
+        insert(first.clone()).unwrap();
         insert(opening(&miner, b, None, 3)).unwrap();
+
+        let mut copy = first.clone();
+        copy.lock_time = 1;
+        copy.finalize();
+        assert!(matches!(insert(copy), Err(RuleError::RejectNonStandard(..))), "a copy outside the signed body");
+
+        consensus.await_opening_seed(a, trace_seed(&Hash::from_bytes(other_block), &a));
+        let redrawn = opening(&miner, a, Some(other_block), 4);
+        insert(redrawn.clone()).unwrap();
+        assert!(!mining_manager.has_transaction(&first.id(), TransactionQuery::All), "the opening of the old draw makes way");
+        assert!(mining_manager.has_transaction(&redrawn.id(), TransactionQuery::All));
+        assert_eq!(insert(opening(&miner, a, Some(other_block), 5)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(a))));
+
+        consensus.await_opening_seed(a, trace_seed(&Hash::from_bytes(drawn_block), &a));
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        assert!(!mining_manager.has_transaction(&redrawn.id(), TransactionQuery::All), "an opening no longer awaited is dropped");
     }
 
     /// Private inference: once the gate is active (the consensus reports a cohort), a request is

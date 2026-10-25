@@ -62,7 +62,7 @@ pub(crate) struct Mempool {
     ai_challenge_index: HashMap<[u8; 32], TransactionId>,
     /// Deduplication index: (response tx id, piece, attention path) → opening tx_id. One opening
     /// per piece of a response, and per path for an attention phase.
-    ai_opening_index: HashMap<([u8; 32], u8, Vec<u64>), TransactionId>,
+    ai_opening_index: HashMap<validate_and_insert_transaction::OpeningKey, TransactionId>,
     /// Private-inference index: request tx id → the escrow keys the pending AiRequest is sealed
     /// to. Admits a named responder's inline-body AiResponse while its request still sits here.
     ai_private_request_index: HashMap<[u8; 32], Vec<[u8; 32]>>,

@@ -78,6 +78,15 @@ impl Mempool {
         // Perform mempool in-context validations prior to possible RBF replacements
         self.validate_transaction_in_context(&transaction)?;
 
+        if transaction.tx.is_ai_opening() {
+            if let Some(key) = self.awaited_opening_holding_key(consensus, &transaction.tx) {
+                return Err(RuleError::RejectDuplicateAiOpening(hex::encode(key.0)));
+            }
+            if let Some(stale) = ai_opening_key(&transaction.tx.payload).and_then(|key| self.ai_opening_index.get(&key).copied()) {
+                self.remove_transaction(&stale, true, TxRemovalReason::Muted, "")?;
+            }
+        }
+
         // Check double spends and try to remove them if the RBF policy requires it
         let removed_transaction = self.execute_replace_by_fee(&transaction, rbf_policy)?;
 
@@ -207,12 +216,6 @@ impl Mempool {
         {
             return Err(RuleError::RejectDuplicateAiChallenge(hex::encode(response_hash)));
         }
-        if transaction.tx.is_ai_opening()
-            && let Some(key) = ai_opening_key(&transaction.tx.payload)
-            && self.ai_opening_index.contains_key(&key)
-        {
-            return Err(RuleError::RejectDuplicateAiOpening(hex::encode(key.0)));
-        }
 
         if !self.config.accept_non_standard {
             self.check_transaction_standard_in_isolation(transaction)?;
@@ -254,24 +257,42 @@ impl Mempool {
         if !transaction.tx.is_ai_opening() {
             return Ok(());
         }
-        let signed = SignedPayload::split(&transaction.tx.payload);
         let response_txid = ai_opening_response_txid(&transaction.tx.payload);
-        let awaited = match (&signed, response_txid) {
-            (Some(s), Some(txid)) => {
-                consensus.awaited_opening_key(&txid) == Some(s.escrow_pubkey)
-                    && seed_block(s.body).is_none_or(|b| {
-                        consensus.awaited_opening_seed(&txid) == Some(trace_seed(&keryx_hashes::Hash::from_bytes(b), &txid))
-                    })
-                    && attn_path(s.body).is_none_or(|p| consensus.awaited_attention_path(&txid) == Some(p))
-                    && consensus.awaited_opening_pieces(&txid).is_some_and(|m| m & opening_body_piece(s.body) != 0)
-                    && verify_opening_signature(&s.escrow_pubkey, &s.signature, s.body)
-            }
-            _ => false,
-        };
+        let awaited = self.opening_awaited(consensus, &transaction.tx)
+            && SignedPayload::split(&transaction.tx.payload).is_some_and(|s| verify_opening_signature(&s.escrow_pubkey, &s.signature, s.body));
         if !awaited {
             return Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(response_txid.unwrap_or_default())));
         }
+        if let Some(key) = self.awaited_opening_holding_key(consensus, &transaction.tx) {
+            return Err(RuleError::RejectDuplicateAiOpening(hex::encode(key.0)));
+        }
         Ok(())
+    }
+
+    /// Key of `tx` when an opening still awaited already holds it in the mempool.
+    fn awaited_opening_holding_key(&self, consensus: &dyn ConsensusApi, tx: &Transaction) -> Option<OpeningKey> {
+        let key = ai_opening_key(&tx.payload)?;
+        let held = self.ai_opening_index.get(&key).filter(|id| **id != tx.id())?;
+        let held = self.transaction_pool.get(held)?;
+        self.opening_awaited(consensus, &held.mtx.tx).then_some(key)
+    }
+
+    /// Openings in the mempool the consensus no longer awaits.
+    pub(crate) fn collect_stale_openings(&self, consensus: &dyn ConsensusApi) -> Vec<TransactionId> {
+        self.ai_opening_index
+            .values()
+            .filter(|id| self.transaction_pool.get(id).is_none_or(|tx| !self.opening_awaited(consensus, &tx.mtx.tx)))
+            .copied()
+            .collect()
+    }
+
+    /// Whether `tx` is an opening the consensus still awaits.
+    fn opening_awaited(&self, consensus: &dyn ConsensusApi, tx: &Transaction) -> bool {
+        let (Some(s), Some(txid)) = (SignedPayload::split(&tx.payload), ai_opening_response_txid(&tx.payload)) else { return false };
+        consensus.awaited_opening_key(&txid) == Some(s.escrow_pubkey)
+            && seed_block(s.body).is_none_or(|b| consensus.awaited_opening_seed(&txid) == Some(trace_seed(&keryx_hashes::Hash::from_bytes(b), &txid)))
+            && attn_path(s.body).is_none_or(|p| consensus.awaited_attention_path(&txid) == Some(p))
+            && consensus.awaited_opening_pieces(&txid).is_some_and(|m| m & opening_body_piece(s.body) != 0)
     }
 
     /// Admission policy for private requests: the envelope must cover the whole target cohort its
@@ -406,11 +427,11 @@ pub(crate) fn ai_opening_response_txid(payload: &[u8]) -> Option<[u8; 32]> {
     SignedPayload::split(payload)?.body.get(1..33)?.try_into().ok()
 }
 
-/// Response, piece (the version of the inner body) and attention path of an opening.
-pub(crate) fn ai_opening_key(payload: &[u8]) -> Option<([u8; 32], u8, Vec<u64>)> {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_SEEDED};
+/// Response, proven piece and attention path of an opening.
+pub(crate) type OpeningKey = ([u8; 32], u8, Vec<u64>);
+
+/// Key of an opening in the mempool: its response, the piece it proves and its attention path.
+pub(crate) fn ai_opening_key(payload: &[u8]) -> Option<OpeningKey> {
     let body = SignedPayload::split(payload)?.body;
-    let inner = if body.first() == Some(&VERSION_SEEDED) { *body.get(65)? } else { *body.first()? };
-    let path = if inner == VERSION_ATTN { attn_path(body).unwrap_or_default() } else { Vec::new() };
-    Some((body.get(1..33)?.try_into().ok()?, inner, path))
+    Some((body.get(1..33)?.try_into().ok()?, opening_body_piece(body), attn_path(body).unwrap_or_default()))
 }

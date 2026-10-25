@@ -159,6 +159,9 @@ pub enum NonStandardError {
 
     #[error("transaction input #{1} has {2} signature operations which is more than the allowed max amount of {3}")]
     RejectSignatureCount(TransactionId, usize, u64, u8),
+
+    #[error("opening transaction carries fields outside its signed body")]
+    RejectAiOpeningForm(TransactionId),
 }
 
 impl NonStandardError {
@@ -175,6 +178,7 @@ impl NonStandardError {
             NonStandardError::RejectInputScriptClass(id, _) => id,
             NonStandardError::RejectInsufficientFee(id, _, _) => id,
             NonStandardError::RejectSignatureCount(id, _, _, _) => id,
+            NonStandardError::RejectAiOpeningForm(id) => id,
         }
     }
 }
