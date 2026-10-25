@@ -128,27 +128,21 @@ pub fn link_block(seed: &Hash, i: u32, x: &[u8], layout: u8, k: u64) -> Option<u
 /// Largest block scale of an unlinked product input over its median block scale.
 const PEAK_OVER_MEDIAN: f32 = 1024.0;
 
-/// Whether no block scale of slot `slot` of `x` (rows of `k` values) exceeds
-/// [`PEAK_OVER_MEDIAN`] times the median block scale over every slot.
+/// Whether no block scale of slot `slot` of `x` (rows of `k` values; a single row serves every
+/// slot) exceeds [`PEAK_OVER_MEDIAN`] times the median block scale of that slot.
 pub fn peak_bounded(x: &[u8], layout: u8, k: u64, slot: u64) -> bool {
     let x_one = crate::verify::x_len(k, layout) as usize;
-    if !k.is_multiple_of(32) || x_one == 0 || x.is_empty() || !x.len().is_multiple_of(x_one) || slot as usize >= x.len() / x_one {
+    if !k.is_multiple_of(32) || x_one == 0 || x.is_empty() || !x.len().is_multiple_of(x_one) {
         return false;
     }
-    let mut d: Vec<f32> = Vec::with_capacity(x.len() / x_one * k as usize / 32);
-    let mut peak = 0f32;
-    for (s, row) in x.chunks_exact(x_one).enumerate() {
-        let Some(blocks) = q8::blocks(row, layout, k as usize) else { return false };
-        for (b, _) in blocks {
-            if !b.is_finite() {
-                return false;
-            }
-            if s as u64 == slot {
-                peak = peak.max(b.abs());
-            }
-            d.push(b.abs());
-        }
+    let slot = if x.len() == x_one { 0 } else { slot as usize };
+    let Some(row) = x.chunks_exact(x_one).nth(slot) else { return false };
+    let Some(blocks) = q8::blocks(row, layout, k as usize) else { return false };
+    let mut d: Vec<f32> = blocks.iter().map(|(b, _)| b.abs()).collect();
+    if d.iter().any(|v| !v.is_finite()) {
+        return false;
     }
+    let peak = d.iter().fold(0f32, |m, &v| m.max(v));
     let mid = d.len() / 2;
     let median = *d.select_nth_unstable_by(mid, f32::total_cmp).1;
     median == 0.0 || peak <= PEAK_OVER_MEDIAN * median
@@ -760,6 +754,10 @@ mod tests {
         assert!(peak_bounded(&heads, q8::MMVQ, D as u64, 1));
         assert!(!peak_bounded(&heads, q8::MMVQ, D as u64, 2), "the drawn slot is the one bounded");
         assert!(!peak_bounded(&heads, q8::MMVQ, D as u64, 3));
+        let loud: Vec<f64> = vec_of(5, 500.0).iter().map(|&a| a as f64).collect();
+        let shifted = [q8_1_row(&loud), spiked_row(1e5)].concat();
+        assert!(!peak_bounded(&shifted, q8::MMVQ, D as u64, 1), "other slots do not move the median of the drawn one");
+        assert!(peak_bounded(&spiked_row(1.0), q8::MMVQ, D as u64, 5), "a single row serves every slot");
     }
 
     #[test]
