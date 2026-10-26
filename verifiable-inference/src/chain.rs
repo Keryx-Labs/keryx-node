@@ -5,7 +5,7 @@ use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
 use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
 use crate::attn::{ATTN_THRESHOLD, Partial};
-use crate::attn_blocks::{BlockTree, LSE_ROOT_TOL, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root};
+use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root, root_lse_tol};
 use crate::opening::{AttnOpening, PrefixPoint};
 use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
 use crate::verify::{Fail, PosShape, Report, ResponseCtx, TierCtx, open_bytes, open_entry, open_row, verify_point_at};
@@ -1366,7 +1366,7 @@ fn mla_phase(
             let mass = committed_lse(ctx, op, s, n_pos, 0, nh, qh)? as f64;
             ARITHS.iter().any(|&ar| {
                 crate::attn::partial(ar, &q, scale, &keys, &values)
-                    .is_some_and(|p| (lse(&p) - mass).abs() <= LSE_ROOT_TOL && block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
+                    .is_some_and(|p| (lse(&p) - mass).abs() <= root_lse_tol(p.m) && block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
             })
         }
         (None, None) => false,

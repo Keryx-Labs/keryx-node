@@ -14,8 +14,14 @@ pub const PARTIAL_STEPS: f64 = 0.25;
 const LEAF_FLOOR: f64 = 1.0 / (1u64 << 24) as f64;
 /// The same for a node, whose children and parent are rounded each.
 const NODE_FLOOR: f64 = 2.0 * LEAF_FLOOR;
-/// Largest difference between the log-sum-exp of the opened children and the committed one.
+/// Largest difference between the log-sum-exp of the opened children and the committed one, at a
+/// largest score of zero.
 pub const LSE_ROOT_TOL: f64 = 1.0 / 64.0;
+
+/// [`LSE_ROOT_TOL`] widened with the largest score `m`, up to `|m| = 256`.
+pub fn root_lse_tol(m: f64) -> f64 {
+    LSE_ROOT_TOL + m.abs().min(256.0) / 4096.0
+}
 
 #[cfg(test)]
 thread_local! {
@@ -224,7 +230,7 @@ pub fn check_root(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[P
 /// [`check_root`] with the softmax mass of `children` matching the committed `lse` of the head.
 pub fn check_root_lse(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[Partial], gate: Option<&[f32]>, committed: f32) -> bool {
     committed.is_finite()
-        && combine(children).is_some_and(|c| (lse(&c) - committed as f64).abs() <= LSE_ROOT_TOL)
+        && combine(children).is_some_and(|c| (lse(&c) - committed as f64).abs() <= root_lse_tol(c.m))
         && check_root(x, layout, n_out, head, children, gate)
 }
 
@@ -517,6 +523,15 @@ mod tests {
     }
 
     #[test]
+    fn the_root_tolerance_widens_with_the_largest_score_up_to_a_cap() {
+        assert_eq!(root_lse_tol(0.0), LSE_ROOT_TOL);
+        assert_eq!(root_lse_tol(-147.0), root_lse_tol(147.0));
+        assert!(root_lse_tol(147.0) > 0.0070 * 4.0);
+        assert_eq!(root_lse_tol(1e9), root_lse_tol(256.0));
+        assert_eq!(root_lse_tol(256.0), LSE_ROOT_TOL + 1.0 / 16.0);
+    }
+
+    #[test]
     fn the_committed_mass_binds_the_root() {
         let k = case(0, 256, 16, 4);
         for a in ARITHS {
@@ -524,7 +539,7 @@ mod tests {
             let x = k.x(a);
             let mass = lse(&k.run((0, 256), a)) as f32;
             assert!(check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass), "{a:?}");
-            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * LSE_ROOT_TOL) as f32), "{a:?}");
+            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * root_lse_tol(256.0)) as f32), "{a:?}");
             assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, f32::NAN), "{a:?}");
         }
         let honest = k.decoded(&[], Arith::Exact);
