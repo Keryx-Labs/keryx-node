@@ -255,7 +255,7 @@ pub fn child_weights(parts: &[Partial]) -> Option<Vec<u16>> {
 }
 
 /// Child drawn by the chain randomness `rand` among children of draw `weights`: uniformly with
-/// probability 1/8, else in proportion to the weights.
+/// probability 1/2, else in proportion to the weights.
 pub fn draw_weighted_child(rand: &Hash, weights: &[u16]) -> u64 {
     let h = blake3::hash(&[rand.as_slice(), b"attn-child-w"].concat());
     let b = h.as_bytes();
