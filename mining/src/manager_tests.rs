@@ -614,17 +614,25 @@ mod tests {
         let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
         insert(opening.clone()).unwrap();
 
-        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 40);
+        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 50);
         let mut paid = parent_txs.into_iter();
         for tx in paid.by_ref().take(5) {
             insert(tx).unwrap();
         }
         let before = consensus.opening_key_queries();
-        for tx in paid {
+        for tx in paid.by_ref().take(35) {
             insert(tx).unwrap();
         }
         assert!(consensus.opening_key_queries() - before <= 1, "{} queries for 35 insertions", consensus.opening_key_queries() - before);
         assert!(mining_manager.has_transaction(&opening.id(), TransactionQuery::All), "the awaited opening is never evicted");
+
+        consensus.set_virtual_daa_score(1);
+        let before = consensus.opening_key_queries();
+        for tx in paid {
+            insert(tx).unwrap();
+        }
+        assert_eq!(consensus.opening_key_queries() - before, 1, "one read at the new score");
+        assert!(mining_manager.has_transaction(&opening.id(), TransactionQuery::All));
     }
 
     /// Templates spread their lead over the openings about due, and keep a lone one in front.
@@ -716,6 +724,8 @@ mod tests {
         assert_eq!(insert(opening.clone()), Err(RuleError::RejectAlreadyAccepted(opening.id())), "held right after its block");
         assert!(mining_manager.unknown_transactions(vec![opening.id()]).is_empty(), "not fetched again from peers");
 
+        consensus.set_virtual_daa_score(101);
+        assert_eq!(insert(opening.clone()), Err(RuleError::RejectAlreadyAccepted(opening.id())), "still held one DAA before the end");
         consensus.set_virtual_daa_score(102);
         insert(opening.clone()).unwrap();
 
