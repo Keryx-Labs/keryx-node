@@ -9,8 +9,7 @@ use crate::tx::ScriptPublicKey;
 pub const COLLATERAL_RATE_BPS: u64 = 2_000;
 
 /// Number of blocks during which an OPoI result may be challenged after its block is accepted.
-/// At 10 BPS, 36 000 blocks ≈ 1 hour — enough time for any active node to detect and submit
-/// a challenge, while keeping the escrow lock reasonable for honest miners.
+/// At 10 BPS, 36 000 blocks ≈ 1 hour.
 pub const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
 
 /// DAA window during which a claim stays burnable (~10 h at 10 BPS): a disposable identity
@@ -536,10 +535,7 @@ pub fn assign_index(seed: &[u8; 32], n: usize) -> Option<usize> {
 pub const STRIKE_1_BURN_CLAIMS: u32 = 5;
 
 /// Minimum DAA between two consecutive strikes on the same miner (~1 h). Any further miss inside
-/// this interval is a no-op: it neither escalates the strike count nor burns escrow. The guard-rail
-/// that separates "offline for ten minutes" (or a request flood) from "refusing to serve for
-/// hours" — a genuinely dead miner still escalates, one strike per interval, reaching suspension in
-/// ~3 intervals.
+/// this interval is a no-op: it neither escalates the strike count nor burns escrow.
 pub const SERVICE_STRIKE_INTERVAL_DAA: u64 = 36_000;
 
 /// Production suspension applied at the third consecutive strike (24 h). Enforced finality-deep
@@ -701,10 +697,7 @@ fn upper_median(mut values: Vec<u32>) -> Option<u32> {
 pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
 
 /// How long a served request hash stays remembered so a later acceptance of the same hash cannot
-/// arm a second audit (~24 h at 10 BPS). A hash can repeat because request identity is the payload
-/// digest: the same prompt, sent twice, is the same request. The second audit would be
-/// unanswerable — responders dedupe on that hash and the identical response is already on chain —
-/// so the whole cohort would be struck for a request nobody can serve.
+/// arm a second audit (~24 h at 10 BPS).
 pub const SERVICE_AUDITED_MEMORY_DAA: u64 = 864_000;
 
 /// Ceiling, above a syncee's pruning point, for service rows it cannot re-derive itself: such
@@ -1331,8 +1324,7 @@ impl ServiceLedger {
             let mut early = self.early_responses.remove(rh).map(|(_, keys)| keys).unwrap_or_default();
             let prompt_len =
                 traces.filter(|tr| tr.shape).and_then(|tr| tr.prompt_lens.iter().find(|(h, _)| h == rh).map(|(_, l)| *l)).unwrap_or(0);
-            // A re-accepted hash (identical payload resubmitted) must not reset the running
-            // audit: overwriting would re-arm the window and push the miss out forever.
+            // A re-accepted hash keeps its running audit.
             let entry = self.pending.entry(*rh).or_insert(PendingRequest {
                 tier: *tier,
                 max_tokens: *max_tokens,
@@ -3897,9 +3889,7 @@ mod tests {
 
     #[test]
     fn answer_in_the_accepting_block_never_strikes() {
-        // A miner fast enough to answer inside the chain block that accepts the request used to
-        // have his answer dropped — no audit existed yet to credit it — and was struck for a
-        // request he had served. Observed on testnet at daa 9132, cohort of one.
+        // An answer in the chain block that accepts the request is credited.
         let a = Hash::from_bytes([1u8; 32]);
         let set = [a];
         let mut ledger = ServiceLedger::default();
@@ -5259,6 +5249,138 @@ mod tests {
             assert!(run.ledger.trace_audits.is_empty());
             assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
             assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        /// A stage-2 audit over the synthetic chain tier, drawn at 202: the ledger, the trace and
+        /// residual piece bodies, and a fold over that ledger.
+        struct Stage2 {
+            ledger: ServiceLedger,
+            tier: keryx_verifiable_inference::chainkit::Tier,
+            trace: keryx_verifiable_inference::chainkit::Trace,
+            seed: [u8; 32],
+        }
+
+        impl Stage2 {
+            fn drawn() -> Self {
+                use keryx_verifiable_inference::{chain::STAGE_CHAIN, chainkit::{Tier, VOCAB}, prefix::PREFIX_LEN};
+                let tier = Tier::new();
+                let mut tokens: Vec<u32> = RH.iter().map(|&b| b as u32).collect();
+                tokens.extend((0..8u32).map(|i| (i * 37 + 5) % VOCAB as u32));
+                let trace = tier.trace(&tokens, PREFIX_LEN);
+                let ev = TraceResponseEvent {
+                    response_txid: TXID,
+                    request_hash: RH,
+                    responder: miner(),
+                    escrow_pubkey: ESCROW_PK,
+                    trace_root: trace.trace_root,
+                    n_prompt: trace.n_prompt,
+                    n_pos: trace.positions.len() as u32,
+                    answer_len: 0,
+                    stage: STAGE_CHAIN,
+                    tokens: true,
+                };
+                let mut run = Self { ledger: ServiceLedger::default(), tier, trace, seed: [0; 32] };
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(run.fold(100, h0, &[], &[]).0.is_empty());
+                assert!(run.fold(102, h0, &[ev], &[]).0.is_empty());
+                let ch = Hash::from_bytes([9u8; 32]);
+                assert!(run.fold(202, ch, &[], &[]).0.is_empty());
+                run.seed = trace_seed(&ch, &TXID);
+                run
+            }
+
+            fn fold(&mut self, daa: u64, chain: Hash, responses: &[TraceResponseEvent], openings: &[TraceOpeningEvent]) -> (Vec<(Hash, u32)>, Vec<Option<&'static str>>) {
+                let rules = TraceRules {
+                    ctx: self.tier.tier(),
+                    prefix: Some(self.tier.prefix_ctx(0)),
+                    chain: Some(self.tier.chain_ctx()),
+                    audit_all: true,
+                    attention: false,
+                };
+                let tier = |t: u8, _at: u64| (t == 0).then(|| rules.clone());
+                let lens = [(RH, 0)];
+                let tr = TraceInputs {
+                    chain_hash: chain,
+                    responses,
+                    openings,
+                    tier: &tier,
+                    prompt_lens: &lens,
+                    shape: false,
+                    sanction: false,
+                    context: false,
+                    draw: false,
+                    window_v3: false,
+                    dedup: false,
+                    seed_bind: false,
+                };
+                let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
+                let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
+                let outcome = self.ledger.on_chain_block_with_traces(daa, &req, &[], &[], &resp, &[], &[], &tr, |_| true, |_| vec![(miner(), miner())]);
+                (outcome.misses.iter().map(|m| (m.miner, m.consecutive_misses)).collect(), outcome.verdicts.iter().map(|v| v.cause).collect())
+            }
+
+            fn trace_body(&self) -> Vec<u8> {
+                use keryx_verifiable_inference::opening::Opening;
+                let (points, links): (Vec<_>, Vec<_>) = (0..draw::POINTS)
+                    .map(|i| {
+                        let (p, tok, link) = self.tier.open_point(&self.trace, &self.seed, i);
+                        (p, (tok, link))
+                    })
+                    .unzip();
+                let prefix = Some(self.tier.open_prefix(&self.trace, &self.seed, 0));
+                Opening { response_txid: TXID, points, prefix, experts: vec![None; links.len()], links, resid: None, roots: None }.encode()
+            }
+
+            fn resid_body(&self, tamper: bool) -> Vec<u8> {
+                let mut r = self.tier.open_resid_piece(&self.trace, &self.seed);
+                r.response_txid = TXID;
+                if tamper {
+                    r.feed.x[0] ^= 1;
+                }
+                r.encode()
+            }
+
+            fn pieces(&self) -> Option<u8> {
+                self.ledger.trace_audits.get(&TXID).map(|a| a.pieces)
+            }
+        }
+
+        #[test]
+        fn a_stage2_audit_closes_with_both_pieces_in_either_order() {
+            use crate::collateral::{PIECE_RESID, PIECE_TRACE};
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            let (misses, verdicts) = run.fold(203, h, &[], &[opening(ESCROW_PK, run.resid_body(false))]);
+            assert!(misses.is_empty() && verdicts.is_empty());
+            assert_eq!(run.pieces(), Some(PIECE_RESID));
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, run.trace_body())]);
+            assert!(misses.is_empty(), "{misses:?}");
+            assert_eq!(verdicts, vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+
+            let mut run = Stage2::drawn();
+            let (misses, _) = run.fold(203, h, &[], &[opening(ESCROW_PK, run.trace_body())]);
+            assert!(misses.is_empty());
+            assert_eq!(run.pieces(), Some(PIECE_TRACE));
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, run.resid_body(false))]);
+            assert!(misses.is_empty() && verdicts == vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_stage2_audit_missing_or_failing_its_residual_piece_strikes() {
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            let deadline = run.ledger.trace_audits.get(&TXID).unwrap().deadline_daa;
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, run.trace_body())]).0.is_empty());
+            let (misses, _) = run.fold(deadline + 1, h, &[], &[]);
+            assert_eq!(misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![miner()], "the trace piece alone does not close the audit");
+
+            let mut run = Stage2::drawn();
+            let (misses, verdicts) = run.fold(203, h, &[], &[opening(ESCROW_PK, run.resid_body(true))]);
+            assert_eq!(verdicts, vec![Some("residual point")]);
+            assert_eq!(misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![miner()]);
+            assert!(run.ledger.trace_audits.is_empty());
         }
 
         #[test]

@@ -60,6 +60,7 @@ fn zero_q8_row(d: f32) -> Vec<u8> {
 }
 
 /// A Q8_1 row of `D` values with block scale `d` and one value per block at full magnitude.
+#[cfg(test)]
 fn peaked_q8_row(d: f32) -> Vec<u8> {
     let mut x = zero_q8_row(d);
     for blk in x.chunks_exact_mut(36) {
@@ -1290,7 +1291,7 @@ mod moe_tests {
         let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3 };
         let entries = vec![
             entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
-            entry("blk.0.ffn_down_exps.weight", manifest::ROLE_PRODUCT, D, D, E as u32, exps_off, E * D * RB, RB, Chain::None),
+            entry("blk.0.ffn_down_exps.weight", last, D, D, E as u32, exps_off, E * D * RB, RB, Chain::None),
             entry("blk.0.ffn_down_shexp.weight", last, D, D, 1, shexp_off, D * RB, RB, Chain::None),
             entry("blk.0.ffn_gate_exps.weight", last, D, D, E as u32, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_gate_inp.weight", manifest::ROLE_ROUTER, D, E, 1, 0, 4 * E * D, 4 * D, Chain::None),
@@ -2198,7 +2199,7 @@ mod attn_tests {
     }
 
     #[test]
-    fn a_phased_forged_cache_fails_at_every_leaf() {
+    fn a_phased_inconsistent_cache_fails_at_every_leaf() {
         set_test_budget(SMALL_BUDGET);
         for c in ALL {
             let a = build(Cfg { forge_cache: true, ..c });
@@ -2274,7 +2275,7 @@ mod attn_tests {
     }
 
     #[test]
-    fn forged_partials_fail_where_they_are_combined() {
+    fn inconsistent_partials_fail_where_they_are_combined() {
         set_test_budget(SMALL_BUDGET);
         let a = build(GEMMA_GLOBAL);
         let (s, ops, roots) = deep(&a);
@@ -2672,7 +2673,7 @@ mod attn_tests {
         }
 
         #[test]
-        fn a_phased_forged_latent_cache_fails_at_every_leaf() {
+        fn a_phased_inconsistent_latent_cache_fails_at_every_leaf() {
             set_test_budget(SMALL_BUDGET);
             let a = build(false, true);
             for s in seeds() {
@@ -2815,7 +2816,7 @@ mod recur_tests {
         bad_ckpt: bool,
         /// The decay product carries the decay bias.
         fused_dt: bool,
-        /// One huge output column per head, the other columns forged, the output committed from them.
+        /// One huge output column per head, the other columns set from it, the output committed from them.
         spike_o: bool,
         /// A huge write strength at the first position, the recurrence following it.
         big_beta: bool,
@@ -3206,7 +3207,7 @@ mod recur_tests {
     }
 
     #[test]
-    fn a_huge_output_column_does_not_widen_the_tolerance() {
+    fn a_huge_output_column_is_refused() {
         for c in KINDS {
             let rt = build(Cfg { spike_o: true, ..c });
             for s in seeds() {
