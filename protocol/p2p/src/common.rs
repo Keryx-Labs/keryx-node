@@ -112,6 +112,11 @@ impl ProtocolError {
         )
     }
 
+    /// [`Self::is_ban_worthy`] for a peer serving IBD: a failing PoM proof only disconnects it.
+    pub fn is_ban_worthy_in_ibd(&self) -> bool {
+        self.is_ban_worthy() && !matches!(self, ProtocolError::RuleError(RuleError::BadPomProofV4(_)))
+    }
+
     pub fn can_send_outgoing_message(&self) -> bool {
         !matches!(self, Self::ConnectionClosed | Self::OutgoingRouteCapacityReached(_))
     }
@@ -251,5 +256,12 @@ mod tests {
     fn a_failing_pom_proof_is_ban_worthy() {
         assert!(ProtocolError::RuleError(RuleError::BadPomProofV4(PomV4VerifyError::FinalStateMismatch)).is_ban_worthy());
         assert!(!ProtocolError::ConnectionClosed.is_ban_worthy());
+    }
+
+    #[test]
+    fn a_failing_pom_proof_served_in_ibd_is_not_ban_worthy() {
+        assert!(!ProtocolError::RuleError(RuleError::BadPomProofV4(PomV4VerifyError::FinalStateMismatch)).is_ban_worthy_in_ibd());
+        assert!(ProtocolError::RuleError(RuleError::KnownInvalid).is_ban_worthy_in_ibd());
+        assert!(!ProtocolError::ConnectionClosed.is_ban_worthy_in_ibd());
     }
 }

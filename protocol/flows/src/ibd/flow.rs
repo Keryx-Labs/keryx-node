@@ -121,7 +121,7 @@ impl IbdFlow {
                     Ok(_) => info!("IBD with peer {} completed successfully", self.router),
                     Err(e) => {
                         info!("IBD with peer {} completed with error: {}", self.router, e);
-                        if e.is_ban_worthy() {
+                        if e.is_ban_worthy_in_ibd() {
                             let peer_ip = self.router.net_address().ip();
                             if self.ctx.ban_peer_automatically(peer_ip).await {
                                 warn!("Banned peer {} for ban-worthy protocol violation: {}", self.router, e);
