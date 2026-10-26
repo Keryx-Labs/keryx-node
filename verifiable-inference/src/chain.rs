@@ -4,7 +4,7 @@ use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
 use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
-use crate::attn::{ATTN_THRESHOLD, Partial};
+use crate::attn::Partial;
 use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root, root_lse_tol};
 use crate::opening::{AttnOpening, PrefixPoint};
 use crate::prefix::{PrefixCtx, THRESHOLD, expected_input, verify_prefix_point_at};
@@ -203,6 +203,35 @@ pub fn block_deviation(x: &[u8], layout: u8, k: usize, first_block: usize, v: &[
         }
     }
     Some(worst)
+}
+
+/// Worst deviation of `v` against the Q8 blocks of `x` from `first_block`, and the most values of
+/// one block past `base`.
+pub fn block_outliers(x: &[u8], layout: u8, k: usize, first_block: usize, v: &[f64], base: f64) -> Option<(f64, usize)> {
+    let blocks = q8::blocks(x, layout, k)?;
+    let n = v.len().div_ceil(32);
+    let vmax = v.iter().fold(0f64, |m, a| m.max(a.abs()));
+    let (mut worst, mut spare) = (0f64, 0usize);
+    for (b, (d, q)) in blocks.get(first_block..first_block.checked_add(n)?)?.iter().enumerate() {
+        let vals = &v[b * 32..((b + 1) * 32).min(v.len())];
+        if !d.is_finite() || !q8::canonical(*d, q) || vals.iter().any(|a| !a.is_finite()) {
+            return None;
+        }
+        if *d == 0.0 {
+            if vals.iter().any(|a| a.abs() > 1e-6 * vmax) {
+                return None;
+            }
+            continue;
+        }
+        let mut over = 0;
+        for (j, a) in vals.iter().enumerate() {
+            let dev = (q[j] as f64 - a / *d as f64).abs();
+            worst = worst.max(dev);
+            over += (dev > base) as usize;
+        }
+        spare = spare.max(over);
+    }
+    Some((worst, spare))
 }
 
 fn within(dev: Option<f64>) -> Result<(), Fail> {
@@ -933,6 +962,20 @@ mod tests {
     }
 
     #[test]
+    fn outliers_count_the_values_of_a_block_past_the_base() {
+        let v: Vec<f64> = rms_norm(&vec_of(1, 3.0), &norm_w(), EPS);
+        let x = q8_1_row(&v);
+        let d: Vec<f64> = q8::blocks(&x, q8::MMVQ, D).unwrap().iter().map(|b| b.0 as f64).collect();
+        let shift = |v: &[f64], n: usize| -> Vec<f64> { v.iter().enumerate().map(|(i, a)| if i % 32 < n { a + 1.6 * d[i / 32] } else { *a }).collect() };
+        let (worst, spare) = block_outliers(&x, q8::MMVQ, D, 0, &v, 1.0).unwrap();
+        assert!(worst <= 0.5 + 1e-9 && spare == 0);
+        let (worst, spare) = block_outliers(&x, q8::MMVQ, D, 0, &shift(&v, 3), 1.0).unwrap();
+        assert!(worst <= 2.1 + 1e-9 && spare == 3);
+        let (worst, spare) = block_outliers(&x, q8::MMVQ, D, 0, &shift(&v, 32), 1.0).unwrap();
+        assert!(worst <= 2.1 + 1e-9 && spare == 32);
+    }
+
+    #[test]
     fn routing_follows_the_top_scores() {
         let scores: Vec<f32> = (0..16).map(|i| ((i * 7) % 16) as f32 * 0.25 - 2.0).collect();
         let bias = vec![0.0f32; 16];
@@ -1366,7 +1409,7 @@ fn mla_phase(
             let mass = committed_lse(ctx, op, s, n_pos, 0, nh, qh)? as f64;
             ARITHS.iter().any(|&ar| {
                 crate::attn::partial(ar, &q, scale, &keys, &values)
-                    .is_some_and(|p| (lse(&p) - mass).abs() <= root_lse_tol(p.m) && block_deviation(x, layout, r, 0, &p.o).is_some_and(|dv| dv <= ATTN_THRESHOLD))
+                    .is_some_and(|p| (lse(&p) - mass).abs() <= root_lse_tol(p.m) && crate::attn_blocks::root_within(x, layout, r, 0, &p.o))
             })
         }
         (None, None) => false,

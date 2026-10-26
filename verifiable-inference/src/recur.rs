@@ -1,6 +1,6 @@
 //! Recomputation of a recurrent layer's delta rule over one segment of one head.
 
-use crate::chain::{ChainCtx, block_deviation, chunk_leaf, f32_weights, f32s, shape_any};
+use crate::chain::{ChainCtx, block_outliers, chunk_leaf, f32_weights, f32s, shape_any};
 use crate::draw;
 use crate::manifest::{self, Chain, RECUR_GDA, RECUR_KDA};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_verify};
@@ -17,6 +17,10 @@ pub const RECUR_ROWS: u64 = 16;
 pub const RECUR_TOL: f64 = 1.0 / 64.0;
 /// Largest `|v|` of a record.
 pub const RECUR_V_MAX: f64 = 1024.0;
+/// Largest deviation, in quantization steps, of a value of the output projection's input.
+pub const RECUR_OUT_MAX: f64 = 2.0;
+/// Values of one block allowed past `THRESHOLD`, up to `RECUR_OUT_MAX`.
+pub const RECUR_OUT_SPARE: usize = 4;
 
 /// Smallest step of a recorded f16 value.
 const F16_MIN_STEP: f64 = 1.0 / 16_777_216.0;
@@ -258,8 +262,7 @@ pub fn verify_recur_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
             rec.o[i] as f64 * rn * norm[i] as f64 * act
         })
         .collect();
-    block_deviation(&op.out.bytes, lay, (nv64 * hd64) as usize, h as usize * hd / 32, &y)
-        .is_some_and(|dv| dv <= THRESHOLD)
-        .then_some(())
-        .ok_or(Fail::Mismatch)
+    let dev = block_outliers(&op.out.bytes, lay, (nv64 * hd64) as usize, h as usize * hd / 32, &y, THRESHOLD);
+    let ok = dev.is_some_and(|(dv, spare)| dv <= RECUR_OUT_MAX && spare <= RECUR_OUT_SPARE);
+    ok.then_some(()).ok_or(Fail::Mismatch)
 }

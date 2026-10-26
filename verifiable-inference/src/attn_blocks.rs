@@ -224,7 +224,18 @@ pub fn check_root(x: &[u8], layout: u8, n_out: usize, head: usize, children: &[P
     {
         return false;
     }
-    crate::chain::block_deviation(x, layout, n_out, head * d / 32, &o).is_some_and(|dv| dv <= ATTN_THRESHOLD)
+    root_within(x, layout, n_out, head * d / 32, &o)
+}
+
+/// Largest deviation, in quantization steps, of a value of the attention-output input.
+pub const ATTN_OUT_MAX: f64 = 3.0;
+/// Values of one block allowed past `ATTN_THRESHOLD`, up to `ATTN_OUT_MAX`.
+pub const ATTN_OUT_SPARE: usize = 4;
+
+/// Whether `o` matches the Q8 blocks of the attention-output input `x` from `first_block`.
+pub fn root_within(x: &[u8], layout: u8, n_out: usize, first_block: usize, o: &[f64]) -> bool {
+    let dev = crate::chain::block_outliers(x, layout, n_out, first_block, o, ATTN_THRESHOLD);
+    dev.is_some_and(|(dv, spare)| dv <= ATTN_OUT_MAX && spare <= ATTN_OUT_SPARE)
 }
 
 /// [`check_root`] with the softmax mass of `children` matching the committed `lse` of the head.
