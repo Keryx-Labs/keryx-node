@@ -38,6 +38,7 @@ pub(crate) struct ConsensusMock {
     private_recipients: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
     response_rule: RwLock<bool>,
     unarmed_requests: RwLock<std::collections::HashSet<[u8; 32]>>,
+    opening_key_queries: std::sync::atomic::AtomicUsize,
 }
 
 impl ConsensusMock {
@@ -56,7 +57,13 @@ impl ConsensusMock {
             private_recipients: RwLock::new(HashMap::default()),
             response_rule: RwLock::new(false),
             unarmed_requests: RwLock::new(Default::default()),
+            opening_key_queries: Default::default(),
         }
+    }
+
+    /// Queries of the awaited opening keys so far.
+    pub(crate) fn opening_key_queries(&self) -> usize {
+        self.opening_key_queries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn set_private_cohort(&self, cohort: Option<Vec<[u8; 32]>>) {
@@ -145,6 +152,7 @@ impl ConsensusMock {
 
 impl ConsensusApi for ConsensusMock {
     fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.opening_key_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.awaited_openings.read().get(response_txid).copied()
     }
 

@@ -67,6 +67,9 @@ pub(crate) struct Mempool {
     /// Private-inference index: request tx id → the escrow keys the pending AiRequest is sealed
     /// to. Admits a named responder's inline-body AiResponse while its request still sits here.
     ai_private_request_index: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    /// Openings and responses the consensus awaits, as of a virtual DAA score; read when a full
+    /// mempool makes room.
+    awaited_ai_cache: Option<(u64, std::collections::HashSet<TransactionId>)>,
 }
 
 impl Mempool {
@@ -84,6 +87,7 @@ impl Mempool {
             ai_challenge_index: HashMap::new(),
             ai_opening_index: HashMap::new(),
             ai_private_request_index: HashMap::new(),
+            awaited_ai_cache: None,
         }
     }
 

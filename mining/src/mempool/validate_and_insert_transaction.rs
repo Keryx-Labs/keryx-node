@@ -114,9 +114,17 @@ impl Mempool {
         // Before adding the transaction, check if there is room in the pool
         let transaction_size = transaction.mempool_estimated_bytes();
         let awaited = self.ai_tx_awaited(consensus, &transaction.tx);
-        let awaited_ids = std::cell::OnceCell::new();
+        if self.transaction_pool.len() >= self.config.maximum_transaction_count
+            || self.transaction_pool.get_estimated_size() + transaction_size > self.config.mempool_size_limit
+        {
+            let daa = consensus.get_virtual_daa_score();
+            if self.awaited_ai_cache.as_ref().is_none_or(|(at, _)| *at != daa) {
+                self.awaited_ai_cache = Some((daa, self.awaited_ai_ids(consensus)));
+            }
+        }
+        let cache = &self.awaited_ai_cache;
         let txs_to_remove = self.transaction_pool.limit_transaction_count(&transaction, transaction_size, awaited, |mtx| {
-            awaited_ids.get_or_init(|| self.awaited_ai_ids(consensus)).contains(&mtx.id())
+            cache.as_ref().is_some_and(|(_, ids)| ids.contains(&mtx.id()))
         })?;
         if !txs_to_remove.is_empty() {
             let transaction_pool_len_before = self.transaction_pool.len();
@@ -158,6 +166,9 @@ impl Mempool {
             .mtx
             .tx
             .clone();
+        if awaited && let Some((_, ids)) = self.awaited_ai_cache.as_mut() {
+            ids.insert(accepted_transaction.id());
+        }
 
         // Private-inference requests: remember the named responders while the request is here.
         if accepted_transaction.is_ai_request()
@@ -363,7 +374,7 @@ impl Mempool {
     }
 
     /// Awaited openings to lead a template with their deadlines: first the one drawn among the
-    /// nearest deadlines (the nearest itself when it is about due), then the others by deadline.
+    /// openings about due (among the nearest deadlines when none is), then the others by deadline.
     fn leading_openings(&self, consensus: &dyn ConsensusApi) -> Vec<(&MempoolTransaction, u64)> {
         let mut due: Vec<(u64, TransactionId)> = self
             .ai_opening_index
@@ -375,10 +386,11 @@ impl Mempool {
             })
             .collect();
         due.sort_unstable();
-        if let Some(&(nearest, _)) = due.first()
-            && nearest > consensus.get_virtual_daa_score() + LEADING_OPENING_DUE_DAA
-        {
-            let pick = rand::thread_rng().gen_range(0..due.len().min(LEADING_OPENING_SPREAD));
+        let soon = consensus.get_virtual_daa_score() + LEADING_OPENING_DUE_DAA;
+        let urgent = due.iter().take_while(|(deadline, _)| *deadline <= soon).count();
+        let spread = if urgent > 0 { urgent } else { due.len() }.min(LEADING_OPENING_SPREAD);
+        if spread > 1 {
+            let pick = rand::thread_rng().gen_range(0..spread);
             due[..=pick].rotate_right(1);
         }
         due.into_iter().filter_map(|(deadline, id)| self.transaction_pool.get(&id).map(|tx| (tx, deadline))).collect()

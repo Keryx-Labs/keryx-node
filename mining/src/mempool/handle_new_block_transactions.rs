@@ -35,7 +35,8 @@ impl Mempool {
             }
             self.remove_double_spends(transaction)?;
             self.orphan_pool.remove_orphan(&transaction_id, false, TxRemovalReason::Accepted, "")?;
-            if self.accepted_transactions.add(transaction_id, block_daa_score) {
+            // An opening stays admissible while the consensus still awaits its piece.
+            if !transaction.is_ai_opening() && self.accepted_transactions.add(transaction_id, block_daa_score) {
                 tx_accepted_counts += 1;
                 input_counts += transaction.inputs.len();
                 output_counts += transaction.outputs.len();
