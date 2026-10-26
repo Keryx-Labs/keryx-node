@@ -50,6 +50,9 @@ type ResponseEntry = (Option<[u8; 32]>, TransactionId);
 ///   rebroadcasts them once in a while.
 /// - Transactions received through P2P have **low-priority**. They expire after
 ///   60 seconds and are removed if not inserted in a block for mining.
+/// DAA during which an opening a block carried is refused again.
+const CARRIED_OPENING_HOLD_DAA: u64 = 100;
+
 pub(crate) struct Mempool {
     config: Arc<Config>,
     transaction_pool: TransactionsPool,
@@ -70,6 +73,8 @@ pub(crate) struct Mempool {
     /// Openings and responses the consensus awaits, as of a virtual DAA score; read when a full
     /// mempool makes room.
     awaited_ai_cache: Option<(u64, std::collections::HashSet<TransactionId>)>,
+    /// Openings carried by a recent block, by the DAA score of that block.
+    carried_openings: HashMap<TransactionId, u64>,
 }
 
 impl Mempool {
@@ -88,6 +93,7 @@ impl Mempool {
             ai_opening_index: HashMap::new(),
             ai_private_request_index: HashMap::new(),
             awaited_ai_cache: None,
+            carried_openings: HashMap::new(),
         }
     }
 
@@ -190,7 +196,11 @@ impl Mempool {
     pub(crate) fn unknown_transactions(&self, transactions: Vec<TransactionId>) -> Vec<TransactionId> {
         let mut not_in_pools_txs = transactions
             .into_iter()
-            .filter(|transaction_id| !(self.transaction_pool.has(transaction_id) || self.orphan_pool.has(transaction_id)));
+            .filter(|transaction_id| {
+                !(self.transaction_pool.has(transaction_id)
+                    || self.orphan_pool.has(transaction_id)
+                    || self.carried_openings.contains_key(transaction_id))
+            });
         self.accepted_transactions.unaccepted(&mut not_in_pools_txs)
     }
 

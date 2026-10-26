@@ -35,14 +35,16 @@ impl Mempool {
             }
             self.remove_double_spends(transaction)?;
             self.orphan_pool.remove_orphan(&transaction_id, false, TxRemovalReason::Accepted, "")?;
-            // An opening stays admissible while the consensus still awaits its piece.
-            if !transaction.is_ai_opening() && self.accepted_transactions.add(transaction_id, block_daa_score) {
+            if transaction.is_ai_opening() {
+                self.carried_openings.insert(transaction_id, block_daa_score);
+            } else if self.accepted_transactions.add(transaction_id, block_daa_score) {
                 tx_accepted_counts += 1;
                 input_counts += transaction.inputs.len();
                 output_counts += transaction.outputs.len();
             }
             unorphaned_transactions.extend(self.get_unorphaned_transactions_after_accepted_transaction(transaction));
         }
+        self.carried_openings.retain(|_, at| *at + super::CARRIED_OPENING_HOLD_DAA > block_daa_score);
         self.counters.block_tx_counts.fetch_add(block_transactions.len() as u64 - 1, Ordering::Relaxed);
         self.counters.tx_accepted_counts.fetch_add(tx_accepted_counts, Ordering::Relaxed);
         self.counters.input_counts.fetch_add(input_counts as u64, Ordering::Relaxed);

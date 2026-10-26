@@ -39,6 +39,7 @@ pub(crate) struct ConsensusMock {
     response_rule: RwLock<bool>,
     unarmed_requests: RwLock<std::collections::HashSet<[u8; 32]>>,
     opening_key_queries: std::sync::atomic::AtomicUsize,
+    virtual_daa: std::sync::atomic::AtomicU64,
 }
 
 impl ConsensusMock {
@@ -58,7 +59,12 @@ impl ConsensusMock {
             response_rule: RwLock::new(false),
             unarmed_requests: RwLock::new(Default::default()),
             opening_key_queries: Default::default(),
+            virtual_daa: Default::default(),
         }
+    }
+
+    pub(crate) fn set_virtual_daa_score(&self, daa: u64) {
+        self.virtual_daa.store(daa, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Queries of the awaited opening keys so far.
@@ -290,7 +296,7 @@ impl ConsensusApi for ConsensusMock {
     }
 
     fn get_virtual_daa_score(&self) -> u64 {
-        0
+        self.virtual_daa.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn get_virtual_state_approx_id(&self) -> VirtualStateApproxId {

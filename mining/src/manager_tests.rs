@@ -661,9 +661,10 @@ mod tests {
             .unwrap();
             tx.id()
         };
-        let (a, b, far) = (opening(1, 50), opening(2, 80), opening(3, 5_000));
+        consensus.set_virtual_daa_score(10);
+        let (a, b, far, _late) = (opening(1, 50), opening(2, 80), opening(3, 5_000), opening(4, 5));
         let leads: Vec<TransactionId> = (0..200).map(|_| mining_manager.build_selector(consensus.as_ref()).select_transactions()[0].id()).collect();
-        assert!(leads.iter().all(|id| *id == a || *id == b), "an opening far from due never leads beside due ones");
+        assert!(leads.iter().all(|id| *id == a || *id == b), "neither an opening far from due nor one past due leads");
         assert!(leads.contains(&a) && leads.contains(&b), "both openings about due get the lead");
 
         consensus.set_opening_deadline([2; 32], 3_000);
@@ -712,9 +713,14 @@ mod tests {
         mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block).unwrap();
         assert!(!mining_manager.has_transaction(&opening.id(), TransactionQuery::All));
         assert_eq!(insert(paid.clone()), Err(RuleError::RejectAlreadyAccepted(paid.id())), "a paying transaction stays accepted");
+        assert_eq!(insert(opening.clone()), Err(RuleError::RejectAlreadyAccepted(opening.id())), "held right after its block");
+        assert!(mining_manager.unknown_transactions(vec![opening.id()]).is_empty(), "not fetched again from peers");
+
+        consensus.set_virtual_daa_score(102);
         insert(opening.clone()).unwrap();
 
-        mining_manager.handle_new_block_transactions(consensus.as_ref(), 3, &block).unwrap();
+        mining_manager.handle_new_block_transactions(consensus.as_ref(), 103, &block).unwrap();
+        consensus.set_virtual_daa_score(300);
         consensus.clear_awaited_opening(&response_txid);
         assert_eq!(insert(opening), Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(response_txid))), "a proven piece is refused");
     }

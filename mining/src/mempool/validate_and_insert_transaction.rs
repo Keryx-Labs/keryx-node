@@ -166,7 +166,8 @@ impl Mempool {
             .mtx
             .tx
             .clone();
-        if awaited && let Some((_, ids)) = self.awaited_ai_cache.as_mut() {
+        let now = consensus.get_virtual_daa_score();
+        if awaited && let Some((_, ids)) = self.awaited_ai_cache.as_mut().filter(|(at, _)| *at == now) {
             ids.insert(accepted_transaction.id());
         }
 
@@ -215,7 +216,7 @@ impl Mempool {
         }
 
         // One AiResponse per (request, responder), with a per-request cap. A V2 responder
-        // signature must verify so the dedup key cannot be forged by third parties.
+        // signature must verify.
         if transaction.tx.is_ai_response()
             && let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload)
         {
@@ -253,8 +254,7 @@ impl Mempool {
 
     /// Admission policy for inline response bodies (private inference): an AiResponse carrying
     /// one is accepted only from a responder its request was sealed to, while that request is
-    /// pending here or in the service ledger. Bodies run up to 32 KiB and AiResponses pay no
-    /// fee, so without this any key could relay large free transactions. Policy only — a block
+    /// pending here or in the service ledger. Policy only — a block
     /// that includes such a response is judged by consensus alone.
     fn validate_ai_response_body(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
         if !transaction.tx.is_ai_response() {
@@ -304,6 +304,9 @@ impl Mempool {
     fn validate_ai_opening(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
         if !transaction.tx.is_ai_opening() {
             return Ok(());
+        }
+        if self.carried_openings.get(&transaction.id()).is_some_and(|&at| consensus.get_virtual_daa_score() < at + super::CARRIED_OPENING_HOLD_DAA) {
+            return Err(RuleError::RejectAlreadyAccepted(transaction.id()));
         }
         let response_txid = ai_opening_response_txid(&transaction.tx.payload);
         let awaited = self.opening_awaited(consensus, &transaction.tx)
@@ -376,17 +379,18 @@ impl Mempool {
     /// Awaited openings to lead a template with their deadlines: first the one drawn among the
     /// openings about due (among the nearest deadlines when none is), then the others by deadline.
     fn leading_openings(&self, consensus: &dyn ConsensusApi) -> Vec<(&MempoolTransaction, u64)> {
+        let now = consensus.get_virtual_daa_score();
         let mut due: Vec<(u64, TransactionId)> = self
             .ai_opening_index
             .values()
             .filter_map(|id| {
                 let tx = self.transaction_pool.get(id).filter(|tx| tx.mtx.tx.inputs.is_empty() && self.opening_awaited(consensus, &tx.mtx.tx))?;
                 let txid = ai_opening_response_txid(&tx.mtx.tx.payload)?;
-                consensus.awaited_opening_deadline(&txid).map(|deadline| (deadline, *id))
+                consensus.awaited_opening_deadline(&txid).filter(|&deadline| deadline >= now).map(|deadline| (deadline, *id))
             })
             .collect();
         due.sort_unstable();
-        let soon = consensus.get_virtual_daa_score() + LEADING_OPENING_DUE_DAA;
+        let soon = now + LEADING_OPENING_DUE_DAA;
         let urgent = due.iter().take_while(|(deadline, _)| *deadline <= soon).count();
         let spread = if urgent > 0 { urgent } else { due.len() }.min(LEADING_OPENING_SPREAD);
         if spread > 1 {
