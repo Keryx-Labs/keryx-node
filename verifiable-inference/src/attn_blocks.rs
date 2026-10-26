@@ -18,9 +18,9 @@ const NODE_FLOOR: f64 = 2.0 * LEAF_FLOOR;
 /// largest score of zero.
 pub const LSE_ROOT_TOL: f64 = 1.0 / 64.0;
 
-/// [`LSE_ROOT_TOL`] widened with the largest score `m`, up to `|m| = 256`.
+/// [`LSE_ROOT_TOL`] widened with the largest score `m`, up to `|m| = 176`.
 pub fn root_lse_tol(m: f64) -> f64 {
-    LSE_ROOT_TOL + m.abs().min(256.0) / 4096.0
+    LSE_ROOT_TOL + m.abs().min(176.0) / 4096.0
 }
 
 #[cfg(test)]
@@ -527,8 +527,8 @@ mod tests {
         assert_eq!(root_lse_tol(0.0), LSE_ROOT_TOL);
         assert_eq!(root_lse_tol(-147.0), root_lse_tol(147.0));
         assert!(root_lse_tol(147.0) > 0.0070 * 4.0);
-        assert_eq!(root_lse_tol(1e9), root_lse_tol(256.0));
-        assert_eq!(root_lse_tol(256.0), LSE_ROOT_TOL + 1.0 / 16.0);
+        assert_eq!(root_lse_tol(1e9), root_lse_tol(176.0));
+        assert_eq!(root_lse_tol(176.0), LSE_ROOT_TOL + 176.0 / 4096.0);
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
             let x = k.x(a);
             let mass = lse(&k.run((0, 256), a)) as f32;
             assert!(check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass), "{a:?}");
-            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * root_lse_tol(256.0)) as f32), "{a:?}");
+            assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, mass + (2.0 * root_lse_tol(176.0)) as f32), "{a:?}");
             assert!(!check_root_lse(&x, q8::MMVQ, 2 * D, 1, &honest, None, f32::NAN), "{a:?}");
         }
         let honest = k.decoded(&[], Arith::Exact);
