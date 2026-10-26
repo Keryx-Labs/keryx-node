@@ -712,7 +712,8 @@ pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, 
         (ResidAdd::Moe(m), Some(er)) => {
             let moe = ll.moe.ok_or(Fail::Shape)?;
             let de = open_entry(tier, &er.entry, moe.down_exps as u64)?;
-            if de.role != manifest::ROLE_PRODUCT || de.glu_form != manifest::FORM_NONE || de.n_exp < 2 || de.m != dim {
+            let trimmed = ctx.trim_last && layer + 1 == n_layers;
+            if !layer_role(de.role, trimmed) || de.glu_form != manifest::FORM_NONE || de.n_exp < 2 || de.m != dim {
                 return Err(Fail::Manifest);
             }
             let n_used = ctx.n_used as u64;
