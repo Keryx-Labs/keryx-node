@@ -288,6 +288,18 @@ impl Tier {
 
     /// [`Self::trace`] committing batch size `ubatch` at every position when given.
     pub fn trace_declaring(&self, tokens: &[u32], n_prompt: u32, ubatch: Option<u32>) -> Trace {
+        self.trace_pinned(tokens, n_prompt, ubatch, None)
+    }
+
+    /// [`Self::trace_declaring`] with residual `(layer, kind)` committed as `pin` at every position;
+    /// with `via_add`, the product output feeding it is committed as `pin - src`.
+    fn trace_pinned(&self, tokens: &[u32], n_prompt: u32, ubatch: Option<u32>, pin: Option<(usize, Resid, &[f32], bool)>) -> Trace {
+        let hit = |l: usize, kind: Resid| pin.filter(|&(pl, pk, _, _)| pl == l && pk == kind);
+        let pinned = |l: usize, kind: Resid, v: Vec<f32>| hit(l, kind).map_or(v, |(_, _, c, _)| c.to_vec());
+        let add = |l: usize, kind: Resid, y: Vec<f32>, src: &[f32]| match hit(l, kind) {
+            Some((_, _, c, true)) => c.iter().zip(src).map(|(a, b)| a - b).collect(),
+            _ => y,
+        };
         let np = N_PRODUCTS as u64;
         let n_leaves = chain::n_pos_leaves(np, N_LAYERS as u64, 0) as usize;
         let as_f32 = |v: &[f64]| -> Vec<f32> { v.iter().map(|&a| a as f32).collect() };
@@ -315,16 +327,16 @@ impl Tier {
                 let y_fb = as_f32(&self.matvec(rank(l, SSM_F_B), &x_fb));
                 let mix: Vec<f64> = (0..D).map(|i| y_q[i % Q_M]).collect();
                 let x_ao = q8_1_row(&mix);
-                let y_ao = as_f32(&self.matvec(rank(l, ATTN_OUTPUT), &x_ao));
-                let r: Vec<f32> = y_ao.iter().zip(&h).map(|(a, b)| a + b).collect();
+                let y_ao = add(l, Resid::Attn, as_f32(&self.matvec(rank(l, ATTN_OUTPUT), &x_ao)), &h);
+                let r: Vec<f32> = pinned(l, Resid::Attn, y_ao.iter().zip(&h).map(|(a, b)| a + b).collect());
 
                 let x_f = q8_1_row(&chain::rms_norm(&r, &self.f32_tensor(ffn_norm(l)), EPS));
                 let g = self.matvec(rank(l, FFN_GATE), &x_f);
                 let u = self.matvec(rank(l, FFN_UP), &x_f);
                 let hglu: Vec<f32> = g.iter().zip(&u).map(|(&a, &b)| (silu(a) * b) as f32).collect();
                 let x_d = q8_1_row(&hglu.iter().map(|&a| a as f64).collect::<Vec<_>>());
-                let y_d = as_f32(&self.matvec(rank(l, FFN_DOWN), &x_d));
-                let out: Vec<f32> = y_d.iter().zip(&r).map(|(a, b)| a + b).collect();
+                let y_d = add(l, Resid::Out, as_f32(&self.matvec(rank(l, FFN_DOWN), &x_d)), &r);
+                let out: Vec<f32> = pinned(l, Resid::Out, y_d.iter().zip(&r).map(|(a, b)| a + b).collect());
 
                 for (p, x, y) in [
                     (ATTN_Q, &x_in, bytes(&as_f32(&y_q))),
@@ -558,9 +570,9 @@ impl Tier {
         let d = draw::point(seed, chain::RESID_POINT);
         let np = N_PRODUCTS as u64;
         let resp = crate::verify::ResponseCtx { trace_root: trace.trace_root, n_prompt: trace.n_prompt, n_pos: trace.positions.len() as u32 };
-        let sel = d[1] % (2 * N_LAYERS as u64);
+        let sel = chain::resid_site(d[1], 2 * N_LAYERS as u64);
         let t = chain::resid_position(ctx, &resp, sel / 2, d[0]).expect("residual position");
-        let sel = d[1] % (2 * N_LAYERS as u64);
+        let sel = chain::resid_site(d[1], 2 * N_LAYERS as u64);
         let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
         let pos = &trace.positions[t as usize];
         let product = if kind == Resid::Attn { rank(layer as usize, ATTN_OUTPUT) } else { rank(layer as usize, FFN_DOWN) };
@@ -585,6 +597,27 @@ impl Tier {
             src,
             add: ResidAdd::Chunk(leaf_chunk(pos, 2 * product as u64 + 1, c)),
         }
+    }
+
+    /// Residual opening drawn by `seed`: the residual point and one row of its feeding product.
+    pub fn open_resid_piece(&self, trace: &Trace, seed: &Hash) -> crate::opening::ResidOpening {
+        let resid = self.open_resid(trace, seed);
+        let d = draw::point(seed, chain::RESID_POINT);
+        let product = resid.product.index as usize;
+        let per = (B3_CHUNK / 4) as u64;
+        let c = resid.dst.index as u64;
+        let row = c * per + (d[3] >> 32) % per.min(self.entry(product).m - c * per);
+        let resp = crate::verify::ResponseCtx { trace_root: trace.trace_root, n_prompt: trace.n_prompt, n_pos: trace.positions.len() as u32 };
+        let sel = chain::resid_site(d[1], 2 * N_LAYERS as u64);
+        let t = chain::resid_position(&self.chain_ctx(), &resp, sel / 2, d[0]).expect("residual position");
+        let pos = &trace.positions[t as usize];
+        let feed = crate::opening::FeedRow {
+            x: pos.leaves[2 * product].clone(),
+            x_path: b3_path(&pos.hashes, 2 * product),
+            row: self.row_of(product, row).1,
+            bias: None,
+        };
+        crate::opening::ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: None }
     }
 }
 
@@ -632,8 +665,49 @@ mod tests {
                 verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None).unwrap_or_else(|e| panic!("seed {s} point {i}: {e:?}"));
             }
             verify_resid_point(&tc, &cc, &rc, &seed, &tier.open_resid(&trace, &seed)).unwrap_or_else(|e| panic!("seed {s} resid: {e:?}"));
+            chain::verify_resid_opening(&tc, &cc, &rc, &seed, &tier.open_resid_piece(&trace, &seed)).unwrap_or_else(|e| panic!("seed {s} resid piece: {e:?}"));
         }
         assert!(links[..4].iter().all(|&n| n > 0), "{links:?}");
+    }
+
+    #[test]
+    fn a_product_output_off_its_input_is_refused_by_the_residual_piece() {
+        let tier = Tier::new();
+        let tokens: Vec<u32> = (0..12u32).map(|i| (i * 37 + 5) % VOCAB as u32).collect();
+        let honest = tier.trace(&tokens, 8);
+        let (tc, cc) = (tier.tier(), tier.chain_ctx());
+        for kind in [Resid::Attn, Resid::Out] {
+            let leaf = chain::resid_leaf(N_PRODUCTS as u64, 0, kind) as usize;
+            let c: Vec<f32> = chain::f32s(&honest.positions[0].leaves[leaf]);
+            let forged = tier.trace_pinned(&tokens, 8, None, Some((0, kind, &c, true)));
+            let rc = resp(&forged);
+            let site = if kind == Resid::Attn { 0 } else { 1 };
+            let (mut on_site, mut refused) = (0, 0);
+            for s in 0..256u32 {
+                let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
+                let d = draw::point(&seed, chain::RESID_POINT);
+                let point = verify_resid_point(&tc, &cc, &rc, &seed, &tier.open_resid(&forged, &seed));
+                assert_eq!(point, Ok(()), "seed {s}");
+                if chain::resid_site(d[1], 2 * N_LAYERS as u64) != site || d[0] % forged.positions.len() as u64 == 0 {
+                    continue;
+                }
+                on_site += 1;
+                let piece = chain::verify_resid_opening(&tc, &cc, &rc, &seed, &tier.open_resid_piece(&forged, &seed));
+                refused += (piece == Err(crate::verify::Fail::Mismatch)) as u32;
+            }
+            assert!(on_site > 0 && refused == on_site, "{kind:?}: {refused} of {on_site}");
+        }
+    }
+
+    #[test]
+    fn residual_sites_lean_towards_the_first_layers() {
+        let n = 8u64;
+        let mut hits = vec![0u64; n as usize];
+        for d1 in 0..n * (n + 1) / 2 {
+            hits[chain::resid_site(d1, n) as usize] += 1;
+        }
+        assert_eq!(hits, (1..=n).rev().collect::<Vec<_>>());
+        assert_eq!(chain::resid_site(u64::MAX, 1), 0);
     }
 
     #[test]
@@ -770,7 +844,7 @@ mod tests {
         for s in 0..64u32 {
             let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
             let d = draw::point(&seed, chain::RESID_POINT);
-            let hits = d[1] % 4 < 2 && d[2].is_multiple_of(2);
+            let hits = chain::resid_site(d[1], 4) < 2 && d[2].is_multiple_of(2);
             let r = verify_resid_point(&tc, &cc, &rc, &seed, &tier.open_resid(&trace, &seed));
             if hits {
                 assert_eq!(r, Err(crate::verify::Fail::Mismatch), "seed {s}");
@@ -795,7 +869,7 @@ mod tests {
         let (mut ok, mut refused) = (0, 0);
         for s in 0..256u32 {
             let seed = *blake3::hash(&s.to_le_bytes()).as_bytes();
-            let sel = draw::point(&seed, chain::RESID_POINT)[1] % (2 * N_LAYERS as u64);
+            let sel = chain::resid_site(draw::point(&seed, chain::RESID_POINT)[1], 2 * N_LAYERS as u64);
             if sel != 2 * N_LAYERS as u64 - 1 {
                 continue;
             }
@@ -1151,7 +1225,19 @@ mod moe_tests {
         pos: Position,
         trace_root: Hash,
         n_ubatch: u32,
+        exps_off: usize,
+        shexp_off: usize,
+        ids: Vec<u32>,
     }
+
+    /// Product output committed with no tie to its input.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Forge {
+        Shexp,
+        Experts,
+    }
+
+    const RB: usize = D / 32 * 34;
 
     fn entry(name: &str, role: u8, k: usize, m: usize, n_exp: u32, off: usize, n: usize, rb: usize, chain: Chain) -> Vec<u8> {
         let e = Entry {
@@ -1181,6 +1267,10 @@ mod moe_tests {
 
     /// `gate_scale`: router input committed as `peaked_q8_row(gate_scale)` under scores of no input.
     fn build_with(order_swap: bool, bump_slot: Option<usize>, batch: u32, gate_scale: Option<f32>) -> Moe {
+        build_full(order_swap, bump_slot, batch, gate_scale, None)
+    }
+
+    fn build_full(order_swap: bool, bump_slot: Option<usize>, batch: u32, gate_scale: Option<f32>, forge: Option<Forge>) -> Moe {
         let router = vecf(1, E * D, 0.05);
         let bias = vecf(2, E, 0.01);
         let norm: Vec<f32> = (0..D).map(|i| 1.0 + 0.001 * (i % 7) as f32).collect();
@@ -1189,6 +1279,10 @@ mod moe_tests {
         weights.extend_from_slice(&bytes(&bias));
         let norm_off = weights.len();
         weights.extend_from_slice(&bytes(&norm));
+        let exps_off = weights.len();
+        weights.extend_from_slice(&q8_0_rows(40, E * D, 0.0004));
+        let shexp_off = weights.len();
+        weights.extend_from_slice(&q8_0_rows(41, D, 0.0004));
         let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
 
         let none = manifest::NONE;
@@ -1196,8 +1290,8 @@ mod moe_tests {
         let moe = manifest::MoeLinks { down_exps: 1, router: 4, probs_bias: 5, w_scale: SCALE.to_bits(), ffn_norm: 6, gate_exps: 3 };
         let entries = vec![
             entry("blk.0.attn_output.weight", manifest::ROLE_PRODUCT, D, D, 1, 0, 0, 0, Chain::None),
-            entry("blk.0.ffn_down_exps.weight", manifest::ROLE_PRODUCT, D, D, E as u32, 0, 0, 0, Chain::None),
-            entry("blk.0.ffn_down_shexp.weight", last, D, D, 1, 0, 0, 0, Chain::None),
+            entry("blk.0.ffn_down_exps.weight", manifest::ROLE_PRODUCT, D, D, E as u32, exps_off, E * D * RB, RB, Chain::None),
+            entry("blk.0.ffn_down_shexp.weight", last, D, D, 1, shexp_off, D * RB, RB, Chain::None),
             entry("blk.0.ffn_gate_exps.weight", last, D, D, E as u32, 0, 0, 0, Chain::None),
             entry("blk.0.ffn_gate_inp.weight", manifest::ROLE_ROUTER, D, E, 1, 0, 4 * E * D, 4 * D, Chain::None),
             entry("blk.0.exp_probs_b.bias", manifest::ROLE_NORM, E, 1, 1, bias_off, 4 * E, 4 * E, Chain::None),
@@ -1227,8 +1321,18 @@ mod moe_tests {
         ids.sort_by(|&a, &b| sel[b as usize].total_cmp(&sel[a as usize]));
         ids.truncate(U);
         let w = route_weights(&scores, &bias, &ids, SCALE as f64).unwrap();
-        let ys: Vec<Vec<f32>> = (0..U).map(|s| vecf(10 + s as u64, D, 0.3)).collect();
-        let sh = vecf(20, D, 0.3);
+        let row_dot = |off: usize, x: &[u8]| crate::dot::canonical_dot(quant::Q8_0, &weights[off..off + RB], D, x, q8::MMVQ).unwrap().y_hat as f32;
+        let q = |v: Vec<f32>| q8_1_row(&v.iter().map(|&a| a as f64).collect::<Vec<_>>());
+        let xs: Vec<Vec<u8>> = (0..U).map(|s| q(vecf(50 + s as u64, D, 1.0))).collect();
+        let x_sh = q(vecf(60, D, 1.0));
+        let ys: Vec<Vec<f32>> = match forge {
+            Some(Forge::Experts) => (0..U).map(|s| vecf(10 + s as u64, D, 0.3)).collect(),
+            _ => (0..U).map(|s| (0..D).map(|j| row_dot(exps_off + (ids[s] as usize * D + j) * RB, &xs[s])).collect()).collect(),
+        };
+        let sh: Vec<f32> = match forge {
+            Some(Forge::Shexp) => vecf(20, D, 0.3),
+            _ => (0..D).map(|j| row_dot(shexp_off + j * RB, &x_sh)).collect(),
+        };
         let out: Vec<f32> = (0..D).map(|j| (w.iter().zip(&ys).map(|(a, y)| a * y[j] as f64).sum::<f64>() + sh[j] as f64 + r[j] as f64) as f32).collect();
         let mut y_exps: Vec<u8> = ys.iter().flat_map(|y| bytes(y)).collect();
         if let Some(s) = bump_slot {
@@ -1249,7 +1353,9 @@ mod moe_tests {
             Some(d) => peaked_q8_row(d),
             None => q8_1_row(&x),
         };
+        leaves[2] = xs.concat();
         leaves[3] = y_exps;
+        leaves[4] = x_sh;
         leaves[5] = bytes(&sh);
         leaves[chain::resid_leaf(np, 0, Resid::Attn) as usize] = bytes(&r);
         leaves[chain::resid_leaf(np, 0, Resid::Out) as usize] = bytes(&out);
@@ -1257,7 +1363,7 @@ mod moe_tests {
         leaves[chain::meta_leaf(np, 1, 1) as usize] = chain::meta(0, 1, 7).to_vec();
         let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
         let trace_root = b3_root(&[b3_root(&hashes)]);
-        Moe { weights, chunk_leaves, entries, entry_leaves, tier, ctx, pos: Position { tok: 7, leaves, hashes }, trace_root, n_ubatch: 1 }
+        Moe { weights, chunk_leaves, entries, entry_leaves, tier, ctx, pos: Position { tok: 7, leaves, hashes }, trace_root, n_ubatch: 1, exps_off, shexp_off, ids: committed }
     }
 
     impl Moe {
@@ -1276,7 +1382,7 @@ mod moe_tests {
 
         fn open(&self, seed: &Hash) -> Option<ResidPoint> {
             let d = draw::point(seed, chain::RESID_POINT);
-            if d[1] % 2 != 1 {
+            if chain::resid_site(d[1], 2) != 1 {
                 return None;
             }
             let np = 4u64;
@@ -1311,6 +1417,28 @@ mod moe_tests {
             let p = self.open(seed)?;
             Some(verify_resid_point(&self.tier, &self.ctx, &resp, seed, &p))
         }
+
+        fn open_piece(&self, seed: &Hash) -> Option<crate::opening::ResidOpening> {
+            let resid = self.open(seed)?;
+            let d = draw::point(seed, chain::RESID_POINT);
+            let per = (B3_CHUNK / 4) as u64;
+            let c = resid.dst.index as u64;
+            let row = (c * per + (d[3] >> 32) % per.min(D as u64 - c * per)) as usize;
+            let id = self.ids[((d[3] >> 48) % U as u64) as usize] as usize;
+            let feed = crate::opening::FeedRow { x: self.pos.leaves[4].clone(), x_path: b3_path(&self.pos.hashes, 4), row: self.range(self.shexp_off + row * RB, RB), bias: None };
+            let expert = crate::opening::ExpertRow {
+                entry: self.eo(1),
+                x: self.pos.leaves[2].clone(),
+                x_path: b3_path(&self.pos.hashes, 2),
+                row: self.range(self.exps_off + (id * D + row) * RB, RB),
+            };
+            Some(crate::opening::ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: Some(expert) })
+        }
+
+        fn check_piece(&self, seed: &Hash) -> Option<Result<(), crate::verify::Fail>> {
+            let resp = ResponseCtx { trace_root: self.trace_root, n_prompt: 1, n_pos: 1 };
+            Some(crate::chain::verify_resid_opening(&self.tier, &self.ctx, &resp, seed, &self.open_piece(seed)?))
+        }
     }
 
     fn seeds() -> impl Iterator<Item = Hash> {
@@ -1321,6 +1449,33 @@ mod moe_tests {
     fn honest_moe_layer_passes() {
         let m = build(false, None, 1);
         let n = seeds().filter_map(|s| m.check(&s).map(|r| r.unwrap_or_else(|e| panic!("{e:?}")))).count();
+        assert!(n > 0);
+        let n = seeds().filter_map(|s| m.check_piece(&s).map(|r| r.unwrap_or_else(|e| panic!("{e:?}")))).count();
+        assert!(n > 0);
+    }
+
+    #[test]
+    fn an_expert_output_off_its_input_is_refused_by_the_residual_piece() {
+        for forge in [Forge::Shexp, Forge::Experts] {
+            let m = build_full(false, None, 1, None, Some(forge));
+            let points: Vec<_> = seeds().filter_map(|s| m.check(&s)).collect();
+            assert!(!points.is_empty() && points.iter().all(Result::is_ok));
+            let pieces: Vec<_> = seeds().filter_map(|s| m.check_piece(&s)).collect();
+            assert!(pieces.iter().all(|r| *r == Err(crate::verify::Fail::Mismatch)), "{pieces:?}");
+        }
+    }
+
+    #[test]
+    fn a_moe_piece_must_carry_its_expert_row() {
+        let m = build(false, None, 1);
+        let resp = ResponseCtx { trace_root: m.trace_root, n_prompt: 1, n_pos: 1 };
+        let mut n = 0;
+        for s in seeds() {
+            let Some(mut op) = m.open_piece(&s) else { continue };
+            op.expert = None;
+            assert_eq!(crate::chain::verify_resid_opening(&m.tier, &m.ctx, &resp, &s, &op), Err(crate::verify::Fail::Shape));
+            n += 1;
+        }
         assert!(n > 0);
     }
 
@@ -1373,6 +1528,8 @@ mod moe_tests {
     fn a_trimmed_last_layer_reads_its_expert_input_as_one_row() {
         let m = build(false, None, 32);
         let n = seeds().filter_map(|s| m.check(&s).map(|r| r.unwrap_or_else(|e| panic!("{e:?}")))).count();
+        assert!(n > 0);
+        let n = seeds().filter_map(|s| m.check_piece(&s).map(|r| r.unwrap_or_else(|e| panic!("{e:?}")))).count();
         assert!(n > 0);
     }
 }

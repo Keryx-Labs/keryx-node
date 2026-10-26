@@ -438,7 +438,7 @@ fn resid_opening_valid(
     let cc = rules.chain.as_ref().ok_or("residual piece before its rule")?;
     let trace_root = split_trace_root(rules, audit, &op.roots)?;
     let resp = verify::ResponseCtx { trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
-    chain::verify_resid_point(&rules.ctx, cc, &resp, seed, &op.resid).map_err(|_| "residual point")
+    chain::verify_resid_opening(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "residual point")
 }
 
 /// Checks that a recurrent opening body proves the recurrent point of `audit` under `seed`.
@@ -5238,7 +5238,7 @@ mod tests {
             let inline = body(Some((pos_root, seq_root)), Some(resid.clone()));
             assert_eq!(trace_opening_valid(&with, &audit, &[9; 32], &TXID, &inline), Err("residual point in the trace piece"));
 
-            let piece = |roots| ResidOpening { response_txid: TXID, roots, resid: resid.clone() }.encode();
+            let piece = |roots| ResidOpening { response_txid: TXID, roots, resid: resid.clone(), feed: Default::default(), expert: None }.encode();
             let check = |r, roots| resid_opening_valid(r, &audit, &[9; 32], &TXID, &piece(roots));
             assert_eq!(check(&with, None), Err("sequence root missing"));
             assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));

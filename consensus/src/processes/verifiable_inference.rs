@@ -164,7 +164,7 @@ mod tests {
             src: ResidSrc::Chunk(LeafChunk::default()),
             add: ResidAdd::Chunk(LeafChunk::default()),
         };
-        let mut body = ResidOpening { response_txid: [5; 32], roots: Some(([1; 32], [2; 32])), resid }.encode();
+        let mut body = ResidOpening { response_txid: [5; 32], roots: Some(([1; 32], [2; 32])), resid, feed: Default::default(), expert: None }.encode();
         body.extend_from_slice(&[6u8; 96]);
         let t = tx(SUBNETWORK_ID_AI_OPENING, body);
         assert_eq!(check_verifiable_inference_era(&t, 2 * GATE - 1, gate, chain, never, never), Err(VerifiableEraViolation::MalformedOpening));

@@ -183,6 +183,28 @@ pub struct ResidOpening {
     /// Position and sequence roots of a trace that commits sequence leaves.
     pub roots: Option<(Hash, Hash)>,
     pub resid: ResidPoint,
+    /// One row of the product whose output the residual adds.
+    pub feed: FeedRow,
+    /// One row of a routed expert, when the residual adds routed experts.
+    pub expert: Option<ExpertRow>,
+}
+
+/// Input and one weight row of the product feeding a residual.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FeedRow {
+    pub x: Vec<u8>,
+    pub x_path: Vec<Hash>,
+    pub row: ChunkRange,
+    pub bias: Option<(EntryOpening, ChunkRange)>,
+}
+
+/// Input and one weight row of a routed expert feeding a residual.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExpertRow {
+    pub entry: EntryOpening,
+    pub x: Vec<u8>,
+    pub x_path: Vec<Hash>,
+    pub row: ChunkRange,
 }
 
 /// Attention point of a response at one phase of the block tree of its attended positions: the
@@ -686,6 +708,26 @@ impl ResidOpening {
             None => w.u8(0),
         }
         w.resid(&self.resid);
+        w.bytes32(&self.feed.x);
+        w.hashes(&self.feed.x_path);
+        w.range(&self.feed.row);
+        match &self.feed.bias {
+            Some(b) => {
+                w.u8(1);
+                w.weights(b);
+            }
+            None => w.u8(0),
+        }
+        match &self.expert {
+            Some(e) => {
+                w.u8(1);
+                w.entry(&e.entry);
+                w.bytes32(&e.x);
+                w.hashes(&e.x_path);
+                w.range(&e.row);
+            }
+            None => w.u8(0),
+        }
         w.0
     }
 
@@ -701,7 +743,22 @@ impl ResidOpening {
             _ => return None,
         };
         let resid = r.resid()?;
-        (r.o == b.len()).then_some(ResidOpening { response_txid, roots, resid })
+        let feed = FeedRow {
+            x: r.bytes32()?,
+            x_path: r.hashes()?,
+            row: r.range()?,
+            bias: match r.u8()? {
+                0 => None,
+                1 => Some(r.weights()?),
+                _ => return None,
+            },
+        };
+        let expert = match r.u8()? {
+            0 => None,
+            1 => Some(ExpertRow { entry: r.entry()?, x: r.bytes32()?, x_path: r.hashes()?, row: r.range()? }),
+            _ => return None,
+        };
+        (r.o == b.len()).then_some(ResidOpening { response_txid, roots, resid, feed, expert })
     }
 }
 
@@ -1013,8 +1070,12 @@ mod resid_opening_tests {
 
     #[test]
     fn residual_opening_round_trips() {
-        for roots in [None, Some(([5; 32], [6; 32]))] {
-            let o = ResidOpening { response_txid: [1; 32], roots, resid: point() };
+        let e = EntryOpening { index: 11, bytes: vec![11; 40], path: vec![[11; 32]; 4] };
+        let range = |s: u8| ChunkRange { first_chunk: s as u64, chunks: vec![s; 4352], proof: vec![[s; 32]; 30] };
+        let feed = FeedRow { x: vec![3; 4608], x_path: vec![[3; 32]; 9], row: range(4), bias: Some((e.clone(), range(5))) };
+        let expert = ExpertRow { entry: e, x: vec![6; 9216], x_path: vec![[6; 32]; 9], row: range(7) };
+        for (roots, expert) in [(None, None), (Some(([5; 32], [6; 32])), Some(expert))] {
+            let o = ResidOpening { response_txid: [1; 32], roots, resid: point(), feed: feed.clone(), expert };
             let b = o.encode();
             assert_eq!(b[0], VERSION_RESID);
             assert_eq!(ResidOpening::decode(&b), Some(o));

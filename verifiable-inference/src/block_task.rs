@@ -88,7 +88,7 @@ pub fn verify_block_task(
     verify_chain_prefix_point(tier, ctx, &pc, &resp, &seed, &bytes, pp)?;
     verify_resid_point(tier, ctx, &resp, &seed, rp)?;
     let d = draw::point(&seed, RESID_POINT);
-    let layer = (d[1] % (2 * ctx.n_layers as u64)) / 2;
+    let layer = crate::chain::resid_site(d[1], 2 * ctx.n_layers as u64) / 2;
     if rp.tok != tok_at(resid_position(ctx, &resp, layer, d[0])?)? {
         return Err(Fail::Mismatch);
     }

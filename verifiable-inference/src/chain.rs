@@ -3,7 +3,7 @@
 use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
-use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
 use crate::attn::{ATTN_THRESHOLD, Partial};
 use crate::attn_blocks::{BlockTree, LSE_ROOT_TOL, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root};
 use crate::opening::{AttnOpening, PrefixPoint};
@@ -582,6 +582,18 @@ pub fn resid_position(ctx: &ChainCtx, resp: &ResponseCtx, layer: u64, d0: u64) -
     Ok(d0 % n_pos)
 }
 
+/// Residual site `2 * layer + kind` drawn from `d1` among `n_sites`, site `j` weighted `n_sites - j`.
+pub fn resid_site(d1: u64, n_sites: u64) -> u64 {
+    let mut x = d1 % (n_sites * (n_sites + 1) / 2).max(1);
+    for j in 0..n_sites {
+        if x < n_sites - j {
+            return j;
+        }
+        x -= n_sites - j;
+    }
+    0
+}
+
 /// Verify the residual point of a stage-2 opening.
 pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, p: &ResidPoint) -> Result<(), Fail> {
     let (np, n_layers) = (tier.n_products, ctx.n_layers as u64);
@@ -589,7 +601,7 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         return Err(Fail::Shape);
     }
     let d = draw::point(seed, RESID_POINT);
-    let sel = d[1] % (2 * n_layers);
+    let sel = resid_site(d[1], 2 * n_layers);
     let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
     let t = resid_position(ctx, resp, layer, d[0])?;
     let shape = shape(tier, ctx, p.tok);
@@ -661,6 +673,108 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
         return Err(Fail::Manifest);
     }
     residual_link(&dst, &add, &src, scale)
+}
+
+/// Verify a residual opening: its residual point, then one row of the product whose output the
+/// residual adds and, on a routed layer, one row of a routed expert.
+pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &ResidOpening) -> Result<(), Fail> {
+    let p = &op.resid;
+    verify_resid_point(tier, ctx, resp, seed, p)?;
+    let (np, n_layers) = (tier.n_products, ctx.n_layers as u64);
+    let d = draw::point(seed, RESID_POINT);
+    let sel = resid_site(d[1], 2 * n_layers);
+    let (layer, kind) = (sel / 2, if sel.is_multiple_of(2) { Resid::Attn } else { Resid::Out });
+    let shape = shape(tier, ctx, p.tok);
+    let ll = match open_entry(tier, &p.layer, ctx.layer_base as u64 + layer)?.chain {
+        Chain::Layer(ll) => ll,
+        _ => return Err(Fail::Manifest),
+    };
+    let rank = if kind == Resid::Attn { ll.proj } else { ll.down } as u64;
+    let pe = open_entry(tier, &p.product, rank)?;
+    let (dim, per) = (pe.m, (B3_CHUNK / 4) as u64);
+    let c = d[2] % n_chunks(4 * dim);
+    let dst_leaf = chunk_leaf(&p.dst, 4 * dim, c)?;
+    let pos_root = b3_fold(shape.n_leaves, resid_leaf(np, layer, kind), &dst_leaf, &p.dst.leaf_path).ok_or(Fail::Trace)?;
+    let lo = c * per;
+    let row = lo + (d[3] >> 32) % per.min(dim.checked_sub(lo).filter(|&n| n > 0).ok_or(Fail::Shape)?);
+    let y_at = |b: &[u8], i: u64| -> Result<f64, Fail> {
+        let i = 4 * i as usize;
+        Ok(f32::from_le_bytes(b.get(i..i + 4).ok_or(Fail::Shape)?.try_into().unwrap()) as f64)
+    };
+    let y = match &p.add {
+        ResidAdd::Chunk(ac) => y_at(&ac.chunk, row - lo)?,
+        ResidAdd::Normed { y, .. } => y_at(&y.bytes, row)?,
+        ResidAdd::Moe(m) => y_at(&m.shexp.chunk, row - lo)?,
+    };
+    let f = &op.feed;
+    feed_row(tier, &shape, &pos_root, p.n_ubatch, (&pe, rank), (0, 0, 1), row, y, (&f.x, &f.x_path), &f.row, f.bias.as_ref())?;
+    match (&p.add, &op.expert) {
+        (ResidAdd::Moe(m), Some(er)) => {
+            let moe = ll.moe.ok_or(Fail::Shape)?;
+            let de = open_entry(tier, &er.entry, moe.down_exps as u64)?;
+            if de.role != manifest::ROLE_PRODUCT || de.glu_form != manifest::FORM_NONE || de.n_exp < 2 || de.m != dim {
+                return Err(Fail::Manifest);
+            }
+            let n_used = ctx.n_used as u64;
+            let slot = (d[3] >> 48) % n_used.max(1);
+            let s = 4 * slot as usize;
+            let id = u32::from_le_bytes(m.ids.chunk.get(s..s + 4).ok_or(Fail::Shape)?.try_into().unwrap()) as u64;
+            let y = y_at(&m.slots.get(slot as usize).ok_or(Fail::Shape)?.chunk, row - lo)?;
+            feed_row(tier, &shape, &pos_root, p.n_ubatch, (&de, moe.down_exps as u64), (id, slot, n_used), row, y, (&er.x, &er.x_path), &er.row, None)
+        }
+        (ResidAdd::Moe(_), None) | (_, Some(_)) => Err(Fail::Shape),
+        (_, None) => Ok(()),
+    }
+}
+
+/// Checks `y` against row `row` of expert `exp` of product `e` over its committed input, slot
+/// `slot` of `n_slots` (a single input row serves every slot).
+#[allow(clippy::too_many_arguments)]
+fn feed_row(
+    tier: &TierCtx,
+    shape: &PosShape,
+    pos_root: &Hash,
+    n_ubatch: u32,
+    (e, rank): (&manifest::Entry, u64),
+    (exp, slot, n_slots): (u64, u64, u64),
+    row: u64,
+    y: f64,
+    (x, x_path): (&[u8], &[Hash]),
+    w: &ChunkRange,
+    bias: Option<&(EntryOpening, ChunkRange)>,
+) -> Result<(), Fail> {
+    let layout = crate::verify::input_layout(e.role, n_ubatch, e.wtype);
+    let x_one = crate::verify::x_len(e.k, layout);
+    let xs = match x.len() as u64 {
+        n if n == x_one => x,
+        n if n_slots > 1 && n == n_slots * x_one => &x[(slot * x_one) as usize..((slot + 1) * x_one) as usize],
+        _ => return Err(Fail::Shape),
+    };
+    if !b3_verify(pos_root, shape.n_leaves, 2 * rank, blake3::hash(x).as_bytes(), x_path) {
+        return Err(Fail::Trace);
+    }
+    let k = e.k as usize;
+    if !q8::sums_consistent(xs, layout, k) {
+        return Err(Fail::Mismatch);
+    }
+    let bytes = crate::verify::open_expert_row(tier, e, w, exp, row)?;
+    let r = crate::dot::canonical_dot(e.wtype, &bytes, k, xs, layout).ok_or(Fail::Unsupported)?;
+    let b = match (e.bias, bias) {
+        (manifest::NONE, None) => 0.0,
+        (bi, Some((be, br))) if bi != manifest::NONE && n_slots == 1 => {
+            let bias_entry = open_entry(tier, be, bi as u64)?;
+            if bias_entry.role != manifest::ROLE_BIAS || bias_entry.wtype != 0 || bias_entry.k != e.m {
+                return Err(Fail::Manifest);
+            }
+            f32::from_le_bytes(open_bytes(tier, &bias_entry, br, row * 4, 4)?.try_into().unwrap()) as f64
+        }
+        _ => return Err(Fail::Shape),
+    };
+    let (y_hat, tol) = (r.y_hat + b, crate::verify::EPS * (r.scale + b.abs()));
+    if !(y.is_finite() && y_hat.is_finite() && tol.is_finite()) || !(y - y_hat).abs().partial_cmp(&tol).is_some_and(std::cmp::Ordering::is_le) {
+        return Err(Fail::Mismatch);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
