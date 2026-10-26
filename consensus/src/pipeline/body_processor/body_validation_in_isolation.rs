@@ -405,13 +405,7 @@ impl BlockBodyProcessor {
                 .map_err(RuleError::BadPomProofV4);
         }
 
-        // H6: matrix-walk witness (pom_v3). The verifier NEVER re-walks (that would be
-        // K * D^3 = 4.3 GMACs per block — IBD in days, the H3 lesson): it re-derives the offset
-        // chain from the listed snippets, recomputes S_0 from the seed, and re-checks 32
-        // PRF-sampled single entries against the per-step state commitments and the UNCHANGED
-        // tier root R_T. `final_state` = fold64(roots[K]) keeps the H3 header pin above and the
-        // header-only pow/level folds byte-identical. H3 is a prerequisite (H6 gates strictly
-        // later), so the pin check above already ran.
+        // H6: `pom_v3` spot-check verifier; `final_state` = fold64(roots[K]).
         if pom_v3 {
             return verify_pom_proof_v3_container(
                 &pre_pow_hash,
@@ -427,13 +421,8 @@ impl BlockBodyProcessor {
         }
 
         // H4: recompute-from-chunks verifier (all K transitions re-walked, `final_state` derived).
-        // Replaces the 32/256 spot-check, which accepted a forged `final_state` ~88% of the time.
-        // The seed/target/final_hash inputs are identical to the spot-check path — only the proof
-        // structure and verification differ. H3 is a prerequisite of H4 (H4 gates strictly later),
-        // so `final_state` is still pinned to the header above.
         if self.coin_age_verification_activation.is_active(header.daa_score) {
-            // H5: re-walk with the non-foldable mix64-chained transition at/after the H5 gate;
-            // pre-H5 blocks re-walk with the frozen v1 fold, so historical blocks stay valid.
+            // H5: mix64-chained transition at/after the H5 gate; the frozen v1 fold before.
             let walk_v2 = self.h5_activation.is_active(header.daa_score);
             return verify_pom_proof_v2(seed, proof, tier.chunks, POM_WALK_STEPS, &tier.root, &target, final_hash, walk_v2)
                 .map_err(RuleError::BadPomProof);

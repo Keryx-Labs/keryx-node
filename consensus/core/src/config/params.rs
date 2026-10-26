@@ -157,43 +157,11 @@ pub const H5_1_ACTIVATION_DAA: u64 = 59_027_921;
 /// mined with an earlier seed era fail body validation beyond it). MUST be mirrored miner-side.
 pub const H5_2_ACTIVATION_DAA: u64 = 59_170_000;
 
-/// H5.3 relaunch activation — the ONE gate of the 2026-07-30 relaunch, opening a difficulty-reset
-/// window (`difficulty_reset_activation_h5_3`). The score is the last one preceding the coin-age
-/// divergence incident: the relaunch base is a datadir capped here.
-///
-/// The reset window is what separates the two chains, in both directions and permanently.
-/// `calculate_difficulty_bits` returns `genesis_bits` unconditionally inside the window, and that
-/// is the value header validation compares the declared bits against — so an un-upgraded node
-/// rejects our blocks (it expects the inherited ~1.64 G), and we reject the abandoned branch's
-/// (they carry the inherited bits). The separation outlives the window because the abandoned
-/// branch STARTS at this gate: reaching it from the relaunched chain means traversing blocks that
-/// sit inside the window and are rejected, whatever weight that branch accumulates.
-///
-/// Deliberately NOT paired with a walk-seed salt rotation. A salt would add nothing to the
-/// separation above and would force every miner to update in lockstep; without one the relaunch is
-/// a node-only upgrade and existing rigs keep mining. Peers below the release version are refused
-/// at the handshake instead (`MINIMUM_KERYXD_PEER_VERSION`).
+/// H5.3 relaunch activation: opens a difficulty-reset window (`difficulty_reset_activation_h5_3`).
 pub const H5_3_ACTIVATION_DAA: u64 = 63_250_000;
 
-/// H5.4 activation — second gate of the 2026-07-31 relaunch, opening a FIFTH difficulty-reset
-/// window (`difficulty_reset_activation_h5_4`). The H5.3 relaunch degenerated within hours (PoM
-/// proof-transport wedge: IBD-served blocks travelled naked, fragmenting the network); the v1.4.2
-/// relaunch restarted from the pre-incident snapshot (tip DAA 63_267_836), but by then the DAA on
-/// the private relaunch chain had decayed to ~52 — each new block weighed ~1/1000th of a
-/// reset-window block, leaving the abandoned v1.4.1 branch a live weight race. Re-opening the
-/// reset window pins blocks back at genesis bits (65_536), settling the cumulative-weight race in
-/// minutes instead of days.
-///
-/// Same separation semantics as H5.3: un-upgraded nodes expect the inherited (decayed) bits and
-/// reject post-gate blocks, while the abandoned branch never contains the gate. Paired with a
-/// chain-anchor re-pin (`CHAIN_ANCHOR_HASH`) rather than a walk-seed salt rotation — node-only
-/// upgrade, existing rigs keep mining.
-///
-/// Same gate placement as H5/H5.3: the score equals the virtual_daa_score the chain is frozen at
-/// before the restart — the daa_score every newly-mined block will carry (a template inherits the
-/// virtual's daa, NOT virtual+1) — so every stored block stays pre-H5.4 and the very first
-/// re-mined block fires the reset. The chain MUST NOT advance past this score on the old binary:
-/// blocks above it carrying the inherited (decayed) bits are rejected by upgraded nodes.
+/// H5.4 activation: opens a difficulty-reset window (`difficulty_reset_activation_h5_4`). Equals the
+/// virtual DAA score of the relaunch base; never advance past it on an older binary.
 pub const H5_4_ACTIVATION_DAA: u64 = 63_280_622;
 
 /// H9 relaunch difficulty reset. MUST equal the virtual_daa_score of the frozen relaunch base:
@@ -269,10 +237,7 @@ pub const CHAIN_ANCHOR_HASH: Hash = Hash::from_bytes([
 /// H5 parallel-block cap: max blocks per selected-parent counted in the DAA score (and paid).
 /// The surplus is forced into `mergeset_non_daa` — excluded from both the DAA increment and the
 /// coinbase payment — never rejected (rejection at admission is non-deterministic → split).
-/// N=20 is the lowest bound that never clips an honest producer: the measured honest ceiling is
-/// ~15 blocks/selected-parent, so 20 leaves margin while neutralizing sibling floods (observed up
-/// to 44/DAA). Gated by `h5_activation` on the selected parent's DAA score, a pure header-level
-/// function so IBD re-derives it identically. See KERYX-KRX/H5_hardfork_plan.
+/// Gated by `h5_activation` on the selected parent's DAA score.
 pub const PARALLEL_BLOCK_CAP_N: usize = 20;
 
 // --- H4 lineup refresh (gated by `coin_age_activation`, bundled into H4). Fully candle-independent:
@@ -368,7 +333,7 @@ pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
 /// Data-dependent 32 B reads per possession-walk attempt (the memory-hard work core).
 /// K=256 — chosen compromise: ~25 MH/s on a 3090 with solid possession strictness.
 pub const POM_WALK_STEPS: u32 = 256;
-/// Fiat-Shamir-opened steps revealed per `PomProof` (soundness `~f^t` vs proof size).
+/// Fiat-Shamir-opened steps revealed per `PomProof`.
 pub const POM_OPENINGS: usize = 32;
 
 /// Depth, in DAA score below the virtual, beyond which a served block ships WITHOUT its ~228 KB
@@ -585,8 +550,7 @@ pub const GEMMA_4_12B_ABLITERATED_MODEL_ID: [u8; 32] = [
 
 /// H6 possession anchors — 5 tiers, same count as H4/H5 so the tier-reward bareme, the
 /// coinbase decode and every per-tier mechanism stay untouched. Changes vs H5: tier 0 =
-/// Qwen3.5-9B (quality + raises the possession floor exploited by every custom-miner
-/// operation measured), tier 1 = GLM-9B (slides from position 2), tier 2 = gemma-4-12B
+/// Qwen3.5-9B, tier 1 = GLM-9B (slides from position 2), tier 2 = gemma-4-12B
 /// (NEW, 16 GB cards), tiers 3-4 unchanged. Gated by `pom_v3_activation` (the single H6
 /// gate). Roots from pom-rt-builder over the pinned GGUFs (name-sorted tensors,
 /// floor(len/32) 32 B chunks, blake3 leaf/tree).
@@ -640,7 +604,7 @@ pub struct TraceManifest {
     pub n_products: u64,
 }
 
-/// Trace manifests of the H14 lineup, by tier. `None`: the tier is not audited.
+/// Trace manifests of the H14 lineup, by tier; `None` = no manifest.
 pub const TRACE_MANIFESTS_H14: [Option<TraceManifest>; 5] = [
     Some(TraceManifest {
         m_t: [
@@ -717,7 +681,7 @@ pub const TRACE_MANIFESTS_PREFIX: [Option<TraceManifest>; 5] = [
 /// Prefix context of a tier (`keryx_verifiable_inference::prefix::PrefixCtx`).
 pub type TracePrefix = keryx_verifiable_inference::prefix::PrefixCtx;
 
-/// Prefix contexts of the H14 lineup, by tier. `None`: the tier is not audited.
+/// Prefix contexts of the H14 lineup, by tier; `None` = no manifest.
 pub const TRACE_PREFIXES: [Option<TracePrefix>; 5] = [
     Some(TracePrefix {
         table: [
@@ -2025,8 +1989,7 @@ pub struct Params {
 
     /// Coin-age holder-reward (v3, H4) activation DAA score. At/after this score the ratio-reward
     /// numerator switches from the instantaneous balance to the per-coin-capped effective balance
-    /// (`coin_age::eff_balance_from_buckets`), closing the "rotation" exploit (bracket-farming by
-    /// hopping the pot across fresh addresses). Requires the `effective_daa` UtxoEntry field
+    /// (`coin_age::eff_balance_from_buckets`). Requires the `effective_daa` UtxoEntry field
     /// (hard fork: UTXO commitment changes at this boundary). `never()` until H4 is scheduled.
     pub coin_age_activation: ForkActivation,
 

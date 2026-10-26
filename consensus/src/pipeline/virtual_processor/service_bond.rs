@@ -337,10 +337,7 @@ impl VirtualStateProcessor {
                     if let Some(req) = AiRequestPayload::deserialize(&tx.payload)
                         && let Some(tier) = service_tiers(private).iter().position(|t| t.model_id == req.model_id)
                     {
-                        // Past the gate a request is identified by its transaction id, which is
-                        // unique by construction. The payload digest is not: the same prompt with
-                        // the same parameters is the same hash, so two senders — or one retry —
-                        // used to collide into a single, unanswerable assignment.
+                        // Past the gate a request is identified by its transaction id.
                         let mut request_hash = [0u8; 32];
                         if txid_identity {
                             request_hash.copy_from_slice(&tx.id().as_bytes());

@@ -158,8 +158,7 @@ pub struct PomProof {
     pub pow_value: [u8; 32],
     /// Final walk state `state[K]`; `kHeavyHash(final_state)` must equal `pow_value`.
     pub final_state: u64,
-    /// Merkle path proving `leaf(seed)` is the FIRST trace leaf (index 0) — binds the
-    /// committed trace to this block's canonical seed (no forged start state).
+    /// Merkle path proving `leaf(seed)` is the first trace leaf (index 0).
     pub initial_trace_path: Vec<[u8; 32]>,
     /// Merkle path proving `leaf(final_state)` is the last trace leaf under `trace_root`.
     pub final_trace_path: Vec<[u8; 32]>,
@@ -167,9 +166,7 @@ pub struct PomProof {
     pub openings: Vec<PomOpening>,
     /// H4 recompute-from-chunks walk record: the K chunks the winning walk read, in step
     /// order, each Merkle-proven under `R_T`. When present the verifier re-walks all K
-    /// transitions itself (`verify_pom_proof_v2`) and derives `final_state` — no trace
-    /// tree, no spot-check, nothing taken on the prover's word (the 32/256 spot-check this
-    /// replaces accepted a forged `final_state` ~88% of the time). `None` on every pre-H4
+    /// transitions itself (`verify_pom_proof_v2`) and derives `final_state`. `None` on every pre-H4
     /// proof. Trailing field: on the borsh wire a `None` proof is re-encoded through the
     /// `PomProofPreH4` layout (`to_wire_bytes`) so it stays byte-identical for not-yet-updated
     /// peers; in the node-local bincode DB, old records (written before this field existed)
@@ -444,10 +441,8 @@ impl PomProof {
             .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
 
-    /// Identity of this witness for negative caching: blake3 of the era-exact wire
-    /// encoding. The witness travels outside the block hash, so a failed verification
-    /// must be remembered per (block, witness) — never per block, or a single crafted
-    /// witness would poison a valid hash permanently.
+    /// Identity of this witness for negative caching: blake3 of the era-exact wire encoding,
+    /// remembered per (block, witness).
     /// Drops the task extension when the block task rule is not active at `daa_score` or when it
     /// exceeds the largest opening.
     pub fn sanitize_task(&mut self, daa_score: u64) {
@@ -695,10 +690,8 @@ pub fn pom_block_seed_rewalk_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce:
 }
 
 
-/// Pre-H5 possession transition (FROZEN — validates all blocks below `h5_activation`). The 4 chunk
-/// words are XOR-folded into a single 64-bit accumulator before one `mix64`, so only their XOR
-/// (8 bytes) is load-bearing — a miner could hold a 4×-smaller possession table. Kept verbatim for
-/// historical re-derivation; never change it.
+/// Pre-H5 possession transition (FROZEN — validates all blocks below `h5_activation`): the 4 chunk
+/// words XOR-folded before one `mix64`. Never change it.
 #[inline]
 fn transition_v1(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
     let mut h = state;
@@ -708,10 +701,8 @@ fn transition_v1(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
     mix64(h)
 }
 
-/// H5 possession transition (active at/after `h5_activation`). `mix64` is chained through each of
-/// the 4 chunk words, so all 32 bytes are load-bearing and order-dependent — the v1 XOR-fold
-/// shortcut is closed and a miner must hold the full chunk. Same weights, same `R_T` (the change is
-/// in the walk, not the weight commitment); only the walk output `final_state` differs per era.
+/// H5 possession transition (active at/after `h5_activation`): `mix64` chained through each of the
+/// 4 chunk words. Same weights, same `R_T`; only the walk output `final_state` differs per era.
 #[inline]
 fn transition_v2(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
     let mut h = state;
@@ -756,10 +747,7 @@ pub(crate) fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 pub(crate) fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
-    // Bound the path to the u64 index bit-width: any Merkle tree addressable by a u64 index has at
-    // most 64 levels, so every honest inclusion path is <= 64 siblings. Rejecting longer paths early
-    // caps verification work — a malicious proof cannot force an unbounded hashing loop — and changes
-    // no accept decision, since an over-length path never hashes to the correct root below anyway.
+    // Paths longer than 64 levels are rejected.
     if path.len() > 64 {
         return false;
     }
@@ -886,9 +874,6 @@ type InclusionCheck<'a> = ([u8; 32], u64, &'a [[u8; 32]]);
 /// H4 verifier — recompute-from-chunks. The prover supplies the K chunks its winning walk
 /// read (in step order), each Merkle-proven under the tier root `r_t`; the verifier re-walks
 /// every transition itself, deriving each chunk index (`state % N`) and the `final_state`.
-/// No transition is taken on the prover's word — this closes the soundness hole of the 32/256
-/// spot-check (`verify_pom_proof`), where the 224 unopened transitions let a single honest
-/// walk back a hash-grinded `final_state` with ~88% acceptance.
 ///
 /// Legacy trace-tree fields must be canonically empty (`trace_root == 0`, empty paths and
 /// openings): one canonical encoding per post-H4 proof, no dead 47 KB payload. `final_state`
@@ -1190,27 +1175,24 @@ mod verify_tests {
         assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &[0u8; 32], fh, false), Err(PomVerifyError::TargetNotMet));
     }
 
-    /// The spot-check exploit scenario, replayed against v2: keep one honest walk record but
-    /// grind `final_state`/`pow_value` in pure hashing. Under the 32/256 spot-check this was
-    /// accepted ~88% of the time; under v2 the verifier derives `final_state` from the chunks
-    /// itself, so EVERY forged value is rejected — no probabilistic escape hatch.
+    /// A `final_state` not derived from the chunks is rejected.
     #[test]
-    fn v2_forged_final_state_always_rejected() {
+    fn v2_final_state_mismatch_rejected() {
         let (n, k) = (4096u64, 256u32);
         let seed = pom_seed_state(0xdead);
         let (proof, r_t) = build_v2(n, k, seed, false);
         let pass = [0xffu8; 32];
         assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh, false), Ok(()));
 
-        for grind in 0..1000u64 {
-            let forged_state = mix64(proof.final_state ^ grind.wrapping_add(1));
-            let mut forged = proof.clone();
-            forged.final_state = forged_state;
-            forged.pow_value = fh(forged_state); // self-consistent fold, exactly like the exploit
+        for i in 0..1000u64 {
+            let other_state = mix64(proof.final_state ^ i.wrapping_add(1));
+            let mut other = proof.clone();
+            other.final_state = other_state;
+            other.pow_value = fh(other_state);
             assert_eq!(
-                verify_pom_proof_v2(seed, &forged, n, k, &r_t, &pass, fh, false),
+                verify_pom_proof_v2(seed, &other, n, k, &r_t, &pass, fh, false),
                 Err(PomVerifyError::FinalStateMismatch),
-                "forged final_state accepted at grind {grind}"
+                "final_state accepted at {i}"
             );
         }
     }

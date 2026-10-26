@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_output_needs_a_forged_child_and_the_child_is_caught_below() {
+    fn an_inconsistent_root_fails_at_the_node_or_the_leaf() {
         let k = case(0, 256, 16, 4);
         let honest = k.decoded(&[], Arith::Exact);
         let mut forged_x = vec![0.0; D];
@@ -508,7 +508,7 @@ mod tests {
         lie[2] = decode_partials(&encode_partial(&Partial { o, m: honest[2].m + 60.0, l: 1.0 }), D).unwrap().remove(0);
         assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None));
         let mass = lse(&k.run((0, 256), Arith::Exact)) as f32;
-        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None, mass), "a dominating child moves the committed mass");
+        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &lie, None, mass));
         assert!(!check_node(&lie[2], &k.decoded(&[2], Arith::Exact)));
         for j in 0..4u64 {
             let (kr, vr) = k.leaf_rows(&[2, j]);
@@ -535,9 +535,9 @@ mod tests {
         let mut all = vec![0.0; D];
         all.extend(c.o.iter().copied());
         let forged_x = q8_1_row(&all);
-        assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None), "the output alone lets a suppression through");
+        assert!(check_root(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None));
         let mass = lse(&k.run((0, 256), Arith::Exact)) as f32;
-        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None, mass), "a suppressed child moves the committed mass");
+        assert!(!check_root_lse(&forged_x, q8::MMVQ, 2 * D, 1, &suppressed, None, mass));
     }
 
     #[test]
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_partials_fail_their_checks() {
+    fn inconsistent_partials_fail_their_checks() {
         let k = case(0, 256, 16, 4);
         let parent = &k.decoded(&[], Arith::Exact)[1];
         let children = k.decoded(&[1], Arith::Exact);

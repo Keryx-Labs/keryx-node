@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn grind_final_state_is_not_free() {
+    fn substituted_tile_changes_or_fails() {
         let (blob, leaves) = test_blob(64);
         let r_t = r_t_root(&leaves);
         let n_chunks = (blob.len() / POM_V4_CHUNK_BYTES) as u64;
@@ -685,12 +685,10 @@ mod tests {
         let honest = v4_prove(seed, 2, &blob, &leaves).unwrap();
         let fs_honest = verify_pom_proof_v4(seed, &honest, &r_t, n_chunks).unwrap();
 
-        // A substituted genuine tile either fails its range proof at the derived offset or
-        // yields a different final_state (rejected by the header pin).
-        let mut forged = honest.clone();
-        forged.tiles[10] = blob[0..POM_V4_TILE_BYTES].to_vec();
-        forged.merkle[10] = PomV4RangeProof { path: v4_tile_path(&leaves, 0) };
-        match verify_pom_proof_v4(seed, &forged, &r_t, n_chunks) {
+        let mut other = honest.clone();
+        other.tiles[10] = blob[0..POM_V4_TILE_BYTES].to_vec();
+        other.merkle[10] = PomV4RangeProof { path: v4_tile_path(&leaves, 0) };
+        match verify_pom_proof_v4(seed, &other, &r_t, n_chunks) {
             Err(_) => {}
             Ok(fs) => assert_ne!(fs, fs_honest, "a re-rolled state must not reproduce the honest final_state"),
         }

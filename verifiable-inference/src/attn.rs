@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn every_kernel_rounding_accepts_the_honest_group_and_no_forgery() {
+    fn every_kernel_rounding_accepts_the_group_only() {
         let t = 15;
         let x = honest_x(t);
         let mut forged = honest_x(t);

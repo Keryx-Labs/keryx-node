@@ -255,8 +255,7 @@ pub fn decode_v4_deduped(bytes: &[u8], seed: u64, n_chunks: u64) -> Result<PomPr
     // Exact-length check: a compact proof has a fully determined size, so anything else is
     // malformed. This also bounds `node_count` before it is used to size anything.
     //
-    // Checked throughout: `node_count` is attacker-controlled and `usize` is 32-bit on wasm, where
-    // `node_count * 32` would otherwise wrap and let a short buffer pass the length check.
+    // Checked arithmetic: `usize` is 32-bit on wasm.
     let expected = node_count
         .checked_mul(32)
         .and_then(|n| n.checked_add(HEADER_BYTES))

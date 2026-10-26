@@ -1,26 +1,13 @@
 //! Proof-of-Model v3 — the H6 matrix-state walk (reference implementation = executable spec).
 //!
-//! The v1/v2 walk proves possession with a hash chain over 32 B chunks; the work spent is
-//! hashing. The v3 walk makes the PoW itself int8 matrix arithmetic over the committed weight
-//! bytes: one step multiplies the D x D state by a data-selected 64 KB weight tile and applies
-//! a non-linear, position-dependent byte reduction. Verification is by spot-checking committed
-//! per-step states — the verifier NEVER re-walks (K * D^3 = 4.3 GMACs/block would put IBD back
-//! to days, the H3 lesson), it re-checks `POM_V3_CHECKS` single entries at D MACs each.
+//! One step multiplies the D x D int8 state by a data-selected 64 KB weight tile and applies a
+//! non-linear, position-dependent byte reduction. The verifier re-checks `POM_V3_CHECKS` single
+//! entries of the committed per-step states.
 //!
-//! Soundness model and attack catalogue: `H6_soundness_spot_checking_2026-08-06.md`. The two
-//! red-team results that shaped this code:
-//!   * offsets derive from (seed, step, previous-tile snippet) and the proof carries the FULL
-//!     snippet list — the verifier derives every offset from that list alone. Deriving offsets
-//!     from the state is fatally steerable (A3); verifying snippet links only locally without
-//!     the listed anchor is fatally shiftable (A9).
-//!   * the byte reduction `rho` is non-linear AND position/step-tweaked: plain `acc & 0xff`
-//!     makes the walk linear over Z/256 (backward repair, A4), and any fixed point of rho
-//!     (e.g. rho(0) = 0) makes a forged constant state self-consistent for free (A10).
+//! Offsets derive from (seed, step, previous snippet) over the full snippet list the proof
+//! carries; `rho` is non-linear and position/step-tweaked.
 //!
-//! This module is intentionally standalone (pure functions over byte slices): the node wires it
-//! into `check_pom_proof` era dispatch separately, the miner's GPU kernel must reproduce it
-//! byte-for-byte, and the tests double as the cheat-miner harness (each attack class from the
-//! study is exercised as a rejection case).
+//! Pure functions over byte slices; the miner's GPU kernel must reproduce them byte-for-byte.
 //!
 //! Weight commitment: UNCHANGED — the existing per-tier `R_T` (blake3 over the canonical 32 B
 //! chunk stream, `pom-rt-builder`). A v3 "tile" is 2048 consecutive canonical chunks (64 KB), a
@@ -34,8 +21,7 @@ use serde::{Deserialize, Serialize};
 pub const POM_V3_D: usize = 256;
 /// Walk length in steps (tiles multiplied per nonce).
 pub const POM_V3_K: usize = 256;
-/// Spot-checks per proof. Soundness: a prover missing/forging a fraction `f` of its steps
-/// survives verification with probability ~e^(-m*f) (study §4).
+/// Spot-checks per proof.
 pub const POM_V3_CHECKS: usize = 32;
 /// Canonical R_T chunk size (bytes) — pinned by `pom-rt-builder`, do not change.
 pub const POM_V3_CHUNK_BYTES: usize = 32;
@@ -80,7 +66,7 @@ pub struct PomV3Opening {
     /// `tile_offset * 256 + j`).
     pub col_path: Vec<[u8; 32]>,
     /// Merkle path proving `leaf(snippets[t-1])` is the FIRST chunk of the tile at the
-    /// list-derived offset `i_t` under `R_T` — anchors the offset chain (A9).
+    /// list-derived offset `i_t` under `R_T`.
     pub snippet_path: Vec<[u8; 32]>,
 }
 
@@ -161,7 +147,7 @@ pub enum PomV3VerifyError {
 
 // --- walk primitives (the miner kernel must reproduce these byte-for-byte) ---
 
-/// Non-linear position/step-tweaked byte reduction (A4 + A10).
+/// Non-linear position/step-tweaked byte reduction.
 /// `acc` is the exact int32 dot product; the tweak folds (step, row, col).
 #[inline]
 pub fn rho8(acc: i32, tweak: u32) -> u8 {
@@ -264,8 +250,7 @@ fn v3_state_row_path(state: &V3State, x: usize) -> Vec<[u8; 32]> {
 }
 
 /// The PRF deriving the spot-check triples (t, x, j). Binds the header (pre_pow_hash, nonce)
-/// and the ENTIRE deterministic commitment (all roots, all snippets) — no salt, no prover
-/// freedom (A5): re-rolling any committed byte re-rolls root_K, i.e. the lottery.
+/// and the entire commitment (all roots, all snippets).
 pub fn v3_check_points(
     pre_pow_hash: &[u8; 32],
     nonce: u64,
@@ -318,7 +303,7 @@ pub fn v3_n_tiles(n_chunks: u64) -> u64 {
     n_chunks / POM_V3_TILE_CHUNKS
 }
 
-/// Reference walk over an in-memory canonical byte stream (tests / cheat-miner harness).
+/// Reference walk over an in-memory canonical byte stream.
 pub fn v3_walk(seed: u64, blob: &[u8]) -> Result<V3Walk, PomV3VerifyError> {
     let n_tiles = v3_n_tiles((blob.len() / POM_V3_CHUNK_BYTES) as u64);
     if n_tiles == 0 {
@@ -448,7 +433,7 @@ pub fn verify_pom_proof_v3(
         return Err(PomV3VerifyError::BadInitialRoot);
     }
 
-    // Derive the FULL offset chain from the listed snippets (A9: list is the anchor).
+    // Offsets derive from the listed snippets.
     let mut offsets = Vec::with_capacity(POM_V3_K);
     let mut off = v3_first_offset(seed, n_tiles);
     for step in 1..=POM_V3_K as u64 {
@@ -492,9 +477,7 @@ pub fn verify_pom_proof_v3(
 
 /// 64-bit header fold of the final-state commitment: `Header::pom_final_state` carries this at
 /// and after the v3 gate, so every header-only mechanism (H3 pin, `pom_pow_value_h3` header PoW,
-/// block levels, pruning proofs) works unchanged. The full 256-bit binding lives in the proof:
-/// re-rolling any committed byte re-rolls `roots[K]`, and colliding this 64-bit fold on purpose
-/// costs ~2^64 walks — far beyond the lottery it would cheat.
+/// block levels, pruning proofs) works unchanged.
 #[inline]
 pub fn fold64(root: &[u8; 32]) -> u64 {
     u64::from_le_bytes(root[..8].try_into().unwrap())
@@ -589,22 +572,17 @@ mod tests {
     fn honest_proof_verifies() {
         let (_, _, root, n_chunks, proof) = honest_setup();
         assert_eq!(verify_pom_proof_v3(&PPH, NONCE, SEED, &proof, &root, n_chunks), Ok(()));
-        // Sanity: proof stays in the ~100 KB envelope from the study.
         assert!(proof.approx_bytes() < 150 * 1024, "proof size {} B", proof.approx_bytes());
     }
 
     #[test]
     fn rho_has_no_zero_fixed_point() {
-        // A10: an all-zero state must NOT be self-reproducing. rho(0, tweak) == 0 for every
-        // entry of a step would be required; assert it fails immediately.
         let z = (0..POM_V3_D as u32).filter(|&j| rho8(0, rho_tweak(1, 0, j)) == 0).count();
         assert!(z < POM_V3_D / 8, "rho(0) collapses to zero on {z}/256 entries");
     }
 
     #[test]
-    fn forged_transition_rejected() {
-        // A1: forge every transition (garbage states, self-consistent trees) — any sampled
-        // check must catch the broken matmul.
+    fn wrong_transitions_rejected() {
         let (blob, leaves, root, n_chunks, honest) = honest_setup();
         let mut walk = v3_walk(SEED, &blob).unwrap();
         for state in walk.states.iter_mut().skip(1) {
@@ -661,10 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn chain_shift_lie_rejected() {
-        // A9: lie about one snippet to redirect the offset chain — the snippet-vs-R_T check
-        // at the list-derived offset must fail wherever sampled (here: lie about ALL of them,
-        // pointing the whole chain elsewhere).
+    fn wrong_snippets_rejected() {
         let (blob, leaves, root, n_chunks, _) = honest_setup();
         let walk = v3_walk(SEED, &blob).unwrap();
         let mut lied_snippets = walk.snippets.clone();
@@ -705,8 +680,6 @@ mod tests {
 
     #[test]
     fn tampered_weight_byte_rejected() {
-        // A7-adjacent: a prover whose blob differs by one byte in an opened column fails the
-        // range proof against the true R_T.
         let (blob, leaves, root, n_chunks, proof) = honest_setup();
         let mut bad = proof.clone();
         bad.checks[0].tile_col[17] ^= 0xFF;
@@ -718,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn forged_initial_root_rejected() {
+    fn wrong_initial_root_rejected() {
         let (_, _, root, n_chunks, proof) = honest_setup();
         let mut bad = proof.clone();
         bad.roots[0][0] ^= 1;
