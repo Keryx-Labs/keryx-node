@@ -17,6 +17,8 @@ pub const VERSION_RECUR: u8 = 6;
 /// Stage-2 opening of a trace that commits sequence leaves: the response id is followed by the
 /// position and sequence roots.
 pub const VERSION_ROOTS: u8 = 7;
+/// Residual opening of a response, sent apart from its trace opening.
+pub const VERSION_RESID: u8 = 8;
 /// Largest opening body.
 pub const MAX_BODY_LEN: usize = 112 * 1024;
 /// `[escrow_pubkey: 32] [signature: 64]` after the body.
@@ -172,6 +174,15 @@ pub struct Opening {
     pub resid: Option<ResidPoint>,
     /// Position and sequence roots of a trace that commits sequence leaves.
     pub roots: Option<(Hash, Hash)>,
+}
+
+/// The residual point of a response, sent apart from its trace opening.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResidOpening {
+    pub response_txid: Hash,
+    /// Position and sequence roots of a trace that commits sequence leaves.
+    pub roots: Option<(Hash, Hash)>,
+    pub resid: ResidPoint,
 }
 
 /// Attention point of a response at one phase of the block tree of its attended positions: the
@@ -499,7 +510,7 @@ impl R<'_> {
 impl Opening {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
-        let chain = self.resid.is_some();
+        let chain = !self.links.is_empty() || self.resid.is_some();
         w.u8(if chain && self.roots.is_some() {
             VERSION_ROOTS
         } else if chain {
@@ -656,8 +667,41 @@ impl Opening {
         } else {
             None
         };
-        let resid = if chain { Some(r.resid()?) } else { None };
+        let resid = if chain && r.o < b.len() { Some(r.resid()?) } else { None };
         (r.o == b.len()).then_some(Opening { response_txid, points, prefix, links, experts, resid, roots })
+    }
+}
+
+impl ResidOpening {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = W(Vec::new());
+        w.u8(VERSION_RESID);
+        w.0.extend_from_slice(&self.response_txid);
+        match &self.roots {
+            Some((p, q)) => {
+                w.u8(1);
+                w.0.extend_from_slice(p);
+                w.0.extend_from_slice(q);
+            }
+            None => w.u8(0),
+        }
+        w.resid(&self.resid);
+        w.0
+    }
+
+    pub fn decode(b: &[u8]) -> Option<ResidOpening> {
+        if b.first() != Some(&VERSION_RESID) {
+            return None;
+        }
+        let mut r = R { b, o: 1 };
+        let response_txid: Hash = r.take(32)?.try_into().ok()?;
+        let roots = match r.u8()? {
+            0 => None,
+            1 => Some((r.take(32)?.try_into().ok()?, r.take(32)?.try_into().ok()?)),
+            _ => return None,
+        };
+        let resid = r.resid()?;
+        (r.o == b.len()).then_some(ResidOpening { response_txid, roots, resid })
     }
 }
 
@@ -669,10 +713,10 @@ pub fn seed_block(body: &[u8]) -> Option<Hash> {
     body.get(33..65)?.try_into().ok()
 }
 
-/// Whether `body` decodes as a trace, attention or recurrent opening.
+/// Whether `body` decodes as a trace, attention, recurrent or residual opening.
 pub fn is_audit_body(body: &[u8]) -> bool {
     Opening::decode(body).is_some()
-        || inner_body(body).is_some_and(|b| AttnOpening::decode(&b).is_some() || RecurOpening::decode(&b).is_some())
+        || inner_body(body).is_some_and(|b| AttnOpening::decode(&b).is_some() || RecurOpening::decode(&b).is_some() || ResidOpening::decode(&b).is_some())
 }
 
 /// The body inside a seeded envelope, or `body` itself when unseeded.
@@ -699,7 +743,7 @@ pub fn attn_path(body: &[u8]) -> Option<Vec<u64>> {
 /// Wraps an unseeded opening body into the seeded envelope naming `seed_block`.
 pub fn seeded(body: &[u8], seed_block: &Hash) -> Option<Vec<u8>> {
     let version = *body.first()?;
-    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS) || body.len() < 33 {
+    if !matches!(version, VERSION | VERSION_PREFIX | VERSION_CHAIN | VERSION_ATTN | VERSION_RECUR | VERSION_ROOTS | VERSION_RESID) || body.len() < 33 {
         return None;
     }
     let mut v = Vec::with_capacity(body.len() + 33);
@@ -941,6 +985,67 @@ mod recur_opening_tests {
         assert!(RecurOpening::decode(&c).is_none());
         assert!(AttnOpening::decode(&b).is_none() && Opening::decode(&b).is_none());
         assert!(seeded(&b, &[9; 32]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod resid_opening_tests {
+    use super::*;
+
+    fn chunk(seed: u8, n: usize) -> LeafChunk {
+        LeafChunk { total_len: 9000, index: seed as u32, chunk: vec![seed; n], chunk_path: vec![[seed; 32]; 3], leaf_path: vec![[seed ^ 2; 32]; 4] }
+    }
+
+    fn point() -> ResidPoint {
+        let e = |i: u32| EntryOpening { index: i, bytes: vec![i as u8; 40], path: vec![[i as u8; 32]; 4] };
+        ResidPoint {
+            n_ubatch: 1,
+            tok: 7,
+            pos_path: vec![[1; 32]; 6],
+            meta_path: vec![[2; 32]; 9],
+            layer: e(3),
+            product: e(4),
+            dst: chunk(5, 1024),
+            src: ResidSrc::Chunk(chunk(6, 1024)),
+            add: ResidAdd::Normed { y: LeafBytes { bytes: vec![7; 4096], leaf_path: vec![[8; 32]; 9] }, norm: (e(9), ChunkRange { first_chunk: 3, chunks: vec![1; 1024], proof: vec![[4; 32]; 20] }) },
+        }
+    }
+
+    #[test]
+    fn residual_opening_round_trips() {
+        for roots in [None, Some(([5; 32], [6; 32]))] {
+            let o = ResidOpening { response_txid: [1; 32], roots, resid: point() };
+            let b = o.encode();
+            assert_eq!(b[0], VERSION_RESID);
+            assert_eq!(ResidOpening::decode(&b), Some(o));
+            assert!(is_audit_body(&b));
+            let s = seeded(&b, &[9; 32]).unwrap();
+            assert!(is_audit_body(&s));
+            assert_eq!(inner_body(&s), Some(b.clone()));
+            let mut c = b.clone();
+            c.push(0);
+            assert!(ResidOpening::decode(&c).is_none() && !is_audit_body(&b[..b.len() - 1]));
+            assert!(Opening::decode(&b).is_none() && AttnOpening::decode(&b).is_none() && RecurOpening::decode(&b).is_none());
+        }
+    }
+
+    #[test]
+    fn a_trace_opening_may_leave_its_residual_out() {
+        let p = Point { x: vec![1; 36], ..Default::default() };
+        let base = Opening {
+            response_txid: [1; 32],
+            points: vec![p.clone(), p],
+            prefix: Some(PrefixPoint::default()),
+            links: vec![(3, LinkOpening::None), (4, LinkOpening::None)],
+            experts: vec![None, None],
+            resid: None,
+            roots: Some(([5; 32], [6; 32])),
+        };
+        for o in [base.clone(), Opening { resid: Some(point()), ..base }] {
+            let b = o.encode();
+            assert_eq!(b[0], VERSION_ROOTS);
+            assert_eq!(Opening::decode(&b), Some(o));
+        }
     }
 }
 

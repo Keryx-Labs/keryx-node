@@ -3,7 +3,7 @@
 
 use keryx_consensus_core::{collateral::SERVICE_LEDGER_HORIZON_DAA, config::params::ForkActivation, tx::Transaction};
 use keryx_inference::AiResponsePayload;
-use keryx_verifiable_inference::opening::{AttnOpening, Opening, RecurOpening, SignedPayload, inner_body, seed_block};
+use keryx_verifiable_inference::opening::{AttnOpening, Opening, RecurOpening, ResidOpening, SignedPayload, inner_body, seed_block};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifiableEraViolation {
@@ -72,8 +72,8 @@ pub fn check_verifiable_inference_era(
         }
         let attention = attention_activation.is_active(daa_score);
         let inner = inner_body(signed.body);
-        let piece = attention
-            && inner.as_deref().is_some_and(|b| AttnOpening::decode(b).is_some() || RecurOpening::decode(b).is_some());
+        let piece = (attention && inner.as_deref().is_some_and(|b| AttnOpening::decode(b).is_some() || RecurOpening::decode(b).is_some()))
+            || (chain_activation.is_active(daa_score) && inner.as_deref().is_some_and(|b| ResidOpening::decode(b).is_some()));
         let trace = Opening::decode(signed.body).is_some_and(|o| attention || o.roots.is_none());
         if !trace && !piece {
             return Err(VerifiableEraViolation::MalformedOpening);
@@ -147,6 +147,28 @@ mod tests {
             assert_eq!(check_verifiable_inference_era(&t, 2 * GATE - 1, gate, never, never, attn), Err(VerifiableEraViolation::MalformedOpening));
             assert!(check_verifiable_inference_era(&t, 2 * GATE, gate, never, never, attn).is_ok());
         }
+    }
+
+    #[test]
+    fn residual_openings_wait_for_the_chain_gate() {
+        use keryx_verifiable_inference::opening::{EntryOpening, LeafChunk, ResidAdd, ResidPoint, ResidSrc};
+        let (gate, never, chain) = (ForkActivation::new(GATE), ForkActivation::never(), ForkActivation::new(2 * GATE));
+        let resid = ResidPoint {
+            n_ubatch: 1,
+            tok: 0,
+            pos_path: vec![],
+            meta_path: vec![],
+            layer: EntryOpening::default(),
+            product: EntryOpening::default(),
+            dst: LeafChunk::default(),
+            src: ResidSrc::Chunk(LeafChunk::default()),
+            add: ResidAdd::Chunk(LeafChunk::default()),
+        };
+        let mut body = ResidOpening { response_txid: [5; 32], roots: Some(([1; 32], [2; 32])), resid }.encode();
+        body.extend_from_slice(&[6u8; 96]);
+        let t = tx(SUBNETWORK_ID_AI_OPENING, body);
+        assert_eq!(check_verifiable_inference_era(&t, 2 * GATE - 1, gate, chain, never, never), Err(VerifiableEraViolation::MalformedOpening));
+        assert!(check_verifiable_inference_era(&t, 2 * GATE, gate, chain, never, never).is_ok());
     }
 
     fn tx(subnet: SubnetworkId, payload: Vec<u8>) -> Transaction {

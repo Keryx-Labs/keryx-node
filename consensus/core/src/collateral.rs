@@ -264,7 +264,7 @@ struct TraceAudit {
     seed: Option<[u8; 32]>,
     deadline_daa: u64,
     /// Pieces already proven when the audit needs several ([`PIECE_TRACE`], [`PIECE_ATTN`],
-    /// [`PIECE_RECUR`]).
+    /// [`PIECE_RECUR`], [`PIECE_RESID`]).
     pieces: u8,
     /// Progress of an attention opening of several phases.
     attn: Option<AttnProgress>,
@@ -312,16 +312,18 @@ const PIECE_TRACE: u8 = 1;
 const PIECE_ATTN: u8 = 2;
 /// The recurrent opening of a several-piece audit is proven.
 const PIECE_RECUR: u8 = 4;
-const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR;
+/// The residual opening of a stage-2 audit is proven.
+const PIECE_RESID: u8 = 8;
+const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID;
 
 /// Pieces an audit under `rules` needs.
-/// Pieces an audit under `rules` needs.
 pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
-    match rules {
-        Some(r) if r.attention => {
-            PIECE_TRACE | PIECE_ATTN | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
-        }
-        _ => PIECE_TRACE,
+    let Some(r) = rules else { return PIECE_TRACE };
+    let resid = if r.chain.is_some() { PIECE_RESID } else { 0 };
+    if r.attention {
+        PIECE_TRACE | PIECE_ATTN | resid | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
+    } else {
+        PIECE_TRACE | resid
     }
 }
 
@@ -355,18 +357,11 @@ fn trace_opening_valid(
     }
     let mut resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     if let Some(cc) = &rules.chain {
-        let (Some(pc), Some(pp), Some(rp)) = (&rules.prefix, &opening.prefix, &opening.resid) else { return Err("stage-2 part missing") };
-        match (rules.attention, &opening.roots) {
-            (true, Some((pos_root, seq_root))) => {
-                if keryx_verifiable_inference::seq::trace_root(pos_root, seq_root) != audit.trace_root {
-                    return Err("trace root split");
-                }
-                resp.trace_root = *pos_root;
-            }
-            (true, None) => return Err("sequence root missing"),
-            (false, Some(_)) => return Err("sequence root before its rule"),
-            (false, None) => {}
+        let (Some(pc), Some(pp)) = (&rules.prefix, &opening.prefix) else { return Err("stage-2 part missing") };
+        if opening.resid.is_some() {
+            return Err("residual point in the trace piece");
         }
+        resp.trace_root = split_trace_root(rules, audit, &opening.roots)?;
         if opening.links.len() != opening.points.len() || opening.experts.len() != opening.points.len() {
             return Err("link count");
         }
@@ -376,8 +371,7 @@ fn trace_opening_valid(
                 return Err(if i == 0 { "point 0" } else { "point 1" });
             }
         }
-        chain::verify_chain_prefix_point(&rules.ctx, cc, pc, &resp, seed, &audit.request_hash, pp).map_err(|_| "prefix point")?;
-        return chain::verify_resid_point(&rules.ctx, cc, &resp, seed, rp).map_err(|_| "residual point");
+        return chain::verify_chain_prefix_point(&rules.ctx, cc, pc, &resp, seed, &audit.request_hash, pp).map(|_| ()).map_err(|_| "prefix point");
     }
     if opening.resid.is_some() {
         return Err("stage-2 opening before its rule");
@@ -399,12 +393,52 @@ fn trace_opening_valid(
 /// The piece an opening body, seeded or not, proves.
 /// Piece an opening body proves.
 pub fn opening_body_piece(body: &[u8]) -> u8 {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_RECUR, inner_body};
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_RECUR, VERSION_RESID, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
         Some(VERSION_ATTN) => PIECE_ATTN,
         Some(VERSION_RECUR) => PIECE_RECUR,
+        Some(VERSION_RESID) => PIECE_RESID,
         _ => PIECE_TRACE,
     }
+}
+
+/// Position root a stage-2 piece is checked against: the split position root under the attention
+/// rule, the trace root otherwise.
+fn split_trace_root(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    roots: &Option<([u8; 32], [u8; 32])>,
+) -> Result<[u8; 32], &'static str> {
+    match (rules.attention, roots) {
+        (true, Some((pos_root, seq_root))) => {
+            if keryx_verifiable_inference::seq::trace_root(pos_root, seq_root) != audit.trace_root {
+                return Err("trace root split");
+            }
+            Ok(*pos_root)
+        }
+        (true, None) => Err("sequence root missing"),
+        (false, Some(_)) => Err("sequence root before its rule"),
+        (false, None) => Ok(audit.trace_root),
+    }
+}
+
+/// Checks that a residual opening body proves the residual point of `audit` under `seed`.
+fn resid_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{chain, opening::{ResidOpening, inner_body}, verify};
+    let op = inner_body(body).as_deref().and_then(ResidOpening::decode).ok_or("malformed residual body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let cc = rules.chain.as_ref().ok_or("residual piece before its rule")?;
+    let trace_root = split_trace_root(rules, audit, &op.roots)?;
+    let resp = verify::ResponseCtx { trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    chain::verify_resid_point(&rules.ctx, cc, &resp, seed, &op.resid).map_err(|_| "residual point")
 }
 
 /// Checks that a recurrent opening body proves the recurrent point of `audit` under `seed`.
@@ -1798,6 +1832,7 @@ impl ServiceLedger {
                     }
                 }),
                 Some(r) if piece == PIECE_RECUR => recur_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(r) if piece == PIECE_RESID => resid_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 None => Err("no rules"),
             };
@@ -5138,21 +5173,22 @@ mod tests {
 
         #[test]
         fn pieces_follow_the_rules() {
-            use crate::collateral::{PIECE_ATTN, PIECE_RECUR, PIECE_TRACE, required_pieces};
+            use crate::collateral::{PIECE_ATTN, PIECE_RECUR, PIECE_RESID, PIECE_TRACE, required_pieces};
             use crate::config::params::trace_rules;
             assert_eq!(required_pieces(None), PIECE_TRACE);
-            assert_eq!(required_pieces(trace_rules(1, true, true, true, false).as_ref()), PIECE_TRACE);
-            assert_eq!(required_pieces(trace_rules(1, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN);
-            assert_eq!(required_pieces(trace_rules(0, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR);
-            assert_eq!(required_pieces(trace_rules(4, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR);
+            assert_eq!(required_pieces(trace_rules(1, true, true, false, false).as_ref()), PIECE_TRACE);
+            assert_eq!(required_pieces(trace_rules(1, true, true, true, false).as_ref()), PIECE_TRACE | PIECE_RESID);
+            assert_eq!(required_pieces(trace_rules(1, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RESID);
+            assert_eq!(required_pieces(trace_rules(0, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
+            assert_eq!(required_pieces(trace_rules(4, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
         }
 
         #[test]
         fn a_trace_opening_carries_the_root_halves_under_the_attention_rules() {
-            use crate::collateral::{TraceAudit, trace_opening_valid};
+            use crate::collateral::{TraceAudit, resid_opening_valid, trace_opening_valid};
             use crate::config::params::trace_rules;
             use keryx_verifiable_inference::draw::POINTS;
-            use keryx_verifiable_inference::opening::{EntryOpening, LeafChunk, LinkOpening, Opening, Point, PrefixPoint, ResidAdd, ResidPoint, ResidSrc};
+            use keryx_verifiable_inference::opening::{EntryOpening, LeafChunk, LinkOpening, Opening, Point, PrefixPoint, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
             let (pos_root, seq_root) = ([0x11u8; 32], [0x22u8; 32]);
             let audit = TraceAudit {
                 request_hash: RH,
@@ -5170,34 +5206,46 @@ mod tests {
                 pieces: 0,
                 attn: None,
             };
-            let body = |roots: Option<([u8; 32], [u8; 32])>| {
+            let resid = ResidPoint {
+                n_ubatch: 1,
+                tok: 0,
+                pos_path: vec![],
+                meta_path: vec![],
+                layer: EntryOpening::default(),
+                product: EntryOpening::default(),
+                dst: LeafChunk::default(),
+                src: ResidSrc::Chunk(LeafChunk::default()),
+                add: ResidAdd::Chunk(LeafChunk::default()),
+            };
+            let body = |roots: Option<([u8; 32], [u8; 32])>, resid: Option<ResidPoint>| {
                 Opening {
                     response_txid: TXID,
                     points: vec![Point::default(); POINTS as usize],
                     prefix: Some(PrefixPoint::default()),
                     links: vec![(0, LinkOpening::None); POINTS as usize],
                     experts: vec![None; POINTS as usize],
-                    resid: Some(ResidPoint {
-                        n_ubatch: 1,
-                        tok: 0,
-                        pos_path: vec![],
-                        meta_path: vec![],
-                        layer: EntryOpening::default(),
-                        product: EntryOpening::default(),
-                        dst: LeafChunk::default(),
-                        src: ResidSrc::Chunk(LeafChunk::default()),
-                        add: ResidAdd::Chunk(LeafChunk::default()),
-                    }),
+                    resid,
                     roots,
                 }
                 .encode()
             };
             let (with, without) = (trace_rules(1, true, true, true, true).unwrap(), trace_rules(1, true, true, true, false).unwrap());
-            let check = |r, roots| trace_opening_valid(r, &audit, &[9; 32], &TXID, &body(roots));
+            let check = |r, roots| trace_opening_valid(r, &audit, &[9; 32], &TXID, &body(roots, None));
             assert_eq!(check(&with, None), Err("sequence root missing"));
             assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));
             assert_eq!(check(&with, Some((pos_root, seq_root))), Err("point 0"));
             assert_eq!(check(&without, Some((pos_root, seq_root))), Err("sequence root before its rule"));
+            let inline = body(Some((pos_root, seq_root)), Some(resid.clone()));
+            assert_eq!(trace_opening_valid(&with, &audit, &[9; 32], &TXID, &inline), Err("residual point in the trace piece"));
+
+            let piece = |roots| ResidOpening { response_txid: TXID, roots, resid: resid.clone() }.encode();
+            let check = |r, roots| resid_opening_valid(r, &audit, &[9; 32], &TXID, &piece(roots));
+            assert_eq!(check(&with, None), Err("sequence root missing"));
+            assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));
+            assert_eq!(check(&with, Some((pos_root, seq_root))), Err("residual point"));
+            assert_eq!(check(&without, Some((pos_root, seq_root))), Err("sequence root before its rule"));
+            assert_eq!(resid_opening_valid(&with, &audit, &[9; 32], &[0x33; 32], &piece(Some((pos_root, seq_root)))), Err("response id mismatch"));
+            assert_eq!(resid_opening_valid(&with, &audit, &[9; 32], &TXID, &inline), Err("malformed residual body"));
         }
 
         #[test]
