@@ -6,6 +6,8 @@ pub const PROMPT_BYTES_PER_POSITION: u32 = 16;
 pub const ANSWER_BYTES_PER_POSITION: u32 = 10;
 /// Answer bytes per token of the request's budget, at most.
 pub const MAX_ANSWER_BYTES_PER_TOKEN: u32 = 32;
+/// Positions a trace commits, at most: the largest context of the lineup.
+pub const MAX_TRACE_POSITIONS: u32 = 131_072;
 
 /// Prompt positions a trace must commit for a prompt of `prompt_len` bytes.
 pub fn min_prompt_positions(prompt_len: u32) -> u32 {
@@ -27,6 +29,8 @@ pub fn max_answer_len(max_tokens: u32) -> u64 {
 pub fn shape_ok(prompt_len: u32, answer_len: u32, max_tokens: u32, n_prompt: u32, n_pos: u32) -> bool {
     n_prompt > 0
         && n_pos >= n_prompt
+        && n_pos <= MAX_TRACE_POSITIONS
+        && n_pos - n_prompt <= max_tokens
         && n_prompt >= min_prompt_positions(prompt_len)
         && n_pos - n_prompt >= min_generated_positions(answer_len, max_tokens)
         && answer_len as u64 <= max_answer_len(max_tokens)
@@ -69,5 +73,8 @@ mod tests {
         assert!(!shape_ok(1_600, 1_000, 2_048, 100, 199));
         assert!(shape_ok(0, 2_048, 64, 1, 65));
         assert!(!shape_ok(0, 2_049, 64, 1, 65));
+        assert!(!shape_ok(0, 100, 64, 1, 66), "more generated positions than the budget");
+        assert!(shape_ok(0, 100, 64, MAX_TRACE_POSITIONS - 64, MAX_TRACE_POSITIONS));
+        assert!(!shape_ok(0, 100, 64, MAX_TRACE_POSITIONS - 63, MAX_TRACE_POSITIONS + 1), "past the largest context");
     }
 }
