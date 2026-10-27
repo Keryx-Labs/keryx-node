@@ -67,6 +67,7 @@ impl Factory {
                 GetUtxoEntriesByOutpoints,
                 GetServiceStrikes,
                 GetServiceProviders,
+                GetAwaitedOpenings,
                 GetBalanceByAddress,
                 GetBalancesByAddresses,
                 GetSinkBlueScore,

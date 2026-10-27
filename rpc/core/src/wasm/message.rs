@@ -288,6 +288,53 @@ try_from! ( args: GetServiceProvidersResponse, IGetServiceProvidersResponse, {
 });
 
 declare! {
+    IGetAwaitedOpeningsRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetAwaitedOpeningsRequest {
+        responseTxids: HexString[];
+    }
+    "#,
+}
+
+try_from! ( args: IGetAwaitedOpeningsRequest, GetAwaitedOpeningsRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetAwaitedOpeningsResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetAwaitedOpeningsResponse {
+        virtualDaaScore: bigint;
+        openings: IAwaitedOpening[];
+    }
+
+    /**
+     * An opening the node awaits for a drawn response.
+     * @category Node RPC
+     */
+    export interface IAwaitedOpening {
+        responseTxid: HexString;
+        escrowPubkey: HexString;
+        seed: HexString;
+        deadlineDaa: bigint;
+        acceptedDaa: bigint;
+        pieces: number;
+        attentionPath: bigint[];
+    }
+    "#,
+}
+
+try_from! ( args: GetAwaitedOpeningsResponse, IGetAwaitedOpeningsResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
     IGetCoinSupplyRequest,
     r#"
     /**

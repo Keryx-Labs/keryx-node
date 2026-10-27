@@ -1203,3 +1203,24 @@ message GetServiceProvidersResponseMessage {
 
   RPCError error = 1000;
 }
+
+message AwaitedOpeningMessage {
+  string responseTxid = 1;
+  string escrowPubkey = 2;
+  string seed = 3;
+  uint64 deadlineDaa = 4;
+  uint32 pieces = 5;
+  repeated uint64 attentionPath = 6;
+  uint64 acceptedDaa = 7;
+}
+
+message GetAwaitedOpeningsRequestMessage {
+  repeated string responseTxids = 1;
+}
+
+message GetAwaitedOpeningsResponseMessage {
+  uint64 virtualDaaScore = 1;
+  repeated AwaitedOpeningMessage openings = 2;
+
+  RPCError error = 1000;
+}

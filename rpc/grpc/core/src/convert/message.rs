@@ -464,6 +464,29 @@ from!(item: RpcResult<&keryx_rpc_core::GetServiceProvidersResponse>, protowire::
     }
 });
 
+from!(item: &keryx_rpc_core::GetAwaitedOpeningsRequest, protowire::GetAwaitedOpeningsRequestMessage, {
+    Self { response_txids: item.response_txids.iter().map(|t| t.to_string()).collect() }
+});
+from!(item: RpcResult<&keryx_rpc_core::GetAwaitedOpeningsResponse>, protowire::GetAwaitedOpeningsResponseMessage, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        openings: item
+            .openings
+            .iter()
+            .map(|o| protowire::AwaitedOpeningMessage {
+                response_txid: o.response_txid.to_string(),
+                escrow_pubkey: o.escrow_pubkey.to_string(),
+                seed: o.seed.to_string(),
+                deadline_daa: o.deadline_daa,
+                accepted_daa: o.accepted_daa,
+                pieces: o.pieces,
+                attention_path: o.attention_path.clone(),
+            })
+            .collect(),
+        error: None,
+    }
+});
+
 from!(item: &keryx_rpc_core::GetDaaScoreTimestampEstimateRequest, protowire::GetDaaScoreTimestampEstimateRequestMessage, {
     Self {
         daa_scores: item.daa_scores.clone()
@@ -1061,6 +1084,30 @@ try_from!(item: &protowire::GetServiceProvidersResponseMessage, RpcResult<keryx_
                     model_id: RpcHash::from_str(&p.model_id)?,
                     identity: RpcHash::from_str(&p.identity)?,
                     escrow_pubkey: RpcHash::from_str(&p.escrow_pubkey)?,
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+    }
+});
+
+try_from!(item: &protowire::GetAwaitedOpeningsRequestMessage, keryx_rpc_core::GetAwaitedOpeningsRequest, {
+    Self { response_txids: item.response_txids.iter().map(|t| RpcHash::from_str(t)).collect::<Result<Vec<_>, _>>()? }
+});
+try_from!(item: &protowire::GetAwaitedOpeningsResponseMessage, RpcResult<keryx_rpc_core::GetAwaitedOpeningsResponse>, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        openings: item
+            .openings
+            .iter()
+            .map(|o| {
+                Ok(keryx_rpc_core::RpcAwaitedOpening {
+                    response_txid: RpcHash::from_str(&o.response_txid)?,
+                    escrow_pubkey: RpcHash::from_str(&o.escrow_pubkey)?,
+                    seed: RpcHash::from_str(&o.seed)?,
+                    deadline_daa: o.deadline_daa,
+                    accepted_daa: o.accepted_daa,
+                    pieces: o.pieces,
+                    attention_path: o.attention_path.clone(),
                 })
             })
             .collect::<RpcResult<Vec<_>>>()?,

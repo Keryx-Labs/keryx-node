@@ -529,6 +529,14 @@ async fn sanity_test() {
                 })
             }
 
+            KaspadPayloadOps::GetAwaitedOpenings => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response = rpc_client.get_awaited_openings_call(None, GetAwaitedOpeningsRequest::default()).await.unwrap();
+                    assert!(response.openings.is_empty());
+                })
+            }
+
             KaspadPayloadOps::GetServiceProviders => {
                 let rpc_client = client.clone();
                 tst!(op, {

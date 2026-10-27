@@ -524,6 +524,25 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_opening_pieces(response_txid, |t, at| self.required_pieces_at(t, at))
     }
 
+    pub(crate) fn awaited_openings(&self, response_txids: &[[u8; 32]]) -> Vec<keryx_consensus_core::collateral::AwaitedOpening> {
+        let sync = self.service_ledger.lock();
+        let ledger = &sync.ledger;
+        response_txids
+            .iter()
+            .filter_map(|txid| {
+                Some(keryx_consensus_core::collateral::AwaitedOpening {
+                    response_txid: *txid,
+                    escrow_pubkey: ledger.awaited_opening_key(txid)?,
+                    seed: ledger.awaited_opening_seed(txid)?,
+                    deadline_daa: ledger.awaited_opening_deadline(txid)?,
+                    accepted_daa: ledger.awaited_opening_accepted_daa(txid)?,
+                    pieces: ledger.awaited_opening_pieces(txid, |t, at| self.required_pieces_at(t, at)).unwrap_or(0),
+                    attention_path: ledger.awaited_attention_path(txid).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
     /// Whether the opening `tx` proves a piece its response still owes, from the key, seed and
     /// attention path the audit awaits (the signature is a validity rule, checked elsewhere).
     pub(crate) fn opening_awaited(&self, tx: &keryx_consensus_core::tx::Transaction) -> bool {

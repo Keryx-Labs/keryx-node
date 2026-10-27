@@ -1178,6 +1178,33 @@ mod mockery {
 
     test!(GetServiceProvidersResponse);
 
+    impl Mock for GetAwaitedOpeningsRequest {
+        fn mock() -> Self {
+            GetAwaitedOpeningsRequest { response_txids: vec![mock(), mock()] }
+        }
+    }
+
+    test!(GetAwaitedOpeningsRequest);
+
+    impl Mock for GetAwaitedOpeningsResponse {
+        fn mock() -> Self {
+            GetAwaitedOpeningsResponse {
+                virtual_daa_score: mock(),
+                openings: vec![RpcAwaitedOpening {
+                    response_txid: mock(),
+                    escrow_pubkey: mock(),
+                    seed: mock(),
+                    deadline_daa: mock(),
+                    accepted_daa: mock(),
+                    pieces: 5,
+                    attention_path: vec![3, 1],
+                }],
+            }
+        }
+    }
+
+    test!(GetAwaitedOpeningsResponse);
+
     impl Mock for GetCoinSupplyResponse {
         fn mock() -> Self {
             GetCoinSupplyResponse { max_sompi: mock(), circulating_sompi: mock() }

@@ -2092,6 +2092,70 @@ impl Deserializer for GetServiceProvidersResponse {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAwaitedOpening {
+    pub response_txid: RpcHash,
+    /// The x-only escrow pubkey expected to sign the opening.
+    pub escrow_pubkey: RpcHash,
+    pub seed: RpcHash,
+    pub deadline_daa: u64,
+    /// Acceptance DAA the response is audited at (its request's admission for a response
+    /// accepted before it).
+    pub accepted_daa: u64,
+    /// Pieces still owed, as the ledger's piece bits.
+    pub pieces: u32,
+    /// Children drawn after each accepted attention phase.
+    pub attention_path: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAwaitedOpeningsRequest {
+    pub response_txids: Vec<RpcHash>,
+}
+
+impl Serializer for GetAwaitedOpeningsRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Vec<RpcHash>, &self.response_txids, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetAwaitedOpeningsRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let response_txids = load!(Vec<RpcHash>, reader)?;
+        Ok(Self { response_txids })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetAwaitedOpeningsResponse {
+    pub virtual_daa_score: u64,
+    pub openings: Vec<RpcAwaitedOpening>,
+}
+
+impl Serializer for GetAwaitedOpeningsResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.virtual_daa_score, writer)?;
+        store!(Vec<RpcAwaitedOpening>, &self.openings, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetAwaitedOpeningsResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let virtual_daa_score = load!(u64, reader)?;
+        let openings = load!(Vec<RpcAwaitedOpening>, reader)?;
+        Ok(Self { virtual_daa_score, openings })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PingRequest {}

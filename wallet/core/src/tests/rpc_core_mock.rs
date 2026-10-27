@@ -379,6 +379,14 @@ impl RpcApi for RpcCoreMock {
         Err(RpcError::NotImplemented)
     }
 
+    async fn get_awaited_openings_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetAwaitedOpeningsRequest,
+    ) -> RpcResult<GetAwaitedOpeningsResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
     async fn get_daa_score_timestamp_estimate_call(
         &self,
         _connection: Option<&DynRpcConnection>,

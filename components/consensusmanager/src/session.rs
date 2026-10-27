@@ -220,6 +220,10 @@ impl ConsensusSessionOwned {
         self.consensus.get_service_providers(window_daa)
     }
 
+    pub fn get_awaited_openings(&self, response_txids: &[[u8; 32]]) -> Vec<keryx_consensus_core::collateral::AwaitedOpening> {
+        self.consensus.awaited_openings(response_txids)
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()

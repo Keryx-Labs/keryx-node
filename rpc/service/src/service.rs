@@ -1013,6 +1013,34 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         })
     }
 
+    async fn get_awaited_openings_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetAwaitedOpeningsRequest,
+    ) -> RpcResult<GetAwaitedOpeningsResponse> {
+        const MAX_TXIDS: usize = 1_024;
+        if request.response_txids.len() > MAX_TXIDS {
+            return Err(RpcError::General(format!("at most {MAX_TXIDS} response txids per call")));
+        }
+        let txids: Vec<[u8; 32]> = request.response_txids.iter().map(|t| t.as_bytes()).collect();
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.get_virtual_daa_score();
+        let openings = session
+            .get_awaited_openings(&txids)
+            .into_iter()
+            .map(|o| RpcAwaitedOpening {
+                response_txid: RpcHash::from_bytes(o.response_txid),
+                escrow_pubkey: RpcHash::from_bytes(o.escrow_pubkey),
+                seed: RpcHash::from_bytes(o.seed),
+                deadline_daa: o.deadline_daa,
+                accepted_daa: o.accepted_daa,
+                pieces: o.pieces as u32,
+                attention_path: o.attention_path,
+            })
+            .collect();
+        Ok(GetAwaitedOpeningsResponse { virtual_daa_score, openings })
+    }
+
     async fn get_coin_supply_call(
         &self,
         _connection: Option<&DynRpcConnection>,

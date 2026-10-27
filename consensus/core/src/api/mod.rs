@@ -225,6 +225,12 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// The awaited openings among `response_txids`, read at once.
+    fn awaited_openings(&self, response_txids: &[[u8; 32]]) -> Vec<crate::collateral::AwaitedOpening> {
+        let _ = response_txids;
+        Vec::new()
+    }
+
     /// The pieces a drawn response still owes.
     fn awaited_opening_pieces(&self, response_txid: &[u8; 32]) -> Option<u8> {
         let _ = response_txid;

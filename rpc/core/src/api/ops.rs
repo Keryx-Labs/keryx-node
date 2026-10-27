@@ -148,6 +148,8 @@ pub enum RpcApiOps {
     GetServiceStrikes = 154,
     /// Service-eligible responders per tier (identity, escrow key) — private-inference targets
     GetServiceProviders = 156,
+    /// Openings the node awaits for a set of response transaction ids
+    GetAwaitedOpenings = 157,
 }
 
 impl RpcApiOps {

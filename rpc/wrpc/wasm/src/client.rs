@@ -942,6 +942,9 @@ build_wrpc_wasm_bindgen_interface!(
         /// sink: identity and escrow pubkey — the keys a private-inference
         /// request is sealed to.
         GetServiceProviders,
+        /// Retrieves the openings the node awaits among a set of response
+        /// transaction ids: signing key, seed, deadline and pieces still owed.
+        GetAwaitedOpenings,
         /// Retrieves information about the peers connected to the Kaspa node.
         /// Returned information: Peer ID, IP address and port, connection
         /// status, protocol version.
