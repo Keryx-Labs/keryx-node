@@ -756,6 +756,7 @@ impl VirtualStateProcessor {
                 window_v3: self.service_window_v3_activation.is_active(daa),
                 dedup: self.trace_dedup_activation.is_active(daa),
                 seed_bind: self.trace_seed_bind_activation.is_active(daa),
+                untraced_silence: self.untraced_response_activation.is_active(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();

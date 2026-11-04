@@ -1967,6 +1967,8 @@ pub struct Params {
     pub exact_verification_activation: ForkActivation,
     /// H16: suspensions judged at the selected parent's DAA, over every recorded window.
     pub suspension_pov_activation: ForkActivation,
+    /// H16: an untraced response on an audited tier does not serve its request.
+    pub untraced_response_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
     pub service_burnable_window_daa: u64,
@@ -2249,6 +2251,7 @@ impl Params {
             production_index_activation: self.production_index_activation,
             exact_verification_activation: self.exact_verification_activation,
             suspension_pov_activation: self.suspension_pov_activation,
+            untraced_response_activation: self.untraced_response_activation,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
@@ -2477,6 +2480,7 @@ pub const MAINNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
     suspension_pov_activation: ForkActivation::never(),
+    untraced_response_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -2624,6 +2628,7 @@ pub const TESTNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(500),
     suspension_pov_activation: ForkActivation::never(),
+    untraced_response_activation: ForkActivation::never(),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2734,6 +2739,7 @@ pub const SIMNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
     suspension_pov_activation: ForkActivation::never(),
+    untraced_response_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2838,6 +2844,7 @@ pub const DEVNET_PARAMS: Params = Params {
     production_index_activation: ForkActivation::never(),
     exact_verification_activation: ForkActivation::never(),
     suspension_pov_activation: ForkActivation::never(),
+    untraced_response_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
