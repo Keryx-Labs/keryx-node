@@ -1666,13 +1666,23 @@ impl ServiceLedger {
                     if let Some(tr) = traces {
                         self.close_or_hold_draw(&rh, &tr.chain_hash, &awaiting, warmup, &mut outcome);
                     }
+                    let one_miss = traces.is_some_and(|tr| tr.one_miss);
                     for miner in audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)) {
+                        let is_late = late.contains(miner);
+                        if one_miss {
+                            if excused && !is_late {
+                                if !warmup {
+                                    outcome.excused.push((rh, *miner));
+                                }
+                                continue;
+                            }
+                            self.forget_struck(&rh, miner);
+                        }
                         if warmup {
                             // The miss is already persisted: its burns came in through `is_burned`
                             // and its strike lives in the baseline.
                             continue;
                         }
-                        let is_late = late.contains(miner);
                         if excused && !is_late {
                             outcome.excused.push((rh, *miner));
                             continue;
@@ -1703,9 +1713,6 @@ impl ServiceLedger {
                             burned,
                             opening_missing: false,
                         });
-                        if traces.is_some_and(|tr| tr.one_miss) {
-                            self.forget_struck(&rh, miner);
-                        }
                     }
                     self.pending.remove(&rh);
                 }
@@ -2032,6 +2039,9 @@ impl ServiceLedger {
             if verdict.is_err() {
                 self.drop_draw_candidates(&a.request_hash, &a.identities);
                 for miner in a.identities.iter() {
+                    if tr.one_miss {
+                        self.forget_struck(&a.request_hash, miner);
+                    }
                     if warmup || (tr.sanction && self.struck_at(miner, daa)) || (tr.uniform_strikes && self.within_strike_interval(miner, daa)) {
                         continue;
                     }
@@ -2050,9 +2060,6 @@ impl ServiceLedger {
                         burned,
                         opening_missing: false,
                     });
-                    if tr.one_miss {
-                        self.forget_struck(&a.request_hash, miner);
-                    }
                 }
             }
         }
@@ -2063,6 +2070,9 @@ impl ServiceLedger {
             let a = self.trace_audits.remove(&txid).unwrap();
             self.drop_draw_candidates(&a.request_hash, &a.identities);
             for miner in a.identities.iter() {
+                if tr.one_miss {
+                    self.forget_struck(&a.request_hash, miner);
+                }
                 if warmup {
                     continue;
                 }
@@ -2085,9 +2095,6 @@ impl ServiceLedger {
                     burned,
                     opening_missing: true,
                 });
-                if tr.one_miss {
-                    self.forget_struck(&a.request_hash, miner);
-                }
             }
         }
 
@@ -6275,6 +6282,11 @@ mod tests {
             /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
             /// `answers`.
             fn fold(&mut self, daa: u64, chain: Hash, requests: &[([u8; 32], u32)], answers: &[Answer]) -> FoldOutcome {
+                self.fold_with(daa, chain, requests, answers, false)
+            }
+
+            /// [`Self::fold`] as a warmup fold when `warm`; the outcome is then empty.
+            fn fold_with(&mut self, daa: u64, chain: Hash, requests: &[([u8; 32], u32)], answers: &[Answer], warm: bool) -> FoldOutcome {
                 let audit_all = self.audit_all;
                 let tier = |_: u8, _: u64| -> Option<crate::config::params::TraceRules> {
                     audit_all.then(|| crate::config::params::TraceRules {
@@ -6333,6 +6345,21 @@ mod tests {
                 };
                 let resp: Vec<([u8; 32], Option<Hash>)> = answers.iter().map(|(rh, r, _)| (*rh, Some(*r))).collect();
                 let set = self.cohort.clone();
+                if warm {
+                    self.ledger.on_chain_block_warmup_with_traces(
+                        daa,
+                        &reqs,
+                        &rewards,
+                        &sealed,
+                        &resp,
+                        &[],
+                        &[],
+                        &tr,
+                        &|_: &crate::tx::TransactionOutpoint| false,
+                        |_| set.iter().map(|m| (*m, *m)).collect(),
+                    );
+                    return FoldOutcome::default();
+                }
                 self.ledger.on_chain_block_with_traces(
                     daa,
                     &reqs,
@@ -6930,6 +6957,38 @@ mod tests {
             let before = misses_of_a_late_unopened_answer(false);
             assert_eq!(before.len(), 2, "before the gate the window and the opening both strike: {before:?}");
             assert_eq!(misses_of_a_late_unopened_answer(true).len(), 1);
+        }
+
+        /// Identities the trace audits of `RH` still judge once its window resolved, the window
+        /// blocks folded in warmup when `warm`.
+        fn audited_after_the_window(one_miss: bool, warm: bool) -> Vec<Hash> {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.one_miss = one_miss;
+            net.fold(100, chain(0), &[(RH, 2048)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let late_at = 101 + service_window_daa_v3(0, 10, 50) + 50;
+            for daa in 102..late_at {
+                net.fold(daa, chain((daa % 7) as u8), &[], &[]);
+            }
+            net.fold(late_at, chain(1), &[], &[(RH, a, Some((10, 60)))]);
+            let end = net.window_end(&RH);
+            for daa in late_at + 1..=end + 1 {
+                net.fold_with(daa, chain((daa % 7) as u8), &[], &[], warm);
+            }
+            assert!(!net.ledger.pending.contains_key(&RH), "the window must have resolved");
+            net.ledger.trace_audits.values().filter(|t| t.request_hash == RH).flat_map(|t| t.identities.clone()).collect()
+        }
+
+        #[test]
+        fn a_miss_folded_in_warmup_leaves_the_other_judgements_past_the_gate() {
+            let a = id(1);
+            assert_eq!(audited_after_the_window(false, false), vec![a], "before the gate the opening still judges a");
+            assert_eq!(audited_after_the_window(false, true), vec![a]);
+            assert!(audited_after_the_window(true, false).is_empty());
+            assert!(audited_after_the_window(true, true).is_empty(), "a warmup fold must forget like an incremental one");
         }
 
         #[test]
