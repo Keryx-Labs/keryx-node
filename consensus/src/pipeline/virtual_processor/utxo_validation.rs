@@ -753,13 +753,15 @@ impl VirtualStateProcessor {
         if !self.pom_v3_activation.is_active(pov_daa_score) || self.service_suspended.read().is_empty() {
             return set;
         }
+        let at_parent = self.suspension_pov_activation.is_active(pov_daa_score);
+        let judged_at = if at_parent { self.headers_store.get_daa_score(ghostdag_data.selected_parent).unwrap() } else { pov_daa_score };
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let txs = self.block_transactions_store.get(*blue).unwrap();
             let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
             // Identity is the payout SPK key: rotating the hot escrow key does not shed a
             // suspension.
             let identity = keryx_consensus_core::collateral::miner_key(&coinbase.miner_data.script_public_key);
-            if self.is_producer_suspended(&identity, pov_daa_score) {
+            if self.is_producer_suspended(&identity, judged_at, at_parent) {
                 set.insert(*blue);
             }
         }

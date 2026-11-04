@@ -149,7 +149,8 @@ pub struct VirtualStateProcessor {
     pub(super) service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
     /// Finality-deep production suspensions (miner escrow key → deadline daa), persisted counterpart
     /// Consulted by block validation; rebuilt from the strike log at boot.
-    pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, u64>>,
+    /// Every deadline per identity, ascending.
+    pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, Vec<u64>>>,
     /// Strike log: the finality-anchored baseline the ledger folds over.
     pub(super) service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
     /// Sealed service-state commitment index (see `processes::service_commit`).
@@ -172,6 +173,7 @@ pub struct VirtualStateProcessor {
     pub(super) service_ledger_activation: ForkActivation,
     pub(super) production_index_activation: ForkActivation,
     pub(super) exact_verification_activation: ForkActivation,
+    pub(super) suspension_pov_activation: ForkActivation,
     pub(super) service_burnable_window_daa: u64,
     /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
     #[allow(clippy::type_complexity)]
@@ -431,6 +433,7 @@ impl VirtualStateProcessor {
             service_ledger_activation: params.service_ledger_activation,
             production_index_activation: params.production_index_activation,
             exact_verification_activation: params.exact_verification_activation,
+            suspension_pov_activation: params.suspension_pov_activation,
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,

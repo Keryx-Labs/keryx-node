@@ -2047,3 +2047,252 @@ async fn a_template_refuses_a_transaction_its_era_rules_refuse() {
         other => panic!("the template took a transaction the block rules refuse: {:?}", other.map(|t| t.block.transactions.len())),
     }
 }
+
+/// Builds a short chain mined by one identity, then the next template, which pays that identity.
+/// Returns the context, the template and the identity's payout script.
+async fn suspension_fixture(gate: bool) -> (TestContext, BlockTemplate, keryx_consensus_core::tx::ScriptPublicKey) {
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_v3_activation = ForkActivation::always();
+            p.exact_verification_activation = ForkActivation::always();
+            p.ratio_verification_activation = ForkActivation::always();
+            p.suspension_pov_activation = if gate { ForkActivation::always() } else { ForkActivation::never() };
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    for _ in 0..5 {
+        ctx.build_block_template_row(0..1).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+    let template = ctx.build_block_template(0, ctx.simulated_time);
+    let miner_spk = ctx.miner_data.script_public_key.clone();
+    (ctx, template, miner_spk)
+}
+
+fn pays(template: &BlockTemplate, spk: &keryx_consensus_core::tx::ScriptPublicKey) -> bool {
+    template.block.transactions[0].outputs.iter().any(|o| &o.script_public_key == spk && o.value > 0)
+}
+
+/// A suspension starting at the template's own DAA is recorded after the template is built.
+async fn suspension_recorded_after_the_template(gate: bool) -> BlockStatus {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use keryx_consensus_core::collateral::{SERVICE_SUSPENSION_DAA, miner_key};
+
+    let (mut ctx, template, miner_spk) = suspension_fixture(gate).await;
+    assert!(pays(&template, &miner_spk));
+    let hash = template.block.header.hash;
+    let daa = template.block.header.daa_score;
+    let vp = ctx.consensus.virtual_processor().clone();
+    let parent = template.block.header.direct_parents()[0];
+    assert!(vp.headers_store.get_daa_score(parent).unwrap() < daa);
+    vp.service_suspended.write().insert(miner_key(&miner_spk), vec![daa + SERVICE_SUSPENSION_DAA]);
+    ctx.validate_and_insert_block(template.block.to_immutable()).await;
+    ctx.consensus.block_status(hash)
+}
+
+/// The coinbase verdict on a block is a function of its past: a suspension recorded between
+/// building a template and validating it does not change the verdict on that template.
+#[tokio::test]
+async fn suspension_recorded_after_the_template_does_not_change_its_verdict() {
+    assert_eq!(suspension_recorded_after_the_template(true).await, BlockStatus::StatusUTXOValid);
+}
+
+/// Before the gate the verdict follows the block's own DAA, as the history was judged.
+#[tokio::test]
+async fn suspension_before_the_gate_keeps_the_block_daa_rule() {
+    assert_eq!(suspension_recorded_after_the_template(false).await, BlockStatus::StatusDisqualifiedFromChain);
+}
+
+/// Past the gate, a suspension in force at the selected parent burns the merged blue's cut, in
+/// the template and in validation alike.
+#[tokio::test]
+async fn suspension_in_force_at_the_selected_parent_burns_the_cut() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use keryx_consensus_core::collateral::{SERVICE_SUSPENSION_DAA, miner_key};
+
+    let (mut ctx, template, miner_spk) = suspension_fixture(true).await;
+    let parent = template.block.header.direct_parents()[0];
+    let vp = ctx.consensus.virtual_processor().clone();
+    let parent_daa = vp.headers_store.get_daa_score(parent).unwrap();
+    vp.service_suspended.write().insert(miner_key(&miner_spk), vec![parent_daa + SERVICE_SUSPENSION_DAA]);
+
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+    let burning = ctx.build_block_template(1, ctx.simulated_time);
+    assert_eq!(burning.block.header.direct_parents(), template.block.header.direct_parents());
+    assert!(!pays(&burning, &miner_spk), "the suspended identity is still paid");
+    let hash = burning.block.header.hash;
+    ctx.validate_and_insert_block(burning.block.to_immutable()).await;
+    assert_eq!(ctx.consensus.block_status(hash), BlockStatus::StatusUTXOValid);
+}
+
+/// A second suspension does not erase the first one past the gate; before it only the latest counts.
+#[tokio::test]
+async fn second_suspension_keeps_the_first_window_past_the_gate() {
+    use keryx_consensus_core::collateral::SERVICE_SUSPENSION_DAA;
+
+    let (ctx, _template, _spk) = suspension_fixture(true).await;
+    let vp = ctx.consensus.virtual_processor().clone();
+    let id = Hash::from_bytes([7; 32]);
+    let first = 1_000_000;
+    let second = first + SERVICE_SUSPENSION_DAA / 2;
+    vp.service_suspended.write().insert(id, vec![first, second]);
+    let only_first = first - SERVICE_SUSPENSION_DAA + 1;
+    assert!(only_first < second - SERVICE_SUSPENSION_DAA);
+    assert!(vp.is_producer_suspended(&id, only_first, true));
+    assert!(!vp.is_producer_suspended(&id, only_first, false));
+    assert!(vp.is_producer_suspended(&id, second - 1, true));
+    assert!(!vp.is_producer_suspended(&id, second, true));
+}
+
+/// A node catching up in one batch across a suspension's start reaches the verdicts of the node
+/// that mined the chain block by block.
+#[tokio::test]
+async fn batch_catch_up_across_a_suspension_start_matches_the_live_chain() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use keryx_consensus_core::api::ConsensusApi;
+    use keryx_consensus_core::collateral::miner_key;
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_v3_activation = ForkActivation::always();
+            p.exact_verification_activation = ForkActivation::always();
+            p.ratio_verification_activation = ForkActivation::always();
+            p.suspension_pov_activation = ForkActivation::always();
+            p.finality_depth = 20;
+        })
+        .build();
+    let mut live = TestContext::new(TestConsensus::new(&config));
+    let miner_spk = live.miner_data.script_public_key.clone();
+    let identity = miner_key(&miner_spk);
+    let (before, after) = (8usize, 40usize);
+
+    let mut blocks = Vec::new();
+    let mut suspension_daa = 0;
+    for i in 0..before + after {
+        live.simulated_time += live.consensus.params().target_time_per_block();
+        let template = live.build_block_template(i as u64, live.simulated_time);
+        blocks.push(template.block.clone().to_immutable());
+        live.validate_and_insert_block(template.block.to_immutable()).await;
+        if i + 1 == before {
+            suspension_daa = live.consensus.virtual_processor().queue_test_suspension(identity);
+        }
+    }
+
+    let vp = live.consensus.virtual_processor().clone();
+    let start = suspension_daa + vp.finality_depth;
+    let (mut paid_past_start, mut burned) = (0, 0);
+    for block in blocks.iter().skip(before) {
+        let parent_daa = vp.headers_store.get_daa_score(block.header.direct_parents()[0]).unwrap();
+        let paid = block.transactions[0].outputs.iter().any(|o| o.script_public_key == miner_spk && o.value > 0);
+        assert_eq!(paid, parent_daa < start, "block at daa {}", block.header.daa_score);
+        if paid && block.header.daa_score >= start {
+            paid_past_start += 1;
+        }
+        if !paid {
+            burned += 1;
+        }
+    }
+    assert!(paid_past_start > 0 && burned > 0, "the chain must cross the suspension start");
+
+    let catch_up = TestContext::new(TestConsensus::new(&config));
+    for block in blocks.iter().take(before) {
+        let status = catch_up.consensus.validate_and_insert_block(block.clone()).virtual_state_task.await.unwrap();
+        assert!(status.has_block_body());
+    }
+    let cvp = catch_up.consensus.virtual_processor().clone();
+    assert_eq!(cvp.queue_test_suspension(identity), suspension_daa);
+    let pending: Vec<_> = blocks.iter().skip(before).map(|b| catch_up.consensus.validate_and_insert_block(b.clone()).virtual_state_task).collect();
+    for task in pending {
+        task.await.unwrap();
+    }
+
+    for block in blocks.iter() {
+        assert_eq!(catch_up.consensus.block_status(block.header.hash), BlockStatus::StatusUTXOValid, "daa {}", block.header.daa_score);
+    }
+    assert_eq!(catch_up.consensus.get_sink(), live.consensus.get_sink());
+    assert!(cvp.is_producer_suspended(&identity, start, true));
+}
+
+/// Node A records a suspension through its own block P at the start; node B, one block behind,
+/// builds a heavier sibling branch Q from the same parent. Returns A's verdict on Q and whether
+/// A followed Q's branch.
+async fn late_sibling_across_a_suspension_start(gate: bool) -> (BlockStatus, bool) {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use keryx_consensus_core::api::ConsensusApi;
+    use keryx_consensus_core::collateral::miner_key;
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_v3_activation = ForkActivation::always();
+            p.exact_verification_activation = ForkActivation::always();
+            p.ratio_verification_activation = ForkActivation::always();
+            p.suspension_pov_activation = if gate { ForkActivation::always() } else { ForkActivation::never() };
+            p.finality_depth = 80;
+        })
+        .build();
+    let mut a = TestContext::new(TestConsensus::new(&config));
+    let mut b = TestContext::new(TestConsensus::new(&config));
+    let miner_spk = a.miner_data.script_public_key.clone();
+    let identity = miner_key(&miner_spk);
+    let avp = a.consensus.virtual_processor().clone();
+    let bvp = b.consensus.virtual_processor().clone();
+    let tip_daa = |vp: &std::sync::Arc<super::VirtualStateProcessor>, ctx: &TestContext| vp.headers_store.get_daa_score(ctx.consensus.get_sink()).unwrap();
+
+    let mut start = u64::MAX;
+    let mut nonce = 0;
+    while start == u64::MAX || tip_daa(&avp, &a) + 1 < start {
+        a.simulated_time += a.consensus.params().target_time_per_block();
+        let block = a.build_block_template(nonce, a.simulated_time).block.to_immutable();
+        nonce += 1;
+        a.validate_and_insert_block(block.clone()).await;
+        b.simulated_time = a.simulated_time;
+        b.validate_and_insert_block(block).await;
+        if nonce == 8 {
+            let daa = avp.queue_test_suspension(identity);
+            assert_eq!(bvp.queue_test_suspension(identity), daa);
+            start = daa + avp.finality_depth;
+        }
+    }
+    assert_eq!(a.consensus.get_sink(), b.consensus.get_sink());
+    assert_eq!(tip_daa(&avp, &a) + 1, start);
+
+    a.simulated_time += a.consensus.params().target_time_per_block();
+    let p = a.build_block_template(1_000, a.simulated_time).block.to_immutable();
+    a.validate_and_insert_block(p).await;
+    assert!(avp.is_producer_suspended(&identity, start, true), "A records the suspension at the start");
+    assert!(!bvp.service_suspended.read().contains_key(&identity), "B has not recorded it yet");
+
+    let mut branch = Vec::new();
+    for k in 0..3 {
+        b.simulated_time += b.consensus.params().target_time_per_block();
+        let q = b.build_block_template(2_000 + k, b.simulated_time).block.to_immutable();
+        b.validate_and_insert_block(q.clone()).await;
+        branch.push(q);
+    }
+    let q = &branch[0];
+    assert!(q.transactions[0].outputs.iter().any(|o| o.script_public_key == miner_spk && o.value > 0), "Q pays the identity");
+    assert!(q.header.daa_score >= start);
+
+    for block in branch.iter() {
+        let status = a.consensus.validate_and_insert_block(block.clone()).virtual_state_task.await.unwrap();
+        assert!(status.has_block_body());
+    }
+    (a.consensus.block_status(q.header.hash), a.consensus.get_sink() == branch[2].header.hash)
+}
+
+#[tokio::test]
+async fn late_sibling_across_a_suspension_start_is_judged_like_its_producer_did() {
+    assert_eq!(late_sibling_across_a_suspension_start(true).await, (BlockStatus::StatusUTXOValid, true));
+}
+
+#[tokio::test]
+async fn late_sibling_across_a_suspension_start_splits_before_the_gate() {
+    assert_eq!(late_sibling_across_a_suspension_start(false).await, (BlockStatus::StatusDisqualifiedFromChain, false));
+}

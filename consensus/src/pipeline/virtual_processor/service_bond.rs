@@ -476,8 +476,9 @@ impl VirtualStateProcessor {
             .service_suspended
             .read()
             .iter()
-            .filter(|(_, until)| until.saturating_sub(SERVICE_SUSPENSION_DAA) <= virtual_daa_score && virtual_daa_score < **until)
-            .map(|(m, until)| (*m, *until))
+            .filter_map(|(m, deadlines)| {
+                deadlines.iter().rev().find(|&&until| suspension_covers(until, virtual_daa_score)).map(|&until| (*m, until))
+            })
             .collect();
         snapshot.suspended.sort_unstable();
         snapshot
@@ -1176,7 +1177,7 @@ impl VirtualStateProcessor {
                     // [daa + finality, daa + finality + SERVICE_SUSPENSION_DAA].
                     if miss.penalty == ServicePenalty::Suspend {
                         let until = daa + self.finality_depth + SERVICE_SUSPENSION_DAA;
-                        self.service_suspended.write().insert(miss.miner, until);
+                        record_suspension(&mut self.service_suspended.write(), miss.miner, until);
                         info!("service-bond: SUSPENSION FINAL for miner {} until daa {} (miss daa {})", miss.miner, until, daa);
                     }
                 }
@@ -1543,10 +1544,9 @@ impl VirtualStateProcessor {
             rows.push((event_daa, service_commit::strike_row_bytes(event_daa, miner, record.count, record.last_daa).to_vec()));
             standing.record_strike(miner, event_daa, record.count, record.last_daa);
             // An executed suspension logs `{0, daa}` with `last_daa` equal to its own event daa;
-            // a served reset carries a strictly older (or zero) preserved daa. The log is in
-            // event order, so the last (largest) deadline per miner wins.
+            // a served reset carries a strictly older (or zero) preserved daa.
             if record.count == 0 && record.last_daa == event_daa {
-                suspended.insert(miner, record.last_daa + self.finality_depth + SERVICE_SUSPENSION_DAA);
+                record_suspension(&mut suspended, miner, record.last_daa + self.finality_depth + SERVICE_SUSPENSION_DAA);
             }
         }
         drop(suspended);
@@ -1659,11 +1659,28 @@ impl VirtualStateProcessor {
     /// this node learned it: a catch-up or fresh node re-validating an old POV must reach the
     /// exact verdict a live node reached — an unbounded lower edge would apply the suspension to
     /// POVs before its finalization.
-    pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64) -> bool {
-        self.service_suspended
-            .read()
-            .get(producer)
-            .is_some_and(|&until| until.saturating_sub(SERVICE_SUSPENSION_DAA) <= daa_score && daa_score < until)
+    /// `every_window` false reads only the latest recorded deadline.
+    pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64, every_window: bool) -> bool {
+        let suspended = self.service_suspended.read();
+        let Some(deadlines) = suspended.get(producer) else { return false };
+        if every_window {
+            deadlines.iter().any(|&until| suspension_covers(until, daa_score))
+        } else {
+            deadlines.last().is_some_and(|&until| suspension_covers(until, daa_score))
+        }
+    }
+}
+
+/// Whether the suspension ending at `until` is in force at `daa_score`.
+fn suspension_covers(until: u64, daa_score: u64) -> bool {
+    until.saturating_sub(SERVICE_SUSPENSION_DAA) <= daa_score && daa_score < until
+}
+
+/// Adds a suspension deadline for `miner`, keeping the deadlines ascending and unique.
+fn record_suspension(suspended: &mut std::collections::HashMap<Hash, Vec<u64>>, miner: Hash, until: u64) {
+    let deadlines = suspended.entry(miner).or_default();
+    if let Err(at) = deadlines.binary_search(&until) {
+        deadlines.insert(at, until);
     }
 }
 
@@ -1771,5 +1788,24 @@ mod tests {
         script.push(keryx_txscript::opcodes::codes::OpCheckSig);
         assert_eq!(csv_escrow_pubkey(&script), Some([0x11u8; 32]));
         assert_eq!(csv_escrow_pubkey(&[0u8; 10]), None);
+    }
+}
+
+#[cfg(test)]
+impl VirtualStateProcessor {
+    /// Queues a third-strike suspension of `miner` at the committed tip, as a fold would. Returns its daa.
+    pub(super) fn queue_test_suspension(&self, miner: Hash) -> u64 {
+        let (idx, hash) = self.selected_chain_store.read().get_tip().unwrap();
+        let daa = self.headers_store.get_daa_score(hash).unwrap();
+        let miss = ServiceMiss {
+            request_hash: [0; 32],
+            miner,
+            consecutive_misses: 3,
+            penalty: ServicePenalty::Suspend,
+            burned: Vec::new(),
+            opening_missing: true,
+        };
+        self.service_ledger.lock().queue.push_back((idx, daa, ServiceEvent::Miss(miss)));
+        daa
     }
 }
