@@ -2296,3 +2296,50 @@ async fn late_sibling_across_a_suspension_start_is_judged_like_its_producer_did(
 async fn late_sibling_across_a_suspension_start_splits_before_the_gate() {
     assert_eq!(late_sibling_across_a_suspension_start(false).await, (BlockStatus::StatusDisqualifiedFromChain, false));
 }
+
+/// A node reopened on its database bounds its first resolution by the same ledger frontier as
+/// before the restart.
+#[tokio::test]
+async fn restart_keeps_the_ledger_batch_frontier() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use keryx_consensus_core::api::ConsensusApi;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_database::prelude::ConnBuilder;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_activation = ForkActivation::always();
+            p.pom_v3_activation = ForkActivation::always();
+            p.exact_verification_activation = ForkActivation::always();
+            p.ratio_verification_activation = ForkActivation::always();
+            p.finality_depth = 80;
+        })
+        .build();
+    let (db_lifetime, db) = keryx_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+    std::mem::forget(db_lifetime);
+
+    let (sender, _receiver) = async_channel::unbounded();
+    let mut ctx = TestContext::new(TestConsensus::with_db(db.clone(), &config, sender));
+    let mut extra = ctx.miner_data.extra_data.to_vec();
+    extra.extend_from_slice(format!("/escrow:{}", "11".repeat(32)).as_bytes());
+    ctx.miner_data.extra_data = extra;
+    for i in 0..76 {
+        ctx.build_block_template_row(i..i + 1).validate_and_insert_row().await.assert_valid_utxo_tip();
+    }
+    let sink = ctx.consensus.get_sink();
+    let vp = ctx.consensus.virtual_processor().clone();
+    let sink_daa = vp.headers_store.get_daa_score(sink).unwrap();
+    let before = vp.virtual_batch_daa_cutoff(sink_daa).unwrap();
+    assert!(before < sink_daa + vp.finality_depth / 8, "the queue must bound the frontier before the restart");
+    drop(vp);
+    drop(ctx);
+
+    let mut reopen = config.clone();
+    reopen.process_genesis = false;
+    let (sender, _receiver) = async_channel::unbounded();
+    let ctx = TestContext::new(TestConsensus::with_db(db.clone(), &reopen, sender));
+    assert_eq!(ctx.consensus.get_sink(), sink);
+    let after = ctx.consensus.virtual_processor().virtual_batch_daa_cutoff(sink_daa).unwrap();
+    assert_eq!(after, before, "the reopened node lost the ledger frontier");
+}
