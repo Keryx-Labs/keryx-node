@@ -2364,6 +2364,41 @@ async fn restart_keeps_the_ledger_batch_frontier() {
     assert_eq!(after, before, "the reopened node lost the ledger frontier");
 }
 
+/// A template requested while the ledger is held keeps its wait bound.
+#[tokio::test]
+async fn template_wait_stays_bounded_while_the_ledger_is_held() {
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_v3_activation = ForkActivation::always();
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    for i in 0..5 {
+        ctx.build_block_template_row(i..i + 1).validate_and_insert_row().await;
+    }
+    let vp = ctx.consensus.virtual_processor().clone();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = vp.clone();
+    let hold = std::thread::spawn(move || {
+        let _guard = holder.service_ledger.lock();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3_500));
+    });
+    held_rx.recv().unwrap();
+    assert!(!vp.service_ledger_folded_tip());
+
+    let started = std::time::Instant::now();
+    ctx.simulated_time += ctx.consensus.params().target_time_per_block();
+    let _template = ctx.build_block_template(99, ctx.simulated_time);
+    let waited = started.elapsed();
+    assert!(waited < std::time::Duration::from_millis(3_000), "the template waited for the held ledger: {waited:?}");
+    hold.join().unwrap();
+    assert!(vp.service_ledger_folded_tip());
+}
+
 /// A template requested between the virtual commit and the ledger fold waits for the fold.
 #[tokio::test]
 async fn template_waits_for_the_ledger_to_fold_the_sink() {

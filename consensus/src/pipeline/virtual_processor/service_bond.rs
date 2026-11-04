@@ -1658,21 +1658,21 @@ impl VirtualStateProcessor {
         wins.into_iter().map(|(_, amount, spk)| (spk, amount)).collect()
     }
 
-    /// Whether `producer` is under a finality-deep suspension at `daa_score`. The window is
-    /// derived from the record itself (`[until − SERVICE_SUSPENSION_DAA, until)`), NOT from when
-    /// this node learned it: a catch-up or fresh node re-validating an old POV must reach the
-    /// exact verdict a live node reached — an unbounded lower edge would apply the suspension to
-    /// POVs before its finalization.
-    /// Whether the ledger has folded the committed selected-chain tip (always true before it folds).
+    /// Whether the ledger has folded the committed selected-chain tip (always true before it folds);
+    /// false while the ledger is busy.
     pub(super) fn service_ledger_folded_tip(&self) -> bool {
         let (idx, hash) = self.selected_chain_store.read().get_tip().unwrap();
         if !self.pom_v3_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
             return true;
         }
-        self.service_ledger.lock().tip == Some(idx)
+        self.service_ledger.try_lock().is_some_and(|l| l.tip == Some(idx))
     }
 
-    /// `every_window` false reads only the latest recorded deadline.
+    /// Whether `producer` is under a finality-deep suspension at `daa_score`. The window is
+    /// derived from the record itself (`[until − SERVICE_SUSPENSION_DAA, until)`), NOT from when
+    /// this node learned it: a catch-up or fresh node re-validating an old POV must reach the
+    /// exact verdict a live node reached — an unbounded lower edge would apply the suspension to
+    /// POVs before its finalization. `every_window` false reads only the latest recorded deadline.
     pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64, every_window: bool) -> bool {
         let suspended = self.service_suspended.read();
         let Some(deadlines) = suspended.get(producer) else { return false };
