@@ -599,6 +599,8 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 /// Context pad tiles of each `POM_TIERS_H14` tier from `pad_margin_activation`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
+const _: () = assert!(POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len() && POM_V5_PAD_TILES_H16.len() == POM_TIERS_H14.len());
+
 /// Context pad tiles of `tier`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool) -> u64 {
     let table = if pad_margin { &POM_V5_PAD_TILES_H16 } else { &POM_V5_PAD_TILES_H14 };
@@ -2987,6 +2989,32 @@ mod h15_gate_tests {
         assert!(p.private_inference_activation.daa_score() < H15_ACTIVATION_DAA);
         assert_eq!(p.block_task_activation, ForkActivation::never());
         assert_eq!(TESTNET_PARAMS.block_task_activation, ForkActivation::never());
+    }
+}
+
+#[cfg(test)]
+mod pad_table_tests {
+    use super::*;
+
+    #[test]
+    fn pad_tables_are_frozen() {
+        assert_eq!(POM_V5_PAD_TILES_H14, [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432]);
+        assert_eq!(POM_V5_PAD_TILES_H16, [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632]);
+        for t in 0..POM_TIERS_H14.len() {
+            assert_eq!(POM_V5_PAD_TILES_H16[t], POM_V5_PAD_TILES_H14[t] - 204_800);
+            assert!(POM_V5_PAD_TILES_H16[t] > 0);
+            assert_eq!(pom_v5_pad_tiles(t as u8, false), POM_V5_PAD_TILES_H14[t]);
+            assert_eq!(pom_v5_pad_tiles(t as u8, true), POM_V5_PAD_TILES_H16[t]);
+        }
+        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, false), 0);
+        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, true), 0);
+    }
+
+    #[test]
+    fn pad_margin_gate_follows_pom_v5() {
+        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS] {
+            assert!(p.pad_margin_activation.daa_score() > p.pom_v5_activation.daa_score());
+        }
     }
 }
 
