@@ -274,8 +274,9 @@ struct EarlyTrace {
     tokens: bool,
 }
 
-fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, prefix_offset: Option<u32>) -> bool {
+fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, prefix_offset: Option<u32>, bounded: bool) -> bool {
     keryx_verifiable_inference::shape::shape_ok(req.prompt_len, shape.answer_len, req.max_tokens, shape.n_prompt, shape.n_pos)
+        && (!bounded || shape.n_prompt <= req.prompt_len.saturating_add(crate::config::params::CONTEXT_OVERHEAD_TOKENS))
         && prefix_offset.is_none_or(|o| keryx_verifiable_inference::prefix::fits(shape.n_prompt, o))
 }
 
@@ -1398,7 +1399,7 @@ impl ServiceLedger {
                     .range((*rh, Hash::from_bytes([0u8; 32]))..=(*rh, Hash::from_bytes([0xffu8; 32])))
                     .map(|((_, key), shape)| (*key, *shape))
                     .collect();
-                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset)));
+                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset, tr.own_shape)));
                 // Under the context rule and the v3 window the well-formed early shapes wait for
                 // the arming, where cohort membership is known.
                 let keep = tr.context || tr.window_v3;
@@ -1459,7 +1460,7 @@ impl ServiceLedger {
                         let rules = (tr.tier)(req.tier, daa);
                         let prefix_offset = rules.as_ref().and_then(|r| r.prefix.as_ref().map(|p| p.offset));
                         let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || (ev.stage == keryx_verifiable_inference::chain::STAGE_CHAIN && ev.tokens));
-                        if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset) {
+                        if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset, tr.own_shape) {
                             misshaped.push((ev.request_hash, ev.responder));
                         } else if (tr.context || tr.window_v3) && req.audit.is_none() {
                             self.early_shapes.insert((ev.request_hash, ev.responder), shape);
@@ -4911,6 +4912,8 @@ mod tests {
             positions: Option<(u32, u32)>,
             /// Attention rule: an audit also needs the attention opening.
             attention: bool,
+            /// Own-shape window rule.
+            own_shape: bool,
             /// Uniform-strike rule.
             uniform_strikes: bool,
         }
@@ -4932,6 +4935,7 @@ mod tests {
                     positions: None,
                     attention: false,
                     uniform_strikes: false,
+                    own_shape: false,
                 }
             }
 
@@ -4995,7 +4999,7 @@ mod tests {
                     dedup: false,
                     seed_bind: self.seed_bind,
                     untraced_silence: false,
-                    own_shape: false,
+                    own_shape: self.own_shape,
                     one_miss: false,
                     uniform_strikes: self.uniform_strikes,
                 };
@@ -6116,6 +6120,26 @@ mod tests {
             assert!(run.ledger.trace_audits.is_empty());
             let end = run.window_end();
             assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+        }
+
+        /// Trace audits a response committing `n_prompt` prompt positions to a 48-byte prompt opens.
+        fn audits_of_prompt_positions(n_prompt: u32, own_shape: bool) -> usize {
+            let mut run = Run::shaped(48, 60);
+            run.own_shape = own_shape;
+            run.positions = Some((n_prompt, n_prompt + 6));
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            run.fold(102, h0, &[ev], &[]);
+            run.ledger.trace_audits.len()
+        }
+
+        #[test]
+        fn prompt_positions_beyond_the_prompt_are_misshaped_past_the_gate() {
+            let bound = 48 + crate::config::params::CONTEXT_OVERHEAD_TOKENS;
+            assert_eq!(audits_of_prompt_positions(bound + 1, false), 1, "before the gate the prompt positions have no upper bound");
+            assert_eq!(audits_of_prompt_positions(bound + 1, true), 0);
+            assert_eq!(audits_of_prompt_positions(bound, true), 1);
         }
 
         #[test]
