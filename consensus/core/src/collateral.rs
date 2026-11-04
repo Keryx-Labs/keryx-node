@@ -242,6 +242,8 @@ pub struct TraceInputs<'a> {
     pub dedup: bool,
     /// Whether an untraced response on an audited tier is left unserved, as before its audit arms.
     pub untraced_silence: bool,
+    /// Whether a traced answer is judged on its own shape when that window is longer.
+    pub own_shape: bool,
     /// Whether an opening naming its seed block is judged only against an audit drawn from that
     /// block, and passed over otherwise.
     pub seed_bind: bool,
@@ -1628,10 +1630,19 @@ impl ServiceLedger {
                     let late: Vec<Hash> = match &audit.v3 {
                         Some(w) => {
                             let (p, g) = req.reference_shape();
-                            let allowed = w.arm_daa + service_window_daa_v3(req.tier, p, g);
+                            let reference = service_window_daa_v3(req.tier, p, g);
+                            let own_shape = traces.is_some_and(|tr| tr.own_shape);
                             w.answers
                                 .iter()
-                                .filter(|(id, at, _)| {
+                                .filter(|(id, at, shape)| {
+                                    let window = match shape.filter(|_| own_shape) {
+                                        Some((sp, sg)) => {
+                                            let sp = if req.prompt_len > 0 { sp.min(req.prompt_len) } else { sp };
+                                            reference.max(service_window_daa_v3(req.tier, sp, sg.min(req.max_tokens)))
+                                        }
+                                        None => reference,
+                                    };
+                                    let allowed = w.arm_daa + window;
                                     audit
                                         .cohort
                                         .binary_search(id)
@@ -4943,6 +4954,7 @@ mod tests {
                     dedup: false,
                     seed_bind: self.seed_bind,
                     untraced_silence: false,
+                    own_shape: false,
                 };
                 let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -5527,6 +5539,7 @@ mod tests {
                     dedup: false,
                     seed_bind: false,
                     untraced_silence: false,
+                    own_shape: false,
                 };
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
                 let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
@@ -6171,6 +6184,8 @@ mod tests {
             recipients: Vec<Hash>,
             /// Untraced-response rule.
             untraced_silence: bool,
+            /// Own-shape window rule.
+            own_shape: bool,
         }
 
         impl Net {
@@ -6189,6 +6204,7 @@ mod tests {
                     sanction: false,
                     recipients: Vec::new(),
                     untraced_silence: false,
+                    own_shape: false,
                 }
             }
 
@@ -6240,6 +6256,7 @@ mod tests {
                     dedup: self.dedup,
                     seed_bind: false,
                     untraced_silence: self.untraced_silence,
+                    own_shape: self.own_shape,
                 };
                 let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
                 let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
@@ -6788,6 +6805,34 @@ mod tests {
             assert_eq!(misses_after_an_armed_answer(false, false), 0, "before the gate an untraced answer still serves");
             assert_eq!(misses_after_an_armed_answer(true, false), 1);
             assert_eq!(misses_after_an_armed_answer(true, true), 0, "a traced answer serves past the gate");
+        }
+
+        /// Misses at the window close when three members answer short and `long` answers a full
+        /// description after the short-answer window but within its own.
+        fn misses_with_a_long_answer_after_short_ones(own_shape: bool) -> (usize, usize) {
+            let (a, b, c, long) = (id(1), id(2), id(3), id(4));
+            let mut net = Net::new(false, true, vec![a, b, c, long]);
+            net.own_shape = own_shape;
+            net.fold(100, chain(0), &[(RH, 2048)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let arm = 101;
+            net.fold(102, chain(0), &[], &[(RH, a, Some((10, 60))), (RH, b, Some((10, 60))), (RH, c, Some((10, 60)))]);
+            let short_window = service_window_daa_v3(0, 10, 50);
+            let own_window = service_window_daa_v3(0, 10, 2000);
+            let at = arm + short_window + 30;
+            assert!(at < arm + own_window, "the long answer must land inside its own window");
+            assert!(at < net.window_end(&RH), "the long answer must land before the audit closes");
+            net.fold(at, chain(0), &[], &[(RH, long, Some((10, 2010)))]);
+            let end = net.window_end(&RH);
+            let misses = net.fold(end + 1, chain(0), &[], &[]).misses;
+            let of = |who: Hash| misses.iter().filter(|m| m.miner == who && m.request_hash == RH).count();
+            (of(long), of(a) + of(b) + of(c))
+        }
+
+        #[test]
+        fn a_long_answer_is_judged_on_its_own_shape_past_the_gate() {
+            assert_eq!(misses_with_a_long_answer_after_short_ones(false), (1, 0), "before the gate the short answers set the window");
+            assert_eq!(misses_with_a_long_answer_after_short_ones(true), (0, 0));
         }
 
         #[test]

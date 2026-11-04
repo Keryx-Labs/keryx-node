@@ -175,6 +175,7 @@ pub struct VirtualStateProcessor {
     pub(super) exact_verification_activation: ForkActivation,
     pub(super) suspension_pov_activation: ForkActivation,
     pub(super) untraced_response_activation: ForkActivation,
+    pub(super) answer_shape_window_activation: ForkActivation,
     pub(super) service_burnable_window_daa: u64,
     /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
     #[allow(clippy::type_complexity)]
@@ -436,6 +437,7 @@ impl VirtualStateProcessor {
             exact_verification_activation: params.exact_verification_activation,
             suspension_pov_activation: params.suspension_pov_activation,
             untraced_response_activation: params.untraced_response_activation,
+            answer_shape_window_activation: params.answer_shape_window_activation,
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
