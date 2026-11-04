@@ -1659,6 +1659,15 @@ impl VirtualStateProcessor {
     /// this node learned it: a catch-up or fresh node re-validating an old POV must reach the
     /// exact verdict a live node reached — an unbounded lower edge would apply the suspension to
     /// POVs before its finalization.
+    /// Whether the ledger has folded the committed selected-chain tip (always true before it folds).
+    pub(super) fn service_ledger_folded_tip(&self) -> bool {
+        let (idx, hash) = self.selected_chain_store.read().get_tip().unwrap();
+        if !self.pom_v3_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
+            return true;
+        }
+        self.service_ledger.lock().tip == Some(idx)
+    }
+
     /// `every_window` false reads only the latest recorded deadline.
     pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64, every_window: bool) -> bool {
         let suspended = self.service_suspended.read();
@@ -1807,5 +1816,11 @@ impl VirtualStateProcessor {
         };
         self.service_ledger.lock().queue.push_back((idx, daa, ServiceEvent::Miss(miss)));
         daa
+    }
+
+    /// Moves the ledger's folded tip back by one chain block, as between commit and fold.
+    pub(super) fn rewind_test_ledger_tip(&self) {
+        let mut sync = self.service_ledger.lock();
+        sync.tip = sync.tip.map(|t| t - 1);
     }
 }

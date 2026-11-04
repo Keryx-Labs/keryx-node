@@ -1720,7 +1720,20 @@ impl VirtualStateProcessor {
         // are called within the lock in order to preserve validness of already validated txs
         let mut txs = tx_selector.select_transactions();
         let mut calculated_fees = Vec::with_capacity(txs.len());
-        let virtual_read = self.virtual_stores.read();
+        let mut waits = 0;
+        let virtual_read = loop {
+            let read = self.virtual_stores.read();
+            if self.service_ledger_folded_tip() {
+                break read;
+            }
+            if waits == 1_000 {
+                warn!("block template built before the service ledger folded the sink");
+                break read;
+            }
+            drop(read);
+            waits += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
 
