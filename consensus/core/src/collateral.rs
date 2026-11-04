@@ -246,6 +246,8 @@ pub struct TraceInputs<'a> {
     pub own_shape: bool,
     /// Whether a request strikes an identity at most once, whichever path misses first.
     pub one_miss: bool,
+    /// Whether every miss path escalates through the same ladder, at most once per strike interval.
+    pub uniform_strikes: bool,
     /// Whether an opening naming its seed block is judged only against an audit drawn from that
     /// block, and passed over otherwise.
     pub seed_bind: bool,
@@ -1680,8 +1682,7 @@ impl ServiceLedger {
                         }
                         // Rate-limit: a strike lands at most once per interval. A miss inside the
                         // interval of the miner's last strike is a no-op — no escalation, no burn.
-                        if self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
-                        {
+                        if self.within_strike_interval(miner, daa) {
                             continue;
                         }
                         let count = self.consecutive_misses(miner) + 1;
@@ -1804,6 +1805,11 @@ impl ServiceLedger {
         }
 
         outcome
+    }
+
+    /// Whether a strike on `miner` at `daa` falls inside the interval of its last strike.
+    fn within_strike_interval(&self, miner: &Hash, daa: u64) -> bool {
+        self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
     }
 
     /// Takes `identity` out of every other judgement of `request_hash`: its trace audits and its
@@ -2026,10 +2032,10 @@ impl ServiceLedger {
             if verdict.is_err() {
                 self.drop_draw_candidates(&a.request_hash, &a.identities);
                 for miner in a.identities.iter() {
-                    if warmup || (tr.sanction && self.struck_at(miner, daa)) {
+                    if warmup || (tr.sanction && self.struck_at(miner, daa)) || (tr.uniform_strikes && self.within_strike_interval(miner, daa)) {
                         continue;
                     }
-                    let count = (self.consecutive_misses(miner) + 1).max(2);
+                    let count = if tr.uniform_strikes { self.consecutive_misses(miner) + 1 } else { (self.consecutive_misses(miner) + 1).max(2) };
                     let penalty = strike_penalty_at(count, is_established(miner), self.v2_at(daa));
                     self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
                     let burned = self.burn(miner, penalty);
@@ -2060,11 +2066,7 @@ impl ServiceLedger {
                 if warmup {
                     continue;
                 }
-                let skip = if tr.sanction {
-                    self.struck_at(miner, daa)
-                } else {
-                    self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
-                };
+                let skip = if tr.sanction && !tr.uniform_strikes { self.struck_at(miner, daa) } else { self.within_strike_interval(miner, daa) };
                 if skip {
                     continue;
                 }
@@ -4902,6 +4904,8 @@ mod tests {
             positions: Option<(u32, u32)>,
             /// Attention rule: an audit also needs the attention opening.
             attention: bool,
+            /// Uniform-strike rule.
+            uniform_strikes: bool,
         }
 
         impl Run {
@@ -4920,6 +4924,7 @@ mod tests {
                     cohort: vec![miner()],
                     positions: None,
                     attention: false,
+                    uniform_strikes: false,
                 }
             }
 
@@ -4985,6 +4990,7 @@ mod tests {
                     untraced_silence: false,
                     own_shape: false,
                     one_miss: false,
+                    uniform_strikes: self.uniform_strikes,
                 };
                 let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -5208,6 +5214,15 @@ mod tests {
             run.until_draw(true, true);
             let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, attention_body())]);
             assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_bad_attention_opening_enters_the_first_rung_past_the_uniform_gate() {
+            let mut run = Run { attention: true, uniform_strikes: true, ..Run::new(true) };
+            run.until_draw(true, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, attention_body())]);
+            assert_eq!(misses, vec![(miner(), 1)]);
             assert!(run.ledger.trace_audits.is_empty());
         }
 
@@ -5571,6 +5586,7 @@ mod tests {
                     untraced_silence: false,
                     own_shape: false,
                     one_miss: false,
+                    uniform_strikes: false,
                 };
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
                 let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
@@ -5874,6 +5890,17 @@ mod tests {
             let h = Hash::from_bytes([3u8; 32]);
             assert_eq!(run.fold(first + 1, h, &[], &[]), vec![(miner(), 1)]);
             assert_eq!(run.fold(last + 1, h, &[], &[]), vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn missing_openings_in_two_folds_strike_once_past_the_uniform_gate() {
+            let (mut run, first, last) = two_drawn_audits(true);
+            run.uniform_strikes = true;
+            assert!(last - first < crate::collateral::SERVICE_STRIKE_INTERVAL_DAA);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert_eq!(run.fold(first + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert_eq!(run.fold(last + 1, h, &[], &[]), vec![]);
             assert!(run.ledger.trace_audits.is_empty());
         }
 
@@ -6219,6 +6246,8 @@ mod tests {
             own_shape: bool,
             /// One-miss-per-request rule.
             one_miss: bool,
+            /// Uniform-strike rule.
+            uniform_strikes: bool,
         }
 
         impl Net {
@@ -6239,6 +6268,7 @@ mod tests {
                     untraced_silence: false,
                     own_shape: false,
                     one_miss: false,
+                    uniform_strikes: false,
                 }
             }
 
@@ -6292,6 +6322,7 @@ mod tests {
                     untraced_silence: self.untraced_silence,
                     own_shape: self.own_shape,
                     one_miss: self.one_miss,
+                    uniform_strikes: self.uniform_strikes,
                 };
                 let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
                 let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
