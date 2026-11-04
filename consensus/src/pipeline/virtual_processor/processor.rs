@@ -1319,14 +1319,26 @@ impl VirtualStateProcessor {
             return (tips, false);
         }
         let mut kept: Vec<Hash> = Vec::with_capacity(tips.len());
+        let mut resolved: std::collections::HashMap<Hash, Hash> = std::collections::HashMap::new();
         for tip in tips {
-            let mut cut = tip;
-            while daa(cut) >= cutoff {
-                let parent = self.ghostdag_store.get_selected_parent(cut).unwrap();
-                if parent.is_origin() || parent == prev_sink {
-                    break;
+            let mut path = Vec::new();
+            let mut at = tip;
+            let cut = loop {
+                if let Some(&r) = resolved.get(&at) {
+                    break r;
                 }
-                cut = parent;
+                if daa(at) < cutoff {
+                    break at;
+                }
+                path.push(at);
+                let parent = self.ghostdag_store.get_selected_parent(at).unwrap();
+                if parent.is_origin() || parent == prev_sink {
+                    break at;
+                }
+                at = parent;
+            };
+            for h in path {
+                resolved.insert(h, cut);
             }
             if !kept.contains(&cut) {
                 kept.push(cut);
