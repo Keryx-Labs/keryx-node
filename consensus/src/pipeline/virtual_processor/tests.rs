@@ -1923,6 +1923,92 @@ async fn fresh_node_import_rebases_and_verifies_exactly() {
     tc.shutdown(handles);
 }
 
+/// After a fast-sync import, a cohort window crossing below the pruning point reads the imported
+/// producers there and never a chain hash the import did not bring.
+#[tokio::test]
+async fn fresh_node_cohort_below_the_imported_pruning_point() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::production_seed::ProductionIndexSeedStore;
+    use crate::model::stores::pruning::PruningStore;
+    use crate::model::stores::selected_chain::{SelectedChainStore, SelectedChainStoreReader};
+    use keryx_consensus_core::collateral::ProductionIndexSnapshot;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::ChainPath;
+    use keryx_database::prelude::ConnBuilder;
+    use rocksdb::WriteBatch;
+
+    const WINDOW: u64 = 20;
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_level_activation = ForkActivation::always();
+            p.pom_v3_activation = ForkActivation::always();
+            p.service_ledger_activation = ForkActivation::always();
+            p.blockrate.finality_depth = 10;
+            p.ratio_reward_window_daa = WINDOW;
+        })
+        .build();
+    let (db_lifetime, db) = keryx_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+    let (dummy_sender, _receiver) = async_channel::unbounded();
+    let tc = TestConsensus::with_db(db.clone(), &config, dummy_sender);
+    std::mem::forget(db_lifetime);
+    let handles = tc.init();
+
+    const BASE: u64 = 7_100_000;
+    let block = |n: u64| Hash::from(BASE + n);
+    let mut parent = config.genesis.hash;
+    for n in 1..=60u64 {
+        tc.add_utxo_valid_block_with_parents(block(n), vec![parent], vec![]).await.unwrap();
+        parent = block(n);
+    }
+    let vp = tc.virtual_processor().clone();
+
+    let samples: Vec<Hash> = (1..=60u64).map(block).filter(|h| vp.is_pruning_sample_block(*h)).collect();
+    let pos = samples
+        .iter()
+        .position(|h| vp.selected_chain_store.read().get_by_hash(*h).unwrap() >= 2 * WINDOW)
+        .expect("a sample two windows in");
+    let sample = samples[pos];
+    let sample_idx = vp.selected_chain_store.read().get_by_hash(sample).unwrap();
+    let sample_daa = vp.headers_store.get_daa_score(sample).unwrap();
+    let (tip_idx, _) = vp.selected_chain_store.read().get_tip().unwrap();
+    let seed = vp.selected_chain_store.read().get_by_index(sample_idx + 1).unwrap();
+    let window = 5;
+    let reference = vp.service_eligible_miners_windowed(seed, 0, window);
+
+    let bytes = vp.production_index_snapshot_store.get(sample).unwrap().expect("the sample carries its snapshot");
+    let snapshot = ProductionIndexSnapshot::from_bytes(&bytes).unwrap();
+    assert!(snapshot.bottom_index < sample_idx);
+    {
+        let mut batch = WriteBatch::default();
+        vp.selected_chain_store.write().init_with_pruning_point(&mut batch, sample).unwrap();
+        vp.windowed_production_prefix_store.clear(&mut batch);
+        vp.production_window_store.clear(&mut batch);
+        vp.production_index_seed_store.write().set_batch(&mut batch, 0).unwrap();
+        db.write(batch).unwrap();
+    }
+    vp.pruning_point_store.write().set(sample, 1).unwrap();
+    vp.install_production_index_snapshot(sample, bytes, snapshot).unwrap();
+    {
+        let path = ChainPath { added: ((sample_idx + 1)..=tip_idx).map(block).collect(), removed: vec![] };
+        let mut batch = WriteBatch::default();
+        let mut sc = vp.selected_chain_store.write();
+        vp.advance_production_prefix(&mut batch, &path, &*sc);
+        sc.apply_changes(&mut batch, &path).unwrap();
+        drop(sc);
+        db.write(batch).unwrap();
+    }
+    assert!(vp.selected_chain_store.read().get_by_index(sample_idx - 1).is_err(), "no chain hash below the imported pruning point");
+
+    assert_eq!(vp.service_eligible_miners_windowed(seed, 0, window), reference);
+    let id = Hash::from_bytes([0xAAu8; 32]);
+    let escrow = Hash::from_bytes([0xBBu8; 32]);
+    *vp.service_imported_producers.write() = vec![(sample_daa, id, 0, escrow)];
+    assert_eq!(vp.service_eligible_miners_windowed(seed, 0, window), vec![(id, escrow)]);
+
+    tc.shutdown(handles);
+}
+
 /// A selector handing out its transactions once and failing once any is rejected.
 struct RejectAwareSelector {
     txs: Option<Vec<Transaction>>,

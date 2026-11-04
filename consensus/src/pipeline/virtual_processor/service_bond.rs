@@ -266,7 +266,9 @@ impl VirtualStateProcessor {
         // the local pruning point (fresh IBD / restart catch-up). Past the ledger gate the part
         // below the pruning point is read from the imported snapshot; before it the audit arms
         // empty rather than with a cohort no local search can reproduce.
-        let (pruning_idx, below) = match self.window_floor_in_retention(sc, seed_header.pruning_point, own_pp, daa_bound) {
+        // The floor may be a snapshot-only index (daa known, no block hash): that is not retained history.
+        let floor = self.window_floor_in_retention(sc, seed_header.pruning_point, own_pp, daa_bound).filter(|&idx| sc.get_by_index(idx).is_ok());
+        let (pruning_idx, below) = match floor {
             Some(idx) => (idx, false),
             None if self.service_ledger_activation.is_active(seed_header.daa_score) => match sc.get_by_hash(own_pp) {
                 Ok(idx) => (idx, true),
