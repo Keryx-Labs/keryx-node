@@ -1299,26 +1299,37 @@ impl VirtualStateProcessor {
     /// The function returns with `diff` being the diff of the new sink from previous virtual.
     /// In addition to the found sink the function also returns a queue of additional virtual
     /// parent candidates ordered in descending blue work order.
-    /// Keeps the resolution below the service-ledger flush frontier: when a tip lies at or past
-    /// it, the tips collapse to the last chain block of the heaviest such tip below the frontier
-    /// (at least the block above `prev_sink`). Returns the tips and whether they were cut.
+    /// Keeps the resolution below the service-ledger flush frontier: every tip at or past it is
+    /// replaced by the last block of its selected chain below the frontier (at least the block
+    /// above `prev_sink`); the result is reduced to an antichain. Returns the tips and whether any
+    /// was cut.
     fn cut_tips_at_ledger_frontier(&self, tips: Vec<Hash>, prev_sink: Hash) -> (Vec<Hash>, bool) {
         let sink_daa = self.headers_store.get_daa_score(prev_sink).unwrap();
         let Some(cutoff) = self.virtual_batch_daa_cutoff(sink_daa) else { return (tips, false) };
         let daa = |h: Hash| self.headers_store.get_daa_score(h).unwrap();
-        let Some(best) = tips.iter().copied().filter(|h| daa(*h) >= cutoff).max_by_key(|h| self.ghostdag_store.get_blue_work(*h).unwrap())
-        else {
+        if tips.iter().all(|h| daa(*h) < cutoff) {
             return (tips, false);
-        };
-        let mut cut = best;
-        while daa(cut) >= cutoff {
-            let parent = self.ghostdag_store.get_selected_parent(cut).unwrap();
-            if parent.is_origin() || parent == prev_sink {
-                break;
-            }
-            cut = parent;
         }
-        (vec![cut], true)
+        let mut kept: Vec<Hash> = Vec::with_capacity(tips.len());
+        for tip in tips {
+            let mut cut = tip;
+            while daa(cut) >= cutoff {
+                let parent = self.ghostdag_store.get_selected_parent(cut).unwrap();
+                if parent.is_origin() || parent == prev_sink {
+                    break;
+                }
+                cut = parent;
+            }
+            if !kept.contains(&cut) {
+                kept.push(cut);
+            }
+        }
+        let antichain = kept
+            .iter()
+            .copied()
+            .filter(|&a| !kept.iter().any(|&b| b != a && self.reachability_service.is_dag_ancestor_of(a, b)))
+            .collect();
+        (antichain, true)
     }
 
     pub(super) fn sink_search_algorithm(

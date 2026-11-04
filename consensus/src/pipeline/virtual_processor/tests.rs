@@ -2221,7 +2221,7 @@ async fn batch_catch_up_across_a_suspension_start_matches_the_live_chain() {
 /// Node A records a suspension through its own block P at the start; node B, one block behind,
 /// builds a heavier sibling branch Q from the same parent. Returns A's verdict on Q and whether
 /// A followed Q's branch.
-async fn late_sibling_across_a_suspension_start(gate: bool) -> (BlockStatus, bool) {
+async fn late_sibling_across_a_suspension_start(gate: bool, finality: u64, pom: bool) -> (BlockStatus, bool, bool) {
     use crate::model::stores::headers::HeaderStoreReader;
     use keryx_consensus_core::api::ConsensusApi;
     use keryx_consensus_core::collateral::miner_key;
@@ -2234,7 +2234,10 @@ async fn late_sibling_across_a_suspension_start(gate: bool) -> (BlockStatus, boo
             p.exact_verification_activation = ForkActivation::always();
             p.ratio_verification_activation = ForkActivation::always();
             p.suspension_pov_activation = if gate { ForkActivation::always() } else { ForkActivation::never() };
-            p.finality_depth = 80;
+            if pom {
+                p.pom_activation = ForkActivation::always();
+            }
+            p.finality_depth = finality;
         })
         .build();
     let mut a = TestContext::new(TestConsensus::new(&config));
@@ -2265,6 +2268,7 @@ async fn late_sibling_across_a_suspension_start(gate: bool) -> (BlockStatus, boo
 
     a.simulated_time += a.consensus.params().target_time_per_block();
     let p = a.build_block_template(1_000, a.simulated_time).block.to_immutable();
+    let p_hash = p.header.hash;
     a.validate_and_insert_block(p).await;
     assert!(avp.is_producer_suspended(&identity, start, true), "A records the suspension at the start");
     assert!(!bvp.service_suspended.read().contains_key(&identity), "B has not recorded it yet");
@@ -2284,17 +2288,18 @@ async fn late_sibling_across_a_suspension_start(gate: bool) -> (BlockStatus, boo
         let status = a.consensus.validate_and_insert_block(block.clone()).virtual_state_task.await.unwrap();
         assert!(status.has_block_body());
     }
-    (a.consensus.block_status(q.header.hash), a.consensus.get_sink() == branch[2].header.hash)
+    let sink = a.consensus.get_sink();
+    (a.consensus.block_status(q.header.hash), sink == branch[2].header.hash, sink == p_hash)
 }
 
 #[tokio::test]
 async fn late_sibling_across_a_suspension_start_is_judged_like_its_producer_did() {
-    assert_eq!(late_sibling_across_a_suspension_start(true).await, (BlockStatus::StatusUTXOValid, true));
+    assert_eq!(late_sibling_across_a_suspension_start(true, 80, false).await, (BlockStatus::StatusUTXOValid, true, false));
 }
 
 #[tokio::test]
 async fn late_sibling_across_a_suspension_start_splits_before_the_gate() {
-    assert_eq!(late_sibling_across_a_suspension_start(false).await, (BlockStatus::StatusDisqualifiedFromChain, false));
+    assert_eq!(late_sibling_across_a_suspension_start(false, 80, false).await, (BlockStatus::StatusDisqualifiedFromChain, false, true));
 }
 
 /// A node reopened on its database bounds its first resolution by the same ledger frontier as
@@ -2381,4 +2386,10 @@ async fn template_waits_for_the_ledger_to_fold_the_sink() {
     assert!(waited < std::time::Duration::from_millis(1_500), "the template waited out its bound: {waited:?}");
     assert!(vp.service_ledger_folded_tip());
     fold.join().unwrap();
+}
+
+/// A heavier branch rejected at the frontier does not pull the sink back off the valid chain.
+#[tokio::test]
+async fn rejected_heavier_branch_across_the_frontier_keeps_the_valid_sink() {
+    assert_eq!(late_sibling_across_a_suspension_start(false, 20, true).await, (BlockStatus::StatusDisqualifiedFromChain, false, true));
 }
