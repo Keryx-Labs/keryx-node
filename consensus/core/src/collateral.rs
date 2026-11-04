@@ -244,6 +244,8 @@ pub struct TraceInputs<'a> {
     pub untraced_silence: bool,
     /// Whether a traced answer is judged on its own shape when that window is longer.
     pub own_shape: bool,
+    /// Whether a request strikes an identity at most once, whichever path misses first.
+    pub one_miss: bool,
     /// Whether an opening naming its seed block is judged only against an audit drawn from that
     /// block, and passed over otherwise.
     pub seed_bind: bool,
@@ -1700,6 +1702,9 @@ impl ServiceLedger {
                             burned,
                             opening_missing: false,
                         });
+                        if traces.is_some_and(|tr| tr.one_miss) {
+                            self.forget_struck(&rh, miner);
+                        }
                     }
                     self.pending.remove(&rh);
                 }
@@ -1801,10 +1806,28 @@ impl ServiceLedger {
         outcome
     }
 
+    /// Takes `identity` out of every other judgement of `request_hash`: its trace audits and its
+    /// cohort (with the matching queue entry).
+    fn forget_struck(&mut self, request_hash: &[u8; 32], identity: &Hash) {
+        for a in self.trace_audits.values_mut().filter(|a| &a.request_hash == request_hash) {
+            a.identities.retain(|id| id != identity);
+        }
+        if let Some(audit) = self.pending.get_mut(request_hash).and_then(|r| r.audit.as_mut())
+            && let Ok(i) = audit.cohort.binary_search(identity)
+        {
+            audit.cohort.remove(i);
+            if let Some(w) = audit.v3.as_mut()
+                && i < w.queue.len()
+            {
+                w.queue.remove(i);
+            }
+        }
+    }
+
     /// Fills the tier, token budget and sanctioned identities of a trace audit from its request,
     /// once that request's audit is armed.
     fn resolve_trace_audit(&self, a: &mut TraceAudit) {
-        if !a.identities.is_empty() {
+        if !a.identities.is_empty() || a.tier != TRACE_TIER_UNKNOWN {
             return;
         }
         let Some(req) = self.pending.get(&a.request_hash) else { return };
@@ -2021,6 +2044,9 @@ impl ServiceLedger {
                         burned,
                         opening_missing: false,
                     });
+                    if tr.one_miss {
+                        self.forget_struck(&a.request_hash, miner);
+                    }
                 }
             }
         }
@@ -2057,6 +2083,9 @@ impl ServiceLedger {
                     burned,
                     opening_missing: true,
                 });
+                if tr.one_miss {
+                    self.forget_struck(&a.request_hash, miner);
+                }
             }
         }
 
@@ -4955,6 +4984,7 @@ mod tests {
                     seed_bind: self.seed_bind,
                     untraced_silence: false,
                     own_shape: false,
+                    one_miss: false,
                 };
                 let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -5540,6 +5570,7 @@ mod tests {
                     seed_bind: false,
                     untraced_silence: false,
                     own_shape: false,
+                    one_miss: false,
                 };
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
                 let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
@@ -6186,6 +6217,8 @@ mod tests {
             untraced_silence: bool,
             /// Own-shape window rule.
             own_shape: bool,
+            /// One-miss-per-request rule.
+            one_miss: bool,
         }
 
         impl Net {
@@ -6205,6 +6238,7 @@ mod tests {
                     recipients: Vec::new(),
                     untraced_silence: false,
                     own_shape: false,
+                    one_miss: false,
                 }
             }
 
@@ -6257,6 +6291,7 @@ mod tests {
                     seed_bind: false,
                     untraced_silence: self.untraced_silence,
                     own_shape: self.own_shape,
+                    one_miss: self.one_miss,
                 };
                 let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
                 let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
@@ -6833,6 +6868,37 @@ mod tests {
         fn a_long_answer_is_judged_on_its_own_shape_past_the_gate() {
             assert_eq!(misses_with_a_long_answer_after_short_ones(false), (1, 0), "before the gate the short answers set the window");
             assert_eq!(misses_with_a_long_answer_after_short_ones(true), (0, 0));
+        }
+
+        /// Misses `a` takes on one request when its traced answer is late and its opening never
+        /// comes, in the order they fall.
+        fn misses_of_a_late_unopened_answer(one_miss: bool) -> Vec<bool> {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.one_miss = one_miss;
+            net.fold(100, chain(0), &[(RH, 2048)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let late_at = 101 + service_window_daa_v3(0, 10, 50) + 50;
+            assert!(late_at < net.window_end(&RH), "the answer must land before the audit closes");
+            for daa in 102..late_at {
+                net.fold(daa, chain((daa % 7) as u8), &[], &[]);
+            }
+            let mut misses = Vec::new();
+            net.fold(late_at, chain(1), &[], &[(RH, a, Some((10, 60)))]);
+            for daa in late_at + 1..late_at + 60_000 {
+                let out = net.fold(daa, chain((daa % 7) as u8), &[], &[]);
+                misses.extend(out.misses.iter().filter(|m| m.miner == a && m.request_hash == RH).map(|m| m.opening_missing));
+            }
+            misses
+        }
+
+        #[test]
+        fn a_late_unopened_answer_strikes_once_past_the_gate() {
+            let before = misses_of_a_late_unopened_answer(false);
+            assert_eq!(before.len(), 2, "before the gate the window and the opening both strike: {before:?}");
+            assert_eq!(misses_of_a_late_unopened_answer(true).len(), 1);
         }
 
         #[test]

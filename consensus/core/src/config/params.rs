@@ -1971,6 +1971,8 @@ pub struct Params {
     pub untraced_response_activation: ForkActivation,
     /// H16: a traced answer is judged on its own shape when that window is longer.
     pub answer_shape_window_activation: ForkActivation,
+    /// H16: a request strikes an identity at most once, whichever path misses first.
+    pub one_miss_per_request_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
     pub service_burnable_window_daa: u64,
@@ -2255,6 +2257,7 @@ impl Params {
             suspension_pov_activation: self.suspension_pov_activation,
             untraced_response_activation: self.untraced_response_activation,
             answer_shape_window_activation: self.answer_shape_window_activation,
+            one_miss_per_request_activation: self.one_miss_per_request_activation,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
@@ -2485,6 +2488,7 @@ pub const MAINNET_PARAMS: Params = Params {
     suspension_pov_activation: ForkActivation::never(),
     untraced_response_activation: ForkActivation::never(),
     answer_shape_window_activation: ForkActivation::never(),
+    one_miss_per_request_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -2634,6 +2638,7 @@ pub const TESTNET_PARAMS: Params = Params {
     suspension_pov_activation: ForkActivation::never(),
     untraced_response_activation: ForkActivation::never(),
     answer_shape_window_activation: ForkActivation::never(),
+    one_miss_per_request_activation: ForkActivation::never(),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2746,6 +2751,7 @@ pub const SIMNET_PARAMS: Params = Params {
     suspension_pov_activation: ForkActivation::never(),
     untraced_response_activation: ForkActivation::never(),
     answer_shape_window_activation: ForkActivation::never(),
+    one_miss_per_request_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2852,6 +2858,7 @@ pub const DEVNET_PARAMS: Params = Params {
     suspension_pov_activation: ForkActivation::never(),
     untraced_response_activation: ForkActivation::never(),
     answer_shape_window_activation: ForkActivation::never(),
+    one_miss_per_request_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
