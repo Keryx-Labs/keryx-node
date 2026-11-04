@@ -2528,6 +2528,22 @@ async fn strikes_snapshot_reports_the_latest_window_in_force() {
     assert_eq!(vp.service_strikes_snapshot(only_older).suspended, vec![(id, older)]);
 }
 
+/// Before the gate the strikes snapshot reads only the latest deadline, as the consensus does.
+#[tokio::test]
+async fn strikes_snapshot_reads_the_latest_deadline_before_the_gate() {
+    use keryx_consensus_core::collateral::SERVICE_SUSPENSION_DAA;
+
+    let (ctx, _template, _spk) = suspension_fixture(false).await;
+    let vp = ctx.consensus.virtual_processor().clone();
+    let id = Hash::from_bytes([9; 32]);
+    let pov = 2_000_000;
+    let (older, newer) = (pov + 100, pov + 200);
+    vp.service_suspended.write().insert(id, vec![older, newer]);
+    assert_eq!(vp.service_strikes_snapshot(pov).suspended, vec![(id, newer)]);
+    let only_older = newer - SERVICE_SUSPENSION_DAA - 1;
+    assert!(vp.service_strikes_snapshot(only_older).suspended.is_empty());
+}
+
 fn suspension_config(finality: u64) -> keryx_consensus_core::config::Config {
     use keryx_consensus_core::config::params::ForkActivation;
     ConfigBuilder::new(MAINNET_PARAMS)

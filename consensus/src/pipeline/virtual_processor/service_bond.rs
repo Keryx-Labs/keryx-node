@@ -472,12 +472,14 @@ impl VirtualStateProcessor {
         // Only the suspensions in force at this POV: the map keeps every record ever flushed, so
         // that re-validating an old POV reaches the verdict a live node reached. Reporting it raw
         // leaves expired suspensions on display long after production resumed.
+        let every_window = self.suspension_pov_activation.is_active(virtual_daa_score);
         snapshot.suspended = self
             .service_suspended
             .read()
             .iter()
             .filter_map(|(m, deadlines)| {
-                deadlines.iter().rev().find(|&&until| suspension_covers(until, virtual_daa_score)).map(|&until| (*m, until))
+                let considered = if every_window { &deadlines[..] } else { &deadlines[deadlines.len().saturating_sub(1)..] };
+                considered.iter().rev().find(|&&until| suspension_covers(until, virtual_daa_score)).map(|&until| (*m, until))
             })
             .collect();
         snapshot.suspended.sort_unstable();
