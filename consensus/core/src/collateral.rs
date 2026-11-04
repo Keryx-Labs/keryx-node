@@ -1594,7 +1594,7 @@ impl ServiceLedger {
         let mut awaiting = std::collections::BTreeSet::new();
         if let Some(tr) = traces {
             self.fold_traces(daa, tr, &parked, &misshaped, warmup, &is_established, &mut outcome);
-            self.resolve_trace_audits();
+            self.resolve_trace_audits(tr.one_miss);
             awaiting = self.audits_awaiting();
             let closing: Vec<[u8; 32]> = self
                 .pending
@@ -1839,8 +1839,8 @@ impl ServiceLedger {
 
     /// Fills the tier, token budget and sanctioned identities of a trace audit from its request,
     /// once that request's audit is armed.
-    fn resolve_trace_audit(&self, a: &mut TraceAudit) {
-        if !a.identities.is_empty() || a.tier != TRACE_TIER_UNKNOWN {
+    fn resolve_trace_audit(&self, a: &mut TraceAudit, one_miss: bool) {
+        if !a.identities.is_empty() || (one_miss && a.tier != TRACE_TIER_UNKNOWN) {
             return;
         }
         let Some(req) = self.pending.get(&a.request_hash) else { return };
@@ -1895,7 +1895,7 @@ impl ServiceLedger {
                 attn: None,
                 chain_start: 0,
             };
-            self.resolve_trace_audit(&mut a);
+            self.resolve_trace_audit(&mut a, tr.one_miss);
             self.trace_audits.insert(ev.response_txid, a);
         }
 
@@ -1914,7 +1914,7 @@ impl ServiceLedger {
         }
         for txid in ripe {
             let mut a = self.trace_audits.remove(&txid).unwrap();
-            self.resolve_trace_audit(&mut a);
+            self.resolve_trace_audit(&mut a, tr.one_miss);
             if tr.sanction && a.identities.is_empty() && self.pending.get(&a.request_hash).is_some_and(|r| r.audit.is_none()) {
                 self.trace_audits.insert(txid, a);
                 continue;
@@ -2302,11 +2302,11 @@ impl ServiceLedger {
     }
 
     /// Binds every trace audit whose request is now armed to the cohort identities it serves.
-    fn resolve_trace_audits(&mut self) {
+    fn resolve_trace_audits(&mut self, one_miss: bool) {
         let unresolved: Vec<[u8; 32]> = self.trace_audits.iter().filter(|(_, a)| a.identities.is_empty()).map(|(k, _)| *k).collect();
         for k in unresolved {
             let mut a = self.trace_audits.remove(&k).unwrap();
-            self.resolve_trace_audit(&mut a);
+            self.resolve_trace_audit(&mut a, one_miss);
             self.trace_audits.insert(k, a);
         }
     }
@@ -6980,6 +6980,25 @@ mod tests {
             }
             assert!(!net.ledger.pending.contains_key(&RH), "the window must have resolved");
             net.ledger.trace_audits.values().filter(|t| t.request_hash == RH).flat_map(|t| t.identities.clone()).collect()
+        }
+
+        #[test]
+        fn a_resolved_audit_with_no_identity_resolves_again_before_the_gate() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((0, 256)))]);
+            let mut t = net.ledger.trace_audits.values().find(|t| t.request_hash == RH).unwrap().clone();
+            assert_eq!(t.identities, vec![a]);
+            assert_ne!(t.tier, TRACE_TIER_UNKNOWN);
+            t.identities.clear();
+            let mut gated = t.clone();
+            net.ledger.resolve_trace_audit(&mut t, false);
+            assert_eq!(t.identities, vec![a], "before the gate a resolved tier does not stop the resolution");
+            net.ledger.resolve_trace_audit(&mut gated, true);
+            assert!(gated.identities.is_empty());
         }
 
         #[test]
