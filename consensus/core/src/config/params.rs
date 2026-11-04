@@ -596,6 +596,15 @@ pub const POM_TIERS_H14: &[crate::pom::PomTier] = &[
 /// Context pad tiles of each `POM_TIERS_H14` tier under the v5 walk; 0 = no pad.
 pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471_680, 2_450_432];
 
+/// Context pad tiles of each `POM_TIERS_H14` tier from `pad_margin_activation`.
+pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
+
+/// Context pad tiles of `tier`; 0 = no pad.
+pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool) -> u64 {
+    let table = if pad_margin { &POM_V5_PAD_TILES_H16 } else { &POM_V5_PAD_TILES_H14 };
+    table.get(tier as usize).copied().unwrap_or(0)
+}
+
 /// Matmul manifest of a tier: root `M_T`, entry count and product count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TraceManifest {
@@ -1975,6 +1984,8 @@ pub struct Params {
     pub one_miss_per_request_activation: ForkActivation,
     /// H16: every miss path escalates through the same ladder, at most once per strike interval.
     pub uniform_strike_activation: ForkActivation,
+    /// H16: context pad tiles from `POM_V5_PAD_TILES_H16`.
+    pub pad_margin_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
     pub service_burnable_window_daa: u64,
@@ -2261,6 +2272,7 @@ impl Params {
             answer_shape_window_activation: self.answer_shape_window_activation,
             one_miss_per_request_activation: self.one_miss_per_request_activation,
             uniform_strike_activation: self.uniform_strike_activation,
+            pad_margin_activation: self.pad_margin_activation,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
@@ -2493,6 +2505,7 @@ pub const MAINNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -2644,6 +2657,7 @@ pub const TESTNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2758,6 +2772,7 @@ pub const SIMNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2866,6 +2881,7 @@ pub const DEVNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
