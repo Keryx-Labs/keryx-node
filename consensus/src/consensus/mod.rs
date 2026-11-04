@@ -560,6 +560,7 @@ impl Consensus {
         self.pruning_meta_stores.write().set_body_missing_anticone(&mut batch, anticone).unwrap();
         self.db.write(batch).unwrap();
         drop(pruning_point_write);
+        self.virtual_processor.reset_service_ledger_to_pruning_point(new_pruning_point);
         Ok(())
     }
 

@@ -1450,6 +1450,16 @@ impl VirtualStateProcessor {
         Ok(())
     }
 
+    /// Drops the folded ledger state once the selected chain restarts at `pruning_point`; the next
+    /// advance folds from the stores as after a restart.
+    pub(crate) fn reset_service_ledger_to_pruning_point(&self, pruning_point: Hash) {
+        let pp_daa = self.headers_store.get_daa_score(pruning_point).unwrap_or(0);
+        let mut sync = self.service_ledger.lock();
+        let deep_cursor_daa = sync.deep_cursor_daa.max(pp_daa);
+        *sync = ServiceLedgerSync::default();
+        sync.deep_cursor_daa = deep_cursor_daa;
+    }
+
     /// Installs an imported ledger snapshot taken at chain block `sample` (the new pruning
     /// point): persists it and restarts the fold from it, so every event above `sample` is
     /// re-derived locally.

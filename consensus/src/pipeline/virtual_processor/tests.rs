@@ -2364,6 +2364,32 @@ async fn restart_keeps_the_ledger_batch_frontier() {
     assert_eq!(after, before, "the reopened node lost the ledger frontier");
 }
 
+/// A ledger reset to the pruning point refolds to the chain tip on the next advance.
+#[tokio::test]
+async fn ledger_reset_to_the_pruning_point_refolds_to_the_tip() {
+    use crate::model::stores::pruning::PruningStoreReader;
+    use keryx_consensus_core::ChainPath;
+    use keryx_consensus_core::config::params::ForkActivation;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_v3_activation = ForkActivation::always();
+        })
+        .build();
+    let mut ctx = TestContext::new(TestConsensus::new(&config));
+    for i in 0..5 {
+        ctx.build_block_template_row(i..i + 1).validate_and_insert_row().await;
+    }
+    let vp = ctx.consensus.virtual_processor().clone();
+    assert!(vp.service_ledger_folded_tip());
+    let pp = vp.pruning_point_store.read().pruning_point().unwrap();
+    vp.reset_service_ledger_to_pruning_point(pp);
+    assert!(!vp.service_ledger_folded_tip());
+    vp.advance_service_ledger(&ChainPath::default(), pp);
+    assert!(vp.service_ledger_folded_tip());
+}
+
 /// A template requested while the ledger is held keeps its wait bound.
 #[tokio::test]
 async fn template_wait_stays_bounded_while_the_ledger_is_held() {
