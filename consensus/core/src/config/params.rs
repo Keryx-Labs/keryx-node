@@ -194,6 +194,8 @@ pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 
 /// Testnet H15 gate: every verifiable-inference, audit and holder-reward v3 rule. Node and miner.
 pub const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+/// Testnet H16 gate.
+pub const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
@@ -2658,13 +2660,13 @@ pub const TESTNET_PARAMS: Params = Params {
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(500),
-    suspension_pov_activation: ForkActivation::never(),
-    untraced_response_activation: ForkActivation::never(),
-    answer_shape_window_activation: ForkActivation::never(),
-    one_miss_per_request_activation: ForkActivation::never(),
-    uniform_strike_activation: ForkActivation::never(),
-    audit_queue_activation: ForkActivation::never(),
-    pad_margin_activation: ForkActivation::never(),
+    suspension_pov_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
+    untraced_response_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
+    answer_shape_window_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
+    one_miss_per_request_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
+    uniform_strike_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
+    audit_queue_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
+    pad_margin_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -3015,6 +3017,26 @@ mod pad_table_tests {
         }
         assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, false), 0);
         assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, true), 0);
+    }
+
+    #[test]
+    fn h16_gates() {
+        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS] {
+            let h16 = [
+                p.suspension_pov_activation,
+                p.untraced_response_activation,
+                p.answer_shape_window_activation,
+                p.one_miss_per_request_activation,
+                p.uniform_strike_activation,
+                p.audit_queue_activation,
+                p.pad_margin_activation,
+            ];
+            let expected = if std::ptr::eq(p, &TESTNET_PARAMS) { TESTNET_H16_ACTIVATION_DAA } else { ForkActivation::never().daa_score() };
+            for g in h16 {
+                assert_eq!(g.daa_score(), expected);
+            }
+        }
+        assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
     }
 
     #[test]
