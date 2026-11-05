@@ -1681,11 +1681,8 @@ impl VirtualStateProcessor {
         self.service_ledger.try_lock().is_some_and(|l| l.tip == Some(idx))
     }
 
-    /// Whether `producer` is under a finality-deep suspension at `daa_score`. The window is
-    /// derived from the record itself (`[until − SERVICE_SUSPENSION_DAA, until)`), NOT from when
-    /// this node learned it: a catch-up or fresh node re-validating an old POV must reach the
-    /// exact verdict a live node reached — an unbounded lower edge would apply the suspension to
-    /// POVs before its finalization. `every_window` false reads only the latest recorded deadline.
+    /// Whether `producer` is suspended at `daa_score`; `every_window` false reads only the latest
+    /// recorded deadline.
     pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64, every_window: bool) -> bool {
         let suspended = self.service_suspended.read();
         let Some(deadlines) = suspended.get(producer) else { return false };
@@ -1819,7 +1816,7 @@ mod tests {
 
 #[cfg(test)]
 impl VirtualStateProcessor {
-    /// Queues a third-strike suspension of `miner` at the committed tip, as a fold would. Returns its daa.
+    /// Queues a test suspension of `miner` at the committed tip. Returns its daa.
     pub(super) fn queue_test_suspension(&self, miner: Hash) -> u64 {
         let (idx, hash) = self.selected_chain_store.read().get_tip().unwrap();
         let daa = self.headers_store.get_daa_score(hash).unwrap();

@@ -240,7 +240,7 @@ pub struct TraceInputs<'a> {
     /// Whether a response accepted more than once by this block is judged once by the shape
     /// and root rules.
     pub dedup: bool,
-    /// Whether an untraced response on an audited tier is left unserved, as before its audit arms.
+    /// Untraced-response rule.
     pub untraced_silence: bool,
     /// Whether a traced answer is judged on its own shape when that window is longer.
     pub own_shape: bool,
@@ -1694,8 +1694,6 @@ impl ServiceLedger {
                         if is_late {
                             outcome.late.push((rh, *miner));
                         }
-                        // Rate-limit: a strike lands at most once per interval. A miss inside the
-                        // interval of the miner's last strike is a no-op — no escalation, no burn.
                         if self.within_strike_interval(miner, daa) {
                             continue;
                         }
@@ -6220,10 +6218,10 @@ mod tests {
         }
 
         #[test]
-        fn prompt_positions_far_beyond_the_sealed_length_stay_well_shaped() {
+        fn prompt_position_shape_bounds() {
             for own_shape in [false, true] {
                 assert_eq!(audits_of_prompt_positions(48 + crate::config::params::CONTEXT_OVERHEAD_TOKENS + 5_000, own_shape), 1);
-                assert_eq!(audits_of_prompt_positions(2, own_shape), 0, "below the sealed prompt's floor");
+                assert_eq!(audits_of_prompt_positions(2, own_shape), 0);
             }
         }
 
@@ -7004,10 +7002,10 @@ mod tests {
         }
 
         #[test]
-        fn an_untraced_answer_after_the_audit_arms_is_a_silence_past_the_gate() {
-            assert_eq!(misses_after_an_armed_answer(false, false), 0, "before the gate an untraced answer still serves");
+        fn untraced_response_rule() {
+            assert_eq!(misses_after_an_armed_answer(false, false), 0);
             assert_eq!(misses_after_an_armed_answer(true, false), 1);
-            assert_eq!(misses_after_an_armed_answer(true, true), 0, "a traced answer serves past the gate");
+            assert_eq!(misses_after_an_armed_answer(true, true), 0);
         }
 
         /// Misses at the window close when three members answer short and `long` answers a full
@@ -7034,7 +7032,7 @@ mod tests {
 
         #[test]
         fn a_long_answer_is_judged_on_its_own_shape_past_the_gate() {
-            assert_eq!(misses_with_a_long_answer_after_short_ones(false), (1, 0), "before the gate the short answers set the window");
+            assert_eq!(misses_with_a_long_answer_after_short_ones(false), (1, 0));
             assert_eq!(misses_with_a_long_answer_after_short_ones(true), (0, 0));
         }
 
@@ -7064,8 +7062,7 @@ mod tests {
 
         #[test]
         fn a_late_unopened_answer_strikes_once_past_the_gate() {
-            let before = misses_of_a_late_unopened_answer(false);
-            assert_eq!(before.len(), 2, "before the gate the window and the opening both strike: {before:?}");
+            assert_eq!(misses_of_a_late_unopened_answer(false).len(), 2);
             assert_eq!(misses_of_a_late_unopened_answer(true).len(), 1);
         }
 
@@ -7106,7 +7103,7 @@ mod tests {
             t.identities.clear();
             let mut gated = t.clone();
             net.ledger.resolve_trace_audit(&mut t, false);
-            assert_eq!(t.identities, vec![a], "before the gate a resolved tier does not stop the resolution");
+            assert_eq!(t.identities, vec![a]);
             net.ledger.resolve_trace_audit(&mut gated, true);
             assert!(gated.identities.is_empty());
         }
@@ -7114,7 +7111,7 @@ mod tests {
         #[test]
         fn a_miss_folded_in_warmup_leaves_the_other_judgements_past_the_gate() {
             let a = id(1);
-            assert_eq!(audited_after_the_window(false, false), vec![a], "before the gate the opening still judges a");
+            assert_eq!(audited_after_the_window(false, false), vec![a]);
             assert_eq!(audited_after_the_window(false, true), vec![a]);
             assert!(audited_after_the_window(true, false).is_empty());
             assert!(audited_after_the_window(true, true).is_empty(), "a warmup fold must forget like an incremental one");

@@ -2107,14 +2107,13 @@ async fn suspension_recorded_after_the_template_at(gate: keryx_consensus_core::c
     (ctx.consensus.block_status(hash), daa)
 }
 
-/// The coinbase verdict on a block is a function of its past: a suspension recorded between
-/// building a template and validating it does not change the verdict on that template.
+/// A suspension recorded after the template leaves its verdict unchanged.
 #[tokio::test]
 async fn suspension_recorded_after_the_template_does_not_change_its_verdict() {
     assert_eq!(suspension_recorded_after_the_template(true).await, BlockStatus::StatusUTXOValid);
 }
 
-/// Before the gate the verdict follows the block's own DAA, as the history was judged.
+/// Pre-gate suspension rule.
 #[tokio::test]
 async fn suspension_before_the_gate_keeps_the_block_daa_rule() {
     assert_eq!(suspension_recorded_after_the_template(false).await, BlockStatus::StatusDisqualifiedFromChain);
@@ -2233,9 +2232,7 @@ async fn batch_catch_up_across_a_suspension_start_matches_the_live_chain() {
     assert!(cvp.is_producer_suspended(&identity, start, true));
 }
 
-/// Node A records a suspension through its own block P at the start; node B, one block behind,
-/// builds a heavier sibling branch Q from the same parent. Returns A's verdict on Q and whether
-/// A followed Q's branch.
+/// Verdicts of two nodes on sibling branches around a suspension start.
 async fn late_sibling_across_a_suspension_start(gate: bool, finality: u64, pom: bool) -> (BlockStatus, bool, bool) {
     use crate::model::stores::headers::HeaderStoreReader;
     use keryx_consensus_core::api::ConsensusApi;
@@ -2313,7 +2310,7 @@ async fn late_sibling_across_a_suspension_start_is_judged_like_its_producer_did(
 }
 
 #[tokio::test]
-async fn late_sibling_across_a_suspension_start_splits_before_the_gate() {
+async fn sibling_branches_before_the_gate() {
     assert_eq!(late_sibling_across_a_suspension_start(false, 80, true).await, (BlockStatus::StatusDisqualifiedFromChain, false, true));
 }
 
@@ -2420,7 +2417,7 @@ async fn template_wait_stays_bounded_while_the_ledger_is_held() {
     ctx.simulated_time += ctx.consensus.params().target_time_per_block();
     let _template = ctx.build_block_template(99, ctx.simulated_time);
     let waited = started.elapsed();
-    assert!(waited < std::time::Duration::from_millis(3_000), "the template waited for the held ledger: {waited:?}");
+    assert!(waited < std::time::Duration::from_millis(3_000));
     hold.join().unwrap();
     assert!(vp.service_ledger_folded_tip());
 }
@@ -2458,8 +2455,8 @@ async fn template_waits_for_the_ledger_to_fold_the_sink() {
     ctx.simulated_time += ctx.consensus.params().target_time_per_block();
     let _template = ctx.build_block_template(99, ctx.simulated_time);
     let waited = started.elapsed();
-    assert!(waited >= std::time::Duration::from_millis(100), "the template did not wait for the fold");
-    assert!(waited < std::time::Duration::from_millis(1_500), "the template waited out its bound: {waited:?}");
+    assert!(waited >= std::time::Duration::from_millis(100));
+    assert!(waited < std::time::Duration::from_millis(1_500));
     assert!(vp.service_ledger_folded_tip());
     fold.join().unwrap();
 }
@@ -2483,8 +2480,7 @@ async fn suspension_rule_switches_exactly_at_the_gate() {
     assert_eq!(before_gate, BlockStatus::StatusDisqualifiedFromChain);
 }
 
-/// With an older window in force and a newer one not started yet, the block pays before the gate
-/// (latest window only) and burns past it; template and validation agree either way.
+/// Overlapping suspension windows across the gate.
 async fn overlapping_windows_pay(gate: bool) -> bool {
     use crate::model::stores::headers::HeaderStoreReader;
     use keryx_consensus_core::collateral::{SERVICE_SUSPENSION_DAA, miner_key};
