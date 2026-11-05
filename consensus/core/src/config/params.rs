@@ -194,6 +194,9 @@ pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 
 /// Testnet H15 gate: every verifiable-inference, audit and holder-reward v3 rule. Node and miner.
 pub const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+/// Mainnet H16 gate. Node and miner.
+pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
+
 /// Testnet H16 gate.
 pub const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
@@ -2507,13 +2510,13 @@ pub const MAINNET_PARAMS: Params = Params {
     service_ledger_activation: ForkActivation::new(H11_ACTIVATION_DAA),
     production_index_activation: ForkActivation::new(H12_ACTIVATION_DAA),
     exact_verification_activation: ForkActivation::new(H13_ACTIVATION_DAA),
-    suspension_pov_activation: ForkActivation::never(),
-    untraced_response_activation: ForkActivation::never(),
-    answer_shape_window_activation: ForkActivation::never(),
-    one_miss_per_request_activation: ForkActivation::never(),
-    uniform_strike_activation: ForkActivation::never(),
-    audit_queue_activation: ForkActivation::never(),
-    pad_margin_activation: ForkActivation::never(),
+    suspension_pov_activation: ForkActivation::new(H16_ACTIVATION_DAA),
+    untraced_response_activation: ForkActivation::new(H16_ACTIVATION_DAA),
+    answer_shape_window_activation: ForkActivation::new(H16_ACTIVATION_DAA),
+    one_miss_per_request_activation: ForkActivation::new(H16_ACTIVATION_DAA),
+    uniform_strike_activation: ForkActivation::new(H16_ACTIVATION_DAA),
+    audit_queue_activation: ForkActivation::new(H16_ACTIVATION_DAA),
+    pad_margin_activation: ForkActivation::new(H16_ACTIVATION_DAA),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -3031,12 +3034,14 @@ mod pad_table_tests {
                 p.audit_queue_activation,
                 p.pad_margin_activation,
             ];
-            let expected = if std::ptr::eq(p, &TESTNET_PARAMS) { TESTNET_H16_ACTIVATION_DAA } else { ForkActivation::never().daa_score() };
+            let expected = if std::ptr::eq(p, &TESTNET_PARAMS) { TESTNET_H16_ACTIVATION_DAA } else { H16_ACTIVATION_DAA };
             for g in h16 {
                 assert_eq!(g.daa_score(), expected);
             }
         }
         assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
+        assert!(H16_ACTIVATION_DAA > H15_ACTIVATION_DAA);
+        assert_eq!(H16_ACTIVATION_DAA, 147_000_000);
     }
 
     #[test]
