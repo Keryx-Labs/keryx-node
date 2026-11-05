@@ -295,6 +295,8 @@ declare! {
      */
     export interface IGetAwaitedOpeningsRequest {
         responseTxids: HexString[];
+        escrowPubkey?: HexString;
+        requestHashes?: HexString[];
     }
     "#,
 }
@@ -312,6 +314,8 @@ declare! {
     export interface IGetAwaitedOpeningsResponse {
         virtualDaaScore: bigint;
         openings: IAwaitedOpening[];
+        awaitedRequests: { requestHash: HexString; windowEndDaa: bigint }[];
+        requestsChecked: boolean;
     }
 
     /**

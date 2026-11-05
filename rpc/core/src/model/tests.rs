@@ -1180,7 +1180,11 @@ mod mockery {
 
     impl Mock for GetAwaitedOpeningsRequest {
         fn mock() -> Self {
-            GetAwaitedOpeningsRequest { response_txids: vec![mock(), mock()] }
+            GetAwaitedOpeningsRequest {
+                response_txids: vec![mock(), mock()],
+                escrow_pubkey: Some(mock()),
+                request_hashes: vec![mock()],
+            }
         }
     }
 
@@ -1199,6 +1203,8 @@ mod mockery {
                     pieces: 5,
                     attention_path: vec![3, 1],
                 }],
+                awaited_requests: vec![RpcAwaitedRequest { request_hash: mock(), window_end_daa: mock() }],
+                requests_checked: true,
             }
         }
     }

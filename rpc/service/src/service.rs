@@ -1038,7 +1038,22 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 attention_path: o.attention_path,
             })
             .collect();
-        Ok(GetAwaitedOpeningsResponse { virtual_daa_score, openings })
+        if request.request_hashes.len() > MAX_TXIDS {
+            return Err(RpcError::General(format!("at most {MAX_TXIDS} request hashes per call")));
+        }
+        let (awaited_requests, requests_checked) = match request.escrow_pubkey {
+            Some(escrow) => {
+                let hashes: Vec<[u8; 32]> = request.request_hashes.iter().map(|h| h.as_bytes()).collect();
+                let awaited = session
+                    .get_awaited_requests(&escrow.as_bytes(), &hashes)
+                    .into_iter()
+                    .map(|(rh, window_end_daa)| RpcAwaitedRequest { request_hash: RpcHash::from_bytes(rh), window_end_daa })
+                    .collect();
+                (awaited, true)
+            }
+            None => (Vec::new(), false),
+        };
+        Ok(GetAwaitedOpeningsResponse { virtual_daa_score, openings, awaited_requests, requests_checked })
     }
 
     async fn get_coin_supply_call(

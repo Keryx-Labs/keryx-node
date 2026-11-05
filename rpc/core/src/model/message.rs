@@ -2109,25 +2109,43 @@ pub struct RpcAwaitedOpening {
     pub attention_path: Vec<u64>,
 }
 
+/// An AiRequest still awaiting an answer from the queried escrow key's identity.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcAwaitedRequest {
+    pub request_hash: RpcHash,
+    /// End of the answer window once the request's audit is armed, zero before.
+    pub window_end_daa: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetAwaitedOpeningsRequest {
     pub response_txids: Vec<RpcHash>,
+    /// Escrow key whose identity `request_hashes` are checked against.
+    #[serde(default)]
+    pub escrow_pubkey: Option<RpcHash>,
+    #[serde(default)]
+    pub request_hashes: Vec<RpcHash>,
 }
 
 impl Serializer for GetAwaitedOpeningsRequest {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(Vec<RpcHash>, &self.response_txids, writer)?;
+        store!(Option<RpcHash>, &self.escrow_pubkey, writer)?;
+        store!(Vec<RpcHash>, &self.request_hashes, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetAwaitedOpeningsRequest {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let response_txids = load!(Vec<RpcHash>, reader)?;
-        Ok(Self { response_txids })
+        let (escrow_pubkey, request_hashes) =
+            if version >= 2 { (load!(Option<RpcHash>, reader)?, load!(Vec<RpcHash>, reader)?) } else { (None, Vec::new()) };
+        Ok(Self { response_txids, escrow_pubkey, request_hashes })
     }
 }
 
@@ -2136,23 +2154,33 @@ impl Deserializer for GetAwaitedOpeningsRequest {
 pub struct GetAwaitedOpeningsResponse {
     pub virtual_daa_score: u64,
     pub openings: Vec<RpcAwaitedOpening>,
+    /// The queried requests still awaiting the escrow key's identity.
+    #[serde(default)]
+    pub awaited_requests: Vec<RpcAwaitedRequest>,
+    /// Whether `request_hashes` were checked.
+    #[serde(default)]
+    pub requests_checked: bool,
 }
 
 impl Serializer for GetAwaitedOpeningsResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        store!(u16, &2, writer)?;
         store!(u64, &self.virtual_daa_score, writer)?;
         store!(Vec<RpcAwaitedOpening>, &self.openings, writer)?;
+        store!(Vec<RpcAwaitedRequest>, &self.awaited_requests, writer)?;
+        store!(bool, &self.requests_checked, writer)?;
         Ok(())
     }
 }
 
 impl Deserializer for GetAwaitedOpeningsResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let virtual_daa_score = load!(u64, reader)?;
         let openings = load!(Vec<RpcAwaitedOpening>, reader)?;
-        Ok(Self { virtual_daa_score, openings })
+        let (awaited_requests, requests_checked) =
+            if version >= 2 { (load!(Vec<RpcAwaitedRequest>, reader)?, load!(bool, reader)?) } else { (Vec::new(), false) };
+        Ok(Self { virtual_daa_score, openings, awaited_requests, requests_checked })
     }
 }
 

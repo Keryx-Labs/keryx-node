@@ -475,7 +475,7 @@ pub trait RpcApi: Sync + Send + AnySync {
     /// The openings the node awaits among `response_txids`: signing key, seed, deadline, pieces
     /// still owed and attention path. A response absent from the result awaits no opening.
     async fn get_awaited_openings(&self, response_txids: Vec<RpcHash>) -> RpcResult<GetAwaitedOpeningsResponse> {
-        self.get_awaited_openings_call(None, GetAwaitedOpeningsRequest { response_txids }).await
+        self.get_awaited_openings_call(None, GetAwaitedOpeningsRequest { response_txids, ..Default::default() }).await
     }
     async fn get_awaited_openings_call(
         &self,

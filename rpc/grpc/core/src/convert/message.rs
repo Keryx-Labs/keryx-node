@@ -465,7 +465,11 @@ from!(item: RpcResult<&keryx_rpc_core::GetServiceProvidersResponse>, protowire::
 });
 
 from!(item: &keryx_rpc_core::GetAwaitedOpeningsRequest, protowire::GetAwaitedOpeningsRequestMessage, {
-    Self { response_txids: item.response_txids.iter().map(|t| t.to_string()).collect() }
+    Self {
+        response_txids: item.response_txids.iter().map(|t| t.to_string()).collect(),
+        escrow_pubkey: item.escrow_pubkey.map(|k| k.to_string()).unwrap_or_default(),
+        request_hashes: item.request_hashes.iter().map(|h| h.to_string()).collect(),
+    }
 });
 from!(item: RpcResult<&keryx_rpc_core::GetAwaitedOpeningsResponse>, protowire::GetAwaitedOpeningsResponseMessage, {
     Self {
@@ -483,6 +487,12 @@ from!(item: RpcResult<&keryx_rpc_core::GetAwaitedOpeningsResponse>, protowire::G
                 attention_path: o.attention_path.clone(),
             })
             .collect(),
+        awaited_requests: item
+            .awaited_requests
+            .iter()
+            .map(|r| protowire::AwaitedRequestMessage { request_hash: r.request_hash.to_string(), window_end_daa: r.window_end_daa })
+            .collect(),
+        requests_checked: item.requests_checked,
         error: None,
     }
 });
@@ -1091,7 +1101,11 @@ try_from!(item: &protowire::GetServiceProvidersResponseMessage, RpcResult<keryx_
 });
 
 try_from!(item: &protowire::GetAwaitedOpeningsRequestMessage, keryx_rpc_core::GetAwaitedOpeningsRequest, {
-    Self { response_txids: item.response_txids.iter().map(|t| RpcHash::from_str(t)).collect::<Result<Vec<_>, _>>()? }
+    Self {
+        response_txids: item.response_txids.iter().map(|t| RpcHash::from_str(t)).collect::<Result<Vec<_>, _>>()?,
+        escrow_pubkey: if item.escrow_pubkey.is_empty() { None } else { Some(RpcHash::from_str(&item.escrow_pubkey)?) },
+        request_hashes: item.request_hashes.iter().map(|h| RpcHash::from_str(h)).collect::<Result<Vec<_>, _>>()?,
+    }
 });
 try_from!(item: &protowire::GetAwaitedOpeningsResponseMessage, RpcResult<keryx_rpc_core::GetAwaitedOpeningsResponse>, {
     Self {
@@ -1111,6 +1125,14 @@ try_from!(item: &protowire::GetAwaitedOpeningsResponseMessage, RpcResult<keryx_r
                 })
             })
             .collect::<RpcResult<Vec<_>>>()?,
+        awaited_requests: item
+            .awaited_requests
+            .iter()
+            .map(|r| {
+                Ok(keryx_rpc_core::RpcAwaitedRequest { request_hash: RpcHash::from_str(&r.request_hash)?, window_end_daa: r.window_end_daa })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+        requests_checked: item.requests_checked,
     }
 });
 
