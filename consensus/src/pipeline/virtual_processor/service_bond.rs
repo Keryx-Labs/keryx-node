@@ -762,6 +762,7 @@ impl VirtualStateProcessor {
                 own_shape: self.answer_shape_window_activation.is_active(daa),
                 one_miss: self.one_miss_per_request_activation.is_active(daa),
                 uniform_strikes: self.uniform_strike_activation.is_active(daa),
+                audit_queue: self.audit_queue_activation.is_active(daa),
             };
             if warmup {
                 let burned = self.service_burned.read();

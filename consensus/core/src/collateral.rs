@@ -248,6 +248,8 @@ pub struct TraceInputs<'a> {
     pub one_miss: bool,
     /// Whether every miss path escalates through the same ladder, at most once per strike interval.
     pub uniform_strikes: bool,
+    /// Whether arming an audit pushes the open audits of its escrow key by its work.
+    pub audit_queue: bool,
     /// Whether an opening naming its seed block is judged only against an audit drawn from that
     /// block, and passed over otherwise.
     pub seed_bind: bool,
@@ -951,6 +953,8 @@ const ATTN_PHASES_RESERVED: u64 = 3;
 /// Replays of its response an open audit costs its responder (first opening and phases), in
 /// units of the response's serving work.
 const OPEN_AUDIT_WORK_PASSES: u64 = 3;
+/// Passes of a newly armed audit's response that push the open audits of its key.
+const AUDIT_QUEUE_PASSES: u64 = OPEN_AUDIT_WORK_PASSES + 1;
 
 /// Longest a held draw waits for the audits of its candidates, from its opening.
 const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA + OPENING_BACKLOG_CAP_DAA;
@@ -1945,6 +1949,9 @@ impl ServiceLedger {
                     a.deadline_daa = start + backlog_daa(backlog);
                     a.chain_start = start;
                     chain_end.insert(a.escrow_pubkey, start);
+                    if tr.audit_queue {
+                        self.push_open_audits(&a, daa);
+                    }
                 } else {
                     if start - own > OPENING_BACKLOG_CAP_DAA {
                         self.drop_draw_candidates(&a.request_hash, &a.identities);
@@ -2375,6 +2382,18 @@ impl ServiceLedger {
             outcome.rewards.push(ServiceReward { request_hash: *rh, winner, amount: reward, spk });
         }
         Some(winner)
+    }
+
+    /// Pushes the deadlines of the open audits of `armed`'s escrow key by the work of `armed`,
+    /// up to [`AUDIT_SPAN_DAA`] after each one's acceptance.
+    fn push_open_audits(&mut self, armed: &TraceAudit, daa: u64) {
+        let generated = armed.n_pos.saturating_sub(armed.n_prompt).min(armed.max_tokens);
+        let push = AUDIT_QUEUE_PASSES * service_work_daa(armed.tier, armed.n_prompt, generated);
+        for o in self.trace_audits.values_mut() {
+            if o.escrow_pubkey == armed.escrow_pubkey && o.seed.is_some() && o.deadline_daa >= daa {
+                o.deadline_daa = o.deadline_daa.saturating_add(push).min(o.accepted_daa + AUDIT_SPAN_DAA).max(o.deadline_daa);
+            }
+        }
     }
 
     /// Sets the per-member queue and the deadline of an audit just armed under the v3 window:
@@ -4916,6 +4935,8 @@ mod tests {
             own_shape: bool,
             /// Uniform-strike rule.
             uniform_strikes: bool,
+            /// Audit-queue rule.
+            audit_queue: bool,
         }
 
         impl Run {
@@ -4936,6 +4957,7 @@ mod tests {
                     attention: false,
                     uniform_strikes: false,
                     own_shape: false,
+                    audit_queue: false,
                 }
             }
 
@@ -5002,6 +5024,7 @@ mod tests {
                     own_shape: self.own_shape,
                     one_miss: false,
                     uniform_strikes: self.uniform_strikes,
+                    audit_queue: self.audit_queue,
                 };
                 let set = self.cohort.clone();
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
@@ -5598,6 +5621,7 @@ mod tests {
                     own_shape: false,
                     one_miss: false,
                     uniform_strikes: false,
+                    audit_queue: false,
                 };
                 let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
                 let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
@@ -5893,6 +5917,68 @@ mod tests {
                 assert_eq!(run.ledger.strike_state(&miner()), Some(crate::collateral::StrikeEntry { count: 1, last_daa: last + 1 }));
                 assert!(run.ledger.trace_audits.is_empty());
             }
+        }
+
+        /// First response of the miner drawn at 202, a second one to `RH2` accepted at 150 under
+        /// `escrow2` and drawn at 250, with `tweak` applied to the first audit before that draw:
+        /// the run, the first deadline before and after the second draw, and the second audit.
+        fn queued_second_draw(
+            audit_queue: bool,
+            escrow2: [u8; 32],
+            tweak: impl Fn(&mut crate::collateral::TraceAudit),
+        ) -> (Run, u64, u64, crate::collateral::TraceAudit) {
+            let mut run = Run::sanctioned();
+            run.audit_queue = audit_queue;
+            let (_, ev) = run.event(true);
+            let r2 = run.model.response(3, 10, true);
+            let ev2 = TraceResponseEvent {
+                response_txid: TXID2,
+                request_hash: RH2,
+                escrow_pubkey: escrow2,
+                trace_root: r2.trace_root,
+                n_prompt: r2.n_prompt,
+                n_pos: r2.n_pos,
+                ..ev.clone()
+            };
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.fold(150, h0, &[ev2], &[]).is_empty());
+            assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
+            tweak(run.ledger.trace_audits.get_mut(&TXID).unwrap());
+            let before = run.deadline();
+            assert!(run.fold(250, chain_hash(false), &[], &[]).is_empty());
+            let second = run.ledger.trace_audits.get(&TXID2).expect("second audit armed").clone();
+            let after = run.deadline();
+            (run, before, after, second)
+        }
+
+        #[test]
+        fn arming_an_audit_pushes_the_open_audits_of_its_key() {
+            let (_, before, after, second) = queued_second_draw(false, ESCROW_PK, |_| {});
+            assert_eq!(after, before, "no push before the gate");
+
+            let (_, before, after, second_q) = queued_second_draw(true, ESCROW_PK, |_| {});
+            assert_eq!(second_q, second, "the armed audit itself is unchanged by the rule");
+            let generated = (second.n_pos - second.n_prompt).min(second.max_tokens);
+            let push = super::super::AUDIT_QUEUE_PASSES * super::super::service_work_daa(0, second.n_prompt, generated);
+            assert!(push > 0);
+            assert_eq!(after, before + push);
+        }
+
+        #[test]
+        fn audit_queue_push_stops_at_the_audit_span() {
+            let (run, _, after, _) =
+                queued_second_draw(true, ESCROW_PK, |a| a.deadline_daa = a.accepted_daa + super::super::AUDIT_SPAN_DAA - 1);
+            let first = run.ledger.trace_audits.get(&TXID).unwrap();
+            assert_eq!(after, first.accepted_daa + super::super::AUDIT_SPAN_DAA);
+        }
+
+        #[test]
+        fn audit_queue_leaves_other_keys_alone() {
+            let (run, before, after, _) = queued_second_draw(true, [0x99u8; 32], |_| {});
+            assert_eq!(run.ledger.trace_audits.len(), 2);
+            assert_eq!(after, before);
         }
 
         #[test]
@@ -6359,6 +6445,7 @@ mod tests {
                     own_shape: self.own_shape,
                     one_miss: self.one_miss,
                     uniform_strikes: self.uniform_strikes,
+                    audit_queue: false,
                 };
                 let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
                 let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();

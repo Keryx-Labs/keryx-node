@@ -1986,6 +1986,8 @@ pub struct Params {
     pub one_miss_per_request_activation: ForkActivation,
     /// H16: every miss path escalates through the same ladder, at most once per strike interval.
     pub uniform_strike_activation: ForkActivation,
+    /// H16: arming an audit pushes the open audits of its escrow key by its work.
+    pub audit_queue_activation: ForkActivation,
     /// H16: context pad tiles from `POM_V5_PAD_TILES_H16`.
     pub pad_margin_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
@@ -2274,6 +2276,7 @@ impl Params {
             answer_shape_window_activation: self.answer_shape_window_activation,
             one_miss_per_request_activation: self.one_miss_per_request_activation,
             uniform_strike_activation: self.uniform_strike_activation,
+            audit_queue_activation: self.audit_queue_activation,
             pad_margin_activation: self.pad_margin_activation,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
@@ -2507,6 +2510,7 @@ pub const MAINNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    audit_queue_activation: ForkActivation::never(),
     pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
@@ -2659,6 +2663,7 @@ pub const TESTNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    audit_queue_activation: ForkActivation::never(),
     pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
@@ -2774,6 +2779,7 @@ pub const SIMNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    audit_queue_activation: ForkActivation::never(),
     pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
@@ -2883,6 +2889,7 @@ pub const DEVNET_PARAMS: Params = Params {
     answer_shape_window_activation: ForkActivation::never(),
     one_miss_per_request_activation: ForkActivation::never(),
     uniform_strike_activation: ForkActivation::never(),
+    audit_queue_activation: ForkActivation::never(),
     pad_margin_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
