@@ -2166,6 +2166,17 @@ impl ServiceLedger {
             .then_some(audit.window_end_daa)
     }
 
+    /// Await status of `request_hash` for the identity of `escrow_pubkey`: `None` when the
+    /// request is not pending, `Some(None)` once it no longer awaits that identity, otherwise
+    /// the answer window end (zero before the audit arms).
+    pub fn request_await_status(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<Option<u64>> {
+        let req = self.pending.get(request_hash)?;
+        if req.audit.is_none() {
+            return Some(Some(0));
+        }
+        Some(self.awaited_response_deadline(request_hash, escrow_pubkey))
+    }
+
     /// Whether a response to `request_hash` signed by `escrow_pubkey` can still count: the
     /// request is pending and not armed yet, or armed and awaiting that responder.
     pub fn response_admissible(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> bool {
@@ -6538,6 +6549,22 @@ mod tests {
             assert_eq!(net.ledger.awaited_response_deadline(&RH, &[0x5Cu8; 32]), None);
             net.fold(102, chain(0), &[], &[(RH, a, None)]);
             assert_eq!(net.ledger.awaited_response_deadline(&RH, &pk), None);
+        }
+
+        #[test]
+        fn request_await_status_tells_unknown_from_closed() {
+            let pk = [0x5Bu8; 32];
+            let a = escrow_miner_key(&pk);
+            let mut net = Net::new(false, false, vec![a]);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), None);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), Some(Some(0)));
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), Some(Some(end)));
+            assert_eq!(net.ledger.request_await_status(&RH, &[0x5Cu8; 32]), Some(None));
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), Some(None));
         }
 
         #[test]

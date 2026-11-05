@@ -315,6 +315,7 @@ declare! {
         virtualDaaScore: bigint;
         openings: IAwaitedOpening[];
         awaitedRequests: { requestHash: HexString; windowEndDaa: bigint }[];
+        closedRequests: HexString[];
         requestsChecked: boolean;
     }
 

@@ -500,6 +500,21 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_response_deadline(request_hash, escrow_pubkey)
     }
 
+    /// Await status of each known request of `request_hashes` for the identity of
+    /// `escrow_pubkey`, under one ledger lock; `None` while the rule is not active.
+    pub(crate) fn awaited_requests(
+        &self,
+        escrow_pubkey: &[u8; 32],
+        request_hashes: &[[u8; 32]],
+        virtual_daa_score: u64,
+    ) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        if !self.trace_sanction_activation.is_active(virtual_daa_score) {
+            return None;
+        }
+        let sync = self.service_ledger.lock();
+        Some(request_hashes.iter().filter_map(|rh| Some((*rh, sync.ledger.request_await_status(rh, escrow_pubkey)?))).collect())
+    }
+
     pub(crate) fn awaited_response_deadlines(&self, keys: &[([u8; 32], [u8; 32])]) -> Vec<Option<u64>> {
         let sync = self.service_ledger.lock();
         keys.iter().map(|(rh, e)| sync.ledger.awaited_response_deadline(rh, e)).collect()

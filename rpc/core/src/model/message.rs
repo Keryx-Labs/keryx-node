@@ -2157,6 +2157,9 @@ pub struct GetAwaitedOpeningsResponse {
     /// The queried requests still awaiting the escrow key's identity.
     #[serde(default)]
     pub awaited_requests: Vec<RpcAwaitedRequest>,
+    /// The queried requests known to the ledger that no longer await that identity.
+    #[serde(default)]
+    pub closed_requests: Vec<RpcHash>,
     /// Whether `request_hashes` were checked.
     #[serde(default)]
     pub requests_checked: bool,
@@ -2168,6 +2171,7 @@ impl Serializer for GetAwaitedOpeningsResponse {
         store!(u64, &self.virtual_daa_score, writer)?;
         store!(Vec<RpcAwaitedOpening>, &self.openings, writer)?;
         store!(Vec<RpcAwaitedRequest>, &self.awaited_requests, writer)?;
+        store!(Vec<RpcHash>, &self.closed_requests, writer)?;
         store!(bool, &self.requests_checked, writer)?;
         Ok(())
     }
@@ -2178,9 +2182,12 @@ impl Deserializer for GetAwaitedOpeningsResponse {
         let version = load!(u16, reader)?;
         let virtual_daa_score = load!(u64, reader)?;
         let openings = load!(Vec<RpcAwaitedOpening>, reader)?;
-        let (awaited_requests, requests_checked) =
-            if version >= 2 { (load!(Vec<RpcAwaitedRequest>, reader)?, load!(bool, reader)?) } else { (Vec::new(), false) };
-        Ok(Self { virtual_daa_score, openings, awaited_requests, requests_checked })
+        let (awaited_requests, closed_requests, requests_checked) = if version >= 2 {
+            (load!(Vec<RpcAwaitedRequest>, reader)?, load!(Vec<RpcHash>, reader)?, load!(bool, reader)?)
+        } else {
+            (Vec::new(), Vec::new(), false)
+        };
+        Ok(Self { virtual_daa_score, openings, awaited_requests, closed_requests, requests_checked })
     }
 }
 

@@ -208,6 +208,14 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// Await status of each known request for the identity of `escrow_pubkey`: `None` inside
+    /// means it no longer awaits that identity, otherwise the window end (zero before arming).
+    /// `None` while the rule is not active.
+    fn awaited_requests(&self, escrow_pubkey: &[u8; 32], request_hashes: &[[u8; 32]]) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        let _ = (escrow_pubkey, request_hashes);
+        None
+    }
+
     /// [`Self::awaited_response_deadline`] of each `(request_hash, escrow_pubkey)`.
     fn awaited_response_deadlines(&self, keys: &[([u8; 32], [u8; 32])]) -> Vec<Option<u64>> {
         keys.iter().map(|(rh, e)| self.awaited_response_deadline(rh, e)).collect()

@@ -492,6 +492,7 @@ from!(item: RpcResult<&keryx_rpc_core::GetAwaitedOpeningsResponse>, protowire::G
             .iter()
             .map(|r| protowire::AwaitedRequestMessage { request_hash: r.request_hash.to_string(), window_end_daa: r.window_end_daa })
             .collect(),
+        closed_requests: item.closed_requests.iter().map(|h| h.to_string()).collect(),
         requests_checked: item.requests_checked,
         error: None,
     }
@@ -1132,6 +1133,7 @@ try_from!(item: &protowire::GetAwaitedOpeningsResponseMessage, RpcResult<keryx_r
                 Ok(keryx_rpc_core::RpcAwaitedRequest { request_hash: RpcHash::from_str(&r.request_hash)?, window_end_daa: r.window_end_daa })
             })
             .collect::<RpcResult<Vec<_>>>()?,
+        closed_requests: item.closed_requests.iter().map(|h| RpcHash::from_str(h)).collect::<Result<Vec<_>, _>>()?,
         requests_checked: item.requests_checked,
     }
 });

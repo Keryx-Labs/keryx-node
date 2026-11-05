@@ -1204,6 +1204,7 @@ mod mockery {
                     attention_path: vec![3, 1],
                 }],
                 awaited_requests: vec![RpcAwaitedRequest { request_hash: mock(), window_end_daa: mock() }],
+                closed_requests: vec![mock()],
                 requests_checked: true,
             }
         }

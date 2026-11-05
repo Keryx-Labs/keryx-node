@@ -224,14 +224,10 @@ impl ConsensusSessionOwned {
         self.consensus.awaited_openings(response_txids)
     }
 
-    /// The requests among `request_hashes` still awaiting an answer from the identity of
-    /// `escrow_pubkey`, with their answer window end (zero before the audit arms).
-    pub fn get_awaited_requests(&self, escrow_pubkey: &[u8; 32], request_hashes: &[[u8; 32]]) -> Vec<([u8; 32], u64)> {
-        request_hashes
-            .iter()
-            .filter(|rh| self.consensus.ai_response_admission(rh, Some(escrow_pubkey)) != Some(false))
-            .map(|rh| (*rh, self.consensus.awaited_response_deadline(rh, escrow_pubkey).unwrap_or(0)))
-            .collect()
+    /// Await status of each known request of `request_hashes` for the identity of
+    /// `escrow_pubkey`; `None` while the rule is not active.
+    pub fn get_awaited_requests(&self, escrow_pubkey: &[u8; 32], request_hashes: &[[u8; 32]]) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        self.consensus.awaited_requests(escrow_pubkey, request_hashes)
     }
 
     pub fn get_virtual_bits(&self) -> u32 {
