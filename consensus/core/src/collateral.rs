@@ -276,9 +276,8 @@ struct EarlyTrace {
     tokens: bool,
 }
 
-fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, prefix_offset: Option<u32>, bounded: bool) -> bool {
+fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, prefix_offset: Option<u32>) -> bool {
     keryx_verifiable_inference::shape::shape_ok(req.prompt_len, shape.answer_len, req.max_tokens, shape.n_prompt, shape.n_pos)
-        && (!bounded || shape.n_prompt <= req.prompt_len.saturating_add(crate::config::params::CONTEXT_OVERHEAD_TOKENS))
         && prefix_offset.is_none_or(|o| keryx_verifiable_inference::prefix::fits(shape.n_prompt, o))
 }
 
@@ -1403,7 +1402,7 @@ impl ServiceLedger {
                     .range((*rh, Hash::from_bytes([0u8; 32]))..=(*rh, Hash::from_bytes([0xffu8; 32])))
                     .map(|((_, key), shape)| (*key, *shape))
                     .collect();
-                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset, tr.own_shape)));
+                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset)));
                 // Under the context rule and the v3 window the well-formed early shapes wait for
                 // the arming, where cohort membership is known.
                 let keep = tr.context || tr.window_v3;
@@ -1464,7 +1463,7 @@ impl ServiceLedger {
                         let rules = (tr.tier)(req.tier, daa);
                         let prefix_offset = rules.as_ref().and_then(|r| r.prefix.as_ref().map(|p| p.offset));
                         let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || (ev.stage == keryx_verifiable_inference::chain::STAGE_CHAIN && ev.tokens));
-                        if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset, tr.own_shape) {
+                        if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset) {
                             misshaped.push((ev.request_hash, ev.responder));
                         } else if (tr.context || tr.window_v3) && req.audit.is_none() {
                             self.early_shapes.insert((ev.request_hash, ev.responder), shape);
@@ -6221,11 +6220,11 @@ mod tests {
         }
 
         #[test]
-        fn prompt_positions_beyond_the_prompt_are_misshaped_past_the_gate() {
-            let bound = 48 + crate::config::params::CONTEXT_OVERHEAD_TOKENS;
-            assert_eq!(audits_of_prompt_positions(bound + 1, false), 1, "before the gate the prompt positions have no upper bound");
-            assert_eq!(audits_of_prompt_positions(bound + 1, true), 0);
-            assert_eq!(audits_of_prompt_positions(bound, true), 1);
+        fn prompt_positions_far_beyond_the_sealed_length_stay_well_shaped() {
+            for own_shape in [false, true] {
+                assert_eq!(audits_of_prompt_positions(48 + crate::config::params::CONTEXT_OVERHEAD_TOKENS + 5_000, own_shape), 1);
+                assert_eq!(audits_of_prompt_positions(2, own_shape), 0, "below the sealed prompt's floor");
+            }
         }
 
         #[test]
