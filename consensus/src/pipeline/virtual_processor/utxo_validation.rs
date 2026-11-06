@@ -84,6 +84,7 @@ static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H15_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H16_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -524,6 +525,22 @@ impl VirtualStateProcessor {
             info!("  ▶ HOLDER REWARD — new bracket table");
             info!("    Brackets      — 5% with nothing held, 80% at 80 days of production held, 100% at 120 days");
             info!("  ▶ MANDATORY UPDATE — miners must run the H15 release");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        if banner_should_fire(self.uniform_strike_activation, header)
+            && H16_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H16 · DAA {} ════════════════", self.uniform_strike_activation.daa_score());
+            info!("  ▶ SERVICE RULES — one ladder, the same verdict on every node");
+            info!("    Strikes       — every miss follows the same ladder, at most one strike per hour per miner");
+            info!("    Requests      — a request strikes a miner at most once");
+            info!("    Suspensions   — applied identically on every node");
+            info!("    Untraced      — an untraced answer on an audited tier does not serve its request");
+            info!("    Audit queue   — a new audit pushes back the open audits of the same escrow key");
+            info!("  ▶ PROOF-OF-MODEL — more VRAM headroom for the desktop on minimum cards");
+            info!("  ▶ MANDATORY UPDATE — node v1.6.7 or newer, miner 0.6.0 or newer");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
