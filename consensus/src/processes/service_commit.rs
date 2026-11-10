@@ -113,7 +113,7 @@ impl ServiceCommitIndex {
     /// Rebuilds the index from the full row set, `rows` being `(event daa, canonical bytes)` in
     /// any order. Pure function of the set: sorting and per-daa sealing happen here.
     pub fn rebuild(&self, mut rows: Vec<(u64, Vec<u8>)>) {
-        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        rows.sort_unstable_by_key(|a| a.0);
         let mut inner = self.inner.write();
         inner.acc = MuHash::new();
         inner.snapshots.clear();

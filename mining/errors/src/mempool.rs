@@ -99,6 +99,9 @@ pub enum RuleError {
     #[error("the AiResponse for request {0} carries an inline body, but that is not a pending private request naming this responder")]
     RejectAiResponseBody(String),
 
+    #[error("the AiResponse for request {0} is not awaited from its responder")]
+    RejectAiResponseNotAwaited(String),
+
     #[error("the private AiRequest is not sealed to {0} of the {1} escrow keys of its tier cohort")]
     RejectPrivateRequestCoverage(usize, usize),
 
@@ -107,6 +110,12 @@ pub enum RuleError {
 
     #[error("an AiChallenge for response {0} is already in the mempool")]
     RejectDuplicateAiChallenge(String),
+
+    #[error("an opening for response {0} is already in the mempool")]
+    RejectDuplicateAiOpening(String),
+
+    #[error("the opening for response {0} is not awaited or not signed by its responder")]
+    RejectAiOpeningNotAwaited(String),
 
     // TODO: This error is added for the tx_relay flow but is never constructed neither in the golang nor in this version. Discuss if it can be removed.
     #[error("transaction {0} is invalid")]
@@ -168,6 +177,9 @@ pub enum NonStandardError {
 
     #[error("transaction input #{1} has {2} signature operations which is more than the allowed max amount of {3}")]
     RejectSignatureCount(TransactionId, usize, u64, u8),
+
+    #[error("opening transaction carries fields outside its signed body")]
+    RejectAiOpeningForm(TransactionId),
 }
 
 impl NonStandardError {
@@ -184,6 +196,7 @@ impl NonStandardError {
             NonStandardError::RejectInputScriptClass(id, _) => id,
             NonStandardError::RejectInsufficientFee(id, _, _) => id,
             NonStandardError::RejectSignatureCount(id, _, _, _) => id,
+            NonStandardError::RejectAiOpeningForm(id) => id,
         }
     }
 }

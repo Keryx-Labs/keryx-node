@@ -1,9 +1,9 @@
 # Private inference — end-to-end encrypted AiRequest / AiResponse
 
-Status: implemented on the node side behind a dormant activation gate
-(`private_inference_activation`, `never()` on every network until scheduled). Requester tooling
-ships in `keryx-cli` (`inference …`). The miner-side change (open the request, seal the answer)
-is specified in §7 and is not part of this repository.
+Status: activated by H14 (`private_inference_activation`, mainnet DAA 121 985 000, node v1.6.4).
+Requester tooling ships in `keryx-cli` (`inference …`). The miner-side change (open the request,
+seal the answer) is specified in §7 and lives in `keryx-miner`. Key schedule 2 (§2) replaced the
+H14 key schedule without a fork.
 
 ## 1. What it does
 
@@ -44,20 +44,20 @@ sequenceDiagram
 
     R->>N: getServiceProviders (current cohort, then a 30 min window)
     N-->>R: eligible responders of the tier with their escrow keys
-    Note over R: seal_request: draw root_key, wrap it to every cohort escrow key (ECDH + HKDF),<br/>encrypt the prompt under k_prompt with the request header as associated data
+    Note over R: seal_request: draw a seed, derive root_key and e from it, wrap root_key to every cohort escrow key (ECDH + HKDF),<br/>encrypt the prompt under k_prompt with the request header as associated data
     R->>N: AiRequest tx: public header, keyless reward vault, prompt = sealed envelope
     Note over N: mempool: the envelope must parse and cover the current target cohort
     N-->>M: block template / block carrying the AiRequest
     N-->>O: the same bytes - ciphertext only, nothing to run
-    Note over M: open_request with the escrow secret: unwrap root_key, decrypt the prompt
+    Note over M: open_request with the escrow secret: unwrap root_key, decrypt the prompt,<br/>derive the own response key
     Note over M: run the inference (llama.cpp)
-    Note over M: seal_response(root_key, request_hash, own escrow key) -> body,<br/>sign v1 head + extension with the escrow key
+    Note over M: seal_response(response key, request_hash) -> body,<br/>sign v1 head + extension with the escrow key
     M->>N: AiResponse V2 + inline sealed body
     Note over N: mempool: an inline body is admitted only from a recipient<br/>of a pending private request
     Note over N: ledger fold at arming: coverage within tolerance, cohort = eligible set<br/>restricted to the recipients, first credited recipient wins the vault
     R->>N: inference fetch: scan the mempool and the blocks since the request
     N-->>R: the AiResponse with the sealed body
-    Note over R: open_response(root_key, request_hash, responder key) -> plaintext answer
+    Note over R: open_response(secret, request_hash, responder key) -> plaintext answer
     N->>M: coinbase mints the vault reward once the win is finality-deep
 ```
 
@@ -83,22 +83,29 @@ the bytes. From the gate on, an `AiRequest` whose prompt does not parse is inval
 Sizes: the 16 KB private `AiRequest` cap leaves `16 332 − 51 − 80·n − 16` bytes of prompt:
 12 665 bytes for a 45-key cohort, 6 025 for the 128-key maximum (`max_private_prompt_len`).
 
-### Keys
+### Keys (key schedule 2)
 
-* `root_key` — 32 random bytes drawn by the requester per request; the one secret it keeps
-  (`PrivateRequestSecret`, printed once by the CLI).
+All derivations are HKDF-SHA256 with `salt = "KeryxPrivateInferenceV2"`.
+
+* `seed` — 32 random bytes drawn by the requester per request; the one secret it keeps
+  (`PrivateRequestSecret`, printed once by the CLI as `02 ‖ seed`, 66 hex digits).
+  `root_key = HKDF(ikm = seed, info = "root")`; the ephemeral secret `e` is the first valid
+  scalar of `HKDF(ikm = seed, info = "ephemeral" ‖ ctr)`, `ctr = 0, 1, …`, so the requester can
+  recompute `e` when the answers arrive. Recipients learn `root_key`, never `seed` or `e`.
 * Per recipient `i`: `ss_i = ECDH(e, lift_x(R_i))` (libsecp default: SHA-256 of the compressed
-  shared point), `kek_i = HKDF-SHA256(salt = "KeryxPrivateInferenceV1", ikm = ss_i,
-  info = "kek" ‖ E ‖ R_i)`, `wrapped_root_key_i = ChaCha20-Poly1305(kek_i, nonce, root_key,
-  aad = request header)`. `lift_x` is the BIP-340 even-Y lift; a responder whose full key has odd
-  Y negates its secret before the ECDH (`open_request` does this).
-* `k_prompt = HKDF(salt, ikm = root_key, info = "prompt")`; the prompt AAD is the 52-byte request
+  shared point), `kek_i = HKDF(ikm = ss_i, info = "kek" ‖ E ‖ R_i)`,
+  `wrapped_root_key_i = ChaCha20-Poly1305(kek_i, nonce, root_key, aad = request header)`.
+  `lift_x` is the BIP-340 even-Y lift; a responder whose full key has odd Y negates its secret
+  before the ECDH (`open_request` does this).
+* `k_prompt = HKDF(ikm = root_key, info = "prompt")`; the prompt AAD is the 52-byte request
   header followed by the envelope header (everything before the ciphertext). Re-parameterizing
   the request (model, tokens, reward, fee), re-addressing it or transplanting a wrapped key from
   another request all fail authentication.
-* `k_response = HKDF(salt, ikm = root_key, info = "response" ‖ responder_escrow_pubkey)` —
-  distinct per responder, so several named responders answering the same request never share a
-  key; a fresh random nonce per envelope keeps a re-published answer safe as well.
+* `k_response_i = HKDF(ikm = ss_i ‖ root_key, info = "response" ‖ R_i)`. Every recipient
+  unwraps the same `root_key`, but `ss_i` is known only to responder `i` (from its escrow
+  secret and `E`) and to the requester (from `e`). Another recipient computing it would need
+  `e` or responder `i`'s escrow secret, so it can neither read responder `i`'s answer nor re-seal
+  it as its own. A fresh random nonce per envelope keeps a re-published answer safe as well.
 
 Using the escrow (signing) key for ECDH is a deliberate trade-off: it is the only key a miner
 already announces on-chain and the one bound to its service identity. Domain-separated HKDF info
@@ -108,14 +115,38 @@ Key material at a glance (one recipient shown, the wrap repeats per named key):
 
 ```mermaid
 flowchart LR
-    e["ephemeral secret e<br/>(E = e*G goes on the wire)"] -->|"ECDH with lift_x(R_i)"| ss["ss_i"]
+    seed["seed<br/>(random 32 B, kept by the requester)"] -->|"HKDF, info = ephemeral"| e["ephemeral secret e<br/>(E = e*G goes on the wire)"]
+    seed -->|"HKDF, info = root"| root["root_key"]
+    e -->|"ECDH with lift_x(R_i)"| ss["ss_i"]
     ss -->|"HKDF, info = kek + E + R_i"| kek["kek_i"]
-    root["root_key<br/>(random 32 B, kept by the requester)"] -->|"ChaCha20-Poly1305 under kek_i,<br/>aad = request header"| wrapped["wrapped_root_key_i<br/>(on the wire)"]
+    root -->|"ChaCha20-Poly1305 under kek_i,<br/>aad = request header"| wrapped["wrapped_root_key_i<br/>(on the wire)"]
     root -->|"HKDF, info = prompt"| kp["k_prompt"]
     kp -->|"encrypt prompt,<br/>aad = request + envelope headers"| ct["prompt ciphertext<br/>(on the wire)"]
-    root -->|"HKDF, info = response + R_responder"| kr["k_response"]
-    kr -->|"encrypt answer,<br/>aad = request_hash + R_responder"| body["sealed body<br/>(in the AiResponse)"]
+    ss -->|"HKDF, ikm = ss_i + root_key,<br/>info = response + R_i"| kr["k_response_i"]
+    root --> kr
+    kr -->|"encrypt answer,<br/>aad = request_hash + R_i"| body["sealed body<br/>(in the AiResponse)"]
 ```
+
+### Key schedule 1 (H14 clients)
+
+The clients released with H14 drew `root_key` and `e` at random, used the salt
+`"KeryxPrivateInferenceV1"` and `k_response = HKDF(ikm = root_key, info = "response" ‖ R_i)`.
+Every recipient unwraps `root_key`, so every recipient could derive every other responder's
+key: a miner could read a competitor's sealed answer in the mempool, re-seal it under its own
+key and be credited for it, without running the model and without being struck for silence.
+The requester could not tell the copy from a real answer.
+
+Schedule 2 needs no fork because the key schedule is not on the wire. Consensus parses request
+envelopes and accepts version 1 only, so a new version byte would invalidate blocks on H14
+nodes. The response body is never parsed on-chain. Instead:
+
+* a responder tries the schedule-2 KEK first and the schedule-1 KEK second; exactly one
+  authenticates the wrapped root key and selects the schedule of the whole request, so
+  schedule-1 requests still in flight stay servable;
+* the requester knows its schedule from its secret: `02 ‖ seed` is schedule 2, a bare 32-byte
+  root key (what H14 clients printed) is schedule 1.
+
+Nothing seals schedule 1 any more. Its answers keep the old weakness.
 
 ## 3. Response payload extension (`inference/src/ai_payload.rs`)
 
@@ -210,15 +241,16 @@ were active recently, so a requester can seal to them too. Op `156`, gRPC messag
 ```text
 inference providers [tier]
 inference send --tier <0-4> [--max-tokens N] [--reward KRX] [--fee KRX] [--wait SECS] <prompt | @file>
-inference fetch <request id> <root key> [--since <block hash>] [--timeout SECS]
-inference decrypt <request id> <root key> <responder escrow> <@file | hex>
+inference fetch <request id> <secret> [--since <block hash>] [--timeout SECS]
+inference decrypt <request id> <secret> <responder escrow> <@file | hex>
 ```
 
 `send` selects the funding inputs first (the first one seeds the target cohort), seals the prompt
 to the target cohort of the tier, completed by rank with the tier's providers of the last 18 000
 DAA (~30 min) up to the 128-key cap, funds the request from the open account (inputs covering `reward + fee + ≥ 1 KRX change`; change at `outputs[0]`, the keyless
 reward vault at `outputs[1]`), signs it with the account keys, submits it, and prints the request
-id, the root key (the only way to read the answer — keep it) and the sink block to scan from. It
+id, the request secret (the only way to read the answer — keep it) and the sink block to scan
+from. `fetch` and `decrypt` also accept the bare root key an H14 client printed. It
 refuses to send when no miner of the tier is eligible. `--reward` defaults to the floor in force at the
 node's DAA: the model's base plus the token surcharge, or the model's fixed price once
 `private_inference_activation` (H14) is live (0.5 KRX for tier 0, 0.5 KRX more per tier, whatever
@@ -237,14 +269,15 @@ changes (the module depends only on `secp256k1`, `chacha20poly1305`, `sha2`, `hm
 
 1. `scan_txs_for_ai_requests` — after `AiRequestPayload::deserialize`, if `req.is_private()`:
    with an escrow key configured, `keryx_inference::open_request(&req, &escrow_secret)` yields
-   the plaintext prompt and the `root_key`; keep the root key with the queued request. Without
+   the plaintext prompt and the `response_key` (either key schedule); keep the response key
+   with the queued request. Without
    an escrow key, or on `NotARecipient`, skip the request (the miner joined the cohort after the
    request was sealed; the audit will not expect an answer from it). On
    `Authentication`/`Malformed`, the miner is a recipient of an unreadable request: answer anyway
    (§4 makes a silent recipient strikable), with a plaintext error body — a body that is not an
    envelope is the documented way to say "could not open".
-2. Response assembly — after inference: `body = seal_response(&root_key, &request_hash,
-   &escrow_pubkey, answer.as_bytes())`, build
+2. Response assembly — after inference: `body = seal_response(&response_key, &request_hash,
+   answer.as_bytes())`, build
    `AiResponsePayload::new(request_hash, window_end, cid, len).with_private_body(body)`, sign
    `signed_bytes()` with `sign_responder` **after** attaching the body, then set `responder`
    (the node's `collateral::responder_signature_message` is the exact digest the miner's
@@ -258,6 +291,11 @@ changes (the module depends only on `secp256k1`, `chacha20poly1305`, `sha2`, `hm
 Pools that dispatch requests to workers (`neuropool`) hold the escrow key at the pool and must
 open the envelope there before forwarding the plaintext over stratum.
 
+Rollout of key schedule 2: miners first. A miner built before it cannot unwrap a schedule-2
+request, answers it with the error body, and that error body is credited like an answer. A
+requester client that seals schedule 2 should therefore ship after a miner release that opens
+it.
+
 Every client that sends requests (wallets, extension, keryx-api, agents) must seal them before
 the gate, and every reader of AI transactions (indexer, explorer, wallets) must accept the
 `174 + 5 + len` response form and requests up to 16 KB.
@@ -266,7 +304,11 @@ the gate, and every reader of AI transactions (indexer, explorer, wallets) must 
 
 * Correctness of the answer is not verified on-chain — unchanged from public requests. Privacy
   here means confidentiality and integrity between the requester and the tier's miners, not
-  verified inference.
+  verified inference. A responder can still be credited for a body that is not an answer;
+  under key schedule 2 it can no longer pass off a competitor's answer as its own, so the
+  requester at least sees the difference.
+* Requests sealed under key schedule 1 (H14 clients) keep its weakness: every recipient can
+  read, and re-seal as its own, every other responder's answer.
 * Every miner of the tier can read the prompt (about 45 keys on the busiest tier in September
   2026), or the 128 of its target cohort once the tier is larger. Nobody else — including the
   node relaying the transaction — can.
@@ -277,15 +319,14 @@ the gate, and every reader of AI transactions (indexer, explorer, wallets) must 
   not persist it.
 * Inline bodies are capped at 32 KiB; larger answers go through IPFS (sealed with the same
   envelope) and `inference decrypt`.
-* Activation scores are `never()` on every network; mainnet and testnet need a scheduled DAA
-  above the live tip, released together with a miner that implements §7 and updated clients.
 
 ## 9. Tests
 
 * `inference/src/private.rs` — both directions round-trip, one and many recipients (up to 128),
   odd-parity escrow keys, non-recipients rejected, tampering of ciphertext / header fields /
   transplanted wrapped keys / response fields detected, strict parsing, size limits,
-  randomization.
+  randomization; no recipient can read or re-seal another responder's answer, key-schedule-1
+  requests still open and answer with the bare root key, request-secret hex forms.
 * `inference/src/ai_payload.rs` — extension round-trip, signed bytes cover the body, malformed
   extensions (including the pipeline-link byte range) and a v1 head with an extension rejected,
   size bounds.

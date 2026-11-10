@@ -16,6 +16,7 @@ keryx-consensusmanager.workspace = true
 keryx-core.workspace = true
 keryx-hashes.workspace = true
 keryx-inference.workspace = true
+keryx-verifiable-inference.workspace = true
 keryx-mining-errors.workspace = true
 keryx-muhash.workspace = true
 keryx-txscript.workspace = true

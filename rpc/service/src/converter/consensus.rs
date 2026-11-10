@@ -239,6 +239,7 @@ impl ConsensusConverter {
                 Default::default()
             },
             pom_tier: if verbosity.include_pom_tier.unwrap_or(false) { Some(header.pom_tier) } else { Default::default() },
+            task_root: if verbosity.include_service_state_hash.unwrap_or(false) { Some(header.task_root) } else { Default::default() },
         })
     }
 

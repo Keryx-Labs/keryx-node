@@ -61,6 +61,7 @@ impl SubnetworkId {
             || *self == SUBNETWORK_ID_AI_REQUEST
             || *self == SUBNETWORK_ID_AI_RESPONSE
             || *self == SUBNETWORK_ID_AI_CHALLENGE
+            || *self == SUBNETWORK_ID_AI_OPENING
             || *self == SUBNETWORK_ID_AI_AVAIL
     }
 
@@ -70,6 +71,7 @@ impl SubnetworkId {
         *self == SUBNETWORK_ID_AI_REQUEST
             || *self == SUBNETWORK_ID_AI_RESPONSE
             || *self == SUBNETWORK_ID_AI_CHALLENGE
+            || *self == SUBNETWORK_ID_AI_OPENING
             || *self == SUBNETWORK_ID_AI_AVAIL
     }
 
@@ -159,5 +161,8 @@ pub const SUBNETWORK_ID_AI_RESPONSE: SubnetworkId = SubnetworkId::from_byte(4);
 /// Subnetwork ID for OPoI fraud challenges.
 pub const SUBNETWORK_ID_AI_CHALLENGE: SubnetworkId = SubnetworkId::from_byte(5);
 
+/// The SUBNETWORK_ID_AI_OPENING is the subnetwork of inference trace openings.
+pub const SUBNETWORK_ID_AI_OPENING: SubnetworkId = SubnetworkId::from_byte(6);
+
 /// Subnetwork ID for network-model availability declarations (model split).
-pub const SUBNETWORK_ID_AI_AVAIL: SubnetworkId = SubnetworkId::from_byte(6);
+pub const SUBNETWORK_ID_AI_AVAIL: SubnetworkId = SubnetworkId::from_byte(7);

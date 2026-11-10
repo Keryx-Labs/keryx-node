@@ -156,6 +156,7 @@ mod mockery {
                 pom_final_state: mock(),
                 service_state_hash: mock(),
                 pom_tier: mock(),
+                task_root: Default::default(),
             }
         }
     }
@@ -178,6 +179,7 @@ mod mockery {
                 pom_final_state: mock(),
                 service_state_hash: mock(),
                 pom_tier: mock(),
+                task_root: Default::default(),
             }
         }
     }
@@ -431,6 +433,7 @@ mod mockery {
                 pom_final_state: mock(),
                 service_state_hash: mock(),
                 pom_tier: mock(),
+                task_root: Default::default(),
             }
         }
     }
@@ -1196,6 +1199,40 @@ mod mockery {
     }
 
     test!(GetServiceProvidersResponse);
+
+    impl Mock for GetAwaitedOpeningsRequest {
+        fn mock() -> Self {
+            GetAwaitedOpeningsRequest {
+                response_txids: vec![mock(), mock()],
+                escrow_pubkey: Some(mock()),
+                request_hashes: vec![mock()],
+            }
+        }
+    }
+
+    test!(GetAwaitedOpeningsRequest);
+
+    impl Mock for GetAwaitedOpeningsResponse {
+        fn mock() -> Self {
+            GetAwaitedOpeningsResponse {
+                virtual_daa_score: mock(),
+                openings: vec![RpcAwaitedOpening {
+                    response_txid: mock(),
+                    escrow_pubkey: mock(),
+                    seed: mock(),
+                    deadline_daa: mock(),
+                    accepted_daa: mock(),
+                    pieces: 5,
+                    attention_path: vec![3, 1],
+                }],
+                awaited_requests: vec![RpcAwaitedRequest { request_hash: mock(), window_end_daa: mock() }],
+                closed_requests: vec![mock()],
+                requests_checked: true,
+            }
+        }
+    }
+
+    test!(GetAwaitedOpeningsResponse);
 
     impl Mock for GetCoinSupplyResponse {
         fn mock() -> Self {

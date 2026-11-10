@@ -12,7 +12,7 @@ use keryx_consensus_core::tx::{
 };
 use keryx_inference::{
     AiResponsePayload, INFERENCE_REWARD_TOKEN_STEP, INFERENCE_VAULT_SCRIPT, MAX_PRIVATE_RECIPIENTS, MIN_AI_REQUEST_PRIORITY_FEE,
-    PrivateRequestSecret, open_response, seal_request,
+    PrivateRequestSecret, open_response, seal_request, seal_request_v1,
 };
 use keryx_rpc_core::{RpcHash, RpcTransaction};
 use keryx_txscript::pay_to_address_script;
@@ -72,11 +72,11 @@ impl Inference {
                     "Seal a prompt to the whole cohort of the tier and submit the AiRequest",
                 ),
                 (
-                    "inference fetch <request id> <root key> [--since <block hash>] [--timeout SECS]",
+                    "inference fetch <request id> <secret> [--since <block hash>] [--timeout SECS]",
                     "Wait for the sealed answer of a request and decrypt it",
                 ),
                 (
-                    "inference decrypt <request id> <root key> <responder escrow> <@file | hex>",
+                    "inference decrypt <request id> <secret> <responder escrow> <@file | hex>",
                     "Decrypt an answer body fetched from IPFS (a response without an inline body)",
                 ),
             ],
@@ -226,9 +226,12 @@ impl Inference {
         let seed = private_cohort_seed(&TransactionOutpoint::from(&selected[0].outpoint));
         let recipients = cohort_recipients(ctx, &model_id, &seed).await?;
 
-        // Seal the prompt: only the tier's escrow keys can open it, and the root key stays here.
-        let (payload, secret) = seal_request(model_id, max_tokens, reward, fee, prompt.as_bytes(), &recipients)
-            .map_err(|e| Error::custom(e.to_string()))?;
+        // Seal the prompt: only the tier's escrow keys can open it, and only this secret opens the answers.
+        let params = Params::from(ctx.wallet().network_id()?);
+        let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
+        let seal = if params.verifiable_inference_activation.is_active(daa) { seal_request } else { seal_request_v1 };
+        let (payload, secret) =
+            seal(model_id, max_tokens, reward, fee, prompt.as_bytes(), &recipients).map_err(|e| Error::custom(e.to_string()))?;
 
         let change = total - reward - fee;
         let change_address = account.change_address()?;
@@ -262,7 +265,7 @@ impl Inference {
 
         tprintln!(ctx, "Private inference request submitted");
         tprintln!(ctx, "  request id : {request_id}");
-        tprintln!(ctx, "  root key   : {}   (keep it: the answer cannot be read without it)", secret.to_hex());
+        tprintln!(ctx, "  secret     : {}   (keep it: the answer cannot be read without it)", secret.to_hex());
         tprintln!(
             ctx,
             "  model      : {}  max_tokens {max_tokens}  reward {} KRX  fee {} KRX",
@@ -311,7 +314,7 @@ impl Inference {
 
     async fn fetch(&self, ctx: &Arc<KaspaCli>, args: &[String]) -> Result<()> {
         if args.len() < 2 {
-            return Err(Error::custom("usage: inference fetch <request id> <root key> [--since <block hash>] [--timeout SECS]"));
+            return Err(Error::custom("usage: inference fetch <request id> <secret> [--since <block hash>] [--timeout SECS]"));
         }
         let request_hash = parse_hex32(&args[0], "request id")?;
         let secret = PrivateRequestSecret::from_hex(&args[1]).map_err(|e| Error::custom(e.to_string()))?;
@@ -385,7 +388,7 @@ impl Inference {
                     continue;
                 };
                 match resp.private_body.as_deref() {
-                    Some(body) => match open_response(&secret.root_key, &request_hash, &responder.escrow_pubkey, body) {
+                    Some(body) => match open_response(secret, &request_hash, &responder.escrow_pubkey, body) {
                         Ok(answer) => {
                             tprintln!(
                                 ctx,
@@ -438,7 +441,7 @@ impl Inference {
 
     async fn decrypt(&self, ctx: &Arc<KaspaCli>, args: &[String]) -> Result<()> {
         if args.len() < 4 {
-            return Err(Error::custom("usage: inference decrypt <request id> <root key> <responder escrow> <@file | hex>"));
+            return Err(Error::custom("usage: inference decrypt <request id> <secret> <responder escrow> <@file | hex>"));
         }
         let request_hash = parse_hex32(&args[0], "request id")?;
         let secret = PrivateRequestSecret::from_hex(&args[1]).map_err(|e| Error::custom(e.to_string()))?;
@@ -447,7 +450,7 @@ impl Inference {
             Some(path) => std::fs::read(path).map_err(|e| Error::custom(format!("cannot read {path}: {e}")))?,
             None => hex::decode(args[3].trim()).map_err(|_| Error::custom("the answer body must be @<file> or hex"))?,
         };
-        let answer = open_response(&secret.root_key, &request_hash, &responder, &body).map_err(|e| Error::custom(e.to_string()))?;
+        let answer = open_response(&secret, &request_hash, &responder, &body).map_err(|e| Error::custom(e.to_string()))?;
         tprintln!(ctx, "{}", String::from_utf8_lossy(&answer));
         Ok(())
     }

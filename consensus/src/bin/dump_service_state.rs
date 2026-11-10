@@ -12,6 +12,11 @@ fn h32(b: &[u8]) -> Hash {
     Hash::from_bytes(a)
 }
 
+/// A service row: event daa, label, canonical bytes.
+type Row = (u64, String, Vec<u8>);
+/// Turns a raw store entry into service rows.
+type RowSink<'a> = dyn FnMut(&[u8], &[u8], &mut Vec<Row>) + 'a;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -70,8 +75,8 @@ fn main() {
         let _ = std::fs::remove_dir_all(&secondary);
         return;
     }
-    let mut rows: Vec<(u64, String, Vec<u8>)> = Vec::new();
-    let mut scan = |prefix: u8, f: &mut dyn FnMut(&[u8], &[u8], &mut Vec<(u64, String, Vec<u8>)>)| {
+    let mut rows: Vec<Row> = Vec::new();
+    let mut scan = |prefix: u8, f: &mut RowSink<'_>| {
         let iter = db.iterator(rocksdb::IteratorMode::From(&[prefix], rocksdb::Direction::Forward));
         for item in iter {
             let (k, v) = match item {

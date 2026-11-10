@@ -11,14 +11,16 @@ use keryx_consensus_core::collateral::{
     ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
     ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
+    TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
 };
-use keryx_consensus_core::config::params::{NETWORK_MODEL_TIER, POM_TIERS_H6, POM_TIERS_H14, service_tiers};
+use keryx_consensus_core::config::params::{NETWORK_MODEL_TIER, POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
-use keryx_inference::{AiAvailPayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
+use keryx_inference::private::PRIVATE_TAG_LEN;
+use keryx_inference::{AiAvailPayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope, PrivateResponseEnvelope};
 use keryx_txscript::script_class::ScriptClass;
 
 const _: () = assert!(keryx_consensus_core::collateral::PRIVATE_COHORT_TARGET == keryx_inference::private::MAX_PRIVATE_RECIPIENTS);
@@ -135,7 +137,7 @@ impl StandingIndex {
     /// already carry their own penalty and no longer demote the reward rate.
     fn standing(&self, id: &Hash, pov: u64, v2: bool) -> bool {
         let anchor = pov.saturating_sub(keryx_consensus_core::collateral::SERVICE_STANDING_LAG_DAA);
-        if !self.first_seen.get(id).is_some_and(|&f| f <= anchor) {
+        if self.first_seen.get(id).is_none_or(|&f| f > anchor) {
             return false;
         }
         if v2 {
@@ -198,10 +200,11 @@ fn log_new_service_misses(
         }
         let burned_total: u64 = miss.burned.iter().map(|c| c.value).sum();
         info!(
-            "service-bond: miss #{} by miner {} on request {} → {:?}, {} claims / {} sompi (awaiting finality)",
+            "service-bond: miss #{} by miner {} on request {}{} → {:?}, {} claims / {} sompi (awaiting finality)",
             miss.consecutive_misses,
             miss.miner,
             hex::encode(miss.request_hash),
+            if miss.opening_missing { " (opening missing)" } else { "" },
             miss.penalty,
             miss.burned.len(),
             burned_total
@@ -312,7 +315,9 @@ impl VirtualStateProcessor {
         // the local pruning point (fresh IBD / restart catch-up). Past the ledger gate the part
         // below the pruning point is read from the imported snapshot; before it the audit arms
         // empty rather than with a cohort no local search can reproduce.
-        let (pruning_idx, below) = match self.window_floor_in_retention(sc, seed_header.pruning_point, own_pp, daa_bound) {
+        // The floor may be a snapshot-only index (daa known, no block hash): that is not retained history.
+        let floor = self.window_floor_in_retention(sc, seed_header.pruning_point, own_pp, daa_bound).filter(|&idx| sc.get_by_index(idx).is_ok());
+        let (pruning_idx, below) = match floor {
             Some(idx) => (idx, false),
             None if self.service_ledger_activation.is_active(seed_header.daa_score) => match sc.get_by_hash(own_pp) {
                 Ok(idx) => (idx, true),
@@ -400,26 +405,18 @@ impl VirtualStateProcessor {
     /// `model_split`, the network model and its shards after it. A v1 response or an invalid
     /// responder signature yields `None` (a volunteer — never serves the assignment). With
     /// `private` set, a request sealed to named responders also yields its recipient set. The
-    /// last output is the block's verified availability declarations as `(request_hash, tier,
-    /// escrow key)`, past the model-split gate only.
-    #[allow(clippy::type_complexity)]
+    /// events also carry the verified pipeline links and availability declarations.
     fn service_events_of_chain_block(
         &self,
         hash: Hash,
         txid_identity: bool,
         private: bool,
         model_split: bool,
-    ) -> (
-        Vec<([u8; 32], u8, u32)>,
-        Vec<([u8; 32], u64)>,
-        Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>,
-        Vec<([u8; 32], Option<Hash>)>,
-        Vec<ResponseLinks>,
-        Vec<([u8; 32], u8, Hash)>,
-    ) {
+    ) -> ServiceEvents {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
         let mut request_recipients = Vec::new();
+        let mut request_prompt_lens = Vec::new();
         let mut responses = Vec::new();
         let mut response_links = Vec::new();
         let mut declarations = Vec::new();
@@ -429,8 +426,8 @@ impl VirtualStateProcessor {
             for entry in mbad.accepted_transactions.iter() {
                 let tx = &txs[entry.index_within_block as usize];
                 if tx.is_ai_request() {
-                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        let tier = if model_split {
+                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload)
+                        && let Some(tier) = if model_split {
                             self.network_model
                                 .tiers
                                 .iter()
@@ -438,54 +435,97 @@ impl VirtualStateProcessor {
                                 .filter(|&tier| tier >= NETWORK_MODEL_TIER as usize)
                         } else {
                             service_tiers(private).iter().position(|t| t.model_id == req.model_id)
-                        };
-                        if let Some(tier) = tier {
-                            // Past the gate a request is identified by its transaction id, which is
-                            // unique by construction. The payload digest is not: the same prompt with
-                            // the same parameters is the same hash, so two senders — or one retry —
-                            // used to collide into a single, unanswerable assignment.
-                            let mut request_hash = [0u8; 32];
-                            if txid_identity {
-                                request_hash.copy_from_slice(&tx.id().as_bytes());
-                            } else {
-                                let digest = blake2b_simd::blake2b(&tx.payload);
-                                request_hash.copy_from_slice(&digest.as_bytes()[..32]);
-                            }
-                            requests.push((request_hash, tier as u8, req.max_tokens));
-                            request_rewards.push((request_hash, req.inference_reward));
-                            // Past the private-inference gate the envelope names the responders
-                            // obligated for (and paid by) this request. A plaintext request from a
-                            // block below the gate, merged past it, folds as a public request.
-                            if private
-                                && req.is_private()
-                                && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
-                                && let Some(first) = tx.inputs.first()
-                            {
-                                let mut recipients: Vec<Hash> = envelope.recipient_keys().map(escrow_miner_key).collect();
-                                recipients.sort_unstable();
-                                recipients.dedup();
-                                request_recipients.push((request_hash, private_cohort_seed(&first.previous_outpoint), recipients));
-                            }
+                        }
+                    {
+                        // Past the gate a request is identified by its transaction id.
+                        let mut request_hash = [0u8; 32];
+                        if txid_identity {
+                            request_hash.copy_from_slice(&tx.id().as_bytes());
+                        } else {
+                            let digest = blake2b_simd::blake2b(&tx.payload);
+                            request_hash.copy_from_slice(&digest.as_bytes()[..32]);
+                        }
+                        requests.push((request_hash, tier as u8, req.max_tokens));
+                        request_rewards.push((request_hash, req.inference_reward));
+                        request_prompt_lens.push((request_hash, plaintext_prompt_len(&req.prompt)));
+                        // Past the private-inference gate the envelope names the responders
+                        // obligated for (and paid by) this request. A plaintext request from a
+                        // block below the gate, merged past it, folds as a public request.
+                        if private
+                            && req.is_private()
+                            && let Ok(envelope) = PrivateRequestEnvelope::parse(&req.prompt)
+                            && let Some(first) = tx.inputs.first()
+                        {
+                            let mut recipients: Vec<Hash> = envelope.recipient_keys().map(escrow_miner_key).collect();
+                            recipients.sort_unstable();
+                            recipients.dedup();
+                            request_recipients.push((request_hash, private_cohort_seed(&first.previous_outpoint), recipients));
                         }
                     }
-                } else if tx.is_ai_response() {
-                    if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-                        let head = verified_responder(&resp);
-                        if let (Some(head), Some(links)) = (head, verified_links(&resp)) {
-                            response_links.push((resp.request_hash, head, links));
-                        }
-                        responses.push((resp.request_hash, head));
+                } else if tx.is_ai_response()
+                    && let Some(resp) = AiResponsePayload::deserialize(&tx.payload)
+                {
+                    let head = verified_responder(&resp);
+                    if let (Some(head), Some(links)) = (head, verified_links(&resp)) {
+                        response_links.push((resp.request_hash, head, links));
                     }
-                } else if model_split && tx.is_ai_avail() {
-                    if let Some(avail) = AiAvailPayload::deserialize(&tx.payload) {
-                        if let Some((tier, escrow)) = verified_declaration(&avail) {
-                            declarations.push((avail.request_hash, tier, escrow));
-                        }
-                    }
+                    responses.push((resp.request_hash, head));
+                } else if model_split
+                    && tx.is_ai_avail()
+                    && let Some(avail) = AiAvailPayload::deserialize(&tx.payload)
+                    && let Some((tier, escrow)) = verified_declaration(&avail)
+                {
+                    declarations.push((avail.request_hash, tier, escrow));
                 }
             }
         }
-        (requests, request_rewards, request_recipients, responses, response_links, declarations)
+        ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses, response_links, declarations }
+    }
+
+    /// Traced responses with a verified responder, and correctly signed openings, accepted by
+    /// chain block `hash`, in acceptance order.
+    fn trace_events_of_chain_block(&self, hash: Hash) -> (Vec<TraceResponseEvent>, Vec<TraceOpeningEvent>) {
+        use keryx_verifiable_inference::opening::{SignedPayload, is_audit_body};
+        let mut responses = Vec::new();
+        let mut openings = Vec::new();
+        let acceptance = self.acceptance_data_store.get(hash).unwrap();
+        for mbad in acceptance.iter() {
+            let txs = self.block_transactions_store.get(mbad.block_hash).unwrap();
+            for entry in mbad.accepted_transactions.iter() {
+                let tx = &txs[entry.index_within_block as usize];
+                if tx.is_ai_response() {
+                    let Some(resp) = AiResponsePayload::deserialize(&tx.payload) else { continue };
+                    let (Some(trace), Some(r), Some(responder)) = (resp.trace, resp.responder.as_ref(), verified_responder(&resp)) else {
+                        continue;
+                    };
+                    let mut response_txid = [0u8; 32];
+                    response_txid.copy_from_slice(&tx.id().as_bytes());
+                    responses.push(TraceResponseEvent {
+                        response_txid,
+                        request_hash: resp.request_hash,
+                        responder,
+                        escrow_pubkey: r.escrow_pubkey,
+                        trace_root: trace.trace_root,
+                        n_prompt: trace.n_prompt,
+                        n_pos: trace.n_pos,
+                        answer_len: resp.private_body.as_deref().map_or(0, plaintext_answer_len),
+                        stage: trace.stage,
+                        tokens: trace.tokens_root.is_some(),
+                    });
+                } else if tx.is_ai_opening() {
+                    let Some(signed) = SignedPayload::split(&tx.payload) else { continue };
+                    if !verify_opening_signature(&signed.escrow_pubkey, &signed.signature, signed.body) {
+                        continue;
+                    }
+                    let Some(response_txid) = signed.body.get(1..33).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { continue };
+                    if !is_audit_body(signed.body) {
+                        continue;
+                    }
+                    openings.push(TraceOpeningEvent { response_txid, escrow_pubkey: signed.escrow_pubkey, body: signed.body.to_vec() });
+                }
+            }
+        }
+        (responses, openings)
     }
 
     /// `(identity, coinbase payout script)` of the chain block's producers — the reward-mint
@@ -545,12 +585,15 @@ impl VirtualStateProcessor {
         // Only the suspensions in force at this POV: the map keeps every record ever flushed, so
         // that re-validating an old POV reaches the verdict a live node reached. Reporting it raw
         // leaves expired suspensions on display long after production resumed.
+        let every_window = self.suspension_pov_activation.is_active(virtual_daa_score);
         snapshot.suspended = self
             .service_suspended
             .read()
             .iter()
-            .filter(|(_, until)| until.saturating_sub(SERVICE_SUSPENSION_DAA) <= virtual_daa_score && virtual_daa_score < **until)
-            .map(|(m, until)| (*m, *until))
+            .filter_map(|(m, deadlines)| {
+                let considered = if every_window { &deadlines[..] } else { &deadlines[deadlines.len().saturating_sub(1)..] };
+                considered.iter().rev().find(|&&until| suspension_covers(until, virtual_daa_score)).map(|&until| (*m, until))
+            })
             .collect();
         snapshot.suspended.sort_unstable();
         snapshot
@@ -558,6 +601,103 @@ impl VirtualStateProcessor {
 
     /// The private-inference recipients of a pending request (see
     /// [`ServiceLedger::private_recipients`]), as raw escrow pubkeys.
+    pub(crate) fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.service_ledger.lock().ledger.awaited_opening_key(response_txid)
+    }
+
+    pub(crate) fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.service_ledger.lock().ledger.awaited_opening_seed(response_txid)
+    }
+
+    pub(crate) fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        self.service_ledger.lock().ledger.awaited_response_deadline(request_hash, escrow_pubkey)
+    }
+
+    /// Await status of each known request of `request_hashes` for the identity of
+    /// `escrow_pubkey`, under one ledger lock; `None` while the rule is not active.
+    pub(crate) fn awaited_requests(
+        &self,
+        escrow_pubkey: &[u8; 32],
+        request_hashes: &[[u8; 32]],
+        virtual_daa_score: u64,
+    ) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        if !self.trace_sanction_activation.is_active(virtual_daa_score) {
+            return None;
+        }
+        let sync = self.service_ledger.lock();
+        Some(request_hashes.iter().filter_map(|rh| Some((*rh, sync.ledger.request_await_status(rh, escrow_pubkey)?))).collect())
+    }
+
+    pub(crate) fn awaited_response_deadlines(&self, keys: &[([u8; 32], [u8; 32])]) -> Vec<Option<u64>> {
+        let sync = self.service_ledger.lock();
+        keys.iter().map(|(rh, e)| sync.ledger.awaited_response_deadline(rh, e)).collect()
+    }
+
+    pub(crate) fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.service_ledger.lock().ledger.awaited_opening_deadline(response_txid)
+    }
+
+    pub(crate) fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        self.service_ledger.lock().ledger.awaited_attention_path(response_txid)
+    }
+
+    /// Pieces an audit of `tier` accepted at `at` needs.
+    fn required_pieces_at(&self, tier: u8, at: u64) -> u8 {
+        let rules = trace_rules(
+            tier,
+            self.trace_prefix_activation.is_active(at),
+            self.trace_audit_activation.is_active(at),
+            self.trace_chain_activation.is_active(at),
+            self.attention_activation.is_active(at),
+        );
+        keryx_consensus_core::collateral::required_pieces(rules.as_ref())
+    }
+
+    pub(crate) fn awaited_opening_pieces(&self, response_txid: &[u8; 32]) -> Option<u8> {
+        self.service_ledger.lock().ledger.awaited_opening_pieces(response_txid, |t, at| self.required_pieces_at(t, at))
+    }
+
+    pub(crate) fn awaited_openings(&self, response_txids: &[[u8; 32]]) -> Vec<keryx_consensus_core::collateral::AwaitedOpening> {
+        let sync = self.service_ledger.lock();
+        let ledger = &sync.ledger;
+        response_txids
+            .iter()
+            .filter_map(|txid| {
+                Some(keryx_consensus_core::collateral::AwaitedOpening {
+                    response_txid: *txid,
+                    escrow_pubkey: ledger.awaited_opening_key(txid)?,
+                    seed: ledger.awaited_opening_seed(txid)?,
+                    deadline_daa: ledger.awaited_opening_deadline(txid)?,
+                    accepted_daa: ledger.awaited_opening_accepted_daa(txid)?,
+                    pieces: ledger.awaited_opening_pieces(txid, |t, at| self.required_pieces_at(t, at)).unwrap_or(0),
+                    attention_path: ledger.awaited_attention_path(txid).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the opening `tx` proves a piece its response still owes, from the key, seed and
+    /// attention path the audit awaits (the signature is a validity rule, checked elsewhere).
+    pub(crate) fn opening_awaited(&self, tx: &keryx_consensus_core::tx::Transaction) -> bool {
+        use keryx_consensus_core::collateral::{opening_body_piece, trace_seed};
+        use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
+        let Some(s) = SignedPayload::split(&tx.payload) else { return false };
+        let Some(txid) = s.body.get(1..33).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { return false };
+        let sync = self.service_ledger.lock();
+        let ledger = &sync.ledger;
+        ledger.awaited_opening_key(&txid) == Some(s.escrow_pubkey)
+            && seed_block(s.body).is_none_or(|b| ledger.awaited_opening_seed(&txid) == Some(trace_seed(&Hash::from_bytes(b), &txid)))
+            && attn_path(s.body).is_none_or(|p| ledger.awaited_attention_path(&txid) == Some(p))
+            && ledger.awaited_opening_pieces(&txid, |t, at| self.required_pieces_at(t, at)).is_some_and(|m| m & opening_body_piece(s.body) != 0)
+    }
+
+    pub(crate) fn ai_response_admission(&self, request_hash: &[u8; 32], escrow_pubkey: Option<&[u8; 32]>, virtual_daa_score: u64) -> Option<bool> {
+        if !self.trace_sanction_activation.is_active(virtual_daa_score) {
+            return None;
+        }
+        Some(escrow_pubkey.is_some_and(|e| self.service_ledger.lock().ledger.response_admissible(request_hash, e)))
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
@@ -592,7 +732,7 @@ impl VirtualStateProcessor {
                 providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
             }
         }
-        providers.sort_by(|x, y| (x.tier, x.identity, x.escrow_pubkey).cmp(&(y.tier, y.identity, y.escrow_pubkey)));
+        providers.sort_by_key(|x| (x.tier, x.identity, x.escrow_pubkey));
         ServiceProvidersSnapshot { virtual_daa_score, providers }
     }
 
@@ -686,12 +826,13 @@ impl VirtualStateProcessor {
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
         ledger.set_network_model(self.network_model);
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let (requests, request_rewards, request_recipients, responses, response_links, declarations) = self.service_events_of_chain_block(
-            hash,
-            self.reward_routing_activation.is_active(daa),
-            self.private_inference_activation.is_active(daa),
-            self.model_split_activation.is_active(daa),
-        );
+        let ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses, response_links, declarations } = self
+            .service_events_of_chain_block(
+                hash,
+                self.reward_routing_activation.is_active(daa),
+                self.private_inference_activation.is_active(daa),
+                self.model_split_activation.is_active(daa),
+            );
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
         // Claims whose outpoint is already in the (reorg-immune) burn store are dead on arrival:
@@ -725,6 +866,97 @@ impl VirtualStateProcessor {
             }
             set
         };
+        if self.verifiable_inference_activation.is_active(daa) {
+            let (trace_responses, trace_openings) = self.trace_events_of_chain_block(hash);
+            let h14 = self.private_inference_activation.is_active(daa);
+            let prefix_at = |at: u64| self.trace_prefix_activation.is_active(at);
+            let audit_at = |at: u64| self.trace_audit_activation.is_active(at);
+            let chain_at = |at: u64| self.trace_chain_activation.is_active(at);
+            let attn_at = |at: u64| self.attention_activation.is_active(at);
+            let tier =
+                |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at)) } else { None };
+            let traces = TraceInputs {
+                chain_hash: hash,
+                responses: &trace_responses,
+                openings: &trace_openings,
+                tier: &tier,
+                prompt_lens: &request_prompt_lens,
+                shape: self.trace_shape_activation.is_active(daa) || prefix_at(daa) || chain_at(daa),
+                sanction: self.trace_sanction_activation.is_active(daa),
+                context: self.trace_context_activation.is_active(daa),
+                draw: self.reward_draw_activation.is_active(daa),
+                window_v3: self.service_window_v3_activation.is_active(daa),
+                dedup: self.trace_dedup_activation.is_active(daa),
+                seed_bind: self.trace_seed_bind_activation.is_active(daa),
+                untraced_silence: self.untraced_response_activation.is_active(daa),
+                own_shape: self.answer_shape_window_activation.is_active(daa),
+                one_miss: self.one_miss_per_request_activation.is_active(daa),
+                uniform_strikes: self.uniform_strike_activation.is_active(daa),
+                audit_queue: self.audit_queue_activation.is_active(daa),
+            };
+            if warmup {
+                let burned = self.service_burned.read();
+                ledger.on_chain_block_warmup_with_pipeline(
+                    daa,
+                    &requests,
+                    &request_rewards,
+                    &request_recipients,
+                    &responses,
+                    &escrows,
+                    &producers,
+                    &response_links,
+                    &declarations,
+                    Some(&traces),
+                    &|op| burned.contains_key(op),
+                    cohort,
+                );
+                return (FoldOutcome::default(), escrows);
+            }
+            let outcome = ledger.on_chain_block_with_pipeline(
+                daa,
+                &requests,
+                &request_rewards,
+                &request_recipients,
+                &responses,
+                &escrows,
+                &producers,
+                &response_links,
+                &declarations,
+                Some(&traces),
+                |id| self.service_standing_at(id, daa),
+                cohort,
+            );
+            if live {
+                for (rh, miner) in outcome.late.iter() {
+                    info!("service-bond: answer of miner {} on request {} past its deadline", miner, hex::encode(rh));
+                }
+                for (rh, miner) in outcome.excused.iter() {
+                    info!(
+                        "service-bond: silence of miner {} on request {} excused (prompt may exceed the tier context floor)",
+                        miner,
+                        hex::encode(rh)
+                    );
+                }
+                for v in outcome.verdicts.iter() {
+                    match v.cause {
+                        None => info!(
+                            "service-bond: opening of response {} by miner {} accepted (request {})",
+                            hex::encode(v.response_txid),
+                            v.responder,
+                            hex::encode(v.request_hash)
+                        ),
+                        Some(cause) => info!(
+                            "service-bond: opening of response {} by miner {} rejected: {} (request {})",
+                            hex::encode(v.response_txid),
+                            v.responder,
+                            cause,
+                            hex::encode(v.request_hash)
+                        ),
+                    }
+                }
+            }
+            return (outcome, escrows);
+        }
         if warmup {
             let burned = self.service_burned.read();
             ledger.on_chain_block_warmup_with_pipeline(
@@ -737,6 +969,7 @@ impl VirtualStateProcessor {
                 &producers,
                 &response_links,
                 &declarations,
+                None,
                 &|op| burned.contains_key(op),
                 cohort,
             );
@@ -752,6 +985,7 @@ impl VirtualStateProcessor {
                 &producers,
                 &response_links,
                 &declarations,
+                None,
                 |id| self.service_standing_at(id, daa),
                 cohort,
             );
@@ -782,12 +1016,8 @@ impl VirtualStateProcessor {
             return lo;
         }
         while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
-            if daa_at(mid) <= bound_daa {
-                lo = mid
-            } else {
-                hi = mid - 1
-            }
+            let mid = lo + (hi - lo).div_ceil(2);
+            if daa_at(mid) <= bound_daa { lo = mid } else { hi = mid - 1 }
         }
         lo
     }
@@ -1094,7 +1324,7 @@ impl VirtualStateProcessor {
                     // [daa + finality, daa + finality + SERVICE_SUSPENSION_DAA].
                     if miss.penalty == ServicePenalty::Suspend {
                         let until = daa + self.finality_depth + SERVICE_SUSPENSION_DAA;
-                        self.service_suspended.write().insert(miss.miner, until);
+                        record_suspension(&mut self.service_suspended.write(), miss.miner, until);
                         info!("service-bond: SUSPENSION FINAL for miner {} until daa {} (miss daa {})", miss.miner, until, daa);
                     }
                 }
@@ -1365,6 +1595,16 @@ impl VirtualStateProcessor {
         Ok(())
     }
 
+    /// Drops the folded ledger state once the selected chain restarts at `pruning_point`; the next
+    /// advance folds from the stores as after a restart.
+    pub(crate) fn reset_service_ledger_to_pruning_point(&self, pruning_point: Hash) {
+        let pp_daa = self.headers_store.get_daa_score(pruning_point).unwrap_or(0);
+        let mut sync = self.service_ledger.lock();
+        let deep_cursor_daa = sync.deep_cursor_daa.max(pp_daa);
+        *sync = ServiceLedgerSync::default();
+        sync.deep_cursor_daa = deep_cursor_daa;
+    }
+
     /// Installs an imported ledger snapshot taken at chain block `sample` (the new pruning
     /// point): persists it and restarts the fold from it, so every event above `sample` is
     /// re-derived locally.
@@ -1463,10 +1703,9 @@ impl VirtualStateProcessor {
             rows.push((event_daa, service_commit::strike_row_bytes(event_daa, miner, record.count, record.last_daa).to_vec()));
             standing.record_strike(miner, event_daa, record.count, record.last_daa);
             // An executed suspension logs `{0, daa}` with `last_daa` equal to its own event daa;
-            // a served reset carries a strictly older (or zero) preserved daa. The log is in
-            // event order, so the last (largest) deadline per miner wins.
+            // a served reset carries a strictly older (or zero) preserved daa.
             if record.count == 0 && record.last_daa == event_daa {
-                suspended.insert(miner, record.last_daa + self.finality_depth + SERVICE_SUSPENSION_DAA);
+                record_suspension(&mut suspended, miner, record.last_daa + self.finality_depth + SERVICE_SUSPENSION_DAA);
             }
         }
         drop(suspended);
@@ -1522,10 +1761,10 @@ impl VirtualStateProcessor {
         hashes.clear();
         for (sample, bytes) in self.service_ledger_snapshot_store.entries() {
             hashes.insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
-            if Some(sample) == own_pp {
-                if let Ok(snapshot) = ServiceLedgerSnapshot::from_bytes(&bytes) {
-                    *self.service_imported_producers.write() = snapshot.recent_producers;
-                }
+            if Some(sample) == own_pp
+                && let Ok(snapshot) = ServiceLedgerSnapshot::from_bytes(&bytes)
+            {
+                *self.service_imported_producers.write() = snapshot.recent_producers;
             }
         }
     }
@@ -1574,16 +1813,69 @@ impl VirtualStateProcessor {
         wins.into_iter().map(|(_, amount, spk)| (spk, amount)).collect()
     }
 
-    /// Whether `producer` is under a finality-deep suspension at `daa_score`. The window is
-    /// derived from the record itself (`[until − SERVICE_SUSPENSION_DAA, until)`), NOT from when
-    /// this node learned it: a catch-up or fresh node re-validating an old POV must reach the
-    /// exact verdict a live node reached — an unbounded lower edge would apply the suspension to
-    /// POVs before its finalization.
-    pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64) -> bool {
-        self.service_suspended
-            .read()
-            .get(producer)
-            .is_some_and(|&until| until.saturating_sub(SERVICE_SUSPENSION_DAA) <= daa_score && daa_score < until)
+    /// Whether the ledger has folded the committed selected-chain tip (always true before it folds);
+    /// false while the ledger is busy.
+    pub(super) fn service_ledger_folded_tip(&self) -> bool {
+        let (idx, hash) = self.selected_chain_store.read().get_tip().unwrap();
+        if !self.pom_v3_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
+            return true;
+        }
+        self.service_ledger.try_lock().is_some_and(|l| l.tip == Some(idx))
+    }
+
+    /// Whether `producer` is suspended at `daa_score`; `every_window` false reads only the latest
+    /// recorded deadline.
+    pub(super) fn is_producer_suspended(&self, producer: &Hash, daa_score: u64, every_window: bool) -> bool {
+        let suspended = self.service_suspended.read();
+        let Some(deadlines) = suspended.get(producer) else { return false };
+        if every_window {
+            deadlines.iter().any(|&until| suspension_covers(until, daa_score))
+        } else {
+            deadlines.last().is_some_and(|&until| suspension_covers(until, daa_score))
+        }
+    }
+}
+
+/// Whether the suspension ending at `until` is in force at `daa_score`.
+fn suspension_covers(until: u64, daa_score: u64) -> bool {
+    until.saturating_sub(SERVICE_SUSPENSION_DAA) <= daa_score && daa_score < until
+}
+
+/// Adds a suspension deadline for `miner`, keeping the deadlines ascending and unique.
+fn record_suspension(suspended: &mut std::collections::HashMap<Hash, Vec<u64>>, miner: Hash, until: u64) {
+    let deadlines = suspended.entry(miner).or_default();
+    if let Err(at) = deadlines.binary_search(&until) {
+        deadlines.insert(at, until);
+    }
+}
+
+/// The service-ledger inputs of one chain block.
+struct ServiceEvents {
+    requests: Vec<([u8; 32], u8, u32)>,
+    request_rewards: Vec<([u8; 32], u64)>,
+    request_recipients: Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)>,
+    request_prompt_lens: Vec<([u8; 32], u32)>,
+    responses: Vec<([u8; 32], Option<Hash>)>,
+    /// Verified pipeline links of V3 responses.
+    response_links: Vec<ResponseLinks>,
+    /// Verified availability declarations `(request_hash, tier, escrow key)`, past the
+    /// model-split gate only.
+    declarations: Vec<([u8; 32], u8, Hash)>,
+}
+
+/// Plaintext length of a request prompt: the sealed length without the envelope, else the bytes.
+fn plaintext_prompt_len(prompt: &[u8]) -> u32 {
+    match PrivateRequestEnvelope::parse(prompt) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => prompt.len().min(u32::MAX as usize) as u32,
+    }
+}
+
+/// Plaintext length of a sealed answer body.
+fn plaintext_answer_len(body: &[u8]) -> u32 {
+    match PrivateResponseEnvelope::parse(body) {
+        Ok(envelope) => envelope.ciphertext.len().saturating_sub(PRIVATE_TAG_LEN) as u32,
+        Err(_) => 0,
     }
 }
 
@@ -1666,5 +1958,30 @@ mod tests {
         script.push(keryx_txscript::opcodes::codes::OpCheckSig);
         assert_eq!(csv_escrow_pubkey(&script), Some([0x11u8; 32]));
         assert_eq!(csv_escrow_pubkey(&[0u8; 10]), None);
+    }
+}
+
+#[cfg(test)]
+impl VirtualStateProcessor {
+    /// Queues a test suspension of `miner` at the committed tip. Returns its daa.
+    pub(super) fn queue_test_suspension(&self, miner: Hash) -> u64 {
+        let (idx, hash) = self.selected_chain_store.read().get_tip().unwrap();
+        let daa = self.headers_store.get_daa_score(hash).unwrap();
+        let miss = ServiceMiss {
+            request_hash: [0; 32],
+            miner,
+            consecutive_misses: 3,
+            penalty: ServicePenalty::Suspend,
+            burned: Vec::new(),
+            opening_missing: true,
+        };
+        self.service_ledger.lock().queue.push_back((idx, daa, ServiceEvent::Miss(miss)));
+        daa
+    }
+
+    /// Moves the ledger's folded tip back by one chain block, as between commit and fold.
+    pub(super) fn rewind_test_ledger_tip(&self) {
+        let mut sync = self.service_ledger.lock();
+        sync.tip = sync.tip.map(|t| t - 1);
     }
 }

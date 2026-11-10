@@ -38,7 +38,7 @@ impl DbServiceRewardStore {
     }
 
     /// All reward rows, for the boot load.
-    pub fn iterator(&self) -> impl Iterator<Item = Result<(Box<[u8]>, RewardEntry), Box<dyn std::error::Error>>> + '_ {
+    pub fn iterator(&self) -> impl Iterator<Item = super::StoreRow<RewardEntry>> + '_ {
         self.access.iterator()
     }
 

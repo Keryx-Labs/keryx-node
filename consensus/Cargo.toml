@@ -23,6 +23,7 @@ itertools.workspace = true
 keryx-addresses.workspace = true
 keryx-consensus-core.workspace = true
 keryx-inference.workspace = true
+keryx-verifiable-inference.workspace = true
 keryx-consensus-notify.workspace = true
 keryx-consensusmanager.workspace = true
 keryx-core.workspace = true

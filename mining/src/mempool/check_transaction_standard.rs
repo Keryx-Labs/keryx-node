@@ -43,6 +43,16 @@ const MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
 const MAXIMUM_STANDARD_AI_REQUEST_TRANSIENT_MASS: u64 =
     (keryx_inference::MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
 
+/// Maximum standard transient mass of an AiResponse: the largest payload plus the transaction header.
+const MAXIMUM_STANDARD_AI_RESPONSE_TRANSIENT_MASS: u64 =
+    (keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
+
+/// Maximum standard compute mass of an opening: the largest payload plus the transaction header.
+const MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS: u64 = keryx_verifiable_inference::opening::MAX_PAYLOAD_LEN as u64 + 4_096;
+
+/// Maximum standard transient mass of an opening: the largest payload plus the transaction header.
+const MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS: u64 = MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS * TRANSIENT_BYTE_TO_MASS_FACTOR;
+
 impl Mempool {
     pub(crate) fn check_transaction_standard_in_isolation(&self, transaction: &MutableTransaction) -> NonStandardResult<()> {
         let transaction_id = transaction.id();
@@ -63,16 +73,27 @@ impl Mempool {
             ));
         }
 
+        let tx = &transaction.tx;
+        if tx.is_ai_opening() && (tx.version != 0 || !tx.inputs.is_empty() || !tx.outputs.is_empty() || tx.lock_time != 0 || tx.gas != 0) {
+            return Err(NonStandardError::RejectAiOpeningForm(transaction_id));
+        }
+
         // Since extremely large transactions with a lot of inputs can cost
         // almost as much to process as the sender fees, limit the maximum
         // size of a transaction. This also helps mitigate CPU exhaustion
         // attacks.
         let NonContextualMasses { compute_mass, transient_mass } = transaction.calculated_non_contextual_masses.unwrap();
-        if compute_mass > MAXIMUM_STANDARD_TRANSACTION_MASS {
-            return Err(NonStandardError::RejectComputeMass(transaction_id, compute_mass, MAXIMUM_STANDARD_TRANSACTION_MASS));
+        let max_compute_mass =
+            if transaction.tx.is_ai_opening() { MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS } else { MAXIMUM_STANDARD_TRANSACTION_MASS };
+        if compute_mass > max_compute_mass {
+            return Err(NonStandardError::RejectComputeMass(transaction_id, compute_mass, max_compute_mass));
         }
         let max_transient_mass = if transaction.tx.is_ai_request() {
             MAXIMUM_STANDARD_AI_REQUEST_TRANSIENT_MASS
+        } else if transaction.tx.is_ai_response() {
+            MAXIMUM_STANDARD_AI_RESPONSE_TRANSIENT_MASS
+        } else if transaction.tx.is_ai_opening() {
+            MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS
         } else {
             MAXIMUM_STANDARD_TRANSACTION_MASS
         };
@@ -624,7 +645,7 @@ mod tests {
     fn inference_vault_output_is_standard() {
         let dummy_prev_out = TransactionOutpoint::new(keryx_hashes::Hash::from_u64_word(1), 1);
         let dummy_tx_input = TransactionInput::new(dummy_prev_out, vec![0u8; 65], MAX_TX_IN_SEQUENCE_NUM, 1);
-        let addr = Address::new(Prefix::Testnet, Version::PubKey, &vec![1u8; 32]);
+        let addr = Address::new(Prefix::Testnet, Version::PubKey, &[1u8; 32]);
         let change = TransactionOutput::new(SOMPI_PER_KASPA, keryx_txscript::pay_to_address_script(&addr));
 
         let with_escrow = |spk: ScriptPublicKey| {
@@ -664,7 +685,7 @@ mod tests {
 
         let dummy_prev_out = TransactionOutpoint::new(keryx_hashes::Hash::from_u64_word(1), 1);
         let dummy_tx_input = TransactionInput::new(dummy_prev_out, vec![0u8; 65], MAX_TX_IN_SEQUENCE_NUM, 1);
-        let addr = Address::new(Prefix::Testnet, Version::PubKey, &vec![1u8; 32]);
+        let addr = Address::new(Prefix::Testnet, Version::PubKey, &[1u8; 32]);
         let change = TransactionOutput::new(SOMPI_PER_KASPA, keryx_txscript::pay_to_address_script(&addr));
         let with_transient = |subnetwork_id, transient_mass| {
             let tx = Transaction::new(TX_VERSION, vec![dummy_tx_input.clone()], vec![change.clone()], 0, subnetwork_id, 0, vec![]);
@@ -690,5 +711,46 @@ mod tests {
             mempool.check_transaction_standard_in_isolation(&with_transient(SUBNETWORK_ID_NATIVE, full_request)),
             Err(NonStandardError::RejectTransientMass(..))
         ));
+    }
+
+    #[test]
+    fn a_full_ai_response_is_standard_by_mass() {
+        use keryx_consensus_core::{mass::MassCalculator, subnets::SUBNETWORK_ID_AI_RESPONSE};
+        use keryx_inference::{AiResponder, AiResponsePayload, TraceCommitment, MAX_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PRIVATE_BODY_LEN};
+        let params: Params = NetworkType::Mainnet.into();
+        let trace = TraceCommitment { trace_root: [4; 32], n_prompt: 3, n_pos: 9, stage: 2, tokens_root: Some([5; 32]) };
+        let payload = AiResponsePayload::new_v2([7u8; 32], 1, [0u8; 34], 1, AiResponder { escrow_pubkey: [1; 32], signature: [2; 64] })
+            .with_private_body(vec![3u8; MAX_AI_RESPONSE_PRIVATE_BODY_LEN])
+            .with_trace(trace)
+            .serialize();
+        assert_eq!(payload.len() + 1 + keryx_inference::MAX_AI_RESPONSE_LINKS * keryx_inference::AI_RESPONSE_LINK_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN);
+        let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload);
+        let m = MassCalculator::new_with_consensus_params(&params).calc_non_contextual_masses(&tx);
+        assert!(m.compute_mass <= MAXIMUM_STANDARD_TRANSACTION_MASS, "{}", m.compute_mass);
+        assert!(m.transient_mass > MAXIMUM_STANDARD_TRANSACTION_MASS && m.transient_mass <= MAXIMUM_STANDARD_AI_RESPONSE_TRANSIENT_MASS, "{}", m.transient_mass);
+        assert!(m.transient_mass <= params.max_block_mass / 2);
+    }
+
+    #[test]
+    fn a_full_pipeline_response_is_standard_by_mass() {
+        use keryx_consensus_core::{mass::MassCalculator, subnets::SUBNETWORK_ID_AI_RESPONSE};
+        use keryx_inference::{
+            AiResponder, AiResponseLink, AiResponsePayload, TraceCommitment, MAX_AI_RESPONSE_LINKS, MAX_AI_RESPONSE_PAYLOAD_LEN,
+            MAX_AI_RESPONSE_PRIVATE_BODY_LEN,
+        };
+        let params: Params = NetworkType::Mainnet.into();
+        let trace = TraceCommitment { trace_root: [4; 32], n_prompt: 3, n_pos: 9, stage: 2, tokens_root: Some([5; 32]) };
+        let links = vec![AiResponseLink { tier: 6, escrow_pubkey: [8; 32], signature: [9; 64] }; MAX_AI_RESPONSE_LINKS];
+        let payload =
+            AiResponsePayload::new_v3([7u8; 32], 1, [0u8; 34], 1, AiResponder { escrow_pubkey: [1; 32], signature: [2; 64] }, links)
+                .with_private_body(vec![3u8; MAX_AI_RESPONSE_PRIVATE_BODY_LEN])
+                .with_trace(trace)
+                .serialize();
+        assert_eq!(payload.len(), MAX_AI_RESPONSE_PAYLOAD_LEN);
+        let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, payload);
+        let m = MassCalculator::new_with_consensus_params(&params).calc_non_contextual_masses(&tx);
+        assert!(m.compute_mass <= MAXIMUM_STANDARD_TRANSACTION_MASS, "{}", m.compute_mass);
+        assert!(m.transient_mass <= MAXIMUM_STANDARD_AI_RESPONSE_TRANSIENT_MASS, "{}", m.transient_mass);
+        assert!(m.transient_mass <= params.max_block_mass / 2);
     }
 }

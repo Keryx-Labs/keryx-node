@@ -68,6 +68,7 @@ impl Factory {
                 GetServiceStrikes,
                 GetNetworkModelAvailability,
                 GetServiceProviders,
+                GetAwaitedOpenings,
                 GetBalanceByAddress,
                 GetBalancesByAddresses,
                 GetSinkBlueScore,

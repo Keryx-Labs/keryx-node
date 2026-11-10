@@ -92,7 +92,7 @@ impl ScriptClass {
     pub fn is_csv_pay_to_pubkey(script_public_key: &[u8]) -> bool {
         let len = script_public_key.len();
         // seq_len in 1..=8, total = seq_len + 1(len_byte) + 1(CSV) + 1(OpData32) + 32(key) + 1(CHECKSIG)
-        if len < 37 || len > 44 { return false; }
+        if !(37..=44).contains(&len) { return false; }
         let seq_len = script_public_key[0] as usize;
         if seq_len == 0 || seq_len > 8 { return false; }
         if len != seq_len + 36 { return false; }

@@ -191,6 +191,70 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// Whether the ledger still takes an AiResponse to `request_hash` signed by `escrow_pubkey`:
+    /// its request is pending and not armed yet, or armed and still awaiting that responder.
+    /// `None` while the rule is not active.
+    fn ai_response_admission(&self, request_hash: &[u8; 32], escrow_pubkey: Option<&[u8; 32]>) -> Option<bool> {
+        let _ = (request_hash, escrow_pubkey);
+        None
+    }
+
+    /// The escrow key expected to sign the opening of a drawn response; `None` when no opening
+    /// is awaited for it.
+    fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        let _ = response_txid;
+        None
+    }
+
+    /// The draw seed of a response whose opening is awaited.
+    fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        let _ = response_txid;
+        None
+    }
+
+    /// The window end of an armed audit still awaiting a response signed by `escrow_pubkey`.
+    fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        let _ = (request_hash, escrow_pubkey);
+        None
+    }
+
+    /// Await status of each known request for the identity of `escrow_pubkey`: `None` inside
+    /// means it no longer awaits that identity, otherwise the window end (zero before arming).
+    /// `None` while the rule is not active.
+    fn awaited_requests(&self, escrow_pubkey: &[u8; 32], request_hashes: &[[u8; 32]]) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        let _ = (escrow_pubkey, request_hashes);
+        None
+    }
+
+    /// [`Self::awaited_response_deadline`] of each `(request_hash, escrow_pubkey)`.
+    fn awaited_response_deadlines(&self, keys: &[([u8; 32], [u8; 32])]) -> Vec<Option<u64>> {
+        keys.iter().map(|(rh, e)| self.awaited_response_deadline(rh, e)).collect()
+    }
+
+    /// The opening deadline of a response whose opening is awaited.
+    fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        let _ = response_txid;
+        None
+    }
+
+    /// The path of the attention phase a response awaits.
+    fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        let _ = response_txid;
+        None
+    }
+
+    /// The awaited openings among `response_txids`, read at once.
+    fn awaited_openings(&self, response_txids: &[[u8; 32]]) -> Vec<crate::collateral::AwaitedOpening> {
+        let _ = response_txids;
+        Vec::new()
+    }
+
+    /// The pieces a drawn response still owes.
+    fn awaited_opening_pieces(&self, response_txid: &[u8; 32]) -> Option<u8> {
+        let _ = response_txid;
+        None
+    }
+
     fn get_virtual_bits(&self) -> u32 {
         unimplemented!()
     }

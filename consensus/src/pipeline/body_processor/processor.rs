@@ -95,12 +95,19 @@ pub struct BlockBodyProcessor {
     pub(super) model_split_activation: ForkActivation,
     pub(super) network_model: &'static keryx_consensus_core::config::params::NetworkModelLayout,
     pub(super) pom_v4_activation: ForkActivation,
+    pub(super) pom_v5_activation: ForkActivation,
+    pub(super) pad_margin_activation: ForkActivation,
+    pub(super) block_task_activation: ForkActivation,
+    pub(super) trace_chain_activation: ForkActivation,
+    pub(super) trace_seed_bind_activation: ForkActivation,
+    pub(super) attention_activation: ForkActivation,
     pub(super) h10_activation: ForkActivation,
     pub(super) private_inference_activation: ForkActivation,
+    pub(super) verifiable_inference_activation: ForkActivation,
 
     // Stores
     pub(super) statuses_store: Arc<RwLock<DbStatusesStore>>,
-    pub(super) _ghostdag_store: Arc<DbGhostdagStore>,
+    pub(super) ghostdag_store: Arc<DbGhostdagStore>,
     pub(super) headers_store: Arc<DbHeadersStore>,
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, persisted at commit for the tier-reward coinbase split.
@@ -129,12 +136,8 @@ pub struct BlockBodyProcessor {
     // Counters
     counters: Arc<ProcessingCounters>,
 
-    /// Negative cache of PoM witnesses that failed verification, keyed by
-    /// (block hash, witness wire digest). The witness travels OUTSIDE the block
-    /// hash, so a bad witness must never invalidate the hash (witness poisoning) — but
-    /// without this cache, dropping the invalidation would let a peer force
-    /// unbounded re-verification of the same bad witness. Bounded two-generation
-    /// set; see `BadWitnessCache`.
+    /// PoM witnesses that failed verification, keyed by (block hash, witness wire digest).
+    /// Bounded two-generation set; see `BadWitnessCache`.
     bad_witness_cache: RwLock<BadWitnessCache>,
 }
 
@@ -149,9 +152,7 @@ pub(super) struct BadWitnessCache {
 }
 
 impl BadWitnessCache {
-    /// Per-generation capacity: 4096 entries × 40 bytes ≈ 160 KiB per generation.
-    /// An attacker cannot use rotation to flush their own entry usefully: filling
-    /// a generation costs 4096 distinct failed verifications.
+    /// Per-generation capacity.
     const GENERATION_CAP: usize = 4096;
 
     pub(super) fn contains(&self, block_hash: Hash, witness_digest: &[u8; 32]) -> bool {
@@ -167,13 +168,8 @@ impl BadWitnessCache {
     }
 }
 
-/// True when a body-validation error is scoped to the PoM WITNESS rather than the
-/// block itself. The witness travels outside the block hash (transport attachment),
-/// so none of these may ever mark the HASH invalid: the same block can arrive later
-/// with its honest witness. Marking the hash would let a single crafted witness
-/// poison a valid block permanently, reject every descendant and wedge the node
-/// (witness poisoning). The delivery is still rejected — and the relay flow still drops the
-/// peer that served it.
+/// True when a body-validation error is scoped to the PoM witness rather than the block itself.
+/// Witness-scoped errors reject the delivery and never mark the block hash invalid.
 pub(super) fn witness_scoped_error(e: &RuleError) -> bool {
     matches!(
         e,
@@ -183,6 +179,7 @@ pub(super) fn witness_scoped_error(e: &RuleError) -> bool {
             | RuleError::PomFinalStateMismatch(_, _)
             | RuleError::PomUnknownTier(_)
             | RuleError::PomDeclaredTierMismatch(_, _)
+            | RuleError::BadBlockTask(_)
     )
 }
 
@@ -207,6 +204,7 @@ pub(super) fn marks_block_invalid(e: &RuleError, bad_witness_rejects_delivery: b
             | RuleError::MissingParents(_)
             | RuleError::PrunedBlock
             | RuleError::PomProofMissing
+            | RuleError::BlockTaskMissing
             | RuleError::KnownBadPomWitness
     ) {
         return false;
@@ -256,11 +254,18 @@ impl BlockBodyProcessor {
             model_split_activation: params.model_split_activation,
             network_model: params.network_model,
             pom_v4_activation: params.pom_v4_activation,
+            pom_v5_activation: params.pom_v5_activation,
+            pad_margin_activation: params.pad_margin_activation,
+            block_task_activation: params.block_task_activation,
+            trace_chain_activation: params.trace_chain_activation,
+            trace_seed_bind_activation: params.trace_seed_bind_activation,
+            attention_activation: params.attention_activation,
             h10_activation: params.h10_activation,
             private_inference_activation: params.private_inference_activation,
+            verifiable_inference_activation: params.verifiable_inference_activation,
 
             statuses_store: storage.statuses_store.clone(),
-            _ghostdag_store: storage.ghostdag_store.clone(),
+            ghostdag_store: storage.ghostdag_store.clone(),
             headers_store: storage.headers_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
@@ -334,30 +339,25 @@ impl BlockBodyProcessor {
             _ => panic!("unexpected block status {status:?}"),
         }
 
-        // Witness-poisoning fix, gated at the H6 (pom_v3) fork by the block's OWN daa_score — the same
-        // deterministic key the proof-era selection uses, so every updated node applies the
-        // same policy to the same block. Pre-gate behavior is byte-identical to the previous
-        // release (a present-but-wrong witness still marks StatusInvalid below).
+        // Gated at `pom_v3` by the block's own DAA score.
         let bad_witness_rejects_delivery = self.pom_v3_activation.is_active(block.header.daa_score);
 
-        // Negative witness cache: a witness that already failed for this block is rejected
-        // without re-verification (pre-v3 verifiers re-walk all K transitions — unbounded
-        // re-verification would be a cheap CPU DoS).
+        // A witness that already failed for this block is rejected without re-verification.
         let witness_digest = if bad_witness_rejects_delivery { block.pom_proof.as_ref().map(|p| p.wire_digest()) } else { None };
-        if let Some(digest) = witness_digest {
-            if self.bad_witness_cache.read().contains(block.hash(), &digest) {
-                return Err(RuleError::KnownBadPomWitness);
-            }
+        if let Some(digest) = witness_digest
+            && self.bad_witness_cache.read().contains(block.hash(), &digest)
+        {
+            return Err(RuleError::KnownBadPomWitness);
         }
 
         let mass = match self.validate_body(block, is_trusted, skip_pom_proof) {
             Ok(mass) => mass,
             Err(e) => {
                 // Remember failed witnesses per (block, witness) — see the cache above.
-                if witness_scoped_error(&e) {
-                    if let Some(digest) = witness_digest {
-                        self.bad_witness_cache.write().insert(block.hash(), digest);
-                    }
+                if witness_scoped_error(&e)
+                    && let Some(digest) = witness_digest
+                {
+                    self.bad_witness_cache.write().insert(block.hash(), digest);
                 }
                 if marks_block_invalid(&e, bad_witness_rejects_delivery) {
                     self.statuses_store.write().set(block.hash(), BlockStatus::StatusInvalid).unwrap();
@@ -372,11 +372,8 @@ impl BlockBodyProcessor {
         // `block.pom_proof` is dropped once a block is reloaded from storage, so both must be
         // captured here while it is still attached to the block.
         //
-        // The IBD path skips `check_pom_proof` at validation (`skip_pom_proof`), but a carried
-        // proof would still be persisted here and re-served later. Never persist an UNVERIFIED
-        // proof — a malicious syncer could feed a bogus one that proof-enforcing relay peers would
-        // then reject from US. Verify it now; on failure persist the block naked (the tier still
-        // travels separately) and let the re-proof loop fetch a valid proof from another peer.
+        // A proof carried during IBD is verified before it is persisted; on failure the block is
+        // persisted without it.
         let pom_proof = if skip_pom_proof && block.pom_proof.is_some() {
             match self.check_pom_proof(block) {
                 Ok(()) => block.pom_proof.clone(),
@@ -439,7 +436,7 @@ impl BlockBodyProcessor {
             // proof before its body reaches this commit.
             match self.pom_proof_store.insert_batch(&mut batch, hash, proof) {
                 Ok(()) | Err(StoreError::HashAlreadyExists(_)) => {}
-                Err(e) => panic!("PoM proof store error for {hash}: {e}"),
+                Err(e) => log::warn!("PoM proof for {hash} not stored: {e}"),
             }
             self.pom_tier_store.insert_batch(&mut batch, hash, proof.tier).unwrap();
         } else if let Some(tier) = pom_tier {
@@ -480,8 +477,7 @@ mod tests {
 
     #[test]
     fn test_witness_errors_never_mark_the_block_invalid_post_gate() {
-        // Post-gate (witness-poisoning fix active): witness-scoped errors reject the delivery,
-        // never persist StatusInvalid.
+        // Post-gate: witness-scoped errors reject the delivery, never persist StatusInvalid.
         let witness_scoped = [
             RuleError::BadPomProof(PomVerifyError::TargetNotMet),
             RuleError::BadPomProofV3(PomV3VerifyError::MissingV3),
@@ -491,7 +487,7 @@ mod tests {
             RuleError::PomDeclaredTierMismatch(3, 2),
         ];
         for e in &witness_scoped {
-            assert!(!marks_block_invalid(e, true), "{e:?} must not poison the block hash post-gate");
+            assert!(!marks_block_invalid(e, true), "{e:?} must not mark the block hash invalid post-gate");
             // Pre-gate: historical behavior is preserved byte-identically — a
             // present-but-wrong witness still marks invalid.
             assert!(marks_block_invalid(e, false), "{e:?} must keep marking invalid pre-gate");
@@ -505,6 +501,10 @@ mod tests {
         assert!(marks_block_invalid(&RuleError::DuplicateTransactions(Default::default()), true));
         assert!(marks_block_invalid(&RuleError::PomTierPaused(0), true));
         assert!(marks_block_invalid(&RuleError::PomTierPaused(4), false));
+        for pov in [true, false] {
+            assert!(marks_block_invalid(&RuleError::AiAvailBeforeActivation(Default::default()), pov));
+            assert!(marks_block_invalid(&RuleError::AiResponseLinksBeforeActivation(Default::default()), pov));
+        }
         assert!(marks_block_invalid(&RuleError::DuplicateTransactions(Default::default()), false));
     }
 

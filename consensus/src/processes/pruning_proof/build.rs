@@ -634,7 +634,7 @@ impl PruningProofManager {
 
         while let Some(Reverse(SortableBlock { hash: current, .. })) = queue.pop() {
             it_pops += 1;
-            if it_pops % 100_000 == 0 && proof_build_debug() {
+            if it_pops.is_multiple_of(100_000) && proof_build_debug() {
                 info!(
                     "TRAVERSAL level {} : pops={} dup={} out_of_past={} kept={} queue={} elapsed={:.0}s",
                     level,

@@ -88,7 +88,9 @@ impl TryFrom<RpcRawBlock> for Block {
     fn try_from(item: RpcRawBlock) -> RpcResult<Self> {
         let pom_proof = match &item.pom_proof {
             Some(bytes) => {
-                Some(Arc::new(PomProof::from_wire_bytes(bytes).map_err(|e| RpcError::PomProofDecodeError(e.to_string()))?))
+                let mut proof = PomProof::from_wire_bytes(bytes).map_err(|e| RpcError::PomProofDecodeError(e.to_string()))?;
+                proof.sanitize_task(item.header.daa_score);
+                Some(Arc::new(proof))
             }
             None => None,
         };

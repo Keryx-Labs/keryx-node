@@ -10,7 +10,11 @@ use keryx_hashes::{Hash, HasherBase};
 /// so miners' pre-PoW hashing is untouched by the fork.
 #[inline]
 pub fn hash_override_nonce_time(header: &Header, nonce: u64, timestamp: u64) -> Hash {
-    hash_internal(header, nonce, timestamp, None, None, None)
+    hash_internal(header, nonce, timestamp, task_root_of(header), None, None, None)
+}
+
+fn task_root_of(header: &Header) -> Option<Hash> {
+    crate::pom::block_task_active(header.daa_score).then_some(header.task_root)
 }
 
 /// Returns the header hash. At/after `pom_level_activation` (gated on the header's own
@@ -25,7 +29,7 @@ pub fn hash(header: &Header) -> Hash {
     let h6 = crate::pom::service_commit_active(header.daa_score);
     let service_state_hash = h6.then_some(header.service_state_hash);
     let pom_tier = h6.then_some(header.pom_tier);
-    hash_internal(header, header.nonce, header.timestamp, pom_final_state, service_state_hash, pom_tier)
+    hash_internal(header, header.nonce, header.timestamp, task_root_of(header), pom_final_state, service_state_hash, pom_tier)
 }
 
 #[inline]
@@ -33,6 +37,7 @@ fn hash_internal(
     header: &Header,
     nonce: u64,
     timestamp: u64,
+    task_root: Option<Hash>,
     pom_final_state: Option<u64>,
     service_state_hash: Option<Hash>,
     pom_tier: Option<u8>,
@@ -57,6 +62,10 @@ fn hash_internal(
         .update(header.blue_score.to_le_bytes())
         .write_blue_work(header.blue_work)
         .update(header.pruning_point);
+
+    if let Some(root) = task_root {
+        hasher.update(root);
+    }
 
     if let Some(final_state) = pom_final_state {
         hasher.update(final_state.to_le_bytes());
@@ -96,8 +105,45 @@ mod tests {
             0,
             Default::default(),
             0,
+            Default::default(),
         );
         assert_ne!(blockhash::NONE, header.hash);
+    }
+
+    /// Shared with the miner's `block_task_header_vector`: both MUST hash these fields alike.
+    #[test]
+    fn block_task_header_vector() {
+        let mut h = Header::from_precomputed_hash(1.into(), vec![Hash::from_bytes([0x11; 32])]);
+        h.version = 1;
+        h.hash_merkle_root = Hash::from_bytes([0x22; 32]);
+        h.accepted_id_merkle_root = Hash::from_bytes([0x23; 32]);
+        h.utxo_commitment = Hash::from_bytes([0x24; 32]);
+        h.timestamp = 1_700_000_000_000;
+        h.bits = 0x1e7f_ffff;
+        h.nonce = 0x0102_0304_0506_0708;
+        h.daa_score = u64::MAX;
+        h.blue_score = 98_765;
+        h.blue_work = BlueWorkType::from_u64(0x0123_4567_89ab_cdef);
+        h.pruning_point = Hash::from_bytes([0x33; 32]);
+        h.task_root = Hash::from_bytes([0x44; 32]);
+        h.pom_final_state = 0xdead_beef;
+        h.service_state_hash = Hash::from_bytes([0x55; 32]);
+        h.pom_tier = 3;
+        let pre = hash_internal(&h, 0, 0, Some(h.task_root), None, None, None);
+        let full = hash_internal(&h, h.nonce, h.timestamp, Some(h.task_root), Some(h.pom_final_state), Some(h.service_state_hash), Some(h.pom_tier));
+        assert_eq!(pre.to_string(), "c850d9d429ed501ce0016297999282297079f3d70c317b9b3aaf933a7868211f");
+        assert_eq!(full.to_string(), "346345442413f856f84442a2866100362d52f7e8426d1e19c9af5c8bae988e3a");
+    }
+
+    #[test]
+    fn task_root_is_hashed_only_when_present() {
+        let mut header = Header::from_precomputed_hash(1.into(), vec![2.into()]);
+        let without = hash_internal(&header, 5, 6, None, None, None, None);
+        let with_a = hash_internal(&header, 5, 6, Some(7.into()), None, None, None);
+        header.task_root = 9.into();
+        assert_eq!(hash_internal(&header, 5, 6, None, None, None, None), without);
+        assert_ne!(hash_internal(&header, 5, 6, Some(header.task_root), None, None, None), with_a);
+        assert_ne!(with_a, without);
     }
 
     #[test]

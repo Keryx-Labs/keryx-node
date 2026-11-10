@@ -45,6 +45,7 @@ impl From<&GenesisBlock> for Header {
             0, // pom_final_state: genesis predates pom_level_activation on every network
             ZERO_HASH, // service_state_hash: genesis predates the H6 gate on every network
             0,         // pom_tier: genesis predates the H6 gate on every network
+            Default::default(),
         )
     }
 }
@@ -252,6 +253,7 @@ mod tests {
                 0,
                 ZERO_HASH,
                 0,
+                Default::default(),
             );
 
             println!("\n=== {} ===", name);

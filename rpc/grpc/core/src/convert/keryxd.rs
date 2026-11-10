@@ -50,6 +50,7 @@ pub mod kaspad_request_convert {
     impl_into_kaspad_request!(GetServiceStrikes);
     impl_into_kaspad_request!(GetNetworkModelAvailability);
     impl_into_kaspad_request!(GetServiceProviders);
+    impl_into_kaspad_request!(GetAwaitedOpenings);
     impl_into_kaspad_request!(GetBalanceByAddress);
     impl_into_kaspad_request!(GetBalancesByAddresses);
     impl_into_kaspad_request!(GetSinkBlueScore);
@@ -194,6 +195,7 @@ pub mod kaspad_response_convert {
     impl_into_kaspad_response!(GetServiceStrikes);
     impl_into_kaspad_response!(GetNetworkModelAvailability);
     impl_into_kaspad_response!(GetServiceProviders);
+    impl_into_kaspad_response!(GetAwaitedOpenings);
     impl_into_kaspad_response!(GetBalanceByAddress);
     impl_into_kaspad_response!(GetBalancesByAddresses);
     impl_into_kaspad_response!(GetSinkBlueScore);

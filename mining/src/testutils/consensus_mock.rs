@@ -29,6 +29,17 @@ pub(crate) struct ConsensusMock {
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
     private_cohort: RwLock<Option<Vec<[u8; 32]>>>,
+    awaited_openings: RwLock<HashMap<[u8; 32], [u8; 32]>>,
+    awaited_seeds: RwLock<HashMap<[u8; 32], [u8; 32]>>,
+    awaited_paths: RwLock<HashMap<[u8; 32], Vec<u64>>>,
+    awaited_pieces: RwLock<HashMap<[u8; 32], u8>>,
+    awaited_responses: RwLock<HashMap<([u8; 32], [u8; 32]), u64>>,
+    opening_deadlines: RwLock<HashMap<[u8; 32], u64>>,
+    private_recipients: RwLock<HashMap<[u8; 32], Vec<[u8; 32]>>>,
+    response_rule: RwLock<bool>,
+    unarmed_requests: RwLock<std::collections::HashSet<[u8; 32]>>,
+    opening_key_queries: std::sync::atomic::AtomicUsize,
+    virtual_daa: std::sync::atomic::AtomicU64,
 }
 
 impl ConsensusMock {
@@ -38,11 +49,76 @@ impl ConsensusMock {
             statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
             private_cohort: RwLock::new(None),
+            awaited_openings: RwLock::new(HashMap::default()),
+            awaited_seeds: RwLock::new(HashMap::default()),
+            awaited_paths: RwLock::new(HashMap::default()),
+            awaited_pieces: RwLock::new(HashMap::default()),
+            awaited_responses: RwLock::new(HashMap::default()),
+            opening_deadlines: RwLock::new(HashMap::default()),
+            private_recipients: RwLock::new(HashMap::default()),
+            response_rule: RwLock::new(false),
+            unarmed_requests: RwLock::new(Default::default()),
+            opening_key_queries: Default::default(),
+            virtual_daa: Default::default(),
         }
+    }
+
+    pub(crate) fn set_virtual_daa_score(&self, daa: u64) {
+        self.virtual_daa.store(daa, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Queries of the awaited opening keys so far.
+    pub(crate) fn opening_key_queries(&self) -> usize {
+        self.opening_key_queries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn set_private_cohort(&self, cohort: Option<Vec<[u8; 32]>>) {
         *self.private_cohort.write() = cohort;
+    }
+
+    pub(crate) fn await_opening(&self, response_txid: [u8; 32], escrow_pubkey: [u8; 32]) {
+        self.awaited_openings.write().insert(response_txid, escrow_pubkey);
+    }
+
+    pub(crate) fn set_response_rule(&self, active: bool) {
+        *self.response_rule.write() = active;
+    }
+
+    pub(crate) fn set_unarmed_request(&self, request_hash: [u8; 32]) {
+        self.unarmed_requests.write().insert(request_hash);
+    }
+
+    pub(crate) fn set_private_recipients(&self, request_hash: [u8; 32], keys: Vec<[u8; 32]>) {
+        self.private_recipients.write().insert(request_hash, keys);
+    }
+
+    pub(crate) fn set_opening_deadline(&self, response_txid: [u8; 32], deadline: u64) {
+        self.opening_deadlines.write().insert(response_txid, deadline);
+    }
+
+    pub(crate) fn await_response(&self, request_hash: [u8; 32], escrow_pubkey: [u8; 32], deadline: u64) {
+        self.awaited_responses.write().insert((request_hash, escrow_pubkey), deadline);
+    }
+
+    pub(crate) fn clear_awaited_response(&self, request_hash: [u8; 32], escrow_pubkey: [u8; 32]) {
+        self.awaited_responses.write().remove(&(request_hash, escrow_pubkey));
+    }
+
+    pub(crate) fn clear_awaited_opening(&self, response_txid: &[u8; 32]) {
+        self.awaited_openings.write().remove(response_txid);
+    }
+
+    pub(crate) fn await_attention_path(&self, response_txid: [u8; 32], path: Vec<u64>) {
+        self.awaited_paths.write().insert(response_txid, path);
+    }
+
+    /// Pieces a response still owes; every piece when unset.
+    pub(crate) fn await_pieces(&self, response_txid: [u8; 32], pieces: u8) {
+        self.awaited_pieces.write().insert(response_txid, pieces);
+    }
+
+    pub(crate) fn await_opening_seed(&self, response_txid: [u8; 32], seed: [u8; 32]) {
+        self.awaited_seeds.write().insert(response_txid, seed);
     }
 
     pub(crate) fn set_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
@@ -81,6 +157,43 @@ impl ConsensusMock {
 }
 
 impl ConsensusApi for ConsensusMock {
+    fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.opening_key_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.awaited_openings.read().get(response_txid).copied()
+    }
+
+    fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.awaited_seeds.read().get(response_txid).copied()
+    }
+
+    fn ai_response_admission(&self, request_hash: &[u8; 32], escrow_pubkey: Option<&[u8; 32]>) -> Option<bool> {
+        (*self.response_rule.read()).then(|| {
+            escrow_pubkey.is_some_and(|e| {
+                self.unarmed_requests.read().contains(request_hash) || self.awaited_responses.read().contains_key(&(*request_hash, *e))
+            })
+        })
+    }
+
+    fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+        self.private_recipients.read().get(request_hash).cloned()
+    }
+
+    fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        self.awaited_responses.read().get(&(*request_hash, *escrow_pubkey)).copied()
+    }
+
+    fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.awaited_openings.read().contains_key(response_txid).then(|| self.opening_deadlines.read().get(response_txid).copied().unwrap_or(0))
+    }
+
+    fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        self.awaited_paths.read().get(response_txid).cloned()
+    }
+
+    fn awaited_opening_pieces(&self, response_txid: &[u8; 32]) -> Option<u8> {
+        self.awaited_openings.read().contains_key(response_txid).then(|| self.awaited_pieces.read().get(response_txid).copied().unwrap_or(7))
+    }
+
     fn private_cohort_escrows(
         &self,
         _model_id: &[u8; 32],
@@ -118,6 +231,7 @@ impl ConsensusApi for ConsensusMock {
             0,
             ZERO_HASH,
             0,
+            Default::default(),
         );
         let mutable_block = MutableBlock::new(header, txs);
 
@@ -182,7 +296,7 @@ impl ConsensusApi for ConsensusMock {
     }
 
     fn get_virtual_daa_score(&self) -> u64 {
-        0
+        self.virtual_daa.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn get_virtual_state_approx_id(&self) -> VirtualStateApproxId {

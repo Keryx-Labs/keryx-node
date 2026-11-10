@@ -168,22 +168,6 @@ impl TaskQueue {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_block() -> Block {
-        Block::from_precomputed_hash(Hash::from_bytes([1; 32]), vec![])
-    }
-
-    #[test]
-    fn pom_proof_skip_policy_distinguishes_live_and_ibd_tasks() {
-        assert!(!BlockTask::Ordinary { block: test_block(), skip_pom_proof: false }.skip_pom_proof());
-        assert!(BlockTask::Ordinary { block: test_block(), skip_pom_proof: true }.skip_pom_proof());
-        assert!(BlockTask::Trusted { block: test_block() }.skip_pom_proof());
-    }
-}
-
 struct BlockTaskGroup {
     // Queue of tasks within this group (where all belong to the same hash)
     tasks: TaskQueue,
@@ -302,5 +286,21 @@ impl BlockTaskDependencyManager {
         if !pending.is_empty() {
             self.idle_signal.wait(&mut pending);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_block() -> Block {
+        Block::from_precomputed_hash(Hash::from_bytes([1; 32]), vec![])
+    }
+
+    #[test]
+    fn pom_proof_skip_policy_distinguishes_live_and_ibd_tasks() {
+        assert!(!BlockTask::Ordinary { block: test_block(), skip_pom_proof: false }.skip_pom_proof());
+        assert!(BlockTask::Ordinary { block: test_block(), skip_pom_proof: true }.skip_pom_proof());
+        assert!(BlockTask::Trusted { block: test_block() }.skip_pom_proof());
     }
 }

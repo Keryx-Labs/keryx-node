@@ -23,7 +23,7 @@ impl DbServiceFirstSeenStore {
     }
 
     /// All sightings, for the boot load and the refold baseline.
-    pub fn iterator(&self) -> impl Iterator<Item = Result<(Box<[u8]>, u64), Box<dyn std::error::Error>>> + '_ {
+    pub fn iterator(&self) -> impl Iterator<Item = super::StoreRow<u64>> + '_ {
         self.access.iterator()
     }
 

@@ -486,6 +486,40 @@ from!(item: RpcResult<&keryx_rpc_core::GetServiceProvidersResponse>, protowire::
     }
 });
 
+from!(item: &keryx_rpc_core::GetAwaitedOpeningsRequest, protowire::GetAwaitedOpeningsRequestMessage, {
+    Self {
+        response_txids: item.response_txids.iter().map(|t| t.to_string()).collect(),
+        escrow_pubkey: item.escrow_pubkey.map(|k| k.to_string()).unwrap_or_default(),
+        request_hashes: item.request_hashes.iter().map(|h| h.to_string()).collect(),
+    }
+});
+from!(item: RpcResult<&keryx_rpc_core::GetAwaitedOpeningsResponse>, protowire::GetAwaitedOpeningsResponseMessage, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        openings: item
+            .openings
+            .iter()
+            .map(|o| protowire::AwaitedOpeningMessage {
+                response_txid: o.response_txid.to_string(),
+                escrow_pubkey: o.escrow_pubkey.to_string(),
+                seed: o.seed.to_string(),
+                deadline_daa: o.deadline_daa,
+                accepted_daa: o.accepted_daa,
+                pieces: o.pieces,
+                attention_path: o.attention_path.clone(),
+            })
+            .collect(),
+        awaited_requests: item
+            .awaited_requests
+            .iter()
+            .map(|r| protowire::AwaitedRequestMessage { request_hash: r.request_hash.to_string(), window_end_daa: r.window_end_daa })
+            .collect(),
+        closed_requests: item.closed_requests.iter().map(|h| h.to_string()).collect(),
+        requests_checked: item.requests_checked,
+        error: None,
+    }
+});
+
 from!(item: &keryx_rpc_core::GetDaaScoreTimestampEstimateRequest, protowire::GetDaaScoreTimestampEstimateRequestMessage, {
     Self {
         daa_scores: item.daa_scores.clone()
@@ -1102,6 +1136,43 @@ try_from!(item: &protowire::GetServiceProvidersResponseMessage, RpcResult<keryx_
                 })
             })
             .collect::<RpcResult<Vec<_>>>()?,
+    }
+});
+
+try_from!(item: &protowire::GetAwaitedOpeningsRequestMessage, keryx_rpc_core::GetAwaitedOpeningsRequest, {
+    Self {
+        response_txids: item.response_txids.iter().map(|t| RpcHash::from_str(t)).collect::<Result<Vec<_>, _>>()?,
+        escrow_pubkey: if item.escrow_pubkey.is_empty() { None } else { Some(RpcHash::from_str(&item.escrow_pubkey)?) },
+        request_hashes: item.request_hashes.iter().map(|h| RpcHash::from_str(h)).collect::<Result<Vec<_>, _>>()?,
+    }
+});
+try_from!(item: &protowire::GetAwaitedOpeningsResponseMessage, RpcResult<keryx_rpc_core::GetAwaitedOpeningsResponse>, {
+    Self {
+        virtual_daa_score: item.virtual_daa_score,
+        openings: item
+            .openings
+            .iter()
+            .map(|o| {
+                Ok(keryx_rpc_core::RpcAwaitedOpening {
+                    response_txid: RpcHash::from_str(&o.response_txid)?,
+                    escrow_pubkey: RpcHash::from_str(&o.escrow_pubkey)?,
+                    seed: RpcHash::from_str(&o.seed)?,
+                    deadline_daa: o.deadline_daa,
+                    accepted_daa: o.accepted_daa,
+                    pieces: o.pieces,
+                    attention_path: o.attention_path.clone(),
+                })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+        awaited_requests: item
+            .awaited_requests
+            .iter()
+            .map(|r| {
+                Ok(keryx_rpc_core::RpcAwaitedRequest { request_hash: RpcHash::from_str(&r.request_hash)?, window_end_daa: r.window_end_daa })
+            })
+            .collect::<RpcResult<Vec<_>>>()?,
+        closed_requests: item.closed_requests.iter().map(|h| RpcHash::from_str(h)).collect::<Result<Vec<_>, _>>()?,
+        requests_checked: item.requests_checked,
     }
 });
 

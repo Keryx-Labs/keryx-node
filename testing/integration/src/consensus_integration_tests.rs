@@ -1104,6 +1104,7 @@ async fn difficulty_test() {
             pom_final_state: 0,
             service_state_hash: 0.into(),
             pom_tier: 0,
+            task_root: Default::default(),
         };
 
         // Stage 0

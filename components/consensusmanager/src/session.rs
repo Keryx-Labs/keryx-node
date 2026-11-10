@@ -228,6 +228,16 @@ impl ConsensusSessionOwned {
         self.consensus.get_service_providers(window_daa)
     }
 
+    pub fn get_awaited_openings(&self, response_txids: &[[u8; 32]]) -> Vec<keryx_consensus_core::collateral::AwaitedOpening> {
+        self.consensus.awaited_openings(response_txids)
+    }
+
+    /// Await status of each known request of `request_hashes` for the identity of
+    /// `escrow_pubkey`; `None` while the rule is not active.
+    pub fn get_awaited_requests(&self, escrow_pubkey: &[u8; 32], request_hashes: &[[u8; 32]]) -> Option<Vec<([u8; 32], Option<u64>)>> {
+        self.consensus.awaited_requests(escrow_pubkey, request_hashes)
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()

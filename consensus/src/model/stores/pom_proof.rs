@@ -157,7 +157,7 @@ impl Ring {
     }
 
     fn open(path: &Path, capacity: u64) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         if file.metadata()?.len() != capacity {
             file.set_len(capacity)?;
         }

@@ -90,6 +90,7 @@ use once_cell::unsync::Lazy;
 
 use super::utxo_validation::check_ai_request_tx_payload_rules;
 use crate::processes::private_inference::{PrivateEraViolation, check_private_inference_era};
+use crate::processes::verifiable_inference::check_verifiable_inference_era;
 use super::errors::{PruningImportError, PruningImportResult};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use itertools::Itertools;
@@ -111,6 +112,9 @@ use std::{
 
 /// Blue-score lead of a UTXO-invalid heaviest branch over the sink past which the node stops.
 const DIVERGENCE_HALT_BLUE_DEPTH: u64 = 1_000;
+
+/// Production entries of a block: SPK and amount.
+type BlockProduction = std::sync::Arc<Vec<(ScriptPublicKey, u64)>>;
 
 pub struct VirtualStateProcessor {
     // Channels
@@ -145,7 +149,8 @@ pub struct VirtualStateProcessor {
     pub(super) service_burn_store: Arc<crate::model::stores::service_burn::DbServiceBurnStore>,
     /// Finality-deep production suspensions (miner escrow key → deadline daa), persisted counterpart
     /// Consulted by block validation; rebuilt from the strike log at boot.
-    pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, u64>>,
+    /// Every deadline per identity, ascending.
+    pub(super) service_suspended: parking_lot::RwLock<std::collections::HashMap<keryx_hashes::Hash, Vec<u64>>>,
     /// Strike log: the finality-anchored baseline the ledger folds over.
     pub(super) service_strike_store: Arc<crate::model::stores::service_strike::DbServiceStrikeStore>,
     /// Sealed service-state commitment index (see `processes::service_commit`).
@@ -172,6 +177,12 @@ pub struct VirtualStateProcessor {
     pub(super) exact_verification_activation: ForkActivation,
     pub(super) model_split_activation: ForkActivation,
     pub(super) network_model: &'static keryx_consensus_core::config::params::NetworkModelLayout,
+    pub(super) suspension_pov_activation: ForkActivation,
+    pub(super) untraced_response_activation: ForkActivation,
+    pub(super) answer_shape_window_activation: ForkActivation,
+    pub(super) one_miss_per_request_activation: ForkActivation,
+    pub(super) uniform_strike_activation: ForkActivation,
+    pub(super) audit_queue_activation: ForkActivation,
     pub(super) service_burnable_window_daa: u64,
     /// Finality-flushed reward wins by event daa — the coinbase mint expectation source.
     #[allow(clippy::type_complexity)]
@@ -182,6 +193,32 @@ pub struct VirtualStateProcessor {
     pub(super) reward_routing_activation: ForkActivation,
     /// Private-inference activation (see `params.private_inference_activation`).
     pub(super) private_inference_activation: ForkActivation,
+    /// Verifiable-inference activation (see `params.verifiable_inference_activation`).
+    pub(super) verifiable_inference_activation: ForkActivation,
+    /// Trace shape rule activation (see `params.trace_shape_activation`).
+    pub(super) trace_shape_activation: ForkActivation,
+    /// Trace prefix rule activation (see `params.trace_prefix_activation`).
+    pub(super) trace_prefix_activation: ForkActivation,
+    /// Trace audit rule activation (see `params.trace_audit_activation`).
+    pub(super) trace_audit_activation: ForkActivation,
+    /// Trace sanction rule activation (see `params.trace_sanction_activation`).
+    pub(super) trace_sanction_activation: ForkActivation,
+    /// Trace context rule activation (see `params.trace_context_activation`).
+    pub(super) trace_context_activation: ForkActivation,
+    /// Reward draw rule activation (see `params.reward_draw_activation`).
+    pub(super) reward_draw_activation: ForkActivation,
+    /// v3 service window activation (see `params.service_window_v3_activation`).
+    pub(super) service_window_v3_activation: ForkActivation,
+    /// Trace dedup rule activation (see `params.trace_dedup_activation`).
+    pub(super) trace_dedup_activation: ForkActivation,
+    /// Seed-bound opening rule activation (see `params.trace_seed_bind_activation`).
+    pub(super) trace_seed_bind_activation: ForkActivation,
+    /// Attention opening activation (see `params.attention_activation`).
+    pub(super) attention_activation: ForkActivation,
+    /// Ratio-reward v3 table activation (see `params.ratio_reward_v3_activation`).
+    pub(super) ratio_reward_v3_activation: ForkActivation,
+    /// Stage-2 trace rule activation (see `params.trace_chain_activation`).
+    pub(super) trace_chain_activation: ForkActivation,
     pub(super) finality_depth: u64,
     pub(super) pruning_point_store: Arc<RwLock<DbPruningStore>>,
     pub(super) past_pruning_points_store: Arc<DbPastPruningPointsStore>,
@@ -215,7 +252,7 @@ pub struct VirtualStateProcessor {
     /// `windowed_production_for_block` and re-reads the SAME growing prefix of coinbases —
     /// quadratic RocksDB reads without this memo (measured: virtual thread pegged at ~4
     /// UTXO-validated blocks/s on an IBD catch-up). Bounded by periodic clear.
-    pub(super) block_production_cache: parking_lot::RwLock<BlockHashMap<std::sync::Arc<Vec<(ScriptPublicKey, u64)>>>>,
+    pub(super) block_production_cache: parking_lot::RwLock<BlockHashMap<BlockProduction>>,
     pub(super) virtual_stores: Arc<RwLock<VirtualStores>>,
     pub(super) pruning_meta_stores: Arc<RwLock<PruningMetaStores>>,
 
@@ -408,10 +445,29 @@ impl VirtualStateProcessor {
             exact_verification_activation: params.exact_verification_activation,
             model_split_activation: params.model_split_activation,
             network_model: params.network_model,
+            suspension_pov_activation: params.suspension_pov_activation,
+            untraced_response_activation: params.untraced_response_activation,
+            answer_shape_window_activation: params.answer_shape_window_activation,
+            one_miss_per_request_activation: params.one_miss_per_request_activation,
+            uniform_strike_activation: params.uniform_strike_activation,
+            audit_queue_activation: params.audit_queue_activation,
             service_burnable_window_daa: params.service_burnable_window_daa,
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
             private_inference_activation: params.private_inference_activation,
+            verifiable_inference_activation: params.verifiable_inference_activation,
+            trace_shape_activation: params.trace_shape_activation,
+            trace_prefix_activation: params.trace_prefix_activation,
+            trace_audit_activation: params.trace_audit_activation,
+            trace_sanction_activation: params.trace_sanction_activation,
+            trace_context_activation: params.trace_context_activation,
+            reward_draw_activation: params.reward_draw_activation,
+            service_window_v3_activation: params.service_window_v3_activation,
+            trace_dedup_activation: params.trace_dedup_activation,
+            trace_seed_bind_activation: params.trace_seed_bind_activation,
+            attention_activation: params.attention_activation,
+            ratio_reward_v3_activation: params.ratio_reward_v3_activation,
+            trace_chain_activation: params.trace_chain_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),
             past_pruning_points_store: storage.past_pruning_points_store.clone(),
@@ -1260,26 +1316,49 @@ impl VirtualStateProcessor {
     /// The function returns with `diff` being the diff of the new sink from previous virtual.
     /// In addition to the found sink the function also returns a queue of additional virtual
     /// parent candidates ordered in descending blue work order.
-    /// Keeps the resolution below the service-ledger flush frontier: when a tip lies at or past
-    /// it, the tips collapse to the last chain block of the heaviest such tip below the frontier
-    /// (at least the block above `prev_sink`). Returns the tips and whether they were cut.
+    /// Keeps the resolution below the service-ledger flush frontier: every tip at or past it is
+    /// replaced by the last block of its selected chain below the frontier (at least the block
+    /// above `prev_sink`); the result is reduced to an antichain. Returns the tips and whether any
+    /// was cut.
     fn cut_tips_at_ledger_frontier(&self, tips: Vec<Hash>, prev_sink: Hash) -> (Vec<Hash>, bool) {
         let sink_daa = self.headers_store.get_daa_score(prev_sink).unwrap();
         let Some(cutoff) = self.virtual_batch_daa_cutoff(sink_daa) else { return (tips, false) };
         let daa = |h: Hash| self.headers_store.get_daa_score(h).unwrap();
-        let Some(best) = tips.iter().copied().filter(|h| daa(*h) >= cutoff).max_by_key(|h| self.ghostdag_store.get_blue_work(*h).unwrap())
-        else {
+        if tips.iter().all(|h| daa(*h) < cutoff) {
             return (tips, false);
-        };
-        let mut cut = best;
-        while daa(cut) >= cutoff {
-            let parent = self.ghostdag_store.get_selected_parent(cut).unwrap();
-            if parent.is_origin() || parent == prev_sink {
-                break;
-            }
-            cut = parent;
         }
-        (vec![cut], true)
+        let mut kept: Vec<Hash> = Vec::with_capacity(tips.len());
+        let mut resolved: std::collections::HashMap<Hash, Hash> = std::collections::HashMap::new();
+        for tip in tips {
+            let mut path = Vec::new();
+            let mut at = tip;
+            let cut = loop {
+                if let Some(&r) = resolved.get(&at) {
+                    break r;
+                }
+                if daa(at) < cutoff {
+                    break at;
+                }
+                path.push(at);
+                let parent = self.ghostdag_store.get_selected_parent(at).unwrap();
+                if parent.is_origin() || parent == prev_sink {
+                    break at;
+                }
+                at = parent;
+            };
+            for h in path {
+                resolved.insert(h, cut);
+            }
+            if !kept.contains(&cut) {
+                kept.push(cut);
+            }
+        }
+        let antichain = kept
+            .iter()
+            .copied()
+            .filter(|&a| !kept.iter().any(|&b| b != a && self.reachability_service.is_dag_ancestor_of(a, b)))
+            .collect();
+        (antichain, true)
     }
 
     pub(super) fn sink_search_algorithm(
@@ -1538,19 +1617,20 @@ impl VirtualStateProcessor {
             if mutable_tx.tx.is_ai_response() && mutable_tx.tx.payload.len() != keryx_inference::AI_RESPONSE_PAYLOAD_LEN {
                 return Err(TxRuleError::AiPayloadTooLong(mutable_tx.tx.payload.len(), keryx_inference::AI_RESPONSE_PAYLOAD_LEN));
             }
-        } else if mutable_tx.tx.is_ai_request() {
-            if let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload) {
-                let cap = keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
-                if req.max_tokens > cap {
-                    return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
-                }
-                // A request the network cannot assemble would burn its reward: refuse it here,
-                // where the sender still holds the coins. Admission policy only.
-                if self.model_split_activation.is_active(virtual_daa_score) && req.model_id == self.network_model.model_id() {
-                    if let Some(tier) = self.network_model_availability(sink, virtual_daa_score).missing_tier() {
-                        return Err(TxRuleError::AiRequestPayloadRule(format!("no eligible producer for shard tier {}", tier)));
-                    }
-                }
+        } else if mutable_tx.tx.is_ai_request()
+            && let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload)
+        {
+            let cap = keryx_consensus_core::collateral::AI_REQUEST_MAX_TOKENS_CAP;
+            if req.max_tokens > cap {
+                return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
+            }
+            // A request the network cannot assemble would burn its reward: refuse it here,
+            // where the sender still holds the coins. Admission policy only.
+            if self.model_split_activation.is_active(virtual_daa_score)
+                && req.model_id == self.network_model.model_id()
+                && let Some(tier) = self.network_model_availability(sink, virtual_daa_score).missing_tier()
+            {
+                return Err(TxRuleError::AiRequestPayloadRule(format!("no eligible producer for shard tier {}", tier)));
             }
         }
         // Declarations: block-valid past the gate only; admitted from eligible producers only,
@@ -1583,6 +1663,8 @@ impl VirtualStateProcessor {
             }
             v => TxRuleError::AiRequestPayloadRule(v.to_string()),
         })?;
+        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation, self.attention_activation)
+            .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
     }
@@ -1679,6 +1761,18 @@ impl VirtualStateProcessor {
             virtual_state.daa_score,
             virtual_state.past_median_time,
         )?;
+        // The block era rules move with the score, past the admission of the transaction.
+        check_private_inference_era(tx, virtual_state.daa_score, self.private_inference_activation)
+            .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
+        check_verifiable_inference_era(
+            tx,
+            virtual_state.daa_score,
+            self.verifiable_inference_activation,
+            self.trace_chain_activation,
+            self.trace_seed_bind_activation,
+            self.attention_activation,
+        )
+        .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         let ValidatedTransaction { calculated_fee, .. } =
             self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full)?;
         Ok(calculated_fee)
@@ -1699,11 +1793,26 @@ impl VirtualStateProcessor {
         // are called within the lock in order to preserve validness of already validated txs
         let mut txs = tx_selector.select_transactions();
         let mut calculated_fees = Vec::with_capacity(txs.len());
-        let virtual_read = self.virtual_stores.read();
+        let mut waits = 0;
+        let virtual_read = loop {
+            let read = self.virtual_stores.read();
+            if self.service_ledger_folded_tip() {
+                break read;
+            }
+            if waits == 1_000 {
+                warn!("block template built before the service ledger folded the sink");
+                break read;
+            }
+            drop(read);
+            waits += 1;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
         let virtual_state = virtual_read.state.get().unwrap();
         let virtual_utxo_view = &virtual_read.utxo_set;
 
         let mut invalid_transactions = HashMap::new();
+        let mut deferred = std::collections::HashSet::new();
+        let mut has_opening = false;
         let results = self.validate_block_template_transactions_in_parallel(&txs, &virtual_state, &virtual_utxo_view);
         for (tx, res) in txs.iter().zip(results) {
             match res {
@@ -1712,14 +1821,22 @@ impl VirtualStateProcessor {
                     tx_selector.reject_selection(tx.id());
                 }
                 Ok(fee) => {
+                    if tx.is_ai_opening() {
+                        if has_opening || !self.opening_awaited(tx) {
+                            deferred.insert(tx.id());
+                            tx_selector.reject_selection(tx.id());
+                            continue;
+                        }
+                        has_opening = true;
+                    }
                     calculated_fees.push(fee);
                 }
             }
         }
 
-        let mut has_rejections = !invalid_transactions.is_empty();
+        let mut has_rejections = !invalid_transactions.is_empty() || !deferred.is_empty();
         if has_rejections {
-            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()));
+            txs.retain(|tx| !invalid_transactions.contains_key(&tx.id()) && !deferred.contains(&tx.id()));
         }
 
         while has_rejections {
@@ -1735,6 +1852,14 @@ impl VirtualStateProcessor {
                         has_rejections = true;
                     }
                     Ok(fee) => {
+                        if tx.is_ai_opening() {
+                            if has_opening || !self.opening_awaited(&tx) {
+                                tx_selector.reject_selection(tx.id());
+                                has_rejections = true;
+                                continue;
+                            }
+                            has_opening = true;
+                        }
                         txs.push(tx);
                         calculated_fees.push(fee);
                     }
@@ -1877,6 +2002,7 @@ impl VirtualStateProcessor {
             0, // pom_final_state: filled by the miner from the winning walk (H3), like the nonce
             service_state_hash,
             0, // pom_tier: filled by the miner from the winning walk (H6), like pom_final_state
+            Default::default(),
         );
         let selected_parent_hash = virtual_state.ghostdag_data.selected_parent;
         let selected_parent_timestamp = self.headers_store.get_timestamp(selected_parent_hash).unwrap();
@@ -1896,9 +2022,8 @@ impl VirtualStateProcessor {
     /// Make sure pruning point-related stores are initialized
     pub fn init(self: &Arc<Self>) {
         self.load_service_burned();
-        if super::service_bond::service_repair_daa().is_some()
-            && let Some(pruning_point) = self.pruning_point_store.read().pruning_point().optional().unwrap()
-        {
+        // Restores the pending event queue before the first resolution.
+        if let Some(pruning_point) = self.pruning_point_store.read().pruning_point().optional().unwrap() {
             self.advance_service_ledger(&ChainPath::default(), pruning_point);
         }
         let pruning_point_read = self.pruning_point_store.upgradable_read();

@@ -36,7 +36,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, ratio_reward_bps, ratio_reward_bps_v2, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -85,6 +85,8 @@ static H11_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H12_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H15_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H16_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static MODEL_SPLIT_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -338,12 +340,12 @@ impl VirtualStateProcessor {
         // least finality-deep past the pruning point), and is skipped in the same trust windows
         // as the coinbase check — a node that cannot yet reproduce the fold trusts the
         // utxo-commitment-pinned chain instead.
-        if keryx_consensus_core::pom::service_commit_active(header.daa_score) && !self.trust_coinbase_at(header.daa_score) {
-            if let Some(expected) = self.expected_service_state_hash(header)? {
-                if header.service_state_hash != expected {
-                    return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
-                }
-            }
+        if keryx_consensus_core::pom::service_commit_active(header.daa_score)
+            && !self.trust_coinbase_at(header.daa_score)
+            && let Some(expected) = self.expected_service_state_hash(header)?
+            && header.service_state_hash != expected
+        {
+            return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
         }
 
         // Verify the header pruning point
@@ -507,6 +509,45 @@ impl VirtualStateProcessor {
             info!("═══════════════════════════════════════════════════════════════");
         }
 
+        if banner_should_fire(self.verifiable_inference_activation, header)
+            && H15_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H15 · DAA {} ════════════════", self.verifiable_inference_activation.daa_score());
+            info!("  ▶ VERIFIABLE INFERENCE — every AI answer is now proven on-chain");
+            info!("    Trace         — every AiResponse commits the trace of its inference; untraced answers are not credited");
+            info!("    Audit         — every traced response is audited: the responder opens the drawn points in an opening transaction");
+            info!("    Trace chain   — openings are chained layer to layer, from the request-bound prompt prefix to the generated tokens");
+            info!("    Attention     — openings also prove the attention of a drawn layer over the whole context");
+            info!("    Sanctions     — a missing or failed opening is struck");
+            info!("    Answers       — sealed answer bodies capped at {} KiB", keryx_inference::ai_payload::MAX_AI_RESPONSE_PRIVATE_BODY_LEN / 1024);
+            info!("    Service       — answer deadlines follow the measured work of each request and the queue of each miner");
+            info!("    Context       — a silent miner is not struck on a prompt beyond its tier context unless another proved it fit");
+            info!("    Reward        — the inference reward is drawn among the miners credited on the request");
+            info!("  ▶ PROOF-OF-MODEL v5 — mining a tier now takes the card that can serve it");
+            info!("    Context pad   — the walk also covers a per-tier context buffer: minimum card 8/12/16/24/32 GB for tiers 0-4");
+            info!("  ▶ HOLDER REWARD — new bracket table");
+            info!("    Brackets      — 5% with nothing held, 80% at 80 days of production held, 100% at 120 days");
+            info!("  ▶ MANDATORY UPDATE — miners must run the H15 release");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        if banner_should_fire(self.uniform_strike_activation, header)
+            && H16_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H16 · DAA {} ════════════════", self.uniform_strike_activation.daa_score());
+            info!("  ▶ SERVICE RULES — one ladder, the same verdict on every node");
+            info!("    Strikes       — every miss follows the same ladder, at most one strike per hour per miner");
+            info!("    Requests      — a request strikes a miner at most once");
+            info!("    Suspensions   — applied identically on every node");
+            info!("    Untraced      — an untraced answer on an audited tier does not serve its request");
+            info!("    Audit queue   — a new audit pushes back the open audits of the same escrow key");
+            info!("  ▶ PROOF-OF-MODEL — more VRAM headroom for the desktop on minimum cards");
+            info!("  ▶ MANDATORY UPDATE — node v1.6.7 or newer, miner 0.6.0 or newer");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
         if banner_should_fire(self.model_split_activation, header)
             && MODEL_SPLIT_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
         {
@@ -567,7 +608,7 @@ impl VirtualStateProcessor {
         // the max_tokens cap on AiRequests.
         if !self.model_split_activation.is_active(header.daa_score) {
             for tx in txs.iter().skip(1) {
-                if tx.is_ai_response() && tx.payload.len() > keryx_inference::AI_RESPONSE_PAYLOAD_V2_LEN {
+                if tx.is_ai_response() && AiResponsePayload::deserialize(&tx.payload).is_some_and(|r| r.is_v3()) {
                     return Err(AiResponseLinksBeforeActivation(tx.id()));
                 }
                 if tx.is_ai_avail() {
@@ -583,12 +624,11 @@ impl VirtualStateProcessor {
             }
         } else {
             for tx in txs.iter().skip(1) {
-                if tx.is_ai_request() {
-                    if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                        if req.max_tokens > AI_REQUEST_MAX_TOKENS_CAP {
-                            return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
-                        }
-                    }
+                if tx.is_ai_request()
+                    && let Some(req) = AiRequestPayload::deserialize(&tx.payload)
+                    && req.max_tokens > AI_REQUEST_MAX_TOKENS_CAP
+                {
+                    return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
                 }
             }
         }
@@ -753,13 +793,15 @@ impl VirtualStateProcessor {
         if !self.pom_v3_activation.is_active(pov_daa_score) || self.service_suspended.read().is_empty() {
             return set;
         }
+        let at_parent = self.suspension_pov_activation.is_active(pov_daa_score);
+        let judged_at = if at_parent { self.headers_store.get_daa_score(ghostdag_data.selected_parent).unwrap() } else { pov_daa_score };
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             let txs = self.block_transactions_store.get(*blue).unwrap();
             let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
             // Identity is the payout SPK key: rotating the hot escrow key does not shed a
             // suspension.
             let identity = keryx_consensus_core::collateral::miner_key(&coinbase.miner_data.script_public_key);
-            if self.is_producer_suspended(&identity, pov_daa_score) {
+            if self.is_producer_suspended(&identity, judged_at, at_parent) {
                 set.insert(*blue);
             }
         }
@@ -828,7 +870,7 @@ impl VirtualStateProcessor {
                 self.pom_tier_store.get(*blue).optional().unwrap()
             };
             let Some(tier) = tier else { continue };
-            let mut bps = schedule.get(tier as usize).copied().unwrap_or(schedule[0]);
+            let mut bps = schedule.get(tier as usize).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR);
             if standing_gate {
                 let txs = self.block_transactions_store.get(*blue).unwrap();
                 let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
@@ -900,7 +942,9 @@ impl VirtualStateProcessor {
                 };
                 let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
                 // Recalibrated bracket table ships bundled with H4 (one hardfork, one gate).
-                let bps = if self.coin_age_activation.is_active(pov_daa_score) {
+                let bps = if self.ratio_reward_v3_activation.is_active(pov_daa_score) {
+                    ratio_reward_bps_v3(balance, production)
+                } else if self.coin_age_activation.is_active(pov_daa_score) {
                     ratio_reward_bps_v2(balance, production)
                 } else {
                     ratio_reward_bps(balance, production)
@@ -1305,7 +1349,7 @@ impl VirtualStateProcessor {
             return lo;
         }
         while lo < hi {
-            let mid = lo + (hi - lo + 1) / 2;
+            let mid = lo + (hi - lo).div_ceil(2);
             if daa_at(mid) <= bound_daa { lo = mid } else { hi = mid - 1 }
         }
         lo
@@ -1936,7 +1980,7 @@ fn check_ai_request_payload_rules(
     token_step: u64,
 ) -> BlockProcessResult<()> {
     if let Some(&(_, base_reward)) = minimums.iter().find(|(id, _)| *id == req.model_id) {
-        let token_surcharge = ((req.max_tokens as u64 + 63) / 64) * token_step;
+        let token_surcharge = (req.max_tokens as u64).div_ceil(64) * token_step;
         let effective_min = base_reward + token_surcharge;
         if req.inference_reward < effective_min {
             return Err(AiRequestInferenceRewardBelowMinimum(tx.id(), req.inference_reward, effective_min, hex::encode(req.model_id)));
@@ -2023,7 +2067,6 @@ pub(super) fn check_ai_request_tx_payload_rules(
 /// All of these except the UTXO-fee one are also enforced earlier by
 /// `check_ai_request_payload_rules_all`; they stay here so this remains the single authoritative
 /// check, and so the original error precedence within a transaction is preserved.
-
 fn check_ai_request_inference_rewards(
     txs: &[Transaction],
     validated: &[(keryx_consensus_core::tx::ValidatedTransaction<'_>, u32)],
@@ -2043,10 +2086,10 @@ fn check_ai_request_inference_rewards(
             check_ai_request_payload_rules(tx, &req, minimums, token_step)?;
             // The one rule that genuinely needs UTXO validation: the fee covers priority_fee
             // (inference_reward itself goes to the output[1] escrow, not to the fee).
-            if let Some(&calculated_fee) = fee_map.get(&tx.id()) {
-                if calculated_fee < req.priority_fee {
-                    return Err(AiRequestFeeBelowInferenceReward(tx.id(), calculated_fee, req.priority_fee));
-                }
+            if let Some(&calculated_fee) = fee_map.get(&tx.id())
+                && calculated_fee < req.priority_fee
+            {
+                return Err(AiRequestFeeBelowInferenceReward(tx.id(), calculated_fee, req.priority_fee));
             }
             // Escrow output[1] structure (shared with the pre-UTXO fast path).
             check_ai_request_escrow_output(tx, &req, routed)?;
@@ -2105,13 +2148,13 @@ fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
     let mut request_model_map: std::collections::HashMap<[u8; 32], [u8; 32]> =
         std::collections::HashMap::new();
     for tx in txs.iter().skip(1) {
-        if tx.is_ai_request() {
-            if let Some(req) = AiRequestPayload::deserialize(&tx.payload) {
-                let digest = blake2b_simd::blake2b(&tx.payload);
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&digest.as_bytes()[..32]);
-                request_model_map.insert(key, req.model_id);
-            }
+        if tx.is_ai_request()
+            && let Some(req) = AiRequestPayload::deserialize(&tx.payload)
+        {
+            let digest = blake2b_simd::blake2b(&tx.payload);
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&digest.as_bytes()[..32]);
+            request_model_map.insert(key, req.model_id);
         }
     }
 
@@ -2119,14 +2162,13 @@ fn check_ai_response_model_caps(txs: &[Transaction]) -> BlockProcessResult<()> {
         if !tx.is_ai_response() {
             continue;
         }
-        if let Some(resp) = AiResponsePayload::deserialize(&tx.payload) {
-            if let Some(&model_id) = request_model_map.get(&resp.request_hash) {
-                if !declared_caps.contains(&model_id) {
-                    return Err(AiResponseModelCapMissing(tx.id(), hex::encode(model_id)));
-                }
-            }
-            // request not in same block → AiRequest came from an earlier block → skip
+        if let Some(resp) = AiResponsePayload::deserialize(&tx.payload)
+            && let Some(&model_id) = request_model_map.get(&resp.request_hash)
+            && !declared_caps.contains(&model_id)
+        {
+            return Err(AiResponseModelCapMissing(tx.id(), hex::encode(model_id)));
         }
+        // request not in same block → AiRequest came from an earlier block → skip
     }
     Ok(())
 }

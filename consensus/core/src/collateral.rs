@@ -10,8 +10,7 @@ use crate::tx::ScriptPublicKey;
 pub const COLLATERAL_RATE_BPS: u64 = 2_000;
 
 /// Number of blocks during which an OPoI result may be challenged after its block is accepted.
-/// At 10 BPS, 36 000 blocks ≈ 1 hour — enough time for any active node to detect and submit
-/// a challenge, while keeping the escrow lock reasonable for honest miners.
+/// At 10 BPS, 36 000 blocks ≈ 1 hour.
 pub const CHALLENGE_WINDOW_BLOCKS: u64 = 36_000;
 
 /// DAA window during which a claim stays burnable (~10 h at 10 BPS): a disposable identity
@@ -163,6 +162,417 @@ fn verify_domain_signature(domain: &[u8], escrow_pubkey: &[u8; 32], signature: &
     secp256k1::SECP256K1.verify_schnorr(&sig, &secp256k1::Message::from_digest(msg), &pk).is_ok()
 }
 
+/// Delay between a traced response's acceptance and the chain block whose hash seeds its draw.
+pub const TRACE_SEED_DELAY_DAA: u64 = 100;
+/// Domain separator of the trace draw seed.
+pub const TRACE_DRAW_DOMAIN: &[u8] = b"KeryxTraceDrawV1";
+/// Base of the window to open the next phase of an attention opening.
+pub const ATTN_PHASE_BASE_DAA: u64 = 3_000;
+/// Prompt positions counted in the window of an attention phase, at most: the largest context a
+/// responder runs.
+pub const ATTN_PHASE_MAX_PROMPT: u32 = 131_072;
+
+/// Window to open the next phase of an attention opening once its child is drawn: a base plus
+/// the replay of the response, its prompt at a floor of 100 positions per second and each
+/// generated position at the generation floor of its tier.
+pub fn attn_phase_window_daa(tier: u8, max_tokens: u32, n_prompt: u32, n_pos: u32) -> u64 {
+    let per_token: u64 = match tier {
+        0..=2 => 2,
+        3 => 3,
+        _ => 4,
+    };
+    ATTN_PHASE_BASE_DAA + n_prompt.min(ATTN_PHASE_MAX_PROMPT) as u64 / 10 + n_pos.saturating_sub(n_prompt).min(max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP)) as u64 * per_token
+}
+/// Replays of the prompt the first opening of an attention audit takes, at most.
+pub const ATTN_FIRST_PROMPT_REPLAYS: u64 = 3;
+
+/// Window the first opening of an attention audit adds for its prompt: its replays at a floor of
+/// 100 positions per second.
+pub fn attn_first_prompt_daa(n_prompt: u32) -> u64 {
+    ATTN_FIRST_PROMPT_REPLAYS * (n_prompt.min(ATTN_PHASE_MAX_PROMPT) as u64 / 10)
+}
+/// Domain separator of the child drawn after an attention phase.
+pub const ATTN_CHILD_DOMAIN: &[u8] = b"KeryxAttnChildV1";
+
+/// A signed response carrying a trace commitment, accepted in a chain block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceResponseEvent {
+    pub response_txid: [u8; 32],
+    pub request_hash: [u8; 32],
+    pub responder: Hash,
+    pub escrow_pubkey: [u8; 32],
+    pub trace_root: [u8; 32],
+    pub n_prompt: u32,
+    pub n_pos: u32,
+    /// Plaintext length of the sealed answer.
+    pub answer_len: u32,
+    pub stage: u8,
+    pub tokens: bool,
+}
+
+/// An opening the ledger awaits: who signs it, its seed, its deadline, the pieces still owed and
+/// the attention path of the next phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AwaitedOpening {
+    pub response_txid: [u8; 32],
+    pub escrow_pubkey: [u8; 32],
+    pub seed: [u8; 32],
+    pub deadline_daa: u64,
+    pub accepted_daa: u64,
+    pub pieces: u8,
+    pub attention_path: Vec<u64>,
+}
+
+/// An opening accepted in a chain block whose signature verifies under `escrow_pubkey`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceOpeningEvent {
+    pub response_txid: [u8; 32],
+    pub escrow_pubkey: [u8; 32],
+    pub body: Vec<u8>,
+}
+
+/// Trace inputs of one chain block.
+pub struct TraceInputs<'a> {
+    pub chain_hash: Hash,
+    pub responses: &'a [TraceResponseEvent],
+    pub openings: &'a [TraceOpeningEvent],
+    /// Audit rules of a tier for a response accepted at a DAA score.
+    pub tier: &'a dyn Fn(u8, u64) -> Option<crate::config::params::TraceRules>,
+    /// Plaintext prompt length of the block's accepted requests, by request hash.
+    pub prompt_lens: &'a [([u8; 32], u32)],
+    /// Whether the shape rule is active at this block.
+    pub shape: bool,
+    /// Whether the sanction rule is active at this block: a missing opening strikes without the
+    /// interval guard, and a response under the audit rule resets the streak at its opening.
+    pub sanction: bool,
+    /// Whether the context rule is active at this block: a silent cohort member is excused on a
+    /// prompt that may exceed the tier context floor unless a member's traced response proved
+    /// it fit.
+    pub context: bool,
+    /// Whether the draw rule is active at this block: the reward of a routed request goes to a
+    /// draw among the members credited within its draw window.
+    pub draw: bool,
+    /// Whether the v3 window is active at this block: an audit armed here is judged on the
+    /// measured work of the request and the queue of each member.
+    pub window_v3: bool,
+    /// Whether a response accepted more than once by this block is judged once by the shape
+    /// and root rules.
+    pub dedup: bool,
+    /// Untraced-response rule.
+    pub untraced_silence: bool,
+    /// Whether a traced answer is judged on its own shape when that window is longer.
+    pub own_shape: bool,
+    /// Whether a request strikes an identity at most once, whichever path misses first.
+    pub one_miss: bool,
+    /// Whether every miss path escalates through the same ladder, at most once per strike interval.
+    pub uniform_strikes: bool,
+    /// Whether arming an audit pushes the open audits of its escrow key by its work.
+    pub audit_queue: bool,
+    /// Whether an opening naming its seed block is judged only against an audit drawn from that
+    /// block, and passed over otherwise.
+    pub seed_bind: bool,
+}
+
+const TRACE_TIER_UNKNOWN: u8 = u8::MAX;
+
+/// The committed shape of a traced response whose request is not pending yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TraceShape {
+    n_prompt: u32,
+    n_pos: u32,
+    /// Text length of the sealed answer.
+    answer_len: u32,
+}
+
+/// The trace fields of a response accepted before its request, audited once it is admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EarlyTrace {
+    response_txid: [u8; 32],
+    escrow_pubkey: [u8; 32],
+    trace_root: [u8; 32],
+    stage: u8,
+    tokens: bool,
+}
+
+fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, prefix_offset: Option<u32>) -> bool {
+    keryx_verifiable_inference::shape::shape_ok(req.prompt_len, shape.answer_len, req.max_tokens, shape.n_prompt, shape.n_pos)
+        && prefix_offset.is_none_or(|o| keryx_verifiable_inference::prefix::fits(shape.n_prompt, o))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TraceAudit {
+    request_hash: [u8; 32],
+    responder: Hash,
+    escrow_pubkey: [u8; 32],
+    trace_root: [u8; 32],
+    n_prompt: u32,
+    n_pos: u32,
+    accepted_daa: u64,
+    tier: u8,
+    max_tokens: u32,
+    identities: Vec<Hash>,
+    seed: Option<[u8; 32]>,
+    deadline_daa: u64,
+    /// Pieces already proven when the audit needs several ([`PIECE_TRACE`], [`PIECE_ATTN`],
+    /// [`PIECE_RECUR`], [`PIECE_RESID`]).
+    pieces: u8,
+    /// Progress of an attention opening of several phases.
+    attn: Option<AttnProgress>,
+    /// Deadline on its escrow key's chain before the network backlog; 0 when unset.
+    chain_start: u64,
+}
+
+/// Accepted phases of an attention opening still short of its last.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttnProgress {
+    /// Child drawn after each accepted phase.
+    path: Vec<u64>,
+    /// Partials root and child count the last accepted phase committed.
+    root: [u8; 32],
+    n: u64,
+    /// DAA of the chain block that accepted the last phase.
+    accepted_daa: u64,
+    /// Whether the child of the last accepted phase is drawn.
+    drawn: bool,
+    /// Draw weights of the `n` children.
+    weights: Vec<u16>,
+}
+
+impl AttnProgress {
+    /// Path of the phase the audit awaits, `None` until the child of the last accepted phase is
+    /// drawn.
+    fn awaited(&self) -> Option<&[u64]> {
+        self.drawn.then_some(&self.path[..])
+    }
+}
+
+/// Seed of the child drawn after attention phase `phase` of a response.
+pub fn attn_child_seed(chain_hash: &Hash, response_txid: &[u8; 32], phase: u8) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(ATTN_CHILD_DOMAIN);
+    hasher.update(&chain_hash.as_bytes());
+    hasher.update(response_txid);
+    hasher.update(&[phase]);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(hasher.finalize().as_bytes());
+    seed
+}
+
+/// The trace opening of a several-piece audit is proven.
+const PIECE_TRACE: u8 = 1;
+/// The attention opening of a several-piece audit is proven.
+const PIECE_ATTN: u8 = 2;
+/// The recurrent opening of a several-piece audit is proven.
+const PIECE_RECUR: u8 = 4;
+/// The residual opening of a stage-2 audit is proven.
+const PIECE_RESID: u8 = 8;
+const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID;
+
+/// Pieces an audit under `rules` needs.
+pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
+    let Some(r) = rules else { return PIECE_TRACE };
+    let resid = if r.chain.is_some() { PIECE_RESID } else { 0 };
+    if r.attention {
+        PIECE_TRACE | PIECE_ATTN | resid | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
+    } else {
+        PIECE_TRACE | resid
+    }
+}
+
+/// Draw seed of a traced response.
+pub fn trace_seed(chain_hash: &Hash, response_txid: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(TRACE_DRAW_DOMAIN);
+    hasher.update(&chain_hash.as_bytes());
+    hasher.update(response_txid);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(hasher.finalize().as_bytes());
+    seed
+}
+
+/// Checks that an opening body proves every drawn point of `audit` under `seed`, the prefix
+/// point included when the rules carry a prefix context; `Err` names the failing check.
+fn trace_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{chain, draw::POINTS, opening::Opening, prefix, verify};
+    let Some(opening) = Opening::decode(body) else { return Err("malformed body") };
+    if &opening.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    if opening.points.len() != POINTS as usize {
+        return Err("point count");
+    }
+    let mut resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    if let Some(cc) = &rules.chain {
+        let (Some(pc), Some(pp)) = (&rules.prefix, &opening.prefix) else { return Err("stage-2 part missing") };
+        if opening.resid.is_some() {
+            return Err("residual point in the trace piece");
+        }
+        resp.trace_root = split_trace_root(rules, audit, &opening.roots)?;
+        if opening.links.len() != opening.points.len() || opening.experts.len() != opening.points.len() {
+            return Err("link count");
+        }
+        for (i, (p, (tok, link))) in opening.points.iter().zip(&opening.links).enumerate() {
+            let ids = opening.experts.get(i).and_then(Option::as_ref);
+            if chain::verify_chain_point(&rules.ctx, cc, &resp, seed, i as u32, p, *tok, link, ids).is_err() {
+                return Err(if i == 0 { "point 0" } else { "point 1" });
+            }
+        }
+        return chain::verify_chain_prefix_point(&rules.ctx, cc, pc, &resp, seed, &audit.request_hash, pp).map(|_| ()).map_err(|_| "prefix point");
+    }
+    if opening.resid.is_some() {
+        return Err("stage-2 opening before its rule");
+    }
+    for (i, p) in opening.points.iter().enumerate() {
+        if verify::verify_point(&rules.ctx, &resp, seed, i as u32, p).is_err() {
+            return Err(if i == 0 { "point 0" } else { "point 1" });
+        }
+    }
+    match (&rules.prefix, &opening.prefix) {
+        (None, _) => Ok(()),
+        (Some(_), None) => Err("prefix point missing"),
+        (Some(pc), Some(p)) => {
+            prefix::verify_prefix_point(&rules.ctx, pc, &resp, seed, &audit.request_hash, p).map(|_| ()).map_err(|_| "prefix point")
+        }
+    }
+}
+
+/// The piece an opening body, seeded or not, proves.
+/// Piece an opening body proves.
+pub fn opening_body_piece(body: &[u8]) -> u8 {
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_RECUR, VERSION_RESID, inner_body};
+    match inner_body(body).and_then(|b| b.first().copied()) {
+        Some(VERSION_ATTN) => PIECE_ATTN,
+        Some(VERSION_RECUR) => PIECE_RECUR,
+        Some(VERSION_RESID) => PIECE_RESID,
+        _ => PIECE_TRACE,
+    }
+}
+
+/// Position root a stage-2 piece is checked against: the split position root under the attention
+/// rule, the trace root otherwise.
+fn split_trace_root(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    roots: &Option<([u8; 32], [u8; 32])>,
+) -> Result<[u8; 32], &'static str> {
+    match (rules.attention, roots) {
+        (true, Some((pos_root, seq_root))) => {
+            if keryx_verifiable_inference::seq::trace_root(pos_root, seq_root) != audit.trace_root {
+                return Err("trace root split");
+            }
+            Ok(*pos_root)
+        }
+        (true, None) => Err("sequence root missing"),
+        (false, Some(_)) => Err("sequence root before its rule"),
+        (false, None) => Ok(audit.trace_root),
+    }
+}
+
+/// Checks that a residual opening body proves the residual point of `audit` under `seed`.
+fn resid_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{chain, opening::{ResidOpening, inner_body}, verify};
+    let op = inner_body(body).as_deref().and_then(ResidOpening::decode).ok_or("malformed residual body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let cc = rules.chain.as_ref().ok_or("residual piece before its rule")?;
+    let trace_root = split_trace_root(rules, audit, &op.roots)?;
+    let resp = verify::ResponseCtx { trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    chain::verify_resid_opening(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "residual point")
+}
+
+/// Checks that a recurrent opening body proves the recurrent point of `audit` under `seed`.
+fn recur_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{opening::{RecurOpening, inner_body}, recur, verify};
+    let op = inner_body(body).as_deref().and_then(RecurOpening::decode).ok_or("malformed recurrent body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let cc = rules.chain.as_ref().ok_or("recurrence without stage-2 rules")?;
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    recur::verify_recur_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "recurrent point")
+}
+
+/// Checks that an attention opening body proves the phase `audit` awaits of its attention point
+/// under `seed`.
+fn attn_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> {
+    use keryx_verifiable_inference::{chain, opening::{AttnOpening, inner_body}, verify};
+    let op = inner_body(body).as_deref().and_then(AttnOpening::decode).ok_or("malformed attention body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let (path, root) = match &audit.attn {
+        Some(p) => (&p.path[..], Some(&p.root)),
+        None => (&[][..], None),
+    };
+    #[cfg(test)]
+    if let Some(r) = ATTN_ORACLE.with(|o| o.borrow().as_ref().map(|f| f(path, root, &op))) {
+        return r;
+    }
+    let cc = rules.chain.as_ref().ok_or("attention without stage-2 rules")?;
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    chain::verify_attn_phase(&rules.ctx, cc, &resp, seed, path, root, &op).map_err(|_| "attention point")
+}
+
+/// Verdict of an attention phase from its path, the previous partials root and the opening.
+#[cfg(test)]
+type AttnOracle = Box<dyn Fn(&[u64], Option<&[u8; 32]>, &keryx_verifiable_inference::opening::AttnOpening) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the attention verifier in the ledger tests of the calling thread.
+    static ATTN_ORACLE: std::cell::RefCell<Option<AttnOracle>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Domain separator of the trace opening signature.
+pub const OPENING_SIG_DOMAIN: &[u8] = b"KeryxTraceOpeningV1";
+
+/// The message an opening is signed over: the domain-tagged blake2b-256 of its body.
+pub fn opening_signature_message(body: &[u8]) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(OPENING_SIG_DOMAIN);
+    hasher.update(body);
+    let mut msg = [0u8; 32];
+    msg.copy_from_slice(hasher.finalize().as_bytes());
+    msg
+}
+
+/// Verifies an opening signature: schnorr by `escrow_pubkey` over [`opening_signature_message`].
+pub fn verify_opening_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], body: &[u8]) -> bool {
+    let msg = opening_signature_message(body);
+    let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(escrow_pubkey) else {
+        return false;
+    };
+    let Ok(sig) = secp256k1::schnorr::Signature::from_slice(signature) else {
+        return false;
+    };
+    secp256k1::SECP256K1.verify_schnorr(&sig, &secp256k1::Message::from_digest(msg), &pk).is_ok()
+}
+
 /// Deterministically select one index in `0..n` from a 32-byte seed (a block hash chosen after
 /// the request). Assigns the single responsible miner for an inference request from the eligible
 /// (recently-active tier) set. `None` for an empty set.
@@ -178,10 +588,7 @@ pub fn assign_index(seed: &[u8; 32], n: usize) -> Option<usize> {
 pub const STRIKE_1_BURN_CLAIMS: u32 = 5;
 
 /// Minimum DAA between two consecutive strikes on the same miner (~1 h). Any further miss inside
-/// this interval is a no-op: it neither escalates the strike count nor burns escrow. The guard-rail
-/// that separates "offline for ten minutes" (or a request flood) from "refusing to serve for
-/// hours" — a genuinely dead miner still escalates, one strike per interval, reaching suspension in
-/// ~3 intervals.
+/// this interval is a no-op: it neither escalates the strike count nor burns escrow.
 pub const SERVICE_STRIKE_INTERVAL_DAA: u64 = 36_000;
 
 /// Production suspension applied at the third consecutive strike (24 h). Enforced finality-deep
@@ -300,6 +707,52 @@ pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
     base + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
 }
 
+/// Window base once `service_window_v3_activation` is live.
+pub const SERVICE_WINDOW_BASE_DAA_V3: u64 = 150;
+
+/// Per-tier generation allowance of the v3 window, in hundredths of a DAA per generated token.
+pub const SERVICE_WINDOW_RATE_V3: [u64; 5] = [90, 180, 85, 70, 35];
+
+/// Requests queued ahead of a request at one responder beyond which no lateness is imputed to
+/// it on that request. Must equal the miner's request queue size.
+pub const SERVICE_QUEUE_CAP: usize = 64;
+
+/// Serving work of one request under the v3 window, in DAA: `n_prompt` prompt tokens (or
+/// sealed bytes, which bound them) and `generated` generated tokens.
+pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32) -> u64 {
+    let rate = SERVICE_WINDOW_RATE_V3[(tier as usize).min(SERVICE_WINDOW_RATE_V3.len() - 1)];
+    2 * (n_prompt as u64).div_ceil(100) + (rate * generated.min(AI_REQUEST_MAX_TOKENS_CAP) as u64).div_ceil(100)
+}
+
+/// Service window of one request under `service_window_v3_activation`, queue excluded.
+pub fn service_window_daa_v3(tier: u8, n_prompt: u32, generated: u32) -> u64 {
+    SERVICE_WINDOW_BASE_DAA_V3 + service_work_daa(tier, n_prompt, generated)
+}
+
+/// Length of the reward draw of a request: half its v3 window at full budget.
+pub fn reward_draw_window_daa(tier: u8, prompt_len: u32, max_tokens: u32) -> u64 {
+    service_window_daa_v3(tier, prompt_len, max_tokens).div_ceil(2)
+}
+
+/// Domain separator of the reward draw seed.
+pub const REWARD_DRAW_DOMAIN: &[u8] = b"KeryxRewardDrawV1";
+
+/// Seed of the reward draw of `request_hash` closed by the chain block `chain_hash`.
+pub fn reward_draw_seed(chain_hash: &Hash, request_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+    hasher.update(REWARD_DRAW_DOMAIN);
+    hasher.update(&chain_hash.as_bytes());
+    hasher.update(request_hash);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(hasher.finalize().as_bytes());
+    seed
+}
+
+fn upper_median(mut values: Vec<u32>) -> Option<u32> {
+    values.sort_unstable();
+    values.get(values.len() / 2).copied()
+}
+
 /// DAA horizon beyond which per-request ledger state is forgotten: pending requests expire and
 /// vault claims drop out. This bounds the request/vault memory a fold must warm up; strike
 /// counts are NOT horizon-bound — they persist in the strike log and only reset on a served
@@ -307,10 +760,7 @@ pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
 pub const SERVICE_LEDGER_HORIZON_DAA: u64 = 72_000;
 
 /// How long a served request hash stays remembered so a later acceptance of the same hash cannot
-/// arm a second audit (~24 h at 10 BPS). A hash can repeat because request identity is the payload
-/// digest: the same prompt, sent twice, is the same request. The second audit would be
-/// unanswerable — responders dedupe on that hash and the identical response is already on chain —
-/// so the whole cohort would be struck for a request nobody can serve.
+/// arm a second audit (~24 h at 10 BPS).
 pub const SERVICE_AUDITED_MEMORY_DAA: u64 = 864_000;
 
 /// Ceiling, above a syncee's pruning point, for service rows it cannot re-derive itself: such
@@ -331,9 +781,13 @@ pub const MAX_REWARD_MINTS_PER_BLOCK: usize = 64;
 /// can no longer be accepted and the inversion is out of reach.
 pub const SERVICE_EARLY_RESPONSE_HORIZON_DAA: u64 = 36_000;
 
-/// Ceiling on distinct request hashes held by the above. Eviction takes the oldest first and only
-/// returns an inversion to the behaviour it had before it was handled — it never creates a miss.
+/// Ceiling on distinct request hashes held by the above. Eviction takes the oldest first.
 const MAX_EARLY_RESPONSE_HASHES: usize = 4_096;
+/// Ceiling on the traces of responses accepted before their request; past it new ones are refused.
+const MAX_EARLY_TRACES: usize = 16_384;
+/// Responders kept per request not accepted yet under the sanction rule: the most keys a private
+/// request can be sealed to.
+const EARLY_KEYS_PER_REQUEST: usize = 128;
 
 /// Penalty applied to a miner for a missed service assignment, by consecutive-miss count.
 /// A successful serve resets the count.
@@ -456,6 +910,8 @@ pub struct ServiceMiss {
     /// finality-deep, reorg-immune deadline from the miss's own daa.
     pub penalty: ServicePenalty,
     pub burned: Vec<EscrowClaim>,
+    /// The miss is an audited response left unopened, not a silent cohort member.
+    pub opening_missing: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -484,6 +940,77 @@ struct PendingRequest {
     /// Network-model requests only: `(tier, escrow key)` of the availability declarations
     /// accepted before the audit armed, chain order. Drained into the audit when it arms.
     early_declarations: Vec<(u8, Hash)>,
+    /// Plaintext prompt length; zero before the shape rule.
+    prompt_len: u32,
+    /// A cohort member's well-formed traced response proved the prompt fits the tier context floor.
+    fit_proven: bool,
+    /// Open reward draw under the draw rule.
+    draw: Option<RewardDraw>,
+}
+
+impl PendingRequest {
+    /// `(prompt tokens, generated tokens)` the request is judged on: the upper medians of its
+    /// traced member answers, bounded by the sealed prompt length and the budget, else those.
+    fn reference_shape(&self) -> (u32, u32) {
+        let shapes: Vec<(u32, u32)> =
+            self.audit.as_ref().and_then(|a| a.v3.as_ref()).map(|w| w.answers.iter().filter_map(|(_, _, s)| *s).collect()).unwrap_or_default();
+        let p = upper_median(shapes.iter().map(|(p, _)| *p).collect()).map_or(self.prompt_len, |p| if self.prompt_len > 0 { p.min(self.prompt_len) } else { p });
+        let g = upper_median(shapes.iter().map(|(_, g)| *g).collect()).map_or(self.max_tokens, |g| g.min(self.max_tokens));
+        (p, g)
+    }
+
+    fn reference_work(&self) -> u64 {
+        let (p, g) = self.reference_shape();
+        service_work_daa(self.tier, p, g)
+    }
+}
+
+/// A reward draw kept past the end of its request's window while a candidate awaits the verdict
+/// of its audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldDraw {
+    draw: RewardDraw,
+    reward: u64,
+}
+
+/// Opening deadline added per piece still owed by the drawn audits open across the network:
+/// the chain carries about one opening every this many DAA.
+pub const OPENING_BACKLOG_DAA: u64 = 2;
+/// Largest opening deadline extension from the network backlog.
+pub const OPENING_BACKLOG_CAP_DAA: u64 = 36_000;
+/// Latest opening deadline after the response's acceptance under the sanction rule, phases included.
+pub const AUDIT_SPAN_DAA: u64 = 270_000;
+/// Attention phases a first deadline leaves room for inside [`AUDIT_SPAN_DAA`].
+const ATTN_PHASES_RESERVED: u64 = 3;
+/// Replays of its response an open audit costs its responder (first opening and phases), in
+/// units of the response's serving work.
+const OPEN_AUDIT_WORK_PASSES: u64 = 3;
+/// Passes of a newly armed audit's response that push the open audits of its key.
+const AUDIT_QUEUE_PASSES: u64 = OPEN_AUDIT_WORK_PASSES + 1;
+
+/// Longest a held draw waits for the audits of its candidates, from its opening.
+const HELD_DRAW_HORIZON_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA + OPENING_BACKLOG_CAP_DAA;
+/// How long a drawn response is remembered so that accepting it again opens no new audit: past
+/// it, its request can no longer be pending.
+const TRACE_REPLAY_MEMORY_DAA: u64 = SERVICE_LEDGER_HORIZON_DAA + SERVICE_EARLY_RESPONSE_HORIZON_DAA;
+
+/// Opening deadline extension for `backlog` pieces still owed.
+fn backlog_daa(backlog: u64) -> u64 {
+    backlog.saturating_mul(OPENING_BACKLOG_DAA).min(OPENING_BACKLOG_CAP_DAA)
+}
+
+/// Whether a candidate of the draw of `rh` is in `awaiting`.
+fn draw_awaits_audit(awaiting: &std::collections::BTreeSet<([u8; 32], Hash)>, rh: &[u8; 32], draw: &RewardDraw) -> bool {
+    draw.candidates.iter().any(|(id, _)| awaiting.contains(&(*rh, *id)))
+}
+
+/// A reward draw: opened by the first credited response, closed `W` DAA later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RewardDraw {
+    open_daa: u64,
+    close_daa: u64,
+    /// Credited identities and the daa they were credited at, credit order.
+    candidates: Vec<(Hash, u64)>,
 }
 
 /// One cohort audit: every declared miner of the request's tier must respond before the window
@@ -496,6 +1023,8 @@ struct Audit {
     delegations: Vec<(Hash, Hash)>,
     responded: Vec<Hash>,
     window_end_daa: u64,
+    /// Present when armed under the v3 window.
+    v3: Option<QueuedWindow>,
     /// Network-model audits only: `(identity, shard tier)` of every eligible producer, sorted —
     /// a signer must hold the tier it signs for, and every member must declare. Empty for a
     /// lineup audit.
@@ -655,6 +1184,20 @@ pub fn split_pipeline_reward(layout: &NetworkModelLayout, reward: u64, head: (u8
     out
 }
 
+/// Per-member state of an audit armed under the v3 window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueuedWindow {
+    arm_daa: u64,
+    /// Cohort order: work queued ahead of the request (DAA), and whether the queue exceeded
+    /// [`SERVICE_QUEUE_CAP`].
+    queue: Vec<(u64, bool)>,
+    /// Credited members.
+    answers: Vec<Answer>,
+}
+
+/// A credited member: identity, credit daa, traced `(n_prompt, generated)`.
+type Answer = (Hash, u64, Option<(u32, u32)>);
+
 /// One miner's strike state: consecutive-miss count and the daa of the last actual strike.
 /// Also the persisted strike-log record: `{0, 0}` marks a served-response reset, `{0, daa}` an
 /// executed suspension (the daa keeps the rate-limit window armed and re-derives the suspension
@@ -703,6 +1246,8 @@ pub struct ServiceReward {
 #[derive(Clone, Debug, Default)]
 pub struct FoldOutcome {
     pub misses: Vec<ServiceMiss>,
+    /// Openings judged by this fold.
+    pub verdicts: Vec<TraceVerdict>,
     /// Inference rewards decided by this fold (first accepted response of a routed request).
     pub rewards: Vec<ServiceReward>,
     /// Served-response streak resets as (identity, preserved last-strike daa). The preserved daa
@@ -713,6 +1258,19 @@ pub struct FoldOutcome {
     /// Claims dropped by the burnable-window purge in this fold, in pop order — the undo log
     /// needs them to reverse the block.
     pub expired: Vec<(Hash, EscrowClaim)>,
+    /// Silent cohort members left unstruck under the context rule, as (request hash, identity).
+    pub excused: Vec<([u8; 32], Hash)>,
+    /// Members whose answer came past their v3 deadline, as (request hash, identity).
+    pub late: Vec<([u8; 32], Hash)>,
+}
+
+/// The judgement of one opening: `cause` is `None` when it closed the audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceVerdict {
+    pub response_txid: [u8; 32],
+    pub request_hash: [u8; 32],
+    pub responder: Hash,
+    pub cause: Option<&'static str>,
 }
 
 /// Reorg-restore state of everything but the vault (see [`ServiceLedger::light_snapshot`]).
@@ -727,6 +1285,11 @@ pub struct LightSnapshot {
     first_seen_base: std::sync::Arc<std::collections::BTreeMap<Hash, u64>>,
     producer_spk: std::collections::BTreeMap<Hash, crate::tx::ScriptPublicKey>,
     audited: std::collections::BTreeMap<[u8; 32], u64>,
+    trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
+    early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
+    early_traces: std::collections::BTreeMap<([u8; 32], Hash), EarlyTrace>,
+    trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
+    held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -773,6 +1336,18 @@ pub struct ServiceLedger {
     /// The network model of this network; `None` = mainnet. Configuration, like the
     /// activation daas — installed on every fold entry, never snapshotted.
     network_model: Option<&'static NetworkModelLayout>,
+    /// Traced responses awaiting their draw or their opening, by response transaction id.
+    trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
+    /// Shapes of traced responses whose request was not pending yet, by `(request hash,
+    /// responder)`; judged when the request is admitted, dropped with `early_responses`.
+    early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
+    /// Trace fields of the same responses under the sanction rule, by `(request hash,
+    /// responder)`; audited when the request is admitted, dropped with `early_responses`.
+    early_traces: std::collections::BTreeMap<([u8; 32], Hash), EarlyTrace>,
+    /// Transaction ids of the drawn traced responses, with the daa of their draw: a response
+    /// accepted again is not audited again.
+    trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
+    held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
 
 impl ServiceLedger {
@@ -803,7 +1378,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], None, is_established, cohort)
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], None, None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block`] with the reward-routing inputs: per-request vaulted amounts and
@@ -824,7 +1399,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, None, None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block_with_rewards`] with the private-inference input: per-request
@@ -842,11 +1417,11 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], None, None, is_established, cohort)
     }
 
-    /// Every fold input at once: reward routing, private-inference recipients, pipeline links
-    /// and availability declarations.
+    /// Every fold input at once: reward routing, private-inference recipients, pipeline links,
+    /// availability declarations and the trace inputs of the block.
     #[allow(clippy::too_many_arguments)]
     pub fn on_chain_block_with_pipeline(
         &mut self,
@@ -859,6 +1434,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[([u8; 32], u8, Hash)],
+        traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
@@ -873,9 +1449,28 @@ impl ServiceLedger {
             response_links,
             declarations,
             None,
+            traces,
             is_established,
             cohort,
         )
+    }
+
+    /// [`Self::on_chain_block_with_recipients`] with the trace inputs of the block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_with_traces(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        request_recipients: &[([u8; 32], PrivateCohortSeed, Vec<Hash>)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        traces: &TraceInputs,
+        is_established: impl Fn(&Hash) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) -> FoldOutcome {
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], None, Some(traces), is_established, cohort)
     }
 
     /// Folds a chain block whose strike events are already persisted (daa at or below the store
@@ -891,7 +1486,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup`] with the reward-routing inputs.
@@ -909,7 +1504,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup_with_rewards`] with the private-inference input.
@@ -926,7 +1521,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], Some(is_burned), |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_with_pipeline`] for a warmup fold.
@@ -942,6 +1537,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[([u8; 32], u8, Hash)],
+        traces: Option<&TraceInputs>,
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
@@ -956,9 +1552,28 @@ impl ServiceLedger {
             response_links,
             declarations,
             Some(is_burned),
+            traces,
             |_| true,
             cohort,
         );
+    }
+
+    /// [`Self::on_chain_block_warmup_with_recipients`] with the trace inputs of the block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chain_block_warmup_with_traces(
+        &mut self,
+        daa: u64,
+        requests: &[([u8; 32], u8, u32)],
+        request_rewards: &[([u8; 32], u64)],
+        request_recipients: &[([u8; 32], PrivateCohortSeed, Vec<Hash>)],
+        responses: &[([u8; 32], Option<Hash>)],
+        escrows: &[(Hash, EscrowClaim)],
+        producers: &[(Hash, crate::tx::ScriptPublicKey)],
+        traces: &TraceInputs,
+        is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
+        cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+    ) {
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], Some(is_burned), Some(traces), |_| true, cohort);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -974,6 +1589,7 @@ impl ServiceLedger {
         response_links: &[ResponseLinks],
         declarations: &[([u8; 32], u8, Hash)],
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
+        traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
         mut cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
@@ -1004,22 +1620,30 @@ impl ServiceLedger {
         }
         self.vault.retain(|_, claims| !claims.is_empty());
 
-        let mut outcome = FoldOutcome::default();
-        outcome.sightings = sightings;
-        outcome.expired = expired;
+        let mut outcome = FoldOutcome { sightings, expired, ..Default::default() };
+        let sanction = traces.is_some_and(|tr| tr.sanction);
 
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
         self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
         self.early_declarations.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
+        let early_hashes: std::collections::BTreeSet<[u8; 32]> = self.early_responses.keys().copied().collect();
+        let keep_shapes = traces.is_some_and(|tr| tr.context || tr.window_v3);
+        let pending = &self.pending;
+        self.early_shapes
+            .retain(|(rh, _), _| early_hashes.contains(rh) || (keep_shapes && pending.get(rh).is_some_and(|r| r.audit.is_none())));
+        self.early_traces.retain(|(rh, _), _| early_hashes.contains(rh));
 
         // This block's own requests are admitted before its responses are folded: a response
         // accepted in the same chain block as its request must find the request pending, or it is
         // dropped and its author struck for an answer he did give. Arming still waits for the next
         // block (`daa > accepted_daa` below), so the cohort is unchanged.
         let gated = self.reward_routing_daa.is_some_and(|a| daa >= a);
+        let draw_rule = traces.is_some_and(|tr| tr.draw);
+        let window_v3 = traces.is_some_and(|tr| tr.window_v3);
         if gated {
             self.audited.retain(|_, seen| *seen + SERVICE_AUDITED_MEMORY_DAA > daa);
         }
+        let mut parked: Vec<TraceResponseEvent> = Vec::new();
         for (rh, tier, max_tokens) in requests {
             // Past the gate, a hash already admitted never opens a second audit: the responders
             // that served it cannot serve it again (same dedup key, same response transaction),
@@ -1030,10 +1654,19 @@ impl ServiceLedger {
             if gated {
                 self.audited.insert(*rh, daa);
             }
-            let early = self.early_responses.remove(rh).map(|(_, keys)| keys).unwrap_or_default();
+            let mut early = self.early_responses.remove(rh).map(|(_, keys)| keys).unwrap_or_default();
             let early_decl = self.early_declarations.remove(rh).map(|(_, d)| d).unwrap_or_default();
-            // A re-accepted hash (identical payload resubmitted) must not reset the running
-            // audit: overwriting would re-arm the window and push the miss out forever.
+            let lo = (*rh, Hash::from_bytes([0u8; 32]));
+            let hi = (*rh, Hash::from_bytes([0xffu8; 32]));
+            let early_traces: Vec<(Hash, EarlyTrace, Option<TraceShape>)> = self
+                .early_traces
+                .range(lo..=hi)
+                .map(|((_, key), t)| (*key, *t, self.early_shapes.get(&(*rh, *key)).copied()))
+                .collect();
+            self.early_traces.retain(|(h, _), _| h != rh);
+            let prompt_len =
+                traces.filter(|tr| tr.shape).and_then(|tr| tr.prompt_lens.iter().find(|(h, _)| h == rh).map(|(_, l)| *l)).unwrap_or(0);
+            // A re-accepted hash keeps its running audit.
             let entry = self.pending.entry(*rh).or_insert(PendingRequest {
                 tier: *tier,
                 max_tokens: *max_tokens,
@@ -1045,7 +1678,47 @@ impl ServiceLedger {
                 recipients: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, _, r)| r.clone()).unwrap_or_default(),
                 cohort_seed: request_recipients.iter().find(|(h, _, _)| h == rh).map(|(_, s, _)| *s).unwrap_or([0u8; 36]),
                 early_declarations: Vec::new(),
+                prompt_len,
+                fit_proven: false,
+                draw: None,
             });
+            if let Some(tr) = traces.filter(|tr| tr.shape) {
+                let prefix_offset = (tr.tier)(entry.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
+                let shapes: Vec<(Hash, TraceShape)> = self
+                    .early_shapes
+                    .range((*rh, Hash::from_bytes([0u8; 32]))..=(*rh, Hash::from_bytes([0xffu8; 32])))
+                    .map(|((_, key), shape)| (*key, *shape))
+                    .collect();
+                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset)));
+                // Under the context rule and the v3 window the well-formed early shapes wait for
+                // the arming, where cohort membership is known.
+                let keep = tr.context || tr.window_v3;
+                self.early_shapes.retain(|(h, key), _| h != rh || (keep && early.contains(key)));
+            }
+            if sanction && !entry.recipients.is_empty() {
+                early.retain(|key| entry.recipients.contains(key));
+            }
+            if let Some(tr) = traces.filter(|tr| tr.sanction && entry.audit.is_none()) {
+                let rules = (tr.tier)(entry.tier, daa);
+                for (key, t, shape) in early_traces {
+                    let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || (t.stage == keryx_verifiable_inference::chain::STAGE_CHAIN && t.tokens));
+                    match shape {
+                        Some(shape) if stage_ok && early.contains(&key) => parked.push(TraceResponseEvent {
+                            response_txid: t.response_txid,
+                            request_hash: *rh,
+                            responder: key,
+                            escrow_pubkey: t.escrow_pubkey,
+                            trace_root: t.trace_root,
+                            n_prompt: shape.n_prompt,
+                            n_pos: shape.n_pos,
+                            answer_len: shape.answer_len,
+                            stage: t.stage,
+                            tokens: t.tokens,
+                        }),
+                        _ => early.retain(|k| *k != key),
+                    }
+                }
+            }
             // Answers and declarations that beat their own request to acceptance.
             if entry.audit.is_none() {
                 for key in early {
@@ -1082,28 +1755,104 @@ impl ServiceLedger {
             }
         }
 
+        // A traced response whose commitment does not fit the sealed sizes of its request and
+        // answer is not an answer: neither credited nor audited.
+        let mut misshaped: Vec<([u8; 32], Hash)> = Vec::new();
+        // An input-less response can be accepted more than once by one chain block.
+        let mut seen_txids = std::collections::BTreeSet::new();
+        let trace_responses: Vec<&TraceResponseEvent> = traces
+            .map(|tr| tr.responses.iter().filter(|ev| !tr.dedup || seen_txids.insert(ev.response_txid)).collect())
+            .unwrap_or_default();
+        if let Some(tr) = traces.filter(|tr| tr.shape) {
+            for ev in trace_responses.iter() {
+                let answer_len = if ev.tokens {
+                    keryx_verifiable_inference::answer::text_len(ev.answer_len, ev.n_pos.saturating_sub(ev.n_prompt)).unwrap_or(u32::MAX)
+                } else {
+                    ev.answer_len
+                };
+                let shape = TraceShape { n_prompt: ev.n_prompt, n_pos: ev.n_pos, answer_len };
+                match self.pending.get(&ev.request_hash) {
+                    Some(req) => {
+                        let rules = (tr.tier)(req.tier, daa);
+                        let prefix_offset = rules.as_ref().and_then(|r| r.prefix.as_ref().map(|p| p.offset));
+                        let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || (ev.stage == keryx_verifiable_inference::chain::STAGE_CHAIN && ev.tokens));
+                        if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset) {
+                            misshaped.push((ev.request_hash, ev.responder));
+                        } else if (tr.context || tr.window_v3) && req.audit.is_none() {
+                            self.early_shapes.insert((ev.request_hash, ev.responder), shape);
+                        }
+                    }
+                    None => {
+                        let lo = (ev.request_hash, Hash::from_bytes([0u8; 32]));
+                        let hi = (ev.request_hash, Hash::from_bytes([0xffu8; 32]));
+                        let known = self.early_shapes.contains_key(&(ev.request_hash, ev.responder));
+                        if !tr.sanction {
+                            self.early_shapes.insert((ev.request_hash, ev.responder), shape);
+                        } else if !known
+                            && self.early_traces.len() < MAX_EARLY_TRACES
+                            && self.early_shapes.range(lo..=hi).count() < EARLY_KEYS_PER_REQUEST
+                        {
+                            self.early_shapes.insert((ev.request_hash, ev.responder), shape);
+                            {
+                                let t = EarlyTrace {
+                                    response_txid: ev.response_txid,
+                                    escrow_pubkey: ev.escrow_pubkey,
+                                    trace_root: ev.trace_root,
+                                    stage: ev.stage,
+                                    tokens: ev.tokens,
+                                };
+                                self.early_traces.insert((ev.request_hash, ev.responder), t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.trace_roots.retain(|_, seen| *seen + TRACE_REPLAY_MEMORY_DAA > daa);
+
         // An authenticated response (signed by a delegated escrow key) marks every cohort
         // identity that delegated to it as having served this audit and resets their streak.
         // Anyone else's response is ignored by the ledger. A response landing before the audit
         // arms is parked on the request and credited when it does.
         for (rh, responder) in responses {
             let Some(r) = responder else { continue };
+            if misshaped.contains(&(*rh, *r)) {
+                continue;
+            }
             let mut served: Vec<Hash> = Vec::new();
             let mut pipeline: Option<(Hash, Vec<(u8, Hash)>)> = None;
+            let req_tier: u8;
+            let req_accepted: u64;
             {
                 let Some(req) = self.pending.get_mut(rh) else {
                     let entry = self.early_responses.entry(*rh).or_insert((daa, Vec::new()));
-                    if !entry.1.contains(r) {
+                    if !entry.1.contains(r) && !(sanction && entry.1.len() >= EARLY_KEYS_PER_REQUEST) {
                         entry.1.push(*r);
                     }
                     continue;
                 };
+                if sanction && !req.recipients.is_empty() && !req.recipients.contains(r) {
+                    continue;
+                }
+                req_tier = req.tier;
+                let req_max_tokens = req.max_tokens;
+                req_accepted = req.accepted_daa;
                 let Some(audit) = req.audit.as_mut() else {
                     if !req.early_responders.contains(r) {
                         req.early_responders.push(*r);
                     }
                     continue;
                 };
+                if sanction
+                    && traces.is_some_and(|tr| {
+                        tr.untraced_silence
+                            && (tr.tier)(req_tier, req_accepted).is_some_and(|rules| rules.audit_all)
+                            && !tr.responses.iter().any(|ev| ev.request_hash == *rh && ev.responder == *r)
+                    })
+                {
+                    continue;
+                }
                 let matched: Vec<Hash> = audit.delegations.iter().filter(|(e, _)| e == r).map(|(_, id)| *id).collect();
                 if !audit.is_pipeline() {
                     for identity in matched {
@@ -1155,15 +1904,44 @@ impl ServiceLedger {
                     }
                     pipeline = Some((head, link_ids));
                 }
+                if let Some(w) = audit.v3.as_mut() {
+                    let shape = traces
+                        .and_then(|tr| tr.responses.iter().find(|ev| ev.request_hash == *rh && ev.responder == *r))
+                        .map(|ev| (ev.n_prompt, ev.n_pos.saturating_sub(ev.n_prompt)));
+                    for identity in served.iter() {
+                        w.answers.push((*identity, daa, shape));
+                    }
+                }
+                if !served.is_empty()
+                    && traces.is_some_and(|tr| {
+                        tr.context
+                            && tr.responses.iter().any(|ev| {
+                                ev.request_hash == *rh && ev.responder == *r && crate::config::params::prompt_fits_floor(req_tier, ev.n_prompt, req_max_tokens)
+                            })
+                    })
+                {
+                    req.fit_proven = true;
+                }
             }
+            let untraced = traces.is_some_and(|tr| {
+                (tr.tier)(req_tier, req_accepted).is_some_and(|rules| rules.audit_all)
+                    && !tr.responses.iter().any(|ev| ev.request_hash == *rh && ev.responder == *r)
+            });
             if let Some((head, link_ids)) = pipeline.take() {
                 self.maybe_award_pipeline(rh, head, &link_ids, warmup, &mut outcome);
-            } else if let Some(first) = served.first().copied() {
-                self.maybe_award(rh, first, warmup, &mut outcome);
+            } else {
+                self.credit_reward(rh, if untraced { &[] } else { &served }, daa, draw_rule, warmup, &mut outcome);
             }
+            // Under the sanction rule a response on an audited tier resets the streak at its
+            // accepted opening, not here.
+            let reset_at_opening = self.reset_waits_for_opening(traces, rh, r, req_tier, daa);
             for identity in served {
                 // A warmup fold leaves strikes alone: the baseline already carries this reset.
-                if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
+                if !warmup
+                    && !reset_at_opening
+                    && !(sanction && self.struck_at(&identity, daa))
+                    && self.strike_state(&identity).is_some_and(|e| e.count > 0)
+                {
                     let preserved = self.reset_preserved_last_daa(&identity, daa);
                     self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: preserved });
                     outcome.resets.push((identity, preserved));
@@ -1175,6 +1953,40 @@ impl ServiceLedger {
             let victim =
                 self.early_responses.iter().min_by_key(|(hash, (seen, _))| (*seen, **hash)).map(|(hash, _)| *hash).unwrap();
             self.early_responses.remove(&victim);
+            self.early_shapes.retain(|(rh, _), _| *rh != victim);
+            self.early_traces.retain(|(rh, _), _| *rh != victim);
+        }
+
+        let mut awaiting = std::collections::BTreeSet::new();
+        if let Some(tr) = traces {
+            self.fold_traces(daa, tr, &parked, &misshaped, warmup, &is_established, &mut outcome);
+            self.resolve_trace_audits(tr.one_miss);
+            awaiting = self.audits_awaiting();
+            let closing: Vec<[u8; 32]> = self
+                .pending
+                .iter()
+                .filter(|(h, r)| {
+                    r.draw.as_ref().is_some_and(|d| daa >= d.close_daa && !draw_awaits_audit(&awaiting, h, d))
+                        && !r.audit.as_ref().is_some_and(|a| a.v3.is_some())
+                })
+                .map(|(h, _)| *h)
+                .collect();
+            for rh in closing {
+                self.close_draw(&rh, &tr.chain_hash, warmup, &mut outcome);
+            }
+            let held_horizon = if tr.sanction { SERVICE_LEDGER_HORIZON_DAA + AUDIT_SPAN_DAA } else { HELD_DRAW_HORIZON_DAA };
+            let released: Vec<[u8; 32]> = self
+                .held_draws
+                .iter()
+                .filter(|(rh, h)| daa >= h.draw.open_daa + held_horizon || !draw_awaits_audit(&awaiting, rh, &h.draw))
+                .map(|(rh, _)| *rh)
+                .collect();
+            for rh in released {
+                let HeldDraw { mut draw, reward } = self.held_draws.remove(&rh).unwrap();
+                let judged: Vec<Hash> = draw.candidates.iter().map(|(id, _)| *id).filter(|id| !awaiting.contains(&(rh, *id))).collect();
+                draw.candidates.retain(|(id, _)| judged.contains(id));
+                self.award_draw(&rh, &draw, reward, &tr.chain_hash, warmup, &mut outcome);
+            }
         }
         while self.early_declarations.len() > MAX_EARLY_RESPONSE_HASHES {
             let victim =
@@ -1184,16 +1996,53 @@ impl ServiceLedger {
 
         let hashes: Vec<[u8; 32]> = self.pending.keys().copied().collect();
         let mut served_at_arm: Vec<Hash> = Vec::new();
+        let mut armed_v3: Vec<[u8; 32]> = Vec::new();
         for rh in hashes {
             let req = self.pending.get(&rh).unwrap();
             match &req.audit {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
-                    // Lineup: every silent cohort member. Pipeline: every member that neither
+                    let late: Vec<Hash> = match &audit.v3 {
+                        Some(w) => {
+                            let (p, g) = req.reference_shape();
+                            let reference = service_window_daa_v3(req.tier, p, g);
+                            let own_shape = traces.is_some_and(|tr| tr.own_shape);
+                            w.answers
+                                .iter()
+                                .filter(|(id, at, shape)| {
+                                    let window = match shape.filter(|_| own_shape) {
+                                        Some((sp, sg)) => {
+                                            let sp = if req.prompt_len > 0 { sp.min(req.prompt_len) } else { sp };
+                                            reference.max(service_window_daa_v3(req.tier, sp, sg.min(req.max_tokens)))
+                                        }
+                                        None => reference,
+                                    };
+                                    let allowed = w.arm_daa + window;
+                                    audit
+                                        .cohort
+                                        .binary_search(id)
+                                        .ok()
+                                        .and_then(|i| w.queue.get(i))
+                                        .is_some_and(|(queued, capped)| !capped && *at > allowed + queued)
+                                })
+                                .map(|(id, _, _)| *id)
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
+                    let excused = traces.is_some_and(|tr| tr.context)
+                        && !req.fit_proven
+                        && crate::config::params::safe_prompt_len(req.tier, req.max_tokens).is_some_and(|safe| req.prompt_len > safe);
+                    self.drop_draw_candidates(&rh, &late);
+                    if let Some(tr) = traces {
+                        self.close_or_hold_draw(&rh, &tr.chain_hash, &awaiting, warmup, &mut outcome);
+                    }
+                    let one_miss = traces.is_some_and(|tr| tr.one_miss);
+                    // Lineup: every silent or late cohort member. Pipeline: every member that neither
                     // declared nor served, plus the chosen head when nothing was served, else
                     // every chosen identity the served response did without.
                     let silent: Vec<Hash> = if !audit.is_pipeline() {
-                        audit.cohort.iter().filter(|m| !audit.responded.contains(m)).copied().collect()
+                        audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)).copied().collect()
                     } else {
                         let declared: Vec<Hash> = audit.declared.iter().map(|(_, id, _)| *id).collect();
                         let mut v: Vec<Hash> =
@@ -1209,15 +2058,29 @@ impl ServiceLedger {
                         v
                     };
                     for miner in silent.iter() {
+                        let is_late = late.contains(miner);
+                        if one_miss {
+                            if excused && !is_late {
+                                if !warmup {
+                                    outcome.excused.push((rh, *miner));
+                                }
+                                continue;
+                            }
+                            self.forget_struck(&rh, miner);
+                        }
                         if warmup {
                             // The miss is already persisted: its burns came in through `is_burned`
                             // and its strike lives in the baseline.
                             continue;
                         }
-                        // Rate-limit: a strike lands at most once per interval. A miss inside the
-                        // interval of the miner's last strike is a no-op — no escalation, no burn.
-                        if self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
-                        {
+                        if excused && !is_late {
+                            outcome.excused.push((rh, *miner));
+                            continue;
+                        }
+                        if is_late {
+                            outcome.late.push((rh, *miner));
+                        }
+                        if self.within_strike_interval(miner, daa) {
                             continue;
                         }
                         let count = self.consecutive_misses(miner) + 1;
@@ -1236,6 +2099,7 @@ impl ServiceLedger {
                             consecutive_misses: count,
                             penalty,
                             burned,
+                            opening_missing: false,
                         });
                     }
                     self.pending.remove(&rh);
@@ -1280,6 +2144,7 @@ impl ServiceLedger {
                             window_end_daa: daa + window,
                             members,
                             declared: Vec::new(),
+                            v3: None,
                         };
                         for (tier, escrow) in early {
                             audit.declare(tier, escrow);
@@ -1305,6 +2170,7 @@ impl ServiceLedger {
                     }
                     if set.is_empty() {
                         self.pending.remove(&rh);
+                        self.early_shapes.retain(|(h, _), _| *h != rh);
                     } else {
                         let mut ids: Vec<Hash> = set.iter().map(|(id, _)| *id).collect();
                         ids.sort_unstable();
@@ -1316,37 +2182,64 @@ impl ServiceLedger {
                             service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa));
                         // Credit whoever answered before the audit existed: same membership test
                         // as the live path, so an early answer and a late one are worth the same.
+                        let req_tier = req.tier;
+                        let req_max_tokens = req.max_tokens;
+                        let audit_rule = traces.is_some_and(|tr| (tr.tier)(req_tier, req.accepted_daa).is_some_and(|rules| rules.audit_all));
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
+                        let mut drawable: Vec<Hash> = Vec::new();
                         let mut responded: Vec<Hash> = Vec::new();
+                        let mut answers: Vec<Answer> = Vec::new();
+                        let mut fit = false;
                         for key in early.iter() {
+                            let waits = self.reset_waits_for_opening(traces, &rh, key, req_tier, daa);
+                            let shape = self.early_shapes.get(&(rh, *key)).map(|s| (s.n_prompt, s.n_pos.saturating_sub(s.n_prompt)));
+                            let audited = self.trace_audits.values().any(|a| a.request_hash == rh && a.responder == *key);
+                            // Under the audit rule an answer without an audited trace is not credited.
+                            if audit_rule && sanction && !audited {
+                                continue;
+                            }
+                            let mut member = false;
                             for identity in delegations.iter().filter(|(e, _)| e == key).map(|(_, id)| id) {
                                 if ids.binary_search(identity).is_ok() && !responded.contains(identity) {
                                     responded.push(*identity);
-                                    served_at_arm.push(*identity);
+                                    answers.push((*identity, daa, shape));
+                                    if !audit_rule || shape.is_some() {
+                                        drawable.push(*identity);
+                                    }
+                                    member = true;
+                                    if !waits {
+                                        served_at_arm.push(*identity);
+                                    }
                                 }
                             }
+                            if member && self.early_shapes.get(&(rh, *key)).is_some_and(|s| crate::config::params::prompt_fits_floor(req_tier, s.n_prompt, req_max_tokens)) {
+                                fit = true;
+                            }
                         }
-                        let first_credit = responded.first().copied();
-                        self.pending.get_mut(&rh).unwrap().audit = Some(Audit {
-                            cohort: ids,
-                            delegations,
-                            responded,
-                            window_end_daa: daa + window,
-                            members: Vec::new(),
-                            declared: Vec::new(),
+                        self.early_shapes.retain(|(h, _), _| *h != rh);
+                        let req = self.pending.get_mut(&rh).unwrap();
+                        if fit && traces.is_some_and(|tr| tr.context) {
+                            req.fit_proven = true;
+                        }
+                        let v3 = window_v3.then(|| {
+                            armed_v3.push(rh);
+                            QueuedWindow { arm_daa: daa, queue: Vec::new(), answers }
                         });
-                        if let Some(first) = first_credit {
-                            self.maybe_award(&rh, first, warmup, &mut outcome);
-                        }
+                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window, members: Vec::new(), declared: Vec::new(), v3 });
+                        self.credit_reward(&rh, &drawable, daa, draw_rule, warmup, &mut outcome);
                     }
                 }
                 None => {}
             }
         }
 
+        for rh in armed_v3 {
+            self.set_queued_window(&rh, daa);
+        }
+
         for identity in served_at_arm {
             // A warmup fold leaves strikes alone: the baseline already carries this reset.
-            if !warmup && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
+            if !warmup && !(sanction && self.struck_at(&identity, daa)) && self.strike_state(&identity).is_some_and(|e| e.count > 0) {
                 let preserved = self.reset_preserved_last_daa(&identity, daa);
                 self.strikes.insert(identity, StrikeEntry { count: 0, last_daa: preserved });
                 outcome.resets.push((identity, preserved));
@@ -1354,6 +2247,314 @@ impl ServiceLedger {
         }
 
         outcome
+    }
+
+    /// Whether a strike on `miner` at `daa` falls inside the interval of its last strike.
+    fn within_strike_interval(&self, miner: &Hash, daa: u64) -> bool {
+        self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
+    }
+
+    /// Takes `identity` out of every other judgement of `request_hash`: its trace audits and its
+    /// cohort (with the matching queue entry).
+    fn forget_struck(&mut self, request_hash: &[u8; 32], identity: &Hash) {
+        for a in self.trace_audits.values_mut().filter(|a| &a.request_hash == request_hash) {
+            a.identities.retain(|id| id != identity);
+        }
+        if let Some(audit) = self.pending.get_mut(request_hash).and_then(|r| r.audit.as_mut())
+            && let Ok(i) = audit.cohort.binary_search(identity)
+        {
+            audit.cohort.remove(i);
+            if let Some(w) = audit.v3.as_mut()
+                && i < w.queue.len()
+            {
+                w.queue.remove(i);
+            }
+        }
+    }
+
+    /// The armed network-model audits, oldest first, each with its declarations so far.
+    pub fn pipeline_assignments(&self) -> Vec<PipelineAssignment> {
+        let mut out: Vec<PipelineAssignment> = self
+            .pending
+            .iter()
+            .filter_map(|(rh, req)| {
+                let audit = req.audit.as_ref()?;
+                if !audit.is_pipeline() {
+                    return None;
+                }
+                let links = audit.declared.iter().map(|(tier, _, escrow)| (*tier, escrow.as_bytes())).collect();
+                Some(PipelineAssignment { request_hash: *rh, accepted_daa: req.accepted_daa, window_end_daa: audit.window_end_daa, links })
+            })
+            .collect();
+        out.sort_by_key(|a| (a.accepted_daa, a.request_hash));
+        out
+    }
+
+    /// Fills the tier, token budget and sanctioned identities of a trace audit from its request,
+    /// once that request's audit is armed.
+    fn resolve_trace_audit(&self, a: &mut TraceAudit, one_miss: bool) {
+        if !a.identities.is_empty() || (one_miss && a.tier != TRACE_TIER_UNKNOWN) {
+            return;
+        }
+        let Some(req) = self.pending.get(&a.request_hash) else { return };
+        let Some(audit) = req.audit.as_ref() else { return };
+        a.tier = req.tier;
+        a.max_tokens = req.max_tokens;
+        a.identities = audit
+            .delegations
+            .iter()
+            .filter(|(e, id)| *e == a.responder && audit.cohort.binary_search(id).is_ok())
+            .map(|(_, id)| *id)
+            .collect();
+    }
+
+    /// Records the block's traced responses, draws the ripe ones, judges the openings and closes
+    /// the audits whose deadline passed.
+    fn fold_traces(
+        &mut self,
+        daa: u64,
+        tr: &TraceInputs,
+        parked: &[TraceResponseEvent],
+        misshaped: &[([u8; 32], Hash)],
+        warmup: bool,
+        is_established: &dyn Fn(&Hash) -> bool,
+        outcome: &mut FoldOutcome,
+    ) {
+        let mut audited: std::collections::HashSet<([u8; 32], Hash)> =
+            if tr.sanction { self.trace_audits.values().map(|a| (a.request_hash, a.responder)).collect() } else { Default::default() };
+        for ev in tr.responses.iter().chain(parked) {
+            if self.trace_audits.contains_key(&ev.response_txid)
+                || self.trace_roots.contains_key(&ev.response_txid)
+                || misshaped.contains(&(ev.request_hash, ev.responder))
+                || (tr.sanction && !self.trace_response_known(ev))
+                || (tr.sanction && !audited.insert((ev.request_hash, ev.responder)))
+            {
+                continue;
+            }
+            let mut a = TraceAudit {
+                request_hash: ev.request_hash,
+                responder: ev.responder,
+                escrow_pubkey: ev.escrow_pubkey,
+                trace_root: ev.trace_root,
+                n_prompt: ev.n_prompt,
+                n_pos: ev.n_pos,
+                accepted_daa: daa,
+                tier: TRACE_TIER_UNKNOWN,
+                max_tokens: 0,
+                identities: Vec::new(),
+                seed: None,
+                deadline_daa: 0,
+                pieces: 0,
+                attn: None,
+                chain_start: 0,
+            };
+            self.resolve_trace_audit(&mut a, tr.one_miss);
+            self.trace_audits.insert(ev.response_txid, a);
+        }
+
+        let ripe: Vec<[u8; 32]> = self
+            .trace_audits
+            .iter()
+            .filter(|(_, a)| a.seed.is_none() && daa >= a.accepted_daa + TRACE_SEED_DELAY_DAA)
+            .map(|(k, _)| *k)
+            .collect();
+        let owed = |a: &TraceAudit| (required_pieces((tr.tier)(a.tier, a.accepted_daa).as_ref()) & !a.pieces).count_ones() as u64;
+        let mut backlog: u64 = self.trace_audits.values().filter(|a| a.seed.is_some()).map(owed).sum();
+        let mut chain_end: std::collections::BTreeMap<[u8; 32], u64> = std::collections::BTreeMap::new();
+        for a in self.trace_audits.values().filter(|a| a.seed.is_some()) {
+            let end = chain_end.entry(a.escrow_pubkey).or_insert(0);
+            *end = (*end).max(if tr.sanction && a.chain_start != 0 { a.chain_start } else { a.deadline_daa });
+        }
+        for txid in ripe {
+            let mut a = self.trace_audits.remove(&txid).unwrap();
+            self.resolve_trace_audit(&mut a, tr.one_miss);
+            if tr.sanction && a.identities.is_empty() && self.pending.get(&a.request_hash).is_some_and(|r| r.audit.is_none()) {
+                self.trace_audits.insert(txid, a);
+                continue;
+            }
+            let seed = trace_seed(&tr.chain_hash, &txid);
+            let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
+            if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
+                let prompt = if rules.as_ref().is_some_and(|r| r.attention) { attn_first_prompt_daa(a.n_prompt) } else { 0 };
+                let own = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt;
+                let work = OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt));
+                let start = chain_end.get(&a.escrow_pubkey).map_or(own, |&end| own.max(end + work));
+                self.trace_roots.insert(txid, daa);
+                if tr.sanction {
+                    a.seed = Some(seed);
+                    let phases = if rules.as_ref().is_some_and(|r| r.attention) {
+                        ATTN_PHASES_RESERVED
+                            * (TRACE_SEED_DELAY_DAA + attn_phase_window_daa(a.tier, a.max_tokens, a.n_prompt, a.n_pos) + backlog_daa(backlog))
+                    } else {
+                        0
+                    };
+                    if start + backlog_daa(backlog) + phases > a.accepted_daa + AUDIT_SPAN_DAA {
+                        // Judged at once as an opening past its deadline.
+                        a.deadline_daa = daa.saturating_sub(1);
+                        self.trace_audits.insert(txid, a);
+                        continue;
+                    }
+                    a.deadline_daa = start + backlog_daa(backlog);
+                    a.chain_start = start;
+                    chain_end.insert(a.escrow_pubkey, start);
+                    if tr.audit_queue {
+                        self.push_open_audits(&a, daa);
+                    }
+                } else {
+                    if start - own > OPENING_BACKLOG_CAP_DAA {
+                        self.drop_draw_candidates(&a.request_hash, &a.identities);
+                        continue;
+                    }
+                    a.deadline_daa = start + backlog_daa(backlog);
+                    a.seed = Some(seed);
+                    chain_end.insert(a.escrow_pubkey, a.deadline_daa);
+                }
+                backlog += owed(&a);
+                self.trace_audits.insert(txid, a);
+            }
+        }
+
+        for (txid, a) in self.trace_audits.iter_mut() {
+            if let Some(p) = a.attn.as_mut().filter(|p| !p.drawn && daa >= p.accepted_daa + TRACE_SEED_DELAY_DAA) {
+                let child = attn_child_seed(&tr.chain_hash, txid, p.path.len() as u8);
+                p.path.push(keryx_verifiable_inference::attn_blocks::draw_weighted_child(&child, &p.weights));
+                p.drawn = true;
+            }
+        }
+
+        for op in tr.openings {
+            let Some(a) = self.trace_audits.get(&op.response_txid) else { continue };
+            let Some(seed) = a.seed else { continue };
+            if op.escrow_pubkey != a.escrow_pubkey {
+                continue;
+            }
+            if let Some(block) = keryx_verifiable_inference::opening::seed_block(&op.body)
+                && (!tr.seed_bind || trace_seed(&Hash::from_bytes(block), &op.response_txid) != seed)
+            {
+                continue;
+            }
+            let rules = (tr.tier)(a.tier, a.accepted_daa);
+            let required = required_pieces(rules.as_ref());
+            let piece = opening_body_piece(&op.body);
+            if piece & required == 0 || a.pieces & piece != 0 {
+                continue;
+            }
+            if piece == PIECE_ATTN
+                && let Some(path) = keryx_verifiable_inference::opening::attn_path(&op.body)
+                && Some(&path[..]) != a.attn.as_ref().map_or(Some(&[][..]), AttnProgress::awaited)
+            {
+                continue;
+            }
+            let mut a = self.trace_audits.remove(&op.response_txid).unwrap();
+            let mut next = None;
+            let verdict = match &rules {
+                Some(r) if piece == PIECE_ATTN => attn_opening_valid(r, &a, &seed, &op.response_txid, &op.body).map(|step| {
+                    if let keryx_verifiable_inference::chain::AttnStep::Next { root, n, weights } = step {
+                        next = Some((root, n, weights));
+                    }
+                }),
+                Some(r) if piece == PIECE_RECUR => recur_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(r) if piece == PIECE_RESID => resid_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                None => Err("no rules"),
+            };
+            if let Some((root, n, weights)) = next {
+                let path = a.attn.take().map(|p| p.path).unwrap_or_default();
+                a.attn = Some(AttnProgress { path, root, n, accepted_daa: daa, drawn: false, weights });
+                a.deadline_daa =
+                    a.deadline_daa.max(daa + TRACE_SEED_DELAY_DAA + attn_phase_window_daa(a.tier, a.max_tokens, a.n_prompt, a.n_pos) + backlog_daa(backlog));
+                if tr.sanction {
+                    a.deadline_daa = a.deadline_daa.min(a.accepted_daa + AUDIT_SPAN_DAA);
+                }
+                self.trace_audits.insert(op.response_txid, a);
+                continue;
+            }
+            if verdict.is_ok() && a.pieces | piece != required {
+                a.pieces |= piece;
+                if piece == PIECE_ATTN {
+                    a.attn = None;
+                }
+                self.trace_audits.insert(op.response_txid, a);
+                continue;
+            }
+            outcome.verdicts.push(TraceVerdict {
+                response_txid: op.response_txid,
+                request_hash: a.request_hash,
+                responder: a.responder,
+                cause: verdict.err(),
+            });
+            if verdict.is_ok() && tr.sanction && !warmup {
+                for miner in a.identities.iter() {
+                    if !self.struck_at(miner, daa) && self.strike_state(miner).is_some_and(|e| e.count > 0) {
+                        let preserved = self.reset_preserved_last_daa(miner, daa);
+                        self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: preserved });
+                        outcome.resets.push((*miner, preserved));
+                    }
+                }
+            }
+            if verdict.is_err() {
+                self.drop_draw_candidates(&a.request_hash, &a.identities);
+                for miner in a.identities.iter() {
+                    if tr.one_miss {
+                        self.forget_struck(&a.request_hash, miner);
+                    }
+                    if warmup || (tr.sanction && self.struck_at(miner, daa)) || (tr.uniform_strikes && self.within_strike_interval(miner, daa)) {
+                        continue;
+                    }
+                    let count = if tr.uniform_strikes { self.consecutive_misses(miner) + 1 } else { (self.consecutive_misses(miner) + 1).max(2) };
+                    let penalty = strike_penalty_at(count, is_established(miner), self.v2_at(daa));
+                    self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
+                    let burned = self.burn(miner, penalty);
+                    if penalty == ServicePenalty::Suspend {
+                        self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: daa });
+                    }
+                    outcome.misses.push(ServiceMiss {
+                        request_hash: a.request_hash,
+                        miner: *miner,
+                        consecutive_misses: count,
+                        penalty,
+                        burned,
+                        opening_missing: false,
+                    });
+                }
+            }
+        }
+
+        let late: Vec<[u8; 32]> =
+            self.trace_audits.iter().filter(|(_, a)| a.seed.is_some() && daa > a.deadline_daa).map(|(k, _)| *k).collect();
+        for txid in late {
+            let a = self.trace_audits.remove(&txid).unwrap();
+            self.drop_draw_candidates(&a.request_hash, &a.identities);
+            for miner in a.identities.iter() {
+                if tr.one_miss {
+                    self.forget_struck(&a.request_hash, miner);
+                }
+                if warmup {
+                    continue;
+                }
+                let skip = if tr.sanction && !tr.uniform_strikes { self.struck_at(miner, daa) } else { self.within_strike_interval(miner, daa) };
+                if skip {
+                    continue;
+                }
+                let count = self.consecutive_misses(miner) + 1;
+                self.strikes.insert(*miner, StrikeEntry { count, last_daa: daa });
+                let penalty = strike_penalty_at(count, is_established(miner), self.v2_at(daa));
+                let burned = self.burn(miner, penalty);
+                if penalty == ServicePenalty::Suspend {
+                    self.strikes.insert(*miner, StrikeEntry { count: 0, last_daa: daa });
+                }
+                outcome.misses.push(ServiceMiss {
+                    request_hash: a.request_hash,
+                    miner: *miner,
+                    consecutive_misses: count,
+                    penalty,
+                    burned,
+                    opening_missing: true,
+                });
+            }
+        }
+
+        self.trace_audits.retain(|_, a| a.seed.is_some() || a.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
     }
 
     /// Last-strike daa a served-response reset carries forward, so a serve no longer disarms
@@ -1385,24 +2586,6 @@ impl ServiceLedger {
         burned
     }
 
-    /// The armed network-model audits, oldest first, each with its declarations so far.
-    pub fn pipeline_assignments(&self) -> Vec<PipelineAssignment> {
-        let mut out: Vec<PipelineAssignment> = self
-            .pending
-            .iter()
-            .filter_map(|(rh, req)| {
-                let audit = req.audit.as_ref()?;
-                if !audit.is_pipeline() {
-                    return None;
-                }
-                let links = audit.declared.iter().map(|(tier, _, escrow)| (*tier, escrow.as_bytes())).collect();
-                Some(PipelineAssignment { request_hash: *rh, accepted_daa: req.accepted_daa, window_end_daa: audit.window_end_daa, links })
-            })
-            .collect();
-        out.sort_by_key(|a| (a.accepted_daa, a.request_hash));
-        out
-    }
-
     /// The miner's still-locked escrow claims, chain order (newest last).
     pub fn vault_claims(&self, miner: &Hash) -> Vec<EscrowClaim> {
         self.vault.get(miner).map(|claims| claims.iter().copied().collect()).unwrap_or_default()
@@ -1412,6 +2595,73 @@ impl ServiceLedger {
     /// the request is pending and was sealed to named responders; `None` when it is unknown,
     /// expired or public. Mempool admission reads it to accept an inline response body only
     /// from a named responder of a live private request.
+    /// Escrow key expected to sign the opening of a drawn response still awaiting it.
+    pub fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.escrow_pubkey)
+    }
+
+    /// Draw seed of a drawn response still awaiting its opening.
+    pub fn awaited_opening_seed(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
+        self.trace_audits.get(response_txid).and_then(|a| a.seed)
+    }
+
+    /// Window end of the armed audit of `request_hash` while a cohort identity delegating to
+    /// `escrow_pubkey` has not responded yet.
+    pub fn awaited_response_deadline(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<u64> {
+        let audit = self.pending.get(request_hash)?.audit.as_ref()?;
+        let escrow = escrow_miner_key(escrow_pubkey);
+        audit
+            .delegations
+            .iter()
+            .any(|(e, id)| *e == escrow && audit.cohort.binary_search(id).is_ok() && !audit.responded.contains(id))
+            .then_some(audit.window_end_daa)
+    }
+
+    /// Await status of `request_hash` for the identity of `escrow_pubkey`: `None` when the
+    /// request is not pending, `Some(None)` once it no longer awaits that identity, otherwise
+    /// the answer window end (zero before the audit arms).
+    pub fn request_await_status(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> Option<Option<u64>> {
+        let req = self.pending.get(request_hash)?;
+        if req.audit.is_none() {
+            return Some(Some(0));
+        }
+        Some(self.awaited_response_deadline(request_hash, escrow_pubkey))
+    }
+
+    /// Whether a response to `request_hash` signed by `escrow_pubkey` can still count: the
+    /// request is pending and not armed yet, or armed and awaiting that responder.
+    pub fn response_admissible(&self, request_hash: &[u8; 32], escrow_pubkey: &[u8; 32]) -> bool {
+        self.pending.get(request_hash).is_some_and(|r| r.audit.is_none())
+            || self.awaited_response_deadline(request_hash, escrow_pubkey).is_some()
+    }
+
+    /// Opening deadline of a drawn response still awaiting its opening.
+    pub fn awaited_opening_deadline(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.deadline_daa)
+    }
+
+    /// The acceptance DAA a drawn response is audited at.
+    pub fn awaited_opening_accepted_daa(&self, response_txid: &[u8; 32]) -> Option<u64> {
+        self.trace_audits.get(response_txid).filter(|a| a.seed.is_some()).map(|a| a.accepted_daa)
+    }
+
+    /// Pieces a drawn response still owes, `required` giving the pieces of a tier at an
+    /// acceptance DAA.
+    pub fn awaited_opening_pieces(&self, response_txid: &[u8; 32], required: impl Fn(u8, u64) -> u8) -> Option<u8> {
+        let a = self.trace_audits.get(response_txid).filter(|a| a.seed.is_some())?;
+        Some(required(a.tier, a.accepted_daa) & !a.pieces)
+    }
+
+    /// Path of the attention phase a drawn response awaits; `None` while a child is still to
+    /// draw or when no attention opening is awaited.
+    pub fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
+        let a = self.trace_audits.get(response_txid).filter(|a| a.seed.is_some() && a.pieces & PIECE_ATTN == 0)?;
+        match &a.attn {
+            None => Some(Vec::new()),
+            Some(p) => p.awaited().map(<[u64]>::to_vec),
+        }
+    }
+
     pub fn private_recipients(&self, request_hash: &[u8; 32]) -> Option<&[Hash]> {
         self.pending.get(request_hash).filter(|r| !r.recipients.is_empty()).map(|r| r.recipients.as_slice())
     }
@@ -1445,6 +2695,15 @@ impl ServiceLedger {
     }
 
     /// Whether `service_bond_v2_activation` is live at `daa`.
+    /// Under the sanction rule a response on an audited tier resets the streak only at an
+    /// accepted opening, not when it is credited.
+    fn reset_waits_for_opening(&self, traces: Option<&TraceInputs>, request_hash: &[u8; 32], responder: &Hash, tier: u8, daa: u64) -> bool {
+        let Some(tr) = traces.filter(|tr| tr.sanction) else { return false };
+        let audited = |at: u64| (tr.tier)(tier, at).is_some_and(|rules| rules.audit_all);
+        audited(daa)
+            || self.trace_audits.values().any(|a| a.request_hash == *request_hash && a.responder == *responder && audited(a.accepted_daa))
+    }
+
     fn v2_at(&self, daa: u64) -> bool {
         self.window_v2_activation_daa.is_some_and(|a| daa >= a)
     }
@@ -1508,6 +2767,156 @@ impl ServiceLedger {
         }
     }
 
+    /// Credits `served` on the reward of `rh`. An open draw takes them as candidates until it
+    /// closes; otherwise the first credit opens a draw under the draw rule, or wins outright.
+    fn credit_reward(&mut self, rh: &[u8; 32], served: &[Hash], daa: u64, draw_rule: bool, warmup: bool, outcome: &mut FoldOutcome) {
+        let Some(&first) = served.first() else { return };
+        let Some(routed_from) = self.reward_routing_daa else { return };
+        let Some(req) = self.pending.get_mut(rh) else { return };
+        if let Some(draw) = req.draw.as_mut() {
+            if daa <= draw.close_daa {
+                for identity in served {
+                    if !draw.candidates.iter().any(|(c, _)| c == identity) {
+                        draw.candidates.push((*identity, daa));
+                    }
+                }
+            }
+            return;
+        }
+        if req.accepted_daa < routed_from || req.winner.is_some() || req.reward == 0 {
+            return;
+        }
+        if draw_rule {
+            let close_daa = daa + reward_draw_window_daa(req.tier, req.prompt_len, req.max_tokens);
+            req.draw = Some(RewardDraw { open_daa: daa, close_daa, candidates: served.iter().map(|id| (*id, daa)).collect() });
+            return;
+        }
+        self.maybe_award(rh, first, warmup, outcome);
+    }
+
+    /// Binds every trace audit whose request is now armed to the cohort identities it serves.
+    fn resolve_trace_audits(&mut self, one_miss: bool) {
+        let unresolved: Vec<[u8; 32]> = self.trace_audits.iter().filter(|(_, a)| a.identities.is_empty()).map(|(k, _)| *k).collect();
+        for k in unresolved {
+            let mut a = self.trace_audits.remove(&k).unwrap();
+            self.resolve_trace_audit(&mut a, one_miss);
+            self.trace_audits.insert(k, a);
+        }
+    }
+
+    /// `(request hash, identity)` of every identity still awaiting the verdict of a trace audit.
+    fn audits_awaiting(&self) -> std::collections::BTreeSet<([u8; 32], Hash)> {
+        self.trace_audits.values().flat_map(|a| a.identities.iter().map(move |id| (a.request_hash, *id))).collect()
+    }
+
+    /// Removes identities the audit sanctioned on `rh` from its open or held draw.
+    fn drop_draw_candidates(&mut self, rh: &[u8; 32], identities: &[Hash]) {
+        if identities.is_empty() {
+            return;
+        }
+        if let Some(draw) = self.pending.get_mut(rh).and_then(|r| r.draw.as_mut()) {
+            draw.candidates.retain(|(id, _)| !identities.contains(id));
+        }
+        if let Some(h) = self.held_draws.get_mut(rh) {
+            h.draw.candidates.retain(|(id, _)| !identities.contains(id));
+        }
+    }
+
+    /// Closes the draw of `rh` at the end of its request's window, or holds it while a
+    /// candidate awaits the verdict of its audit.
+    fn close_or_hold_draw(
+        &mut self,
+        rh: &[u8; 32],
+        chain_hash: &Hash,
+        awaiting: &std::collections::BTreeSet<([u8; 32], Hash)>,
+        warmup: bool,
+        outcome: &mut FoldOutcome,
+    ) {
+        let held = self.pending.get(rh).and_then(|r| r.draw.as_ref()).is_some_and(|d| draw_awaits_audit(awaiting, rh, d));
+        if !held {
+            self.close_draw(rh, chain_hash, warmup, outcome);
+            return;
+        }
+        let req = self.pending.get_mut(rh).unwrap();
+        let draw = req.draw.take().unwrap();
+        self.held_draws.insert(*rh, HeldDraw { draw, reward: req.reward });
+    }
+
+    /// Draws the winner of `rh` among its remaining candidates, seeded by the closing chain
+    /// block; with none left the reward stays burned.
+    fn close_draw(&mut self, rh: &[u8; 32], chain_hash: &Hash, warmup: bool, outcome: &mut FoldOutcome) {
+        let Some(req) = self.pending.get_mut(rh) else { return };
+        let Some(draw) = req.draw.take() else { return };
+        let reward = req.reward;
+        let winner = self.award_draw(rh, &draw, reward, chain_hash, warmup, outcome);
+        let req = self.pending.get_mut(rh).unwrap();
+        match winner {
+            Some(w) => req.winner = Some(w),
+            None => req.reward = 0,
+        }
+    }
+
+    /// Draws and pays the winner of `draw` for `reward`; `None` when no candidate is left.
+    fn award_draw(&mut self, rh: &[u8; 32], draw: &RewardDraw, reward: u64, chain_hash: &Hash, warmup: bool, outcome: &mut FoldOutcome) -> Option<Hash> {
+        let mut candidates: Vec<Hash> = draw.candidates.iter().map(|(id, _)| *id).collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let winner = candidates[assign_index(&reward_draw_seed(chain_hash, rh), candidates.len())?];
+        if !warmup {
+            let spk = self.producer_spk.get(&winner).cloned();
+            outcome.rewards.push(ServiceReward { request_hash: *rh, winner, amount: reward, spk });
+        }
+        Some(winner)
+    }
+
+    /// Pushes the deadlines of the open audits of `armed`'s escrow key by the work of `armed`,
+    /// up to [`AUDIT_SPAN_DAA`] after each one's acceptance.
+    fn push_open_audits(&mut self, armed: &TraceAudit, daa: u64) {
+        let generated = armed.n_pos.saturating_sub(armed.n_prompt).min(armed.max_tokens);
+        let push = AUDIT_QUEUE_PASSES * service_work_daa(armed.tier, armed.n_prompt, generated);
+        for o in self.trace_audits.values_mut() {
+            if o.escrow_pubkey == armed.escrow_pubkey && o.seed.is_some() && o.deadline_daa >= daa {
+                o.deadline_daa = o.deadline_daa.saturating_add(push).min(o.accepted_daa + AUDIT_SPAN_DAA).max(o.deadline_daa);
+            }
+        }
+    }
+
+    /// Sets the per-member queue and the deadline of an audit just armed under the v3 window:
+    /// each member's queue is the work of the other armed requests it has not answered yet.
+    fn set_queued_window(&mut self, rh: &[u8; 32], daa: u64) {
+        let Some(req) = self.pending.get(rh) else { return };
+        let Some(audit) = req.audit.as_ref() else { return };
+        let queue: Vec<(u64, bool)> = audit
+            .cohort
+            .iter()
+            .map(|m| {
+                let ahead: Vec<u64> = self
+                    .pending
+                    .iter()
+                    .filter(|(h, j)| {
+                        *h != rh && j.audit.as_ref().is_some_and(|ja| ja.cohort.binary_search(m).is_ok() && !ja.responded.contains(m))
+                    })
+                    .map(|(_, j)| j.reference_work())
+                    .collect();
+                let audits: u64 = self
+                    .trace_audits
+                    .values()
+                    .filter(|a| a.identities.contains(m))
+                    .map(|a| OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt)))
+                    .sum();
+                (ahead.iter().sum::<u64>() + audits, ahead.len() > SERVICE_QUEUE_CAP)
+            })
+            .collect();
+        let own = service_window_daa_v3(req.tier, req.prompt_len, req.max_tokens);
+        let horizon_end = req.accepted_daa + SERVICE_LEDGER_HORIZON_DAA - 2;
+        let end = (daa + own + queue.iter().map(|(q, _)| *q).max().unwrap_or(0)).min(horizon_end);
+        let audit = self.pending.get_mut(rh).unwrap().audit.as_mut().unwrap();
+        audit.window_end_daa = end;
+        if let Some(w) = audit.v3.as_mut() {
+            w.queue = queue;
+        }
+    }
+
     /// The small reorg-restore state: everything but the vault (whose restore goes through the
     /// per-block undo log — cloning a full burnable window per chain block does not scale).
     pub fn light_snapshot(&self) -> LightSnapshot {
@@ -1521,6 +2930,11 @@ impl ServiceLedger {
             first_seen_base: self.first_seen_base.clone(),
             producer_spk: self.producer_spk.clone(),
             audited: self.audited.clone(),
+            trace_audits: self.trace_audits.clone(),
+            early_shapes: self.early_shapes.clone(),
+            early_traces: self.early_traces.clone(),
+            trace_roots: self.trace_roots.clone(),
+            held_draws: self.held_draws.clone(),
         }
     }
 
@@ -1535,6 +2949,11 @@ impl ServiceLedger {
         self.first_seen_base = snap.first_seen_base.clone();
         self.producer_spk = snap.producer_spk.clone();
         self.audited = snap.audited.clone();
+        self.trace_audits = snap.trace_audits.clone();
+        self.early_shapes = snap.early_shapes.clone();
+        self.early_traces = snap.early_traces.clone();
+        self.trace_roots = snap.trace_roots.clone();
+        self.held_draws = snap.held_draws.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -1561,6 +2980,17 @@ impl ServiceLedger {
     }
 
     /// The miner's strike state: the folded delta, falling back to the persisted baseline.
+    /// Whether a traced response answers a request the ledger holds, from one of its recipients.
+    fn trace_response_known(&self, ev: &TraceResponseEvent) -> bool {
+        self.pending.get(&ev.request_hash).is_some_and(|r| r.recipients.is_empty() || r.recipients.contains(&ev.responder))
+    }
+
+    /// Whether the miner already took a strike in the block at `daa`: under the sanction rule a
+    /// miner takes at most one strike and no reset per block.
+    fn struck_at(&self, miner: &Hash, daa: u64) -> bool {
+        self.strike_state(miner).is_some_and(|e| e.last_daa == daa)
+    }
+
     fn strike_state(&self, miner: &Hash) -> Option<StrikeEntry> {
         self.strikes.get(miner).or_else(|| self.base.get(miner)).copied()
     }
@@ -1604,6 +3034,11 @@ pub struct ServiceLedgerSnapshot {
     /// the eligibility window ending at the snapshot block, chain order — what a cohort walk
     /// below the pruning point reads.
     pub recent_producers: Vec<(u64, Hash, u8, Hash)>,
+    trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
+    early_shapes: std::collections::BTreeMap<([u8; 32], Hash), TraceShape>,
+    early_traces: std::collections::BTreeMap<([u8; 32], Hash), EarlyTrace>,
+    trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
+    held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
@@ -1612,6 +3047,46 @@ const SNAPSHOT_ENCODING_VERSION: u8 = 1;
 /// request carries recipients, so every snapshot without one keeps its historical bytes and
 /// hash, and one byte form per state keeps the encoding canonical.
 const SNAPSHOT_ENCODING_VERSION_PRIVATE: u8 = 2;
+/// Private section (possibly empty) followed by the trace audits.
+const SNAPSHOT_ENCODING_VERSION_TRACE: u8 = 3;
+/// Private and trace sections (possibly empty) followed by the prompt lengths of the pending
+/// requests that carry one (`[n: u32] n × [request_hash: 32] [prompt_len: u32]`, pending order)
+/// and the early shapes (`[n: u32] n × [request_hash: 32] [responder: 32] [n_prompt: u32]
+/// [n_pos: u32] [answer_len: u32]`, key order).
+const SNAPSHOT_ENCODING_VERSION_SHAPE: u8 = 4;
+/// Private, trace and shape sections (possibly empty) followed by the admitted trace roots
+/// (`[n: u32] n × [root: 32] [daa: u64]`, key order).
+const SNAPSHOT_ENCODING_VERSION_ROOT: u8 = 5;
+/// Private, trace, shape and root sections (possibly empty) followed by the pending requests
+/// whose prompt was proven to fit the tier context floor (`[n: u32] n × [request_hash: 32]`,
+/// pending order).
+const SNAPSHOT_ENCODING_VERSION_CONTEXT: u8 = 6;
+/// Sections of version 6 (possibly empty) followed by the open reward draws (`[n: u32] n ×
+/// [request_hash: 32] [open_daa: u64] [close_daa: u64] [k: u32] k × [identity: 32] [daa: u64]`,
+/// pending order) and the v3 windows (`[n: u32] n × [request_hash: 32] [arm_daa: u64] [q: u32]
+/// q × [queued: u64] [capped: u8] [a: u32] a × [identity: 32] [daa: u64] [traced: u8]
+/// ([n_prompt: u32] [generated: u32] when traced)`, pending order, queue in cohort order).
+const SNAPSHOT_ENCODING_VERSION_QUEUE: u8 = 7;
+/// Sections of version 7 (possibly empty) followed by the trace audits holding one proven piece
+/// of two (`[n: u32] n × [response_txid: 32] [piece: u8]`, key order).
+const SNAPSHOT_ENCODING_VERSION_ATTN: u8 = 8;
+/// Sections of version 8 (possibly empty) followed by the attention openings short of their
+/// last phase (`[n: u32] n × [response_txid: 32] [k: u8] k × [child: u64] [root: 32]
+/// [children: u64] [accepted_daa: u64] [drawn: u8] children × [weight: u16]`, key order).
+const SNAPSHOT_ENCODING_VERSION_PHASES: u8 = 10;
+/// Sections of version 10 (possibly empty) followed by the draws held past their request's
+/// window (`[n: u32] n × [request_hash: 32] [reward: u64] [open_daa: u64] [close_daa: u64]
+/// [k: u32] k × [identity: 32] [daa: u64]`, key order).
+const SNAPSHOT_ENCODING_VERSION_HELD: u8 = 11;
+/// Sections of version 11 (possibly empty) followed by the trace fields of the responses
+/// accepted before their request (`[n: u32] n × [request_hash: 32] [responder: 32]
+/// [response_txid: 32] [escrow_pubkey: 32] [trace_root: 32] [stage: u8] [tokens: u8]`, key order).
+const SNAPSHOT_ENCODING_VERSION_EARLY: u8 = 12;
+/// Sections of version 12 (possibly empty) followed by the chain deadlines of the drawn audits
+/// (`[n: u32] n × [response_txid: 32] [chain_start: u64]`, key order).
+const SNAPSHOT_ENCODING_VERSION_CHAIN: u8 = 13;
+/// Children an attention phase may commit.
+const MAX_ATTN_CHILDREN: u64 = 1 << 16;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -1708,7 +3183,40 @@ impl ServiceLedgerSnapshot {
             .filter(|(_, r)| !r.recipients.is_empty())
             .map(|(rh, r)| (rh, &r.cohort_seed, &r.recipients))
             .collect();
-        out.push(if private.is_empty() { SNAPSHOT_ENCODING_VERSION } else { SNAPSHOT_ENCODING_VERSION_PRIVATE });
+        let shaped = self.pending.values().any(|r| r.prompt_len > 0) || !self.early_shapes.is_empty();
+        let fit: Vec<&[u8; 32]> = self.pending.iter().filter(|(_, r)| r.fit_proven).map(|(rh, _)| rh).collect();
+        let drawn: Vec<(&[u8; 32], &RewardDraw)> = self.pending.iter().filter_map(|(rh, r)| r.draw.as_ref().map(|d| (rh, d))).collect();
+        let windowed: Vec<(&[u8; 32], &QueuedWindow)> =
+            self.pending.iter().filter_map(|(rh, r)| r.audit.as_ref().and_then(|a| a.v3.as_ref()).map(|w| (rh, w))).collect();
+        let halves: Vec<(&[u8; 32], u8)> = self.trace_audits.iter().filter(|(_, a)| a.pieces != 0).map(|(k, a)| (k, a.pieces)).collect();
+        let phased: Vec<(&[u8; 32], &AttnProgress)> = self.trace_audits.iter().filter_map(|(k, a)| a.attn.as_ref().map(|p| (k, p))).collect();
+        let chained: Vec<(&[u8; 32], u64)> = self.trace_audits.iter().filter(|(_, a)| a.chain_start != 0).map(|(k, a)| (k, a.chain_start)).collect();
+        let version = if !chained.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_CHAIN
+        } else if !self.early_traces.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_EARLY
+        } else if !self.held_draws.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_HELD
+        } else if !phased.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_PHASES
+        } else if !halves.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_ATTN
+        } else if !drawn.is_empty() || !windowed.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_QUEUE
+        } else if !fit.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_CONTEXT
+        } else if !self.trace_roots.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_ROOT
+        } else if shaped {
+            SNAPSHOT_ENCODING_VERSION_SHAPE
+        } else if !self.trace_audits.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_TRACE
+        } else if private.is_empty() {
+            SNAPSHOT_ENCODING_VERSION
+        } else {
+            SNAPSHOT_ENCODING_VERSION_PRIVATE
+        };
+        out.push(version);
         out.extend_from_slice(&(self.vault.len() as u32).to_le_bytes());
         for (miner, claims) in self.vault.iter() {
             out.extend_from_slice(&miner.as_bytes());
@@ -1806,12 +3314,158 @@ impl ServiceLedgerSnapshot {
             out.push(*tier);
             out.extend_from_slice(&escrow.as_bytes());
         }
-        if !private.is_empty() {
+        if version >= SNAPSHOT_ENCODING_VERSION_PRIVATE {
             out.extend_from_slice(&(private.len() as u32).to_le_bytes());
             for (rh, seed, recipients) in private {
                 out.extend_from_slice(rh);
                 out.extend_from_slice(seed);
                 put_hashes(&mut out, recipients);
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_TRACE {
+            out.extend_from_slice(&(self.trace_audits.len() as u32).to_le_bytes());
+            for (txid, a) in self.trace_audits.iter() {
+                out.extend_from_slice(txid);
+                out.extend_from_slice(&a.request_hash);
+                out.extend_from_slice(&a.responder.as_bytes());
+                out.extend_from_slice(&a.escrow_pubkey);
+                out.extend_from_slice(&a.trace_root);
+                out.extend_from_slice(&a.n_prompt.to_le_bytes());
+                out.extend_from_slice(&a.n_pos.to_le_bytes());
+                out.extend_from_slice(&a.accepted_daa.to_le_bytes());
+                out.push(a.tier);
+                out.extend_from_slice(&a.max_tokens.to_le_bytes());
+                put_hashes(&mut out, &a.identities);
+                match &a.seed {
+                    Some(s) => {
+                        out.push(1);
+                        out.extend_from_slice(s);
+                        out.extend_from_slice(&a.deadline_daa.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_SHAPE {
+            let lens: Vec<(&[u8; 32], u32)> = self.pending.iter().filter(|(_, r)| r.prompt_len > 0).map(|(rh, r)| (rh, r.prompt_len)).collect();
+            out.extend_from_slice(&(lens.len() as u32).to_le_bytes());
+            for (rh, len) in lens {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&len.to_le_bytes());
+            }
+            out.extend_from_slice(&(self.early_shapes.len() as u32).to_le_bytes());
+            for ((rh, key), shape) in self.early_shapes.iter() {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&key.as_bytes());
+                out.extend_from_slice(&shape.n_prompt.to_le_bytes());
+                out.extend_from_slice(&shape.n_pos.to_le_bytes());
+                out.extend_from_slice(&shape.answer_len.to_le_bytes());
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ROOT {
+            out.extend_from_slice(&(self.trace_roots.len() as u32).to_le_bytes());
+            for (root, daa) in self.trace_roots.iter() {
+                out.extend_from_slice(root);
+                out.extend_from_slice(&daa.to_le_bytes());
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_CONTEXT {
+            out.extend_from_slice(&(fit.len() as u32).to_le_bytes());
+            for rh in fit {
+                out.extend_from_slice(rh);
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_QUEUE {
+            out.extend_from_slice(&(drawn.len() as u32).to_le_bytes());
+            for (rh, d) in drawn {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&d.open_daa.to_le_bytes());
+                out.extend_from_slice(&d.close_daa.to_le_bytes());
+                out.extend_from_slice(&(d.candidates.len() as u32).to_le_bytes());
+                for (id, at) in d.candidates.iter() {
+                    out.extend_from_slice(&id.as_bytes());
+                    out.extend_from_slice(&at.to_le_bytes());
+                }
+            }
+            out.extend_from_slice(&(windowed.len() as u32).to_le_bytes());
+            for (rh, w) in windowed {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&w.arm_daa.to_le_bytes());
+                out.extend_from_slice(&(w.queue.len() as u32).to_le_bytes());
+                for (queued, capped) in w.queue.iter() {
+                    out.extend_from_slice(&queued.to_le_bytes());
+                    out.push(*capped as u8);
+                }
+                out.extend_from_slice(&(w.answers.len() as u32).to_le_bytes());
+                for (id, at, shape) in w.answers.iter() {
+                    out.extend_from_slice(&id.as_bytes());
+                    out.extend_from_slice(&at.to_le_bytes());
+                    match shape {
+                        Some((n_prompt, generated)) => {
+                            out.push(1);
+                            out.extend_from_slice(&n_prompt.to_le_bytes());
+                            out.extend_from_slice(&generated.to_le_bytes());
+                        }
+                        None => out.push(0),
+                    }
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ATTN {
+            out.extend_from_slice(&(halves.len() as u32).to_le_bytes());
+            for (txid, piece) in halves {
+                out.extend_from_slice(txid);
+                out.push(piece);
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_PHASES {
+            out.extend_from_slice(&(phased.len() as u32).to_le_bytes());
+            for (txid, p) in phased {
+                out.extend_from_slice(txid);
+                out.push(p.path.len() as u8);
+                for c in &p.path {
+                    out.extend_from_slice(&c.to_le_bytes());
+                }
+                out.extend_from_slice(&p.root);
+                out.extend_from_slice(&p.n.to_le_bytes());
+                out.extend_from_slice(&p.accepted_daa.to_le_bytes());
+                out.push(p.drawn as u8);
+                for w in &p.weights {
+                    out.extend_from_slice(&w.to_le_bytes());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_HELD {
+            out.extend_from_slice(&(self.held_draws.len() as u32).to_le_bytes());
+            for (rh, h) in self.held_draws.iter() {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&h.reward.to_le_bytes());
+                out.extend_from_slice(&h.draw.open_daa.to_le_bytes());
+                out.extend_from_slice(&h.draw.close_daa.to_le_bytes());
+                out.extend_from_slice(&(h.draw.candidates.len() as u32).to_le_bytes());
+                for (id, at) in h.draw.candidates.iter() {
+                    out.extend_from_slice(&id.as_bytes());
+                    out.extend_from_slice(&at.to_le_bytes());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_EARLY {
+            out.extend_from_slice(&(self.early_traces.len() as u32).to_le_bytes());
+            for ((rh, key), t) in self.early_traces.iter() {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&key.as_bytes());
+                out.extend_from_slice(&t.response_txid);
+                out.extend_from_slice(&t.escrow_pubkey);
+                out.extend_from_slice(&t.trace_root);
+                out.push(t.stage);
+                out.push(t.tokens as u8);
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_CHAIN {
+            out.extend_from_slice(&(chained.len() as u32).to_le_bytes());
+            for (txid, start) in chained {
+                out.extend_from_slice(txid);
+                out.extend_from_slice(&start.to_le_bytes());
             }
         }
         if !self.early_declarations.is_empty() {
@@ -1829,7 +3483,21 @@ impl ServiceLedgerSnapshot {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { bytes, pos: 0 };
         let version = r.u8()?;
-        if version != SNAPSHOT_ENCODING_VERSION && version != SNAPSHOT_ENCODING_VERSION_PRIVATE {
+        if !matches!(
+            version,
+            SNAPSHOT_ENCODING_VERSION
+                | SNAPSHOT_ENCODING_VERSION_PRIVATE
+                | SNAPSHOT_ENCODING_VERSION_TRACE
+                | SNAPSHOT_ENCODING_VERSION_SHAPE
+                | SNAPSHOT_ENCODING_VERSION_ROOT
+                | SNAPSHOT_ENCODING_VERSION_CONTEXT
+                | SNAPSHOT_ENCODING_VERSION_QUEUE
+                | SNAPSHOT_ENCODING_VERSION_ATTN
+                | SNAPSHOT_ENCODING_VERSION_PHASES
+                | SNAPSHOT_ENCODING_VERSION_HELD
+                | SNAPSHOT_ENCODING_VERSION_EARLY
+                | SNAPSHOT_ENCODING_VERSION_CHAIN
+        ) {
             return Err("unsupported snapshot encoding".into());
         }
         let mut snap = Self::default();
@@ -1894,7 +3562,7 @@ impl ServiceLedgerSnapshot {
                             declared.push((t, id, e));
                         }
                     }
-                    Some(Audit { cohort, delegations, responded, window_end_daa, members, declared })
+                    Some(Audit { cohort, delegations, responded, window_end_daa, members, declared, v3: None })
                 }
                 _ => return Err("malformed audit".into()),
             };
@@ -1911,6 +3579,9 @@ impl ServiceLedgerSnapshot {
                 recipients: Vec::new(),
                 cohort_seed: [0u8; 36],
                 early_declarations,
+                prompt_len: 0,
+                fit_proven: false,
+                draw: None,
             };
             if snap.pending.insert(rh, req).is_some() {
                 return Err("malformed pending".into());
@@ -1968,9 +3639,9 @@ impl ServiceLedgerSnapshot {
             let escrow = r.hash()?;
             snap.recent_producers.push((daa, id, tier, escrow));
         }
-        if version == SNAPSHOT_ENCODING_VERSION_PRIVATE {
+        if version >= SNAPSHOT_ENCODING_VERSION_PRIVATE {
             let n = r.u32()?;
-            if n == 0 {
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_PRIVATE {
                 return Err("empty private section".into());
             }
             for _ in 0..n {
@@ -1986,6 +3657,247 @@ impl ServiceLedgerSnapshot {
                         req.cohort_seed = seed;
                     }
                     _ => return Err("malformed private section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_TRACE {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_TRACE {
+                return Err("empty trace section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let mut a = TraceAudit {
+                    request_hash: r.key()?,
+                    responder: r.hash()?,
+                    escrow_pubkey: r.key()?,
+                    trace_root: r.key()?,
+                    n_prompt: r.u32()?,
+                    n_pos: r.u32()?,
+                    accepted_daa: r.u64()?,
+                    tier: r.u8()?,
+                    max_tokens: r.u32()?,
+                    identities: r.hashes()?,
+                    seed: None,
+                    deadline_daa: 0,
+                    pieces: 0,
+                    attn: None,
+                    chain_start: 0,
+                };
+                match r.u8()? {
+                    0 => {}
+                    1 => {
+                        a.seed = Some(r.key()?);
+                        a.deadline_daa = r.u64()?;
+                    }
+                    _ => return Err("malformed trace audit".into()),
+                }
+                if snap.trace_audits.insert(txid, a).is_some() {
+                    return Err("malformed trace section".into());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_SHAPE {
+            let n = r.u32()?;
+            for _ in 0..n {
+                let rh = r.key()?;
+                let len = r.u32()?;
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if req.prompt_len == 0 && len > 0 => req.prompt_len = len,
+                    _ => return Err("malformed prompt lengths".into()),
+                }
+            }
+            let n = r.u32()?;
+            for _ in 0..n {
+                let rh = r.key()?;
+                let key = r.hash()?;
+                let shape = TraceShape { n_prompt: r.u32()?, n_pos: r.u32()?, answer_len: r.u32()? };
+                if snap.early_shapes.insert((rh, key), shape).is_some() {
+                    return Err("malformed early shapes".into());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ROOT {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_ROOT {
+                return Err("empty root section".into());
+            }
+            for _ in 0..n {
+                let root = r.key()?;
+                let daa = r.u64()?;
+                if snap.trace_roots.insert(root, daa).is_some() {
+                    return Err("malformed trace roots".into());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_CONTEXT {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_CONTEXT {
+                return Err("empty context section".into());
+            }
+            for _ in 0..n {
+                let rh = r.key()?;
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if !req.fit_proven => req.fit_proven = true,
+                    _ => return Err("malformed context section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_QUEUE {
+            let n_draws = r.u32()?;
+            for _ in 0..n_draws {
+                let rh = r.key()?;
+                let open_daa = r.u64()?;
+                let close_daa = r.u64()?;
+                let k = r.u32()? as usize;
+                let mut candidates = Vec::with_capacity(k.min(1 << 16));
+                for _ in 0..k {
+                    let id = r.hash()?;
+                    let at = r.u64()?;
+                    candidates.push((id, at));
+                }
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if req.draw.is_none() => req.draw = Some(RewardDraw { open_daa, close_daa, candidates }),
+                    _ => return Err("malformed draw section".into()),
+                }
+            }
+            let n_windows = r.u32()?;
+            if n_draws == 0 && n_windows == 0 && version == SNAPSHOT_ENCODING_VERSION_QUEUE {
+                return Err("empty queue section".into());
+            }
+            for _ in 0..n_windows {
+                let rh = r.key()?;
+                let arm_daa = r.u64()?;
+                let q = r.u32()? as usize;
+                let mut queue = Vec::with_capacity(q.min(1 << 16));
+                for _ in 0..q {
+                    let queued = r.u64()?;
+                    let capped = match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err("malformed queue".into()),
+                    };
+                    queue.push((queued, capped));
+                }
+                let k = r.u32()? as usize;
+                let mut answers = Vec::with_capacity(k.min(1 << 16));
+                for _ in 0..k {
+                    let id = r.hash()?;
+                    let at = r.u64()?;
+                    let shape = match r.u8()? {
+                        0 => None,
+                        1 => Some((r.u32()?, r.u32()?)),
+                        _ => return Err("malformed answer".into()),
+                    };
+                    answers.push((id, at, shape));
+                }
+                match snap.pending.get_mut(&rh).and_then(|req| req.audit.as_mut()) {
+                    Some(a) if a.v3.is_none() && a.cohort.len() == queue.len() => a.v3 = Some(QueuedWindow { arm_daa, queue, answers }),
+                    _ => return Err("malformed window section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ATTN {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_ATTN {
+                return Err("empty attention section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let piece = r.u8()?;
+                match snap.trace_audits.get_mut(&txid) {
+                    Some(a) if a.pieces == 0 && a.seed.is_some() && piece != 0 && piece & !PIECE_ALL == 0 && piece != PIECE_ALL => a.pieces = piece,
+                    _ => return Err("malformed attention section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_PHASES {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_PHASES {
+                return Err("empty phase section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let k = r.u8()? as usize;
+                let path = (0..k).map(|_| r.u64()).collect::<Result<Vec<_>, _>>()?;
+                let root = r.key()?;
+                let children = r.u64()?;
+                let accepted_daa = r.u64()?;
+                let drawn = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("malformed phase section".into()),
+                };
+                if !(1..=MAX_ATTN_CHILDREN).contains(&children) {
+                    return Err("malformed phase section".into());
+                }
+                let weights = (0..children).map(|_| r.u16()).collect::<Result<Vec<_>, _>>()?;
+                let ok = weights.iter().all(|&w| w >= 1) && (!drawn || path.last().is_some_and(|&c| c < children));
+                match snap.trace_audits.get_mut(&txid) {
+                    Some(a) if ok && a.attn.is_none() && a.seed.is_some() && a.pieces & PIECE_ATTN == 0 => {
+                        a.attn = Some(AttnProgress { path, root, n: children, accepted_daa, drawn, weights })
+                    }
+                    _ => return Err("malformed phase section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_HELD {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_HELD {
+                return Err("empty held draw section".into());
+            }
+            for _ in 0..n {
+                let rh = r.key()?;
+                let reward = r.u64()?;
+                let open_daa = r.u64()?;
+                let close_daa = r.u64()?;
+                let k = r.u32()? as usize;
+                let mut candidates = Vec::with_capacity(k.min(1 << 16));
+                for _ in 0..k {
+                    let id = r.hash()?;
+                    let at = r.u64()?;
+                    candidates.push((id, at));
+                }
+                if snap.held_draws.insert(rh, HeldDraw { draw: RewardDraw { open_daa, close_daa, candidates }, reward }).is_some() {
+                    return Err("malformed held draw section".into());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_EARLY {
+            let n = r.u32()?;
+            if n == 0 && version == SNAPSHOT_ENCODING_VERSION_EARLY {
+                return Err("empty early trace section".into());
+            }
+            for _ in 0..n {
+                let rh = r.key()?;
+                let key = r.hash()?;
+                let t = EarlyTrace {
+                    response_txid: r.key()?,
+                    escrow_pubkey: r.key()?,
+                    trace_root: r.key()?,
+                    stage: r.u8()?,
+                    tokens: match r.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err("malformed early trace".into()),
+                    },
+                };
+                if snap.early_traces.insert((rh, key), t).is_some() {
+                    return Err("malformed early trace section".into());
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_CHAIN {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty chain section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let start = r.u64()?;
+                match snap.trace_audits.get_mut(&txid) {
+                    Some(a) if a.seed.is_some() && a.chain_start == 0 && start != 0 => a.chain_start = start,
+                    _ => return Err("malformed chain section".into()),
                 }
             }
         }
@@ -2264,6 +4176,11 @@ impl ServiceLedger {
             audited: self.audited.clone(),
             producer_spk: self.producer_spk.clone(),
             recent_producers: Vec::new(),
+            trace_audits: self.trace_audits.clone(),
+            early_shapes: self.early_shapes.clone(),
+            early_traces: self.early_traces.clone(),
+            trace_roots: self.trace_roots.clone(),
+            held_draws: self.held_draws.clone(),
         }
     }
 
@@ -2279,6 +4196,11 @@ impl ServiceLedger {
         self.first_seen_base = std::sync::Arc::new(Default::default());
         self.audited = snap.audited.clone();
         self.producer_spk = snap.producer_spk.clone();
+        self.trace_audits = snap.trace_audits.clone();
+        self.early_shapes = snap.early_shapes.clone();
+        self.early_traces = snap.early_traces.clone();
+        self.trace_roots = snap.trace_roots.clone();
+        self.held_draws = snap.held_draws.clone();
     }
 }
 
@@ -2417,7 +4339,7 @@ mod tests {
         assert_eq!(tabled.window_daa_at(99), None);
         assert_eq!(tabled.window_daa_at(251), None);
         // Large deltas exercise multi-byte varints.
-        let wide = ProductionIndexSnapshot { window_daa: (0..=150u64).map(|i| 1 << 40 | i * 300).collect(), ..snap.clone() };
+        let wide = ProductionIndexSnapshot { window_daa: (0..=150u64).map(|i| (1 << 40) | (i * 300)).collect(), ..snap.clone() };
         assert_eq!(ProductionIndexSnapshot::from_bytes(&wide.to_bytes()).unwrap(), wide);
 
         // A table that does not cover exactly [bottom, sample] is rejected.
@@ -2834,9 +4756,7 @@ mod tests {
 
     #[test]
     fn answer_in_the_accepting_block_never_strikes() {
-        // A miner fast enough to answer inside the chain block that accepts the request used to
-        // have his answer dropped — no audit existed yet to credit it — and was struck for a
-        // request he had served. Observed on testnet at daa 9132, cohort of one.
+        // An answer in the chain block that accepts the request is credited.
         let a = Hash::from_bytes([1u8; 32]);
         let set = [a];
         let mut ledger = ServiceLedger::default();
@@ -3983,5 +5903,2354 @@ mod tests {
             c = update_strikes(c, false);
         }
         assert_eq!(c, 0);
+    }
+
+    mod traces {
+        use super::super::{ServiceLedger, ServiceLedgerSnapshot, TraceInputs, TraceOpeningEvent, TraceResponseEvent, trace_seed};
+        use keryx_hashes::Hash;
+        use crate::config::params::TraceRules;
+        use keryx_verifiable_inference::{
+            draw,
+            testkit::{Model, Response},
+        };
+
+        const RH: [u8; 32] = [7u8; 32];
+        const TXID: [u8; 32] = [0x51u8; 32];
+        /// Second request and response of the root rule runs.
+        const RH2: [u8; 32] = [8u8; 32];
+        const TXID2: [u8; 32] = [0x52u8; 32];
+        const ESCROW_PK: [u8; 32] = [0xA5u8; 32];
+
+        fn miner() -> Hash {
+            Hash::from_bytes([1u8; 32])
+        }
+
+        fn chain_hash(drawn: bool) -> Hash {
+            (0u64..)
+                .map(|i| {
+                    let mut b = [0u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    Hash::from_bytes(b)
+                })
+                .find(|h| draw::audited(&trace_seed(h, &TXID)) == drawn)
+                .unwrap()
+        }
+
+        struct Run {
+            ledger: ServiceLedger,
+            model: Model,
+            auditable: bool,
+            /// Shape rule: `(prompt length, answer length)` of the request and its response.
+            shape: Option<(u32, u32)>,
+            /// Prefix rule: the prefix offset, and the request id the traced prompt carries.
+            prefix: Option<(u32, [u8; 32])>,
+            /// Audit rule: every traced response is audited, and the root rule admits a second
+            /// request `RH2` at 100.
+            audit_all: bool,
+            /// Sanction rule: a missing opening strikes without the interval guard, the streak
+            /// resets at the accepted opening.
+            sanction: bool,
+            /// Context rule: silence on a prompt that may exceed the tier floor is excused unless
+            /// a member's traced response proved it fit.
+            context: bool,
+            /// Seed-bound opening rule.
+            seed_bind: bool,
+            /// Token budget of the request `RH`.
+            max_tokens: u32,
+            /// Cohort of tier 0.
+            cohort: Vec<Hash>,
+            /// `(n_prompt, n_pos)` of the traced response when set.
+            positions: Option<(u32, u32)>,
+            /// Attention rule: an audit also needs the attention opening.
+            attention: bool,
+            /// Own-shape window rule.
+            own_shape: bool,
+            /// Uniform-strike rule.
+            uniform_strikes: bool,
+            /// Audit-queue rule.
+            audit_queue: bool,
+        }
+
+        impl Run {
+            fn new(auditable: bool) -> Self {
+                Self {
+                    ledger: ServiceLedger::default(),
+                    model: Model::new(),
+                    auditable,
+                    shape: None,
+                    prefix: None,
+                    audit_all: false,
+                    sanction: false,
+                    context: false,
+                    seed_bind: false,
+                    max_tokens: 256,
+                    cohort: vec![miner()],
+                    positions: None,
+                    attention: false,
+                    uniform_strikes: false,
+                    own_shape: false,
+                    audit_queue: false,
+                }
+            }
+
+            /// Context rule over the shape rule: tier 0 floor 8 192, budget 256, so a prompt over
+            /// 7 424 bytes is grey.
+            fn context(prompt_len: u32) -> Self {
+                Self { context: true, ..Self::shaped(prompt_len, 10) }
+            }
+
+            fn audited_all() -> Self {
+                Self { audit_all: true, ..Self::new(true) }
+            }
+
+            fn sanctioned() -> Self {
+                Self { sanction: true, ..Self::audited_all() }
+            }
+
+            fn shaped(prompt_len: u32, answer_len: u32) -> Self {
+                Self { shape: Some((prompt_len, answer_len)), ..Self::new(true) }
+            }
+
+            /// Prefix rule at `offset`, traced prompt carrying `carried` as the request id.
+            fn prefixed(offset: u32, carried: [u8; 32]) -> Self {
+                Self { prefix: Some((offset, carried)), ..Self::shaped(64, 10) }
+            }
+
+            fn fold(&mut self, daa: u64, chain: Hash, responses: &[TraceResponseEvent], openings: &[TraceOpeningEvent]) -> Vec<(Hash, u32)> {
+                self.fold_with_verdicts(daa, chain, responses, openings, &mut Vec::new())
+            }
+
+            /// [`Self::fold`] that also reports the causes of the openings it judged.
+            fn fold_with_verdicts(
+                &mut self,
+                daa: u64,
+                chain: Hash,
+                responses: &[TraceResponseEvent],
+                openings: &[TraceOpeningEvent],
+                verdicts: &mut Vec<Option<&'static str>>,
+            ) -> Vec<(Hash, u32)> {
+                let tier = |t: u8, _at: u64| -> Option<TraceRules> {
+                    (self.auditable && t == 0).then(|| TraceRules {
+                        ctx: self.model.tier(),
+                        prefix: self.prefix.map(|(o, _)| self.model.prefix_ctx(o)),
+                        chain: None,
+                        audit_all: self.audit_all,
+                        attention: self.attention,
+                    })
+                };
+                let lens = [(RH, self.shape.map_or(0, |(p, _)| p))];
+                let tr = TraceInputs {
+                    chain_hash: chain,
+                    responses,
+                    openings,
+                    tier: &tier,
+                    prompt_lens: &lens,
+                    shape: self.shape.is_some(),
+                    sanction: self.sanction,
+                    context: self.context,
+                    draw: false,
+                    window_v3: false,
+                    dedup: false,
+                    seed_bind: self.seed_bind,
+                    untraced_silence: false,
+                    own_shape: self.own_shape,
+                    one_miss: false,
+                    uniform_strikes: self.uniform_strikes,
+                    audit_queue: self.audit_queue,
+                };
+                let set = self.cohort.clone();
+                let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
+                let req: Vec<([u8; 32], u8, u32)> = match (daa, self.audit_all) {
+                    (100, false) => vec![(RH, 0, self.max_tokens)],
+                    (100, true) => vec![(RH, 0, self.max_tokens), (RH2, 0, 256)],
+                    _ => vec![],
+                };
+                let outcome = self.ledger.on_chain_block_with_traces(
+                    daa,
+                    &req,
+                    &[],
+                    &[],
+                    &resp,
+                    &[],
+                    &[],
+                    &tr,
+                    |_| true,
+                    |_| set.iter().map(|m| (*m, *m)).collect(),
+                );
+                verdicts.extend(outcome.verdicts.iter().map(|v| v.cause));
+                outcome.misses.iter().map(|m| (m.miner, m.consecutive_misses)).collect()
+            }
+
+            /// The traced response of this run: 3 prompt positions, 9 in total (40 and 48 under
+            /// the prefix rule).
+            fn event(&mut self, honest: bool) -> (keryx_verifiable_inference::testkit::Response, TraceResponseEvent) {
+                let r = match (&self.prefix, self.positions) {
+                    (Some((offset, carried)), _) => self.model.response_with_prefix(40, 48, honest, Some((carried, *offset))),
+                    (None, Some((n_prompt, n_pos))) => self.model.response(n_prompt, n_pos, honest),
+                    (None, None) => self.model.response(3, 9, honest),
+                };
+                let ev = TraceResponseEvent {
+                    response_txid: TXID,
+                    request_hash: RH,
+                    responder: miner(),
+                    escrow_pubkey: ESCROW_PK,
+                    trace_root: r.trace_root,
+                    n_prompt: r.n_prompt,
+                    n_pos: r.n_pos,
+                    answer_len: self.shape.map_or(0, |(_, a)| a),
+                    stage: 1,
+                    tokens: false,
+                };
+                (r, ev)
+            }
+
+            fn window_end(&self) -> u64 {
+                self.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().window_end_daa
+            }
+
+            /// Request at 100, traced response at 102, draw at 202: the response and its seed.
+            fn drawn(&mut self, honest: bool, drawn: bool) -> (keryx_verifiable_inference::testkit::Response, [u8; 32]) {
+                let (r, ev) = self.event(honest);
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(self.fold(100, h0, &[], &[]).is_empty());
+                assert!(self.fold(102, h0, &[ev], &[]).is_empty());
+                let ch = chain_hash(drawn);
+                assert!(self.fold(202, ch, &[], &[]).is_empty());
+                (r, trace_seed(&ch, &TXID))
+            }
+
+            fn deadline(&self) -> u64 {
+                self.ledger.trace_audits.get(&TXID).map(|a| a.deadline_daa).unwrap_or(0)
+            }
+
+            /// [`Self::drawn`] then the opening of this run. Returns the opening deadline.
+            fn until_draw(&mut self, honest: bool, drawn: bool) -> (u64, Vec<u8>) {
+                let (r, seed) = self.drawn(honest, drawn);
+                let body = match &self.prefix {
+                    Some((offset, carried)) => self.model.open_with_prefix(&r, TXID, &seed, carried, *offset),
+                    None => self.model.open(&r, TXID, &seed),
+                }
+                .encode();
+                (self.deadline(), body)
+            }
+        }
+
+        fn opening(pk: [u8; 32], body: Vec<u8>) -> TraceOpeningEvent {
+            TraceOpeningEvent { response_txid: TXID, escrow_pubkey: pk, body }
+        }
+
+        /// Request at 100, audit armed at 101, then the window expires with nobody answering.
+        fn silent_window(run: &mut Run) -> Vec<(Hash, u32)> {
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            let end = run.window_end();
+            run.fold(end + 1, h0, &[], &[])
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_excused_when_nobody_answers() {
+            let mut run = Run::context(8_000);
+            assert!(silent_window(&mut run).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            assert!(run.ledger.pending.is_empty());
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_struck_without_the_rule() {
+            let mut run = Run::shaped(8_000, 10);
+            assert_eq!(silent_window(&mut run), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn safe_prompt_silence_is_struck() {
+            let mut run = Run::context(64);
+            assert_eq!(silent_window(&mut run), vec![(miner(), 1)]);
+        }
+
+        /// Request at 100, audit armed at 101, the traced response of `miner()` at 102, then the
+        /// window expires on the silent second member `b`.
+        fn answered_window(run: &mut Run, b: Hash) -> Vec<(Hash, u32)> {
+            run.cohort.push(b);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            let end = run.window_end();
+            run.fold(end + 1, h0, &[], &[])
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_struck_once_a_member_proved_the_fit() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            run.positions = Some((500, 510));
+            assert_eq!(answered_window(&mut run, b), vec![(b, 1)]);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn grey_prompt_silence_is_excused_when_the_answer_exceeded_the_floor() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            run.max_tokens = 8_000;
+            run.positions = Some((500, 510));
+            assert!(answered_window(&mut run, b).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&b), 0);
+        }
+
+        #[test]
+        fn a_misshaped_answer_proves_nothing() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            // 3 prompt positions for an 8 000-byte prompt: not an answer.
+            assert!(answered_window(&mut run, b).is_empty());
+        }
+
+        #[test]
+        fn an_early_member_answer_proves_the_fit() {
+            let b = Hash::from_bytes([2u8; 32]);
+            let mut run = Run::context(8_000);
+            run.cohort.push(b);
+            run.positions = Some((500, 510));
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            // the answer lands in the request's own block, before the audit arms
+            assert!(run.fold(100, h0, &[ev], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.ledger.early_shapes.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, h0, &[], &[]), vec![(b, 1)]);
+        }
+
+        #[test]
+        fn a_proven_fit_survives_the_snapshot() {
+            let mut run = Run::context(8_000);
+            run.positions = Some((500, 510));
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.pending.get(&RH).unwrap().fit_proven);
+            let bytes = run.ledger.snapshot().to_bytes();
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_CONTEXT);
+            let back = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert!(back.pending.get(&RH).unwrap().fit_proven);
+            assert_eq!(back.to_bytes(), bytes);
+        }
+
+        #[test]
+        fn valid_opening_closes_the_audit() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(true, true);
+            assert!(deadline > 203);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        fn attention_body() -> Vec<u8> {
+            use keryx_verifiable_inference::opening::AttnOpening;
+            AttnOpening { response_txid: TXID, ..Default::default() }
+            .encode()
+        }
+
+        #[test]
+        fn a_valid_trace_opening_waits_for_the_attention_opening() {
+            let mut run = Run { attention: true, ..Run::new(true) };
+            let (deadline, body) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(crate::collateral::PIECE_TRACE));
+            let bytes = run.ledger.snapshot().to_bytes();
+            assert_eq!(bytes[0], crate::collateral::SNAPSHOT_ENCODING_VERSION_ATTN);
+            assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap().to_bytes(), bytes);
+            assert!(run.fold(deadline, h, &[], &[]).is_empty());
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_bad_attention_opening_strikes_immediately() {
+            let mut run = Run { attention: true, ..Run::new(true) };
+            run.until_draw(true, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, attention_body())]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_bad_attention_opening_enters_the_first_rung_past_the_uniform_gate() {
+            let mut run = Run { attention: true, uniform_strikes: true, ..Run::new(true) };
+            run.until_draw(true, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, attention_body())]);
+            assert_eq!(misses, vec![(miner(), 1)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        fn phase_body(path: &[u64]) -> Vec<u8> {
+            keryx_verifiable_inference::opening::AttnOpening { response_txid: TXID, path: path.to_vec(), partials: vec![path.len() as u8; 4], ..Default::default() }
+                .encode()
+        }
+
+        type Seen = std::rc::Rc<std::cell::RefCell<Vec<(Vec<u64>, Option<[u8; 32]>, u8)>>>;
+
+        /// Attention phases judged by `step` (by phase) instead of the verifier; returns what each
+        /// call saw.
+        fn oracle(step: impl Fn(u8) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> + 'static) -> Seen {
+            let seen: Seen = Default::default();
+            let log = seen.clone();
+            crate::collateral::ATTN_ORACLE.with(|o| {
+                *o.borrow_mut() = Some(Box::new(move |path: &[u64], root: Option<&[u8; 32]>, op: &keryx_verifiable_inference::opening::AttnOpening| {
+                    log.borrow_mut().push((path.to_vec(), root.copied(), op.path.len() as u8));
+                    step(op.path.len() as u8)
+                }))
+            });
+            seen
+        }
+
+        const R0: [u8; 32] = [0x51; 32];
+        const R1: [u8; 32] = [0x52; 32];
+
+        const W0: [u16; 4] = [1, 1, 60_000, 1];
+        const W1: [u16; 3] = [5, 5, 5];
+
+        fn three_phases(phase: u8) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> {
+            use keryx_verifiable_inference::chain::AttnStep;
+            Ok(match phase {
+                0 => AttnStep::Next { root: R0, n: 4, weights: W0.to_vec() },
+                1 => AttnStep::Next { root: R1, n: 3, weights: W1.to_vec() },
+                _ => AttnStep::Done,
+            })
+        }
+
+        /// Trace opening and attention phase 0 accepted at 203.
+        fn after_phase_0(step: impl Fn(u8) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> + 'static) -> (Run, Seen) {
+            let seen = oracle(step);
+            let mut run = Run { attention: true, ..Run::new(true) };
+            let (_, body) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body), opening(ESCROW_PK, phase_body(&[]))]).is_empty());
+            (run, seen)
+        }
+
+        #[test]
+        fn the_child_seed_matches_its_known_answer() {
+            let seed = crate::collateral::attn_child_seed(&Hash::from_bytes([1u8; 32]), &[2u8; 32], 1);
+            let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, "347b8cd184f5fdf5d3ef1828b99bb28d859b019df6b09ece1ec8167ea62e534b");
+        }
+
+        #[test]
+        fn an_attention_opening_runs_its_phases_on_drawn_children() {
+            use crate::collateral::{AttnProgress, attn_child_seed};
+            use keryx_verifiable_inference::attn_blocks::draw_weighted_child;
+            let (mut run, seen) = after_phase_0(three_phases);
+            let h = Hash::from_bytes([3u8; 32]);
+            let progress = |run: &Run| run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.clone());
+            assert_eq!(progress(&run), Some(AttnProgress { path: vec![], root: R0, n: 4, accepted_daa: 203, drawn: false, weights: W0.to_vec() }));
+            let (h2, h3) = (Hash::from_bytes([0x61u8; 32]), Hash::from_bytes([0x62u8; 32]));
+            let c0 = draw_weighted_child(&attn_child_seed(&h2, &TXID, 0), &W0);
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), None, "no child drawn yet");
+            assert!(run.fold(250, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
+            assert_eq!(seen.borrow().len(), 1, "a phase before its child is drawn is passed over");
+            assert!(run.fold(303, h2, &[], &[]).is_empty());
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), Some(vec![c0]));
+            assert_eq!(progress(&run).map(|p| (p.path, p.drawn)), Some((vec![c0], true)));
+            let other = (c0 + 1) % 4;
+            let wrong = [phase_body(&[c0, 0]), phase_body(&[]), phase_body(&[other])];
+            assert!(run.fold(304, h, &[], &wrong.map(|b| opening(ESCROW_PK, b))).is_empty());
+            assert_eq!(seen.borrow().len(), 1, "phases built for another path are passed over");
+            assert!(run.fold(305, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
+            assert_eq!(progress(&run), Some(AttnProgress { path: vec![c0], root: R1, n: 3, accepted_daa: 305, drawn: false, weights: W1.to_vec() }));
+            assert!(run.fold(405, h3, &[], &[]).is_empty());
+            let c1 = draw_weighted_child(&attn_child_seed(&h3, &TXID, 1), &W1);
+            assert!(run.fold(406, h, &[], &[opening(ESCROW_PK, phase_body(&[c0, c1]))]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty(), "the last phase closes the audit");
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), None);
+            assert_eq!(*seen.borrow(), vec![(vec![], None, 0), (vec![c0], Some(R0), 1), (vec![c0, c1], Some(R1), 2)]);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn a_trace_opening_after_phase_0_keeps_the_attention_progress() {
+            use crate::collateral::attn_child_seed;
+            use keryx_verifiable_inference::attn_blocks::draw_weighted_child;
+            for same_block in [true, false] {
+                let seen = oracle(three_phases);
+                let mut run = Run { attention: true, ..Run::new(true) };
+                let (_, trace) = run.until_draw(true, true);
+                let h = Hash::from_bytes([3u8; 32]);
+                if same_block {
+                    assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, phase_body(&[])), opening(ESCROW_PK, trace)]).is_empty());
+                } else {
+                    assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, phase_body(&[]))]).is_empty());
+                    assert!(run.fold(250, h, &[], &[opening(ESCROW_PK, trace)]).is_empty());
+                }
+                assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(crate::collateral::PIECE_TRACE));
+                assert_eq!(run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.as_ref().map(|p| (p.root, p.n))), Some((R0, 4)));
+                assert_eq!(run.ledger.awaited_attention_path(&TXID), None, "phase 0 is not awaited again");
+                assert!(run.fold(260, h, &[], &[opening(ESCROW_PK, phase_body(&[]))]).is_empty());
+                assert_eq!(seen.borrow().len(), 1, "a replayed phase 0 is passed over");
+                let (h2, h3) = (Hash::from_bytes([0x61u8; 32]), Hash::from_bytes([0x62u8; 32]));
+                assert!(run.fold(303, h2, &[], &[]).is_empty());
+                let c0 = draw_weighted_child(&attn_child_seed(&h2, &TXID, 0), &W0);
+                assert_eq!(run.ledger.awaited_attention_path(&TXID), Some(vec![c0]));
+                assert!(run.fold(305, h, &[], &[opening(ESCROW_PK, phase_body(&[c0]))]).is_empty());
+                assert!(run.fold(405, h3, &[], &[]).is_empty());
+                let c1 = draw_weighted_child(&attn_child_seed(&h3, &TXID, 1), &W1);
+                assert!(run.fold(406, h, &[], &[opening(ESCROW_PK, phase_body(&[c0, c1]))]).is_empty());
+                assert!(run.ledger.trace_audits.is_empty(), "same block {same_block}");
+                assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            }
+        }
+
+        #[test]
+        fn phase_0_is_awaited_once_the_response_is_drawn() {
+            let mut run = Run { attention: true, ..Run::new(true) };
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), None);
+            run.until_draw(true, true);
+            assert_eq!(run.ledger.awaited_attention_path(&TXID), Some(vec![]));
+        }
+
+        #[test]
+        fn a_failed_attention_phase_strikes_immediately() {
+            let (mut run, _) = after_phase_0(|phase| if phase == 0 { three_phases(0) } else { Err("attention point") });
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(303, h, &[], &[]).is_empty());
+            let path = run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.clone()).unwrap().path;
+            assert_eq!(run.fold(304, h, &[], &[opening(ESCROW_PK, phase_body(&path))]), vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn the_attention_phase_window_scales_with_the_replay() {
+            assert_eq!(crate::collateral::attn_phase_window_daa(0, 0, 0, 0), 3_000);
+            assert_eq!(crate::collateral::attn_phase_window_daa(2, 1_000, 30_000, 30_900), 7_800);
+            assert_eq!(crate::collateral::attn_phase_window_daa(4, 8_000, 0, 5_000), 19_384);
+            assert_eq!(crate::collateral::attn_phase_window_daa(3, 100, 2_000, 9_000), 3_500);
+            assert_eq!(crate::collateral::attn_phase_window_daa(4, u32::MAX, u32::MAX, u32::MAX), 16_107);
+            assert_eq!(crate::collateral::attn_first_prompt_daa(30_000), 9_000);
+            assert_eq!(crate::collateral::attn_first_prompt_daa(u32::MAX), 39_321);
+        }
+
+        #[test]
+        fn a_missing_attention_phase_strikes_after_its_window() {
+            use crate::collateral::{TRACE_SEED_DELAY_DAA, attn_phase_window_daa};
+            let (mut run, _) = after_phase_0(three_phases);
+            let deadline = run.deadline();
+            assert!(deadline >= 203 + TRACE_SEED_DELAY_DAA + attn_phase_window_daa(0, 0, 0, 0));
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(deadline, h, &[], &[]).is_empty());
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn attention_progress_survives_the_snapshot_and_malformed_sections_are_refused() {
+            let (mut run, _) = after_phase_0(three_phases);
+            let check = |run: &Run| {
+                let bytes = run.ledger.snapshot().to_bytes();
+                assert_eq!(bytes[0], crate::collateral::SNAPSHOT_ENCODING_VERSION_PHASES);
+                let back = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+                assert_eq!(back.trace_audits.get(&TXID).and_then(|a| a.attn.clone()), run.ledger.trace_audits.get(&TXID).and_then(|a| a.attn.clone()));
+                assert_eq!(back.to_bytes(), bytes);
+                bytes
+            };
+            let bytes = check(&run);
+            let n = bytes.len();
+            let mut undrawn_with_flag = bytes.clone();
+            undrawn_with_flag[n - 9] = 1;
+            assert!(ServiceLedgerSnapshot::from_bytes(&undrawn_with_flag).is_err());
+            let mut bad_flag = bytes.clone();
+            bad_flag[n - 9] = 2;
+            assert!(ServiceLedgerSnapshot::from_bytes(&bad_flag).is_err());
+            let mut childless = bytes.clone();
+            childless[n - 25..n - 17].copy_from_slice(&0u64.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&childless).is_err());
+            let mut weightless = bytes.clone();
+            weightless[n - 2..].copy_from_slice(&0u16.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&weightless).is_err());
+            let mut huge = bytes.clone();
+            huge[n - 25..n - 17].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&huge).is_err());
+            assert!(ServiceLedgerSnapshot::from_bytes(&childless).is_err());
+            assert!(run.fold(303, Hash::from_bytes([0x61u8; 32]), &[], &[]).is_empty());
+            let drawn = check(&run);
+            let n = drawn.len();
+            let mut out_of_range = drawn.clone();
+            out_of_range[n - 65..n - 57].copy_from_slice(&4u64.to_le_bytes());
+            assert!(ServiceLedgerSnapshot::from_bytes(&out_of_range).is_err());
+        }
+
+        #[test]
+        fn a_recurrent_opening_is_passed_over_without_its_rule() {
+            use keryx_verifiable_inference::opening::RecurOpening;
+            let mut run = Run { attention: true, ..Run::new(true) };
+            run.until_draw(true, true);
+            let body = RecurOpening { response_txid: TXID, ..Default::default() }.encode();
+            assert!(run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(0));
+        }
+
+        #[test]
+        fn pieces_follow_the_rules() {
+            use crate::collateral::{PIECE_ATTN, PIECE_RECUR, PIECE_RESID, PIECE_TRACE, required_pieces};
+            use crate::config::params::trace_rules;
+            assert_eq!(required_pieces(None), PIECE_TRACE);
+            assert_eq!(required_pieces(trace_rules(1, true, true, false, false).as_ref()), PIECE_TRACE);
+            assert_eq!(required_pieces(trace_rules(1, true, true, true, false).as_ref()), PIECE_TRACE | PIECE_RESID);
+            assert_eq!(required_pieces(trace_rules(1, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RESID);
+            assert_eq!(required_pieces(trace_rules(0, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
+            assert_eq!(required_pieces(trace_rules(4, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
+        }
+
+        #[test]
+        fn a_trace_opening_carries_the_root_halves_under_the_attention_rules() {
+            use crate::collateral::{TraceAudit, resid_opening_valid, trace_opening_valid};
+            use crate::config::params::trace_rules;
+            use keryx_verifiable_inference::draw::POINTS;
+            use keryx_verifiable_inference::opening::{EntryOpening, LeafChunk, LinkOpening, Opening, Point, PrefixPoint, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
+            let (pos_root, seq_root) = ([0x11u8; 32], [0x22u8; 32]);
+            let audit = TraceAudit {
+                request_hash: RH,
+                responder: miner(),
+                escrow_pubkey: ESCROW_PK,
+                trace_root: keryx_verifiable_inference::seq::trace_root(&pos_root, &seq_root),
+                n_prompt: 4,
+                n_pos: 9,
+                accepted_daa: 0,
+                tier: 1,
+                max_tokens: 16,
+                identities: vec![miner()],
+                seed: Some([9; 32]),
+                deadline_daa: 0,
+                pieces: 0,
+                attn: None,
+                chain_start: 0,
+            };
+            let resid = ResidPoint {
+                n_ubatch: 1,
+                tok: 0,
+                pos_path: vec![],
+                meta_path: vec![],
+                layer: EntryOpening::default(),
+                product: EntryOpening::default(),
+                dst: LeafChunk::default(),
+                src: ResidSrc::Chunk(LeafChunk::default()),
+                add: ResidAdd::Chunk(LeafChunk::default()),
+            };
+            let body = |roots: Option<([u8; 32], [u8; 32])>, resid: Option<ResidPoint>| {
+                Opening {
+                    response_txid: TXID,
+                    points: vec![Point::default(); POINTS as usize],
+                    prefix: Some(PrefixPoint::default()),
+                    links: vec![(0, LinkOpening::None); POINTS as usize],
+                    experts: vec![None; POINTS as usize],
+                    resid,
+                    roots,
+                }
+                .encode()
+            };
+            let (with, without) = (trace_rules(1, true, true, true, true).unwrap(), trace_rules(1, true, true, true, false).unwrap());
+            let check = |r, roots| trace_opening_valid(r, &audit, &[9; 32], &TXID, &body(roots, None));
+            assert_eq!(check(&with, None), Err("sequence root missing"));
+            assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));
+            assert_eq!(check(&with, Some((pos_root, seq_root))), Err("point 0"));
+            assert_eq!(check(&without, Some((pos_root, seq_root))), Err("sequence root before its rule"));
+            let inline = body(Some((pos_root, seq_root)), Some(resid.clone()));
+            assert_eq!(trace_opening_valid(&with, &audit, &[9; 32], &TXID, &inline), Err("residual point in the trace piece"));
+
+            let piece = |roots| ResidOpening { response_txid: TXID, roots, resid: resid.clone(), feed: Default::default(), expert: None }.encode();
+            let check = |r, roots| resid_opening_valid(r, &audit, &[9; 32], &TXID, &piece(roots));
+            assert_eq!(check(&with, None), Err("sequence root missing"));
+            assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));
+            assert_eq!(check(&with, Some((pos_root, seq_root))), Err("residual point"));
+            assert_eq!(check(&without, Some((pos_root, seq_root))), Err("sequence root before its rule"));
+            assert_eq!(resid_opening_valid(&with, &audit, &[9; 32], &[0x33; 32], &piece(Some((pos_root, seq_root)))), Err("response id mismatch"));
+            assert_eq!(resid_opening_valid(&with, &audit, &[9; 32], &TXID, &inline), Err("malformed residual body"));
+        }
+
+        #[test]
+        fn an_attention_opening_is_passed_over_without_its_rule() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, attention_body())]).is_empty());
+            assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| a.pieces), Some(0));
+            assert!(run.fold(204, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        /// A stage-2 audit over the synthetic chain tier, drawn at 202: the ledger, the trace and
+        /// residual piece bodies, and a fold over that ledger.
+        struct Stage2 {
+            ledger: ServiceLedger,
+            tier: keryx_verifiable_inference::chainkit::Tier,
+            trace: keryx_verifiable_inference::chainkit::Trace,
+            seed: [u8; 32],
+        }
+
+        impl Stage2 {
+            fn drawn() -> Self {
+                use keryx_verifiable_inference::{chain::STAGE_CHAIN, chainkit::{Tier, VOCAB}, prefix::PREFIX_LEN};
+                let tier = Tier::new();
+                let mut tokens: Vec<u32> = RH.iter().map(|&b| b as u32).collect();
+                tokens.extend((0..8u32).map(|i| (i * 37 + 5) % VOCAB as u32));
+                let trace = tier.trace(&tokens, PREFIX_LEN);
+                let ev = TraceResponseEvent {
+                    response_txid: TXID,
+                    request_hash: RH,
+                    responder: miner(),
+                    escrow_pubkey: ESCROW_PK,
+                    trace_root: trace.trace_root,
+                    n_prompt: trace.n_prompt,
+                    n_pos: trace.positions.len() as u32,
+                    answer_len: 0,
+                    stage: STAGE_CHAIN,
+                    tokens: true,
+                };
+                let mut run = Self { ledger: ServiceLedger::default(), tier, trace, seed: [0; 32] };
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(run.fold(100, h0, &[], &[]).0.is_empty());
+                assert!(run.fold(102, h0, &[ev], &[]).0.is_empty());
+                let ch = Hash::from_bytes([9u8; 32]);
+                assert!(run.fold(202, ch, &[], &[]).0.is_empty());
+                run.seed = trace_seed(&ch, &TXID);
+                run
+            }
+
+            fn fold(&mut self, daa: u64, chain: Hash, responses: &[TraceResponseEvent], openings: &[TraceOpeningEvent]) -> (Vec<(Hash, u32)>, Vec<Option<&'static str>>) {
+                let rules = TraceRules {
+                    ctx: self.tier.tier(),
+                    prefix: Some(self.tier.prefix_ctx(0)),
+                    chain: Some(self.tier.chain_ctx()),
+                    audit_all: true,
+                    attention: false,
+                };
+                let tier = |t: u8, _at: u64| (t == 0).then(|| rules.clone());
+                let lens = [(RH, 0)];
+                let tr = TraceInputs {
+                    chain_hash: chain,
+                    responses,
+                    openings,
+                    tier: &tier,
+                    prompt_lens: &lens,
+                    shape: false,
+                    sanction: false,
+                    context: false,
+                    draw: false,
+                    window_v3: false,
+                    dedup: false,
+                    seed_bind: false,
+                    untraced_silence: false,
+                    own_shape: false,
+                    one_miss: false,
+                    uniform_strikes: false,
+                    audit_queue: false,
+                };
+                let resp: Vec<([u8; 32], Option<Hash>)> = responses.iter().map(|e| (e.request_hash, Some(e.responder))).collect();
+                let req: Vec<([u8; 32], u8, u32)> = if daa == 100 { vec![(RH, 0, 256)] } else { vec![] };
+                let outcome = self.ledger.on_chain_block_with_traces(daa, &req, &[], &[], &resp, &[], &[], &tr, |_| true, |_| vec![(miner(), miner())]);
+                (outcome.misses.iter().map(|m| (m.miner, m.consecutive_misses)).collect(), outcome.verdicts.iter().map(|v| v.cause).collect())
+            }
+
+            fn trace_body(&self) -> Vec<u8> {
+                use keryx_verifiable_inference::opening::Opening;
+                let (points, links): (Vec<_>, Vec<_>) = (0..draw::POINTS)
+                    .map(|i| {
+                        let (p, tok, link) = self.tier.open_point(&self.trace, &self.seed, i);
+                        (p, (tok, link))
+                    })
+                    .unzip();
+                let prefix = Some(self.tier.open_prefix(&self.trace, &self.seed, 0));
+                Opening { response_txid: TXID, points, prefix, experts: vec![None; links.len()], links, resid: None, roots: None }.encode()
+            }
+
+            fn resid_body(&self, tamper: bool) -> Vec<u8> {
+                let mut r = self.tier.open_resid_piece(&self.trace, &self.seed);
+                r.response_txid = TXID;
+                if tamper {
+                    r.feed.x[0] ^= 1;
+                }
+                r.encode()
+            }
+
+            fn pieces(&self) -> Option<u8> {
+                self.ledger.trace_audits.get(&TXID).map(|a| a.pieces)
+            }
+        }
+
+        #[test]
+        fn a_stage2_audit_closes_with_both_pieces_in_either_order() {
+            use crate::collateral::{PIECE_RESID, PIECE_TRACE};
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            let (misses, verdicts) = run.fold(203, h, &[], &[opening(ESCROW_PK, run.resid_body(false))]);
+            assert!(misses.is_empty() && verdicts.is_empty());
+            assert_eq!(run.pieces(), Some(PIECE_RESID));
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, run.trace_body())]);
+            assert!(misses.is_empty(), "{misses:?}");
+            assert_eq!(verdicts, vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+
+            let mut run = Stage2::drawn();
+            let (misses, _) = run.fold(203, h, &[], &[opening(ESCROW_PK, run.trace_body())]);
+            assert!(misses.is_empty());
+            assert_eq!(run.pieces(), Some(PIECE_TRACE));
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, run.resid_body(false))]);
+            assert!(misses.is_empty() && verdicts == vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_stage2_audit_missing_or_failing_its_residual_piece_strikes() {
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            let deadline = run.ledger.trace_audits.get(&TXID).unwrap().deadline_daa;
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, run.trace_body())]).0.is_empty());
+            let (misses, _) = run.fold(deadline + 1, h, &[], &[]);
+            assert_eq!(misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![miner()], "the trace piece alone does not close the audit");
+
+            let mut run = Stage2::drawn();
+            let (misses, verdicts) = run.fold(203, h, &[], &[opening(ESCROW_PK, run.resid_body(true))]);
+            assert_eq!(verdicts, vec![Some("residual point")]);
+            assert_eq!(misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![miner()]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn fraudulent_opening_slashes_immediately() {
+            let mut run = Run::new(true);
+            let (_, body) = run.until_draw(false, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        /// Two chain blocks that both draw `TXID`, an honest response, and the ledger before the
+        /// draw (accepted at 102, drawn at 202).
+        fn reorged_draw(run: &mut Run) -> (Response, Hash, Hash, ServiceLedger) {
+            let (r, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            let mut drawn = (0u64..)
+                .map(|i| {
+                    let mut b = [0u8; 32];
+                    b[..8].copy_from_slice(&i.to_le_bytes());
+                    Hash::from_bytes(b)
+                })
+                .filter(|h| draw::audited(&trace_seed(h, &TXID)));
+            let (block_a, block_b) = (drawn.next().unwrap(), drawn.next().unwrap());
+            (r, block_a, block_b, run.ledger.clone())
+        }
+
+        fn seeded_body(run: &Run, r: &Response, built_for: &Hash, named: &Hash) -> Vec<u8> {
+            keryx_verifiable_inference::opening::seeded(&run.model.open(r, TXID, &trace_seed(built_for, &TXID)).encode(), &named.as_bytes())
+                .unwrap()
+        }
+
+        #[test]
+        fn unseeded_opening_judged_after_its_seed_block_left_the_chain_strikes() {
+            let mut run = Run::new(true);
+            let (r, block_a, block_b, fork) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_a, &[], &[]).is_empty());
+            let body = run.model.open(&r, TXID, &trace_seed(&block_a, &TXID)).encode();
+
+            run.ledger = fork;
+            assert!(run.fold(202, block_b, &[], &[]).is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), Some(ESCROW_PK));
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)], &mut verdicts);
+            assert!(matches!(verdicts[..], [Some(_)]), "{verdicts:?}");
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), None);
+        }
+
+        #[test]
+        fn seeded_opening_of_a_seed_block_that_left_the_chain_waits_for_the_one_of_the_chain() {
+            let mut run = Run { seed_bind: true, ..Run::new(true) };
+            let (r, block_a, block_b, fork) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_a, &[], &[]).is_empty());
+            let stale = seeded_body(&run, &r, &block_a, &block_a);
+
+            run.ledger = fork;
+            assert!(run.fold(202, block_b, &[], &[]).is_empty());
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, stale)], &mut verdicts);
+            assert!(verdicts.is_empty(), "{verdicts:?}");
+            assert!(misses.is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), Some(ESCROW_PK));
+
+            let fresh = seeded_body(&run, &r, &block_b, &block_b);
+            let misses = run.fold_with_verdicts(204, Hash::from_bytes([4u8; 32]), &[], &[opening(ESCROW_PK, fresh)], &mut verdicts);
+            assert_eq!(verdicts, vec![None]);
+            assert!(misses.is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), None);
+        }
+
+        #[test]
+        fn seeded_opening_before_its_rule_is_passed_over() {
+            let mut run = Run::new(true);
+            let (r, block_a, _, _) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_a, &[], &[]).is_empty());
+            let body = seeded_body(&run, &r, &block_a, &block_a);
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)], &mut verdicts);
+            assert!(verdicts.is_empty(), "{verdicts:?}");
+            assert!(misses.is_empty());
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), Some(ESCROW_PK));
+        }
+
+        #[test]
+        fn seeded_opening_naming_the_seed_block_is_judged_on_its_points() {
+            let mut run = Run { seed_bind: true, ..Run::new(true) };
+            let (r, block_a, block_b, _) = reorged_draw(&mut run);
+            assert!(run.fold(202, block_b, &[], &[]).is_empty());
+            let forged = seeded_body(&run, &r, &block_a, &block_b);
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, forged)], &mut verdicts);
+            assert!(matches!(verdicts[..], [Some(_)]), "{verdicts:?}");
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert_eq!(run.ledger.awaited_opening_key(&TXID), None);
+        }
+
+        #[test]
+        fn malformed_opening_is_fraud() {
+            let mut run = Run::new(true);
+            let (_, mut body) = run.until_draw(true, true);
+            body.pop();
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+        }
+
+        #[test]
+        fn a_traced_answer_ahead_of_its_request_is_audited_at_admission() {
+            let mut run = Run { shape: Some((32, 40)), ..Run::sanctioned() };
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(99, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty(), "parked until its request is admitted");
+            let snap = run.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], crate::collateral::SNAPSHOT_ENCODING_VERSION_EARLY);
+            assert_eq!(crate::collateral::ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), snap);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.ledger.trace_audits.contains_key(&TXID), "audited at admission");
+            assert!(run.ledger.early_traces.is_empty());
+            assert_ne!(run.ledger.snapshot().to_bytes()[0], crate::collateral::SNAPSHOT_ENCODING_VERSION_EARLY);
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert_eq!(run.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
+            assert!(run.fold(100 + crate::collateral::TRACE_SEED_DELAY_DAA, chain_hash(true), &[], &[]).is_empty());
+            let deadline = run.deadline();
+            assert!(deadline > 0, "drawn like any answer");
+            run.fold(deadline + 1, h0, &[], &[]);
+            assert!(run.ledger.trace_audits.is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 1, "the missing opening strikes");
+        }
+
+        #[test]
+        fn missing_opening_strikes_at_the_deadline() {
+            let mut run = Run::new(true);
+            let (deadline, _) = run.until_draw(true, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(deadline, h, &[], &[]).is_empty());
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn missing_opening_is_rate_limited_under_the_audit_rule_alone() {
+            let mut run = Run::audited_all();
+            run.ledger.strikes.insert(miner(), crate::collateral::StrikeEntry { count: 1, last_daa: 99 });
+            let (deadline, _) = run.until_draw(true, false);
+            // The served response resets the streak at once.
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            let h = Hash::from_bytes([3u8; 32]);
+            // The unanswered second request strikes at its window end.
+            assert_eq!(run.fold(run.window_end() + 1, h, &[], &[]), vec![(miner(), 1)]);
+            // The unopened audit falls inside the interval guard of that strike.
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn missing_opening_ignores_the_interval_guard_under_the_sanction_rule() {
+            let mut run = Run::sanctioned();
+            run.ledger.strikes.insert(miner(), crate::collateral::StrikeEntry { count: 1, last_daa: 99 });
+            let (deadline, _) = run.until_draw(true, false);
+            // Served, credited, but the streak waits for the opening.
+            assert_eq!(run.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 1);
+            let h = Hash::from_bytes([3u8; 32]);
+            // Cohort silence on the second request keeps the interval guard.
+            assert!(run.fold(run.window_end() + 1, h, &[], &[]).is_empty());
+            // The unopened audit strikes anyway and escalates.
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn accepted_opening_resets_the_streak_under_the_sanction_rule() {
+            let mut run = Run::sanctioned();
+            run.ledger.strikes.insert(miner(), crate::collateral::StrikeEntry { count: 1, last_daa: 99 });
+            let (deadline, body) = run.until_draw(true, false);
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 1);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+            assert!(run.ledger.trace_audits.is_empty());
+            // The unanswered second request strikes at its window end; the closed audit does not.
+            assert_eq!(run.fold(run.window_end() + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+        }
+
+        /// Two traced responses of the miner to `RH` and `RH2`, both drawn: the run and the two
+        /// opening deadlines, earliest first.
+        fn two_drawn_audits(sanction: bool) -> (Run, u64, u64) {
+            let mut run = Run::audited_all();
+            run.sanction = sanction;
+            let (_, ev) = run.event(true);
+            let r2 = run.model.response(3, 10, true);
+            let ev2 = TraceResponseEvent {
+                response_txid: TXID2,
+                request_hash: RH2,
+                trace_root: r2.trace_root,
+                n_prompt: r2.n_prompt,
+                n_pos: r2.n_pos,
+                ..ev.clone()
+            };
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
+            assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 2);
+            let first = run.ledger.trace_audits.values().map(|a| a.deadline_daa).min().unwrap();
+            let second = run.ledger.trace_audits.values().max_by_key(|a| a.deadline_daa).unwrap();
+            let work = super::super::OPEN_AUDIT_WORK_PASSES * super::super::service_work_daa(0, second.n_prompt, second.n_pos - second.n_prompt);
+            let last = second.deadline_daa;
+            assert_eq!(last, first + work + super::super::OPENING_BACKLOG_DAA, "the second draw of one key chains behind the first");
+            (run, first, last)
+        }
+
+        #[test]
+        fn two_missing_openings_in_one_fold_strike_once() {
+            for sanction in [false, true] {
+                let (mut run, _, last) = two_drawn_audits(sanction);
+                let misses = run.fold(last + 1, Hash::from_bytes([3u8; 32]), &[], &[]);
+                assert_eq!(misses, vec![(miner(), 1)]);
+                assert_eq!(run.ledger.strike_state(&miner()), Some(crate::collateral::StrikeEntry { count: 1, last_daa: last + 1 }));
+                assert!(run.ledger.trace_audits.is_empty());
+            }
+        }
+
+        /// First response of the miner drawn at 202, a second one to `RH2` accepted at 150 under
+        /// `escrow2` and drawn at 250, with `tweak` applied to the first audit before that draw:
+        /// the run, the first deadline before and after the second draw, and the second audit.
+        fn queued_second_draw(
+            audit_queue: bool,
+            escrow2: [u8; 32],
+            tweak: impl Fn(&mut crate::collateral::TraceAudit),
+        ) -> (Run, u64, u64, crate::collateral::TraceAudit) {
+            let mut run = Run::sanctioned();
+            run.audit_queue = audit_queue;
+            let (_, ev) = run.event(true);
+            let r2 = run.model.response(3, 10, true);
+            let ev2 = TraceResponseEvent {
+                response_txid: TXID2,
+                request_hash: RH2,
+                escrow_pubkey: escrow2,
+                trace_root: r2.trace_root,
+                n_prompt: r2.n_prompt,
+                n_pos: r2.n_pos,
+                ..ev.clone()
+            };
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.fold(150, h0, &[ev2], &[]).is_empty());
+            assert!(run.fold(202, chain_hash(false), &[], &[]).is_empty());
+            tweak(run.ledger.trace_audits.get_mut(&TXID).unwrap());
+            let before = run.deadline();
+            assert!(run.fold(250, chain_hash(false), &[], &[]).is_empty());
+            let second = run.ledger.trace_audits.get(&TXID2).expect("second audit armed").clone();
+            let after = run.deadline();
+            (run, before, after, second)
+        }
+
+        #[test]
+        fn arming_an_audit_pushes_the_open_audits_of_its_key() {
+            let (_, before, after, second) = queued_second_draw(false, ESCROW_PK, |_| {});
+            assert_eq!(after, before, "no push before the gate");
+
+            let (_, before, after, second_q) = queued_second_draw(true, ESCROW_PK, |_| {});
+            assert_eq!(second_q, second, "the armed audit itself is unchanged by the rule");
+            let generated = (second.n_pos - second.n_prompt).min(second.max_tokens);
+            let push = super::super::AUDIT_QUEUE_PASSES * super::super::service_work_daa(0, second.n_prompt, generated);
+            assert!(push > 0);
+            assert_eq!(after, before + push);
+        }
+
+        #[test]
+        fn audit_queue_push_stops_at_the_audit_span() {
+            let (run, _, after, _) =
+                queued_second_draw(true, ESCROW_PK, |a| a.deadline_daa = a.accepted_daa + super::super::AUDIT_SPAN_DAA - 1);
+            let first = run.ledger.trace_audits.get(&TXID).unwrap();
+            assert_eq!(after, first.accepted_daa + super::super::AUDIT_SPAN_DAA);
+        }
+
+        #[test]
+        fn audit_queue_leaves_other_keys_alone() {
+            let (run, before, after, _) = queued_second_draw(true, [0x99u8; 32], |_| {});
+            assert_eq!(run.ledger.trace_audits.len(), 2);
+            assert_eq!(after, before);
+        }
+
+        #[test]
+        fn missing_openings_in_two_folds_escalate_under_the_sanction_rule() {
+            let (mut run, first, last) = two_drawn_audits(true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert_eq!(run.fold(first + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert_eq!(run.fold(last + 1, h, &[], &[]), vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn missing_openings_in_two_folds_strike_once_past_the_uniform_gate() {
+            let (mut run, first, last) = two_drawn_audits(true);
+            run.uniform_strikes = true;
+            assert!(last - first < crate::collateral::SERVICE_STRIKE_INTERVAL_DAA);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert_eq!(run.fold(first + 1, h, &[], &[]), vec![(miner(), 1)]);
+            assert_eq!(run.fold(last + 1, h, &[], &[]), vec![]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_struck_miner_is_not_reset_in_the_same_fold_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let mut run = Run::audited_all();
+                run.sanction = sanction;
+                let (r1, ev) = run.event(false);
+                let r2 = run.model.response(3, 10, true);
+                let ev2 = TraceResponseEvent {
+                    response_txid: TXID2,
+                    request_hash: RH2,
+                    trace_root: r2.trace_root,
+                    n_prompt: r2.n_prompt,
+                    n_pos: r2.n_pos,
+                    ..ev.clone()
+                };
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(run.fold(100, h0, &[], &[]).is_empty());
+                assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
+                let ch = chain_hash(false);
+                assert!(run.fold(202, ch, &[], &[]).is_empty());
+                let bad = opening(ESCROW_PK, run.model.open(&r1, TXID, &trace_seed(&ch, &TXID)).encode());
+                let good = TraceOpeningEvent {
+                    response_txid: TXID2,
+                    escrow_pubkey: ESCROW_PK,
+                    body: run.model.open(&r2, TXID2, &trace_seed(&ch, &TXID2)).encode(),
+                };
+                assert_eq!(run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[bad, good]), vec![(miner(), 2)]);
+                if sanction {
+                    assert_eq!(run.ledger.strike_state(&miner()), Some(crate::collateral::StrikeEntry { count: 2, last_daa: 203 }));
+                }
+                assert!(run.ledger.trace_audits.is_empty());
+            }
+        }
+
+        #[test]
+        fn a_response_is_admissible_until_its_responder_answered() {
+            let mut run = Run::audited_all();
+            let (member, stranger) = (miner().as_bytes(), [9u8; 32]);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(!run.ledger.response_admissible(&RH, &member), "unknown request");
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.ledger.response_admissible(&RH, &stranger), "pending, not armed");
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            assert!(run.ledger.response_admissible(&RH, &member));
+            assert!(!run.ledger.response_admissible(&RH, &stranger), "armed, not a member");
+            let (_, ev) = run.event(true);
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(!run.ledger.response_admissible(&RH, &member), "already answered");
+        }
+
+        #[test]
+        fn a_repeated_response_opens_one_audit_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let mut run = Run::audited_all();
+                run.sanction = sanction;
+                let (_, ev) = run.event(true);
+                let dup = TraceResponseEvent { response_txid: TXID2, ..ev.clone() };
+                let h0 = Hash::from_bytes([0u8; 32]);
+                assert!(run.fold(100, h0, &[], &[]).is_empty());
+                assert!(run.fold(102, h0, &[ev.clone()], &[]).is_empty());
+                assert!(run.fold(103, h0, &[dup], &[]).is_empty());
+                assert_eq!(run.ledger.trace_audits.len(), if sanction { 1 } else { 2 });
+                assert!(run.ledger.trace_audits.contains_key(&TXID));
+            }
+        }
+
+        #[test]
+        fn opening_under_another_key_is_ignored() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(false, true);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening([0x11u8; 32], body)]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 1);
+            assert_eq!(run.fold(deadline + 1, h, &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn undrawn_response_is_dropped() {
+            let mut run = Run::new(true);
+            let (deadline, body) = run.until_draw(false, false);
+            assert_eq!(deadline, 0);
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]).is_empty());
+        }
+
+        #[test]
+        fn every_trace_is_audited_under_the_audit_rule() {
+            let mut run = Run::audited_all();
+            let (deadline, body) = run.until_draw(true, false);
+            assert!(deadline > 203);
+            assert_eq!(run.ledger.trace_audits.len(), 1);
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut verdicts = Vec::new();
+            assert!(run.fold_with_verdicts(203, h, &[], &[opening(ESCROW_PK, body)], &mut verdicts).is_empty());
+            assert_eq!(verdicts, vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+            // The second request of the run was never answered.
+            assert_eq!(run.fold(run.window_end() + 1, h, &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn fraud_verdict_names_the_failing_check() {
+            let mut run = Run::prefixed(8, RH);
+            let (r, seed) = run.drawn(true, true);
+            let body = run.model.open(&r, TXID, &seed).encode();
+            let mut verdicts = Vec::new();
+            let misses = run.fold_with_verdicts(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)], &mut verdicts);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert_eq!(verdicts, vec![Some("prefix point missing")]);
+        }
+
+        #[test]
+        fn a_reused_trace_root_is_audited_on_each_response() {
+            let mut run = Run::audited_all();
+            let (_, ev) = run.event(true);
+            let ev2 = TraceResponseEvent { response_txid: TXID2, request_hash: RH2, ..ev.clone() };
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev, ev2], &[]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 2);
+            assert!(run.ledger.trace_audits.contains_key(&TXID) && run.ledger.trace_audits.contains_key(&TXID2));
+            assert!(run.ledger.trace_roots.is_empty(), "remembered once drawn");
+            assert_eq!(run.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().responded, vec![miner()]);
+        }
+
+        #[test]
+        fn a_response_accepted_again_after_its_verdict_is_not_audited_again() {
+            let mut runs = [Run::sanctioned(), Run::sanctioned()];
+            let mut outcomes = Vec::new();
+            for (i, run) in runs.iter_mut().enumerate() {
+                let (deadline, body) = run.until_draw(true, true);
+                let ev = run.event(true).1;
+                assert!(run.fold(203, chain_hash(false), &[], &[opening(ESCROW_PK, body)]).is_empty());
+                assert!(!run.ledger.trace_audits.contains_key(&TXID), "the verdict closes the audit");
+                let replay = if i == 1 { vec![ev] } else { Vec::new() };
+                run.fold(300, chain_hash(false), &replay, &[]);
+                assert!(!run.ledger.trace_audits.contains_key(&TXID), "a replayed response opens no audit");
+                outcomes.push(run.fold(deadline + 2_000, chain_hash(true), &[], &[]));
+            }
+            assert_eq!(outcomes[0], outcomes[1], "a replay strikes no one");
+        }
+
+        #[test]
+        fn tier_without_manifest_is_not_audited() {
+            let mut run = Run::new(false);
+            let (deadline, _) = run.until_draw(false, true);
+            assert_eq!(deadline, 0);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn prefix_opening_closes_the_audit() {
+            let mut run = Run::prefixed(8, RH);
+            let (deadline, body) = run.until_draw(true, true);
+            assert!(deadline > 203);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            assert!(run.fold(deadline + 1, h, &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn opening_without_the_prefix_point_is_fraud_under_the_prefix_rule() {
+            let mut run = Run::prefixed(8, RH);
+            let (r, seed) = run.drawn(true, true);
+            let body = run.model.open(&r, TXID, &seed).encode();
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn trace_of_another_request_is_fraud_under_the_prefix_rule() {
+            let mut run = Run::prefixed(8, [0x99u8; 32]);
+            let (_, body) = run.until_draw(true, true);
+            let misses = run.fold(203, Hash::from_bytes([3u8; 32]), &[], &[opening(ESCROW_PK, body)]);
+            assert_eq!(misses, vec![(miner(), 2)]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn prompt_too_short_for_the_prefix_is_misshaped() {
+            // 40 prompt positions hold a prefix at offset 8, not at offset 9.
+            let mut run = Run::prefixed(9, RH);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn misshaped_trace_is_neither_credited_nor_audited() {
+            // 64 prompt bytes need 4 prompt positions; the trace commits 3.
+            let mut run = Run::shaped(64, 8);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+        }
+
+        /// Trace audits a response committing `n_prompt` prompt positions to a 48-byte prompt opens.
+        fn audits_of_prompt_positions(n_prompt: u32, own_shape: bool) -> usize {
+            let mut run = Run::shaped(48, 60);
+            run.own_shape = own_shape;
+            run.positions = Some((n_prompt, n_prompt + 6));
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            run.fold(102, h0, &[ev], &[]);
+            run.ledger.trace_audits.len()
+        }
+
+        #[test]
+        fn prompt_position_shape_bounds() {
+            for own_shape in [false, true] {
+                assert_eq!(audits_of_prompt_positions(48 + crate::config::params::CONTEXT_OVERHEAD_TOKENS + 5_000, own_shape), 1);
+                assert_eq!(audits_of_prompt_positions(2, own_shape), 0);
+            }
+        }
+
+        #[test]
+        fn well_shaped_trace_is_credited_and_audited() {
+            // 48 prompt bytes need 3 prompt positions, 60 answer bytes need 6 generated ones.
+            let mut run = Run::shaped(48, 60);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert_eq!(run.ledger.trace_audits.len(), 1);
+            let end = run.window_end();
+            assert!(run.fold(end + 1, chain_hash(false), &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn answer_over_the_token_budget_is_misshaped() {
+            // max_tokens 256 allows 8 192 answer bytes.
+            let mut run = Run::shaped(0, 8_193);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(102, h0, &[ev], &[]).is_empty());
+            assert!(run.ledger.trace_audits.is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+        }
+
+        #[test]
+        fn early_misshaped_trace_is_dropped_when_its_request_arrives() {
+            let mut run = Run::shaped(64, 8);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(98, h0, &[ev], &[]).is_empty());
+            assert_eq!(run.ledger.early_shapes.len(), 1);
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.ledger.early_shapes.is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            let end = run.window_end();
+            assert_eq!(run.fold(end + 1, chain_hash(false), &[], &[]), vec![(miner(), 1)]);
+
+            let mut run = Run::shaped(48, 60);
+            let (_, ev) = run.event(true);
+            assert!(run.fold(98, h0, &[ev], &[]).is_empty());
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            assert!(run.fold(101, h0, &[], &[]).is_empty());
+            let end = run.window_end();
+            assert!(run.fold(end + 1, chain_hash(false), &[], &[]).is_empty());
+            assert_eq!(run.ledger.consecutive_misses(&miner()), 0);
+        }
+
+        #[test]
+        fn shapes_round_trip_through_the_snapshot() {
+            let mut run = Run::shaped(48, 60);
+            let (_, ev) = run.event(true);
+            let h0 = Hash::from_bytes([0u8; 32]);
+            assert!(run.fold(98, h0, &[ev], &[]).is_empty());
+            let bytes = run.ledger.snapshot().to_bytes();
+            assert_eq!(bytes[0], 4);
+            assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), run.ledger.snapshot());
+            assert!(run.fold(100, h0, &[], &[]).is_empty());
+            let snap = run.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], 4);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+            let mut restored = Run::shaped(48, 60);
+            restored.ledger.restore_snapshot(&parsed);
+            assert_eq!(restored.ledger.pending.get(&RH).unwrap().prompt_len, 48);
+            assert!(restored.fold(101, h0, &[], &[]).is_empty());
+            let end = restored.window_end();
+            assert!(restored.fold(end + 1, chain_hash(false), &[], &[]).is_empty());
+        }
+
+        #[test]
+        fn trace_audits_round_trip_through_the_snapshot() {
+            let mut run = Run::new(true);
+            assert_eq!(run.ledger.snapshot().to_bytes()[0], 1);
+            let (deadline, body) = run.until_draw(true, true);
+            let snap = run.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+
+            let mut restored = Run::new(true);
+            restored.ledger.restore_snapshot(&parsed);
+            assert_eq!(restored.ledger.trace_audits.get(&TXID).unwrap().deadline_daa, deadline);
+            let h = Hash::from_bytes([3u8; 32]);
+            assert!(restored.fold(203, h, &[], &[opening(ESCROW_PK, body)]).is_empty());
+            assert_eq!(restored.ledger.snapshot().to_bytes()[0], super::super::SNAPSHOT_ENCODING_VERSION_ROOT, "the response stays remembered");
+        }
+    }
+
+    mod draw_and_window {
+        use super::super::*;
+        use keryx_hashes::Hash;
+
+        const RH: [u8; 32] = [7u8; 32];
+        const RH2: [u8; 32] = [8u8; 32];
+        const REWARD: u64 = 1_000;
+
+        fn id(b: u8) -> Hash {
+            Hash::from_bytes([b; 32])
+        }
+
+        fn chain(b: u8) -> Hash {
+            Hash::from_bytes([b; 32])
+        }
+
+        /// One answer: request, responder, traced `(n_prompt, n_pos)`.
+        type Answer = ([u8; 32], Hash, Option<(u32, u32)>);
+
+        struct Net {
+            ledger: ServiceLedger,
+            cohort: Vec<Hash>,
+            draw: bool,
+            window_v3: bool,
+            /// Every traced answer carries the same trace root.
+            same_root: bool,
+            /// Dedup rule: a response accepted twice by one block is judged once.
+            dedup: bool,
+            /// Audit rule: every traced response is audited.
+            audit_all: bool,
+            /// Sanction rule.
+            sanction: bool,
+            /// Keys every request of the run is sealed to; empty for a public request.
+            recipients: Vec<Hash>,
+            /// Untraced-response rule.
+            untraced_silence: bool,
+            /// Own-shape window rule.
+            own_shape: bool,
+            /// One-miss-per-request rule.
+            one_miss: bool,
+            /// Uniform-strike rule.
+            uniform_strikes: bool,
+        }
+
+        impl Net {
+            fn new(draw: bool, window_v3: bool, cohort: Vec<Hash>) -> Self {
+                let mut ledger = ServiceLedger::default();
+                ledger.set_window_v2_activation(0);
+                ledger.set_reward_routing_activation(0);
+                Self {
+                    ledger,
+                    cohort,
+                    draw,
+                    window_v3,
+                    same_root: false,
+                    dedup: false,
+                    audit_all: false,
+                    sanction: false,
+                    recipients: Vec::new(),
+                    untraced_silence: false,
+                    own_shape: false,
+                    one_miss: false,
+                    uniform_strikes: false,
+                }
+            }
+
+            /// Folds one chain block accepting `requests` as `(hash, max_tokens)` on tier 0 and
+            /// `answers`.
+            fn fold(&mut self, daa: u64, chain: Hash, requests: &[([u8; 32], u32)], answers: &[Answer]) -> FoldOutcome {
+                self.fold_with(daa, chain, requests, answers, false)
+            }
+
+            /// [`Self::fold`] as a warmup fold when `warm`; the outcome is then empty.
+            fn fold_with(&mut self, daa: u64, chain: Hash, requests: &[([u8; 32], u32)], answers: &[Answer], warm: bool) -> FoldOutcome {
+                let audit_all = self.audit_all;
+                let tier = |_: u8, _: u64| -> Option<crate::config::params::TraceRules> {
+                    audit_all.then(|| crate::config::params::TraceRules {
+                        ctx: keryx_verifiable_inference::verify::TierCtx { r_t: [0; 32], n_chunks: 0, m_t: [0; 32], n_entries: 0, n_products: 0 },
+                        prefix: None,
+                        chain: None,
+                        audit_all: true,
+                        attention: false,
+                    })
+                };
+                let events: Vec<TraceResponseEvent> = answers
+                    .iter()
+                    .filter_map(|(rh, r, s)| {
+                        s.map(|(n_prompt, n_pos)| {
+                            let mut txid = r.as_bytes();
+                            txid[0] ^= rh[0];
+                            TraceResponseEvent {
+                                response_txid: txid,
+                                request_hash: *rh,
+                                responder: *r,
+                                escrow_pubkey: [0u8; 32],
+                                trace_root: if self.same_root { [0xEEu8; 32] } else { txid },
+                                n_prompt,
+                                n_pos,
+                                answer_len: 0,
+                                stage: 1,
+                                tokens: false,
+                            }
+                        })
+                    })
+                    .collect();
+                let tr = TraceInputs {
+                    chain_hash: chain,
+                    responses: &events,
+                    openings: &[],
+                    tier: &tier,
+                    prompt_lens: &[],
+                    shape: false,
+                    sanction: self.sanction,
+                    context: false,
+                    draw: self.draw,
+                    window_v3: self.window_v3,
+                    dedup: self.dedup,
+                    seed_bind: false,
+                    untraced_silence: self.untraced_silence,
+                    own_shape: self.own_shape,
+                    one_miss: self.one_miss,
+                    uniform_strikes: self.uniform_strikes,
+                    audit_queue: false,
+                };
+                let reqs: Vec<([u8; 32], u8, u32)> = requests.iter().map(|(h, m)| (*h, 0, *m)).collect();
+                let rewards: Vec<([u8; 32], u64)> = requests.iter().map(|(h, _)| (*h, REWARD)).collect();
+                let sealed: Vec<([u8; 32], PrivateCohortSeed, Vec<Hash>)> = if self.recipients.is_empty() {
+                    Vec::new()
+                } else {
+                    requests.iter().map(|(h, _)| (*h, [0u8; 36], self.recipients.clone())).collect()
+                };
+                let resp: Vec<([u8; 32], Option<Hash>)> = answers.iter().map(|(rh, r, _)| (*rh, Some(*r))).collect();
+                let set = self.cohort.clone();
+                if warm {
+                    self.ledger.on_chain_block_warmup_with_traces(
+                        daa,
+                        &reqs,
+                        &rewards,
+                        &sealed,
+                        &resp,
+                        &[],
+                        &[],
+                        &tr,
+                        &|_: &crate::tx::TransactionOutpoint| false,
+                        |_| set.iter().map(|m| (*m, *m)).collect(),
+                    );
+                    return FoldOutcome::default();
+                }
+                self.ledger.on_chain_block_with_traces(
+                    daa,
+                    &reqs,
+                    &rewards,
+                    &sealed,
+                    &resp,
+                    &[],
+                    &[],
+                    &tr,
+                    |_| true,
+                    |_| set.iter().map(|m| (*m, *m)).collect(),
+                )
+            }
+
+            fn window_end(&self, rh: &[u8; 32]) -> u64 {
+                self.ledger.pending.get(rh).unwrap().audit.as_ref().unwrap().window_end_daa
+            }
+
+            fn struck(outcome: &FoldOutcome) -> Vec<Hash> {
+                let mut v: Vec<Hash> = outcome.misses.iter().map(|m| m.miner).collect();
+                v.sort_unstable();
+                v
+            }
+        }
+
+        /// The same traced response accepted twice by one chain block, as an input-less
+        /// transaction merged from two blocks of the mergeset.
+        fn twice(a: Hash) -> Vec<Answer> {
+            vec![(RH, a, Some((100, 300))), (RH, a, Some((100, 300)))]
+        }
+
+        #[test]
+        fn a_response_accepted_twice_after_the_arming_is_credited_once() {
+            let a = id(1);
+            let mut net = Net::new(false, false, vec![a]);
+            net.dedup = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &twice(a));
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![a]);
+            assert_eq!(net.ledger.trace_audits.len(), 1);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn a_response_accepted_twice_with_its_request_is_credited_at_the_arming() {
+            let a = id(1);
+            let mut net = Net::new(false, false, vec![a]);
+            net.dedup = true;
+            net.fold(100, chain(0), &[(RH, 256)], &twice(a));
+            net.fold(101, chain(0), &[], &[]);
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![a]);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn a_response_is_awaited_until_its_member_is_credited() {
+            let pk = [0x5Bu8; 32];
+            let a = escrow_miner_key(&pk);
+            let mut net = Net::new(false, false, vec![a]);
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &pk), None);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &pk), Some(end));
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &[0x5Cu8; 32]), None);
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            assert_eq!(net.ledger.awaited_response_deadline(&RH, &pk), None);
+        }
+
+        #[test]
+        fn request_await_status_tells_unknown_from_closed() {
+            let pk = [0x5Bu8; 32];
+            let a = escrow_miner_key(&pk);
+            let mut net = Net::new(false, false, vec![a]);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), None);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), Some(Some(0)));
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), Some(Some(end)));
+            assert_eq!(net.ledger.request_await_status(&RH, &[0x5Cu8; 32]), Some(None));
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            assert_eq!(net.ledger.request_await_status(&RH, &pk), Some(None));
+        }
+
+        #[test]
+        fn responders_with_the_same_trace_root_are_both_credited() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, false, vec![a, b]);
+            net.same_root = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((100, 300)))]);
+            net.fold(103, chain(0), &[], &[(RH, b, Some((100, 300)))]);
+            let end = net.window_end(&RH);
+            assert!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])).is_empty());
+        }
+
+        #[test]
+        fn v3_work_matches_the_measured_coefficients() {
+            assert_eq!(service_work_daa(2, 5_000, 2_048), 100 + 1_741);
+            assert_eq!(service_window_daa_v3(2, 5_000, 2_048), 1_991);
+            assert_eq!(reward_draw_window_daa(2, 5_000, 2_048), 996);
+            assert_eq!(service_window_daa_v3(4, 5_000, 2_048), 150 + 100 + 717);
+            assert_eq!(reward_draw_window_daa(4, 5_000, 2_048), 484);
+            assert_eq!(service_work_daa(1, 0, 4_096), service_work_daa(1, 0, 10_000));
+        }
+
+        #[test]
+        fn without_the_draw_the_first_credit_wins() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let out = net.fold(102, chain(0), &[], &[(RH, b, None)]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![b]);
+        }
+
+        #[test]
+        fn the_draw_picks_among_members_credited_within_its_window() {
+            let (a, b, c) = (id(1), id(2), id(3));
+            let mut net = Net::new(true, false, vec![a, b, c]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            assert!(net.fold(102, chain(0), &[], &[(RH, b, None)]).rewards.is_empty());
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            assert_eq!(close, 102 + 191);
+            assert!(net.fold(close - 1, chain(0), &[], &[(RH, a, None)]).rewards.is_empty());
+            let closing = chain(9);
+            let out = net.fold(close, closing, &[], &[(RH, c, None)]);
+            let winner = [a, b, c][assign_index(&reward_draw_seed(&closing, &RH), 3).unwrap()];
+            assert_eq!(out.rewards.len(), 1);
+            assert_eq!(out.rewards[0].winner, winner);
+            assert_eq!(out.rewards[0].amount, REWARD);
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().winner, Some(winner));
+            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_none());
+        }
+
+        #[test]
+        fn a_member_credited_after_the_close_is_not_a_candidate() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            let out = net.fold(close, chain(9), &[], &[]);
+            assert_eq!(out.rewards[0].winner, a);
+            assert!(net.fold(close + 1, chain(9), &[], &[(RH, b, None)]).rewards.is_empty());
+        }
+
+        #[test]
+        fn early_answers_open_the_draw_at_the_arming() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[(RH, a, None), (RH, b, None)]);
+            assert!(net.fold(101, chain(0), &[], &[]).rewards.is_empty());
+            let draw = net.ledger.pending.get(&RH).unwrap().draw.clone().unwrap();
+            assert_eq!(draw.open_daa, 101);
+            assert_eq!(draw.candidates.len(), 2);
+        }
+
+        fn open_audit(net: &mut Net, key: u8, responder: Hash, deadline_daa: u64) {
+            let audit = super::super::TraceAudit {
+                request_hash: RH,
+                responder,
+                escrow_pubkey: [0u8; 32],
+                trace_root: [0u8; 32],
+                n_prompt: 4,
+                n_pos: 9,
+                accepted_daa: 102,
+                tier: 0,
+                max_tokens: 256,
+                identities: vec![responder],
+                seed: Some([9; 32]),
+                deadline_daa,
+                pieces: 0,
+                attn: None,
+                chain_start: 0,
+            };
+            net.ledger.trace_audits.insert([key; 32], audit);
+        }
+
+        #[test]
+        fn a_draw_waits_for_the_audit_of_its_candidates() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, b, None)]);
+            open_audit(&mut net, 0xAA, a, 9_999);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end + 1, chain(9), &[], &[]).rewards.is_empty());
+            assert!(!net.ledger.pending.contains_key(&RH), "the request leaves at the end of its window");
+            assert_eq!(net.ledger.held_draws.len(), 1, "an audit still open holds the draw");
+
+            let snap = net.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_HELD);
+            assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), snap);
+            assert!(net.fold(end + 2, chain(9), &[], &[]).rewards.is_empty());
+
+            // The audit sanctions its responder: only the other candidate remains.
+            net.ledger.trace_audits.clear();
+            net.ledger.drop_draw_candidates(&RH, &[a]);
+            let out = net.fold(end + 3, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| (r.winner, r.amount)).collect::<Vec<_>>(), vec![(b, REWARD)]);
+            assert!(net.ledger.held_draws.is_empty());
+            assert_ne!(net.ledger.snapshot().to_bytes()[0], super::super::SNAPSHOT_ENCODING_VERSION_HELD);
+        }
+
+        #[test]
+        fn a_traced_answer_with_its_request_holds_a_short_draw_until_drawn() {
+            let a = id(1);
+            let mut net = Net::new(true, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 16)], &[(RH, a, Some((4, 20)))]);
+            net.fold(101, chain(0), &[], &[]);
+            let close = net.ledger.pending.get(&RH).unwrap().draw.as_ref().unwrap().close_daa;
+            assert!(close < 100 + TRACE_SEED_DELAY_DAA);
+            let paid = (net.window_end(&RH) + 1).max(100 + TRACE_SEED_DELAY_DAA);
+            for daa in 102..paid {
+                assert!(net.fold(daa, chain(9), &[], &[]).rewards.is_empty(), "paid at {daa} before its window ends and its audit is drawn");
+            }
+            let out = net.fold(paid, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
+        }
+
+        #[test]
+        fn an_untraced_answer_under_the_audit_rule_is_no_draw_candidate() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, true, vec![a, b]);
+            net.audit_all = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[(RH, a, None)]);
+            net.fold(101, chain(0), &[], &[]);
+            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_none(), "an early untraced answer opens no draw");
+            net.fold(102, chain(0), &[], &[(RH, b, None)]);
+            assert!(net.ledger.pending.get(&RH).unwrap().draw.is_none(), "nor a later one");
+        }
+
+        #[test]
+        fn an_answer_accepted_long_before_its_request_counts_only_once_sent_again() {
+            let a = id(1);
+            let mut net = Net::new(true, true, vec![a]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.fold(0, chain(0), &[], &[(RH, a, Some((4, 20)))]);
+            for daa in 1..150 {
+                net.fold(daa, chain(0), &[], &[]);
+            }
+            assert!(net.ledger.trace_audits.is_empty(), "no request to bind the audit to");
+            net.fold(150, chain(0), &[(RH, 256)], &[]);
+            net.fold(151, chain(0), &[], &[]);
+            let req = net.ledger.pending.get(&RH).unwrap();
+            assert!(req.audit.as_ref().unwrap().responded.is_empty(), "an answer that escaped its audit does not count");
+            assert!(req.draw.is_none(), "an answer that escaped its audit draws nothing");
+            net.fold(152, chain(0), &[], &[(RH, a, Some((4, 20)))]);
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().audit.as_ref().unwrap().responded, vec![a], "sent again, it counts");
+        }
+
+        #[test]
+        fn a_held_draw_drops_the_candidates_still_unjudged_at_its_horizon() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, b, None)]);
+            open_audit(&mut net, 0xAA, a, u64::MAX / 2);
+            let end = net.window_end(&RH);
+            net.fold(end + 1, chain(9), &[], &[]);
+            let open = net.ledger.held_draws.get(&RH).unwrap().draw.open_daa;
+            assert!(net.fold(open + super::super::HELD_DRAW_HORIZON_DAA - 1, chain(9), &[], &[]).rewards.is_empty());
+            let out = net.fold(open + super::super::HELD_DRAW_HORIZON_DAA, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![b]);
+        }
+
+        #[test]
+        fn a_draw_with_no_candidate_left_burns_the_reward() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None)]);
+            net.ledger.drop_draw_candidates(&RH, &[a]);
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            assert!(net.fold(close, chain(9), &[], &[]).rewards.is_empty());
+            let req = net.ledger.pending.get(&RH).unwrap();
+            assert_eq!((req.winner, req.reward), (None, 0));
+            assert!(net.fold(close + 1, chain(9), &[], &[(RH, b, None)]).rewards.is_empty());
+        }
+
+        #[test]
+        fn an_open_draw_closes_before_its_request_is_judged() {
+            let a = id(1);
+            let mut net = Net::new(true, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            net.fold(end, chain(0), &[], &[(RH, a, Some((0, 256)))]);
+            assert!(net.fold(end + 1, chain(9), &[], &[]).rewards.is_empty(), "the traced answer is not drawn yet");
+            assert!(net.ledger.pending.is_empty());
+            let ripe = end + TRACE_SEED_DELAY_DAA;
+            assert!(net.fold(ripe - 1, chain(9), &[], &[]).rewards.is_empty());
+            let out = net.fold(ripe, chain(9), &[], &[]);
+            assert_eq!(out.rewards.iter().map(|r| r.winner).collect::<Vec<_>>(), vec![a]);
+            assert!(net.ledger.held_draws.is_empty());
+        }
+
+        #[test]
+        fn a_response_from_outside_the_recipients_counts_for_nothing_under_the_sanction_rule() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.recipients = vec![a];
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((0, 10))), (RH, b, Some((0, 10)))]);
+            let audit = net.ledger.pending.get(&RH).unwrap().audit.clone().unwrap();
+            assert_eq!(audit.responded, vec![a]);
+            assert_eq!(net.ledger.trace_audits.values().map(|t| t.responder).collect::<Vec<_>>(), vec![a]);
+        }
+
+        #[test]
+        fn a_traced_response_to_a_request_not_accepted_opens_no_audit_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let a = id(1);
+                let mut net = Net::new(false, true, vec![a]);
+                net.audit_all = true;
+                net.sanction = sanction;
+                net.fold(100, chain(0), &[], &[(RH, a, Some((0, 10)))]);
+                assert_eq!(net.ledger.trace_audits.len(), if sanction { 0 } else { 1 });
+                assert_eq!(net.ledger.early_responses.get(&RH).unwrap().1, vec![a], "the answer is still credited at the arming");
+            }
+        }
+
+        #[test]
+        fn early_responders_are_capped_under_the_sanction_rule() {
+            for sanction in [false, true] {
+                let mut net = Net::new(false, true, vec![id(1)]);
+                net.sanction = sanction;
+                let answers: Vec<Answer> = (0..=EARLY_KEYS_PER_REQUEST as u32).map(|i| {
+                    let mut k = [0u8; 32];
+                    k[..4].copy_from_slice(&i.to_le_bytes());
+                    k[31] = 0xAB;
+                    (RH, Hash::from_bytes(k), None)
+                }).collect();
+                net.fold(100, chain(0), &[], &answers);
+                let kept = net.ledger.early_responses.get(&RH).unwrap().1.len();
+                assert_eq!(kept, if sanction { EARLY_KEYS_PER_REQUEST } else { EARLY_KEYS_PER_REQUEST + 1 });
+            }
+        }
+
+        #[test]
+        fn audits_beyond_the_chain_cap_of_one_key_are_not_opened() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            let requests: Vec<([u8; 32], u32)> = (0..6u8).map(|i| ([i + 10; 32], 4_096)).collect();
+            net.fold(100, chain(0), &requests, &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let answers: Vec<Answer> = requests.iter().map(|(h, _)| (*h, a, Some((0, 4_096)))).collect();
+            net.fold(102, chain(0), &[], &answers);
+            assert_eq!(net.ledger.trace_audits.len(), 6);
+            net.fold(102 + TRACE_SEED_DELAY_DAA, chain(0), &[], &[]);
+            let work = super::super::OPEN_AUDIT_WORK_PASSES * service_work_daa(0, 0, 4_096);
+            let opened = (super::super::OPENING_BACKLOG_CAP_DAA / work + 1) as usize;
+            assert!(opened < 6);
+            assert_eq!(net.ledger.trace_audits.len(), opened);
+            assert_eq!(net.ledger.trace_roots.len(), 6, "every answer stays remembered");
+            let mut deadlines: Vec<u64> = net.ledger.trace_audits.values().map(|a| a.deadline_daa).collect();
+            deadlines.sort_unstable();
+            assert!(deadlines.windows(2).all(|w| w[1] >= w[0] + work));
+        }
+
+        #[test]
+        fn audits_beyond_the_span_strike_under_the_sanction_rule() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.sanction = true;
+            let work = super::super::OPEN_AUDIT_WORK_PASSES * service_work_daa(0, 0, 4_096);
+            let fit = (super::super::AUDIT_SPAN_DAA / work) as usize;
+            let requests: Vec<([u8; 32], u32)> = (0..fit as u8 + 3).map(|i| ([i + 10; 32], 4_096)).collect();
+            net.fold(100, chain(0), &requests, &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let answers: Vec<Answer> = requests.iter().map(|(h, _)| (*h, a, Some((0, 4_096)))).collect();
+            net.fold(102, chain(0), &[], &answers);
+            let out = net.fold(102 + TRACE_SEED_DELAY_DAA, chain(0), &[], &[]);
+            let kept: Vec<&super::super::TraceAudit> = net.ledger.trace_audits.values().collect();
+            assert!(kept.len() < requests.len(), "the audits past the span are judged at once");
+            assert!(kept.iter().all(|t| t.deadline_daa <= t.accepted_daa + super::super::AUDIT_SPAN_DAA));
+            let mut starts: Vec<u64> = kept.iter().map(|t| t.chain_start).collect();
+            starts.sort_unstable();
+            assert!(starts.windows(2).all(|w| w[1] == w[0] + work), "the chain carries no network backlog");
+            let snap = net.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_CHAIN);
+            assert_eq!(super::super::ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), snap);
+            assert_eq!(out.misses.len(), 1, "one strike per block");
+            assert!(out.misses.iter().all(|m| m.miner == a && m.opening_missing));
+        }
+
+        #[test]
+        fn the_audit_span_leaves_the_vault_burnable() {
+            use super::super::{
+                AUDIT_SPAN_DAA, SERVICE_BURNABLE_WINDOW_DAA, SERVICE_EARLY_RESPONSE_HORIZON_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA,
+                SERVICE_LEDGER_HORIZON_DAA,
+            };
+            let reach = SERVICE_LEDGER_HORIZON_DAA.max(SERVICE_EARLY_RESPONSE_HORIZON_DAA);
+            assert!(AUDIT_SPAN_DAA + reach + SERVICE_ELIGIBILITY_WINDOW_DAA < SERVICE_BURNABLE_WINDOW_DAA);
+        }
+
+        #[test]
+        fn an_inflated_shape_is_bounded_by_the_budget() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((10, 100_000))), (RH, b, Some((10, 110)))]);
+            assert_eq!(net.ledger.pending.get(&RH).unwrap().reference_shape(), (10, 256));
+        }
+
+        /// One member with a strike, audit rule on: `(answer with the request, answer later)`.
+        fn streak_after(sanction: bool, early: bool) -> u32 {
+            let a = id(1);
+            let mut net = Net::new(false, false, vec![a]);
+            net.audit_all = true;
+            net.sanction = sanction;
+            net.ledger.strikes.insert(a, StrikeEntry { count: 1, last_daa: 99 });
+            let answer = [(RH, a, None)];
+            net.fold(100, chain(0), &[(RH, 256)], if early { &answer } else { &[] });
+            net.fold(101, chain(0), &[], &[]);
+            if !early {
+                net.fold(102, chain(0), &[], &answer);
+            }
+            net.ledger.consecutive_misses(&a)
+        }
+
+        #[test]
+        fn an_answer_without_its_opening_keeps_the_streak_under_the_sanction_rule() {
+            assert_eq!(streak_after(false, false), 0);
+            assert_eq!(streak_after(true, false), 1);
+        }
+
+        #[test]
+        fn an_answer_ahead_of_its_audit_without_a_trace_keeps_the_streak() {
+            assert_eq!(streak_after(false, true), 0);
+            assert_eq!(streak_after(true, true), 1);
+        }
+
+        #[test]
+        fn a_late_member_is_no_candidate_under_the_v3_window() {
+            let (a, b, c) = (id(1), id(2), id(3));
+            let mut net = Net::new(true, true, vec![a, b, c]);
+            net.fold(100, chain(0), &[(RH, 4_096)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, None), (RH, c, None)]);
+            let close = 102 + reward_draw_window_daa(0, 0, 4_096);
+            let allowed = 101 + service_window_daa_v3(0, 0, 1);
+            assert!(allowed + 1 < close);
+            net.fold(allowed - 1, chain(0), &[], &[(RH, a, Some((0, 1))), (RH, c, Some((0, 1)))]);
+            net.fold(allowed + 1, chain(0), &[], &[(RH, b, Some((0, 1)))]);
+            assert!(net.fold(close, chain(9), &[], &[]).rewards.is_empty(), "the draw waits for the window end");
+            let out = net.fold(net.window_end(&RH) + 1, chain(9), &[], &[]);
+            assert_eq!(out.late, vec![(RH, b)]);
+            assert!(out.rewards.iter().all(|r| r.winner != b));
+        }
+
+        #[test]
+        fn an_open_draw_survives_the_snapshot() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(true, false, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, b, None)]);
+            let snap = net.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], SNAPSHOT_ENCODING_VERSION_QUEUE);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+            let mut restored = Net::new(true, false, vec![a, b]);
+            restored.ledger.restore_snapshot(&parsed);
+            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            assert_eq!(restored.fold(close, chain(9), &[], &[]).rewards, net.fold(close, chain(9), &[], &[]).rewards);
+        }
+
+        #[test]
+        fn the_v3_deadline_is_judged_on_the_median_answer() {
+            let (a, b, c, d) = (id(1), id(2), id(3), id(4));
+            let mut net = Net::new(false, true, vec![a, b, c, d]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            // full budget, no prompt bytes: 150 + 231
+            assert_eq!(net.window_end(&RH), 101 + 381);
+            // 200 generated tokens on 100 prompt tokens: allowed until 101 + 150 + 2 + 180
+            let allowed = 101 + service_window_daa_v3(0, 100, 200);
+            assert_eq!(allowed, 433);
+            net.fold(150, chain(0), &[], &[(RH, a, Some((100, 300)))]);
+            net.fold(allowed, chain(0), &[], &[(RH, b, Some((100, 300)))]);
+            // a padded answer does not move the median nor buy its author time
+            net.fold(allowed + 1, chain(0), &[], &[(RH, c, Some((100, 356)))]);
+            let out = net.fold(net.window_end(&RH) + 1, chain(0), &[], &[]);
+            assert_eq!(Net::struck(&out), vec![c, d]);
+            assert_eq!(out.late, vec![(RH, c)]);
+            assert_eq!(net.ledger.consecutive_misses(&a), 0);
+            assert_eq!(net.ledger.consecutive_misses(&b), 0);
+        }
+
+        #[test]
+        fn without_any_answer_the_v3_window_runs_the_full_budget() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            assert!(net.fold(end, chain(0), &[], &[]).misses.is_empty());
+            assert_eq!(Net::struck(&net.fold(end + 1, chain(0), &[], &[])), vec![a]);
+        }
+
+        #[test]
+        fn an_untraced_answer_is_judged_on_the_full_budget() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let end = net.window_end(&RH);
+            net.fold(end, chain(0), &[], &[(RH, a, None)]);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        /// Misses taken by `a` at the window close after one answer once the audit is armed.
+        fn misses_after_an_armed_answer(untraced_silence: bool, traced: bool) -> usize {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.untraced_silence = untraced_silence;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            assert!(net.ledger.pending.get(&RH).unwrap().audit.is_some(), "the audit must be armed before the answer");
+            net.fold(102, chain(0), &[], &[(RH, a, traced.then_some((4, 20)))]);
+            let end = net.window_end(&RH);
+            net.fold(end + 1, chain(0), &[], &[]).misses.iter().filter(|m| m.miner == a && m.request_hash == RH).count()
+        }
+
+        #[test]
+        fn untraced_response_rule() {
+            assert_eq!(misses_after_an_armed_answer(false, false), 0);
+            assert_eq!(misses_after_an_armed_answer(true, false), 1);
+            assert_eq!(misses_after_an_armed_answer(true, true), 0);
+        }
+
+        /// Misses at the window close when three members answer short and `long` answers a full
+        /// description after the short-answer window but within its own.
+        fn misses_with_a_long_answer_after_short_ones(own_shape: bool) -> (usize, usize) {
+            let (a, b, c, long) = (id(1), id(2), id(3), id(4));
+            let mut net = Net::new(false, true, vec![a, b, c, long]);
+            net.own_shape = own_shape;
+            net.fold(100, chain(0), &[(RH, 2048)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let arm = 101;
+            net.fold(102, chain(0), &[], &[(RH, a, Some((10, 60))), (RH, b, Some((10, 60))), (RH, c, Some((10, 60)))]);
+            let short_window = service_window_daa_v3(0, 10, 50);
+            let own_window = service_window_daa_v3(0, 10, 2000);
+            let at = arm + short_window + 30;
+            assert!(at < arm + own_window, "the long answer must land inside its own window");
+            assert!(at < net.window_end(&RH), "the long answer must land before the audit closes");
+            net.fold(at, chain(0), &[], &[(RH, long, Some((10, 2010)))]);
+            let end = net.window_end(&RH);
+            let misses = net.fold(end + 1, chain(0), &[], &[]).misses;
+            let of = |who: Hash| misses.iter().filter(|m| m.miner == who && m.request_hash == RH).count();
+            (of(long), of(a) + of(b) + of(c))
+        }
+
+        #[test]
+        fn a_long_answer_is_judged_on_its_own_shape_past_the_gate() {
+            assert_eq!(misses_with_a_long_answer_after_short_ones(false), (1, 0));
+            assert_eq!(misses_with_a_long_answer_after_short_ones(true), (0, 0));
+        }
+
+        /// Misses `a` takes on one request when its traced answer is late and its opening never
+        /// comes, in the order they fall.
+        fn misses_of_a_late_unopened_answer(one_miss: bool) -> Vec<bool> {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.one_miss = one_miss;
+            net.fold(100, chain(0), &[(RH, 2048)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let late_at = 101 + service_window_daa_v3(0, 10, 50) + 50;
+            assert!(late_at < net.window_end(&RH), "the answer must land before the audit closes");
+            for daa in 102..late_at {
+                net.fold(daa, chain((daa % 7) as u8), &[], &[]);
+            }
+            let mut misses = Vec::new();
+            net.fold(late_at, chain(1), &[], &[(RH, a, Some((10, 60)))]);
+            for daa in late_at + 1..late_at + 60_000 {
+                let out = net.fold(daa, chain((daa % 7) as u8), &[], &[]);
+                misses.extend(out.misses.iter().filter(|m| m.miner == a && m.request_hash == RH).map(|m| m.opening_missing));
+            }
+            misses
+        }
+
+        #[test]
+        fn a_late_unopened_answer_strikes_once_past_the_gate() {
+            assert_eq!(misses_of_a_late_unopened_answer(false).len(), 2);
+            assert_eq!(misses_of_a_late_unopened_answer(true).len(), 1);
+        }
+
+        /// Identities the trace audits of `RH` still judge once its window resolved, the window
+        /// blocks folded in warmup when `warm`.
+        fn audited_after_the_window(one_miss: bool, warm: bool) -> Vec<Hash> {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.sanction = true;
+            net.one_miss = one_miss;
+            net.fold(100, chain(0), &[(RH, 2048)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let late_at = 101 + service_window_daa_v3(0, 10, 50) + 50;
+            for daa in 102..late_at {
+                net.fold(daa, chain((daa % 7) as u8), &[], &[]);
+            }
+            net.fold(late_at, chain(1), &[], &[(RH, a, Some((10, 60)))]);
+            let end = net.window_end(&RH);
+            for daa in late_at + 1..=end + 1 {
+                net.fold_with(daa, chain((daa % 7) as u8), &[], &[], warm);
+            }
+            assert!(!net.ledger.pending.contains_key(&RH), "the window must have resolved");
+            net.ledger.trace_audits.values().filter(|t| t.request_hash == RH).flat_map(|t| t.identities.clone()).collect()
+        }
+
+        #[test]
+        fn a_resolved_audit_with_no_identity_resolves_again_before_the_gate() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            net.audit_all = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[], &[(RH, a, Some((0, 256)))]);
+            let mut t = net.ledger.trace_audits.values().find(|t| t.request_hash == RH).unwrap().clone();
+            assert_eq!(t.identities, vec![a]);
+            assert_ne!(t.tier, TRACE_TIER_UNKNOWN);
+            t.identities.clear();
+            let mut gated = t.clone();
+            net.ledger.resolve_trace_audit(&mut t, false);
+            assert_eq!(t.identities, vec![a]);
+            net.ledger.resolve_trace_audit(&mut gated, true);
+            assert!(gated.identities.is_empty());
+        }
+
+        #[test]
+        fn a_miss_folded_in_warmup_leaves_the_other_judgements_past_the_gate() {
+            let a = id(1);
+            assert_eq!(audited_after_the_window(false, false), vec![a]);
+            assert_eq!(audited_after_the_window(false, true), vec![a]);
+            assert!(audited_after_the_window(true, false).is_empty());
+            assert!(audited_after_the_window(true, true).is_empty(), "a warmup fold must forget like an incremental one");
+        }
+
+        #[test]
+        fn open_audits_extend_the_queue_of_their_responder() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.audit_all = true;
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, Some((0, 256)))]);
+            net.fold(103, chain(0), &[], &[]);
+            let replays = 3 * service_work_daa(0, 0, 256);
+            let w = net.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
+            assert_eq!(w.queue[1], (replays, false), "b's open audit is work ahead of the next request");
+            assert!(net.window_end(&RH2) >= 103 + replays);
+        }
+
+        #[test]
+        fn the_queue_ahead_extends_the_deadline() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let first_end = net.window_end(&RH);
+            // b already served the first request: only a has it queued
+            net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, None)]);
+            net.fold(103, chain(0), &[], &[]);
+            let queued = service_work_daa(0, 0, 256);
+            assert_eq!(net.window_end(&RH2), 103 + 381 + queued);
+            assert_eq!(net.window_end(&RH), first_end);
+            let w = net.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
+            assert_eq!(w.queue, vec![(queued, false), (0, false)]);
+            net.fold(300, chain(0), &[], &[(RH, a, None)]);
+            // past its own work, inside its own work plus the queue
+            net.fold(103 + 381 + queued, chain(0), &[], &[(RH2, a, Some((0, 256))), (RH2, b, Some((0, 256)))]);
+            assert!(!net.ledger.pending.contains_key(&RH));
+            let out = net.fold(net.window_end(&RH2) + 1, chain(0), &[], &[]);
+            assert_eq!(Net::struck(&out), vec![b]);
+            assert_eq!(out.late, vec![(RH2, b)]);
+        }
+
+        #[test]
+        fn no_lateness_past_the_queue_cap() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            let requests: Vec<([u8; 32], u32)> =
+                (0..SERVICE_QUEUE_CAP as u8 + 2).map(|i| ([i + 10; 32], 256)).collect();
+            net.fold(100, chain(0), &requests, &[]);
+            net.fold(101, chain(0), &[], &[]);
+            let rh = requests[0].0;
+            let w = net.ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
+            assert_eq!(w.queue, vec![(service_work_daa(0, 0, 256) * (SERVICE_QUEUE_CAP as u64 + 1), true)]);
+            let end = net.window_end(&rh);
+            let answers: Vec<Answer> = requests.iter().map(|(h, _)| (*h, a, Some((0, 1)))).collect();
+            net.fold(end, chain(0), &[], &answers);
+            assert!(net.fold(end + 1, chain(0), &[], &[]).misses.is_empty());
+        }
+
+        #[test]
+        fn the_v3_deadline_stays_under_the_ledger_horizon() {
+            let a = id(1);
+            let mut net = Net::new(false, true, vec![a]);
+            let requests: Vec<([u8; 32], u32)> = (0..40u8).map(|i| ([i + 10; 32], 4_096)).collect();
+            net.fold(100, chain(0), &requests, &[]);
+            net.fold(101, chain(0), &[], &[]);
+            assert_eq!(net.window_end(&requests[0].0), 100 + SERVICE_LEDGER_HORIZON_DAA - 2);
+            let out = net.fold(100 + SERVICE_LEDGER_HORIZON_DAA - 1, chain(0), &[], &[]);
+            assert_eq!(out.misses.len(), 1);
+        }
+
+        #[test]
+        fn a_v3_window_survives_the_snapshot() {
+            let (a, b) = (id(1), id(2));
+            let mut net = Net::new(false, true, vec![a, b]);
+            net.fold(100, chain(0), &[(RH, 256)], &[]);
+            net.fold(101, chain(0), &[], &[]);
+            net.fold(150, chain(0), &[], &[(RH, a, Some((100, 300))), (RH, b, None)]);
+            let snap = net.ledger.snapshot();
+            let bytes = snap.to_bytes();
+            assert_eq!(bytes[0], SNAPSHOT_ENCODING_VERSION_QUEUE);
+            let parsed = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed, snap);
+            let mut restored = Net::new(false, true, vec![a, b]);
+            restored.ledger.restore_snapshot(&parsed);
+            assert_eq!(restored.ledger.snapshot().to_bytes(), bytes);
+        }
     }
 }

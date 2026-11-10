@@ -632,6 +632,7 @@ impl RpcApi for KaspaRpcClient {
             GetServiceStrikes,
             GetNetworkModelAvailability,
             GetServiceProviders,
+            GetAwaitedOpenings,
             GetBlock,
             GetBlockCount,
             GetBlockDagInfo,

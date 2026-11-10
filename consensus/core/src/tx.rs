@@ -267,13 +267,18 @@ impl Transaction {
         self.subnetwork_id == subnets::SUBNETWORK_ID_AI_CHALLENGE
     }
 
+    #[inline(always)]
+    pub fn is_ai_opening(&self) -> bool {
+        self.subnetwork_id == subnets::SUBNETWORK_ID_AI_OPENING
+    }
+
     pub fn is_ai_avail(&self) -> bool {
         self.subnetwork_id == subnets::SUBNETWORK_ID_AI_AVAIL
     }
 
-    /// Input-less data-publication transaction (AiResponse, AiChallenge, AiAvail).
+    /// Input-less data-publication transaction (AiResponse, AiChallenge, AiOpening, AiAvail).
     pub fn is_ai_publication(&self) -> bool {
-        self.is_ai_response() || self.is_ai_challenge() || self.is_ai_avail()
+        self.is_ai_response() || self.is_ai_challenge() || self.is_ai_opening() || self.is_ai_avail()
     }
 
     /// Recompute and finalize the tx id based on updated tx fields

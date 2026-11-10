@@ -67,6 +67,24 @@ pub fn pom_seed_h10_active(daa_score: u64) -> bool {
     daa_score >= POM_SEED_H10_ACTIVATION_DAA.load(Ordering::Relaxed)
 }
 
+/// Largest encoded block task opening.
+pub const BLOCK_TASK_MAX_LEN: usize = keryx_verifiable_inference::opening::MAX_BODY_LEN;
+
+/// DAA score at which headers carry the block task root. u64::MAX means "never" — initialised at
+/// startup from `Params::block_task_activation`.
+static BLOCK_TASK_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::block_task_activation`.
+pub fn init_block_task_activation(daa_score: u64) {
+    BLOCK_TASK_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Whether a header at `daa_score` carries the block task root.
+#[inline(always)]
+pub fn block_task_active(daa_score: u64) -> bool {
+    daa_score >= BLOCK_TASK_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
+
 /// DAA score at which the H14 tier lineup applies. u64::MAX means "never" — initialised at startup
 /// from `Params::private_inference_activation`, for the paths that only hold a header.
 static PRIVATE_INFERENCE_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -140,8 +158,7 @@ pub struct PomProof {
     pub pow_value: [u8; 32],
     /// Final walk state `state[K]`; `kHeavyHash(final_state)` must equal `pow_value`.
     pub final_state: u64,
-    /// Merkle path proving `leaf(seed)` is the FIRST trace leaf (index 0) — binds the
-    /// committed trace to this block's canonical seed (no forged start state).
+    /// Merkle path proving `leaf(seed)` is the first trace leaf (index 0).
     pub initial_trace_path: Vec<[u8; 32]>,
     /// Merkle path proving `leaf(final_state)` is the last trace leaf under `trace_root`.
     pub final_trace_path: Vec<[u8; 32]>,
@@ -149,9 +166,7 @@ pub struct PomProof {
     pub openings: Vec<PomOpening>,
     /// H4 recompute-from-chunks walk record: the K chunks the winning walk read, in step
     /// order, each Merkle-proven under `R_T`. When present the verifier re-walks all K
-    /// transitions itself (`verify_pom_proof_v2`) and derives `final_state` — no trace
-    /// tree, no spot-check, nothing taken on the prover's word (the 32/256 spot-check this
-    /// replaces accepted a forged `final_state` ~88% of the time). `None` on every pre-H4
+    /// transitions itself (`verify_pom_proof_v2`) and derives `final_state`. `None` on every pre-H4
     /// proof. Trailing field: on the borsh wire a `None` proof is re-encoded through the
     /// `PomProofPreH4` layout (`to_wire_bytes`) so it stays byte-identical for not-yet-updated
     /// peers; in the node-local bincode DB, old records (written before this field existed)
@@ -169,6 +184,62 @@ pub struct PomProof {
     /// result and `pow_value` = the v4 era fold (nonce-bound). Trailing field, same era-exact
     /// wire mechanism as `v3`: proofs without it re-encode through `PomProofPreV4`.
     pub v4: Option<crate::pom_v4::PomProofV4>,
+    /// Encoded block task opening (`keryx_verifiable_inference::opening::Opening`), at/after
+    /// the block task gate. Trailing field, same era-exact wire mechanism as `v4`: proofs
+    /// without it re-encode through `PomProofPreTask`.
+    pub task: Option<Vec<u8>>,
+}
+
+/// Exact pre-task layout of `PomProof` (through `v4`, no `task`). Decode-fallback and
+/// byte-identical encode source for proofs without the task extension.
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PomProofPreTask {
+    pub tier: u8,
+    pub trace_root: [u8; 32],
+    pub pow_value: [u8; 32],
+    pub final_state: u64,
+    pub initial_trace_path: Vec<[u8; 32]>,
+    pub final_trace_path: Vec<[u8; 32]>,
+    pub openings: Vec<PomOpening>,
+    pub steps_v2: Option<Vec<PomStep>>,
+    pub v3: Option<crate::pom_v3::PomProofV3>,
+    pub v4: Option<crate::pom_v4::PomProofV4>,
+}
+
+impl From<PomProofPreTask> for PomProof {
+    fn from(p: PomProofPreTask) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path,
+            final_trace_path: p.final_trace_path,
+            openings: p.openings,
+            steps_v2: p.steps_v2,
+            v3: p.v3,
+            v4: p.v4,
+            task: None,
+        }
+    }
+}
+
+impl From<&PomProof> for PomProofPreTask {
+    fn from(p: &PomProof) -> Self {
+        Self {
+            tier: p.tier,
+            trace_root: p.trace_root,
+            pow_value: p.pow_value,
+            final_state: p.final_state,
+            initial_trace_path: p.initial_trace_path.clone(),
+            final_trace_path: p.final_trace_path.clone(),
+            openings: p.openings.clone(),
+            steps_v2: p.steps_v2.clone(),
+            v3: p.v3.clone(),
+            v4: p.v4.clone(),
+        }
+    }
 }
 
 /// Exact pre-H4 layout of `PomProof` (no `steps_v2`). Decode-fallback target for legacy
@@ -232,6 +303,7 @@ impl From<PomProofPreV4> for PomProof {
             steps_v2: p.steps_v2,
             v3: p.v3,
             v4: None,
+            task: None,
         }
     }
 }
@@ -265,6 +337,7 @@ impl From<PomProofPreV3> for PomProof {
             steps_v2: p.steps_v2,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 }
@@ -297,6 +370,7 @@ impl From<PomProofPreH4> for PomProof {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         }
     }
 }
@@ -333,7 +407,8 @@ impl PomProof {
             self.steps_v2.as_ref().map_or(0, |steps| steps.iter().map(|s| 32 + path_bytes(&s.weight_path)).sum());
         let v3: usize = self.v3.as_ref().map_or(0, |v3| v3.approx_bytes());
         let v4: usize = self.v4.as_ref().map_or(0, |v4| v4.approx_bytes());
-        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps + v3 + v4
+        let task: usize = self.task.as_ref().map_or(0, Vec::len);
+        1 + 32 + 32 + 8 + path_bytes(&self.initial_trace_path) + path_bytes(&self.final_trace_path) + openings + steps + v3 + v4 + task
     }
 
     /// Canonical wire (borsh) encoding, era-exact: a proof without the v3 extension encodes
@@ -341,8 +416,10 @@ impl PomProof {
     /// layout), so re-served older blocks stay readable by not-yet-updated peers. ALL borsh
     /// encode sites MUST use this instead of `borsh::to_vec`.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        if self.v4.is_some() {
+        if self.task.is_some() {
             borsh::to_vec(self).expect("PomProof borsh serialize")
+        } else if self.v4.is_some() {
+            borsh::to_vec(&PomProofPreTask::from(self)).expect("PomProof borsh serialize")
         } else if self.v3.is_some() {
             borsh::to_vec(&PomProofPreV4::from(self)).expect("PomProof borsh serialize")
         } else if self.steps_v2.is_some() {
@@ -358,15 +435,22 @@ impl PomProof {
     /// the layouts can never be confused. ALL borsh decode sites MUST use this.
     pub fn from_wire_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         borsh::from_slice::<PomProof>(bytes)
+            .or_else(|_| borsh::from_slice::<PomProofPreTask>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV4>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreV3>(bytes).map(PomProof::from))
             .or_else(|_| borsh::from_slice::<PomProofPreH4>(bytes).map(PomProof::from))
     }
 
-    /// Identity of this witness for negative caching: blake3 of the era-exact wire
-    /// encoding. The witness travels outside the block hash, so a failed verification
-    /// must be remembered per (block, witness) — never per block, or a single crafted
-    /// witness would poison a valid hash permanently.
+    /// Identity of this witness for negative caching: blake3 of the era-exact wire encoding,
+    /// remembered per (block, witness).
+    /// Drops the task extension when the block task rule is not active at `daa_score` or when it
+    /// exceeds the largest opening.
+    pub fn sanitize_task(&mut self, daa_score: u64) {
+        if !block_task_active(daa_score) || self.task.as_ref().is_some_and(|t| t.len() > BLOCK_TASK_MAX_LEN) {
+            self.task = None;
+        }
+    }
+
     pub fn wire_digest(&self) -> [u8; 32] {
         *blake3::hash(&self.to_wire_bytes()).as_bytes()
     }
@@ -606,10 +690,8 @@ pub fn pom_block_seed_rewalk_era(pre_pow_hash: &[u8; 32], timestamp: u64, nonce:
 }
 
 
-/// Pre-H5 possession transition (FROZEN — validates all blocks below `h5_activation`). The 4 chunk
-/// words are XOR-folded into a single 64-bit accumulator before one `mix64`, so only their XOR
-/// (8 bytes) is load-bearing — a miner could hold a 4×-smaller possession table. Kept verbatim for
-/// historical re-derivation; never change it.
+/// Pre-H5 possession transition (FROZEN — validates all blocks below `h5_activation`): the 4 chunk
+/// words XOR-folded before one `mix64`. Never change it.
 #[inline]
 fn transition_v1(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
     let mut h = state;
@@ -619,10 +701,8 @@ fn transition_v1(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
     mix64(h)
 }
 
-/// H5 possession transition (active at/after `h5_activation`). `mix64` is chained through each of
-/// the 4 chunk words, so all 32 bytes are load-bearing and order-dependent — the v1 XOR-fold
-/// shortcut is closed and a miner must hold the full chunk. Same weights, same `R_T` (the change is
-/// in the walk, not the weight commitment); only the walk output `final_state` differs per era.
+/// H5 possession transition (active at/after `h5_activation`): `mix64` chained through each of the
+/// 4 chunk words. Same weights, same `R_T`; only the walk output `final_state` differs per era.
 #[inline]
 fn transition_v2(state: u64, chunk: &[u64; POM_CHUNK_WORDS]) -> u64 {
     let mut h = state;
@@ -667,10 +747,7 @@ pub(crate) fn le_leq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 pub(crate) fn verify_merkle(leaf: [u8; 32], index: u64, path: &[[u8; 32]], root: &[u8; 32]) -> bool {
-    // Bound the path to the u64 index bit-width: any Merkle tree addressable by a u64 index has at
-    // most 64 levels, so every honest inclusion path is <= 64 siblings. Rejecting longer paths early
-    // caps verification work — a malicious proof cannot force an unbounded hashing loop — and changes
-    // no accept decision, since an over-length path never hashes to the correct root below anyway.
+    // Paths longer than 64 levels are rejected.
     if path.len() > 64 {
         return false;
     }
@@ -791,12 +868,12 @@ pub fn verify_pom_proof<Hf: Fn(u64) -> [u8; 32]>(
     Ok(())
 }
 
+/// A Merkle inclusion check: leaf, chunk index, sibling path.
+type InclusionCheck<'a> = ([u8; 32], u64, &'a [[u8; 32]]);
+
 /// H4 verifier — recompute-from-chunks. The prover supplies the K chunks its winning walk
 /// read (in step order), each Merkle-proven under the tier root `r_t`; the verifier re-walks
 /// every transition itself, deriving each chunk index (`state % N`) and the `final_state`.
-/// No transition is taken on the prover's word — this closes the soundness hole of the 32/256
-/// spot-check (`verify_pom_proof`), where the 224 unopened transitions let a single honest
-/// walk back a hash-grinded `final_state` with ~88% acceptance.
 ///
 /// Legacy trace-tree fields must be canonically empty (`trace_root == 0`, empty paths and
 /// openings): one canonical encoding per post-H4 proof, no dead 47 KB payload. `final_state`
@@ -829,7 +906,7 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
     // Walk transitions are sequential (each chunk index depends on prior state), but the Merkle
     // inclusion checks are independent once `(leaf, index, path)` are known — parallelise them.
     let mut state = seed;
-    let mut checks: Vec<([u8; 32], u64, &[[u8; 32]])> = Vec::with_capacity(steps.len());
+    let mut checks: Vec<InclusionCheck> = Vec::with_capacity(steps.len());
     for step in steps.iter() {
         let off = state % n_chunks;
         checks.push((blake(&step.chunk), off, step.weight_path.as_slice()));
@@ -861,6 +938,30 @@ pub fn verify_pom_proof_v2<Hf: Fn(u64) -> [u8; 32]>(
         return Err(PomVerifyError::TargetNotMet);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod task_sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn task_is_dropped_before_its_gate() {
+        let mut p = PomProof {
+            tier: 0,
+            trace_root: [0; 32],
+            pow_value: [0; 32],
+            final_state: 0,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: None,
+            v3: None,
+            v4: None,
+            task: Some(vec![1; 10]),
+        };
+        p.sanitize_task(1_000);
+        assert!(p.task.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -965,6 +1066,7 @@ mod verify_tests {
             steps_v2: None,
             v3: None,
             v4: None,
+            task: None,
         };
         (proof, r_t, seed)
     }
@@ -996,6 +1098,7 @@ mod verify_tests {
             steps_v2: Some(steps),
             v3: None,
             v4: None,
+            task: None,
         };
         (proof, r_t)
     }
@@ -1072,27 +1175,24 @@ mod verify_tests {
         assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &[0u8; 32], fh, false), Err(PomVerifyError::TargetNotMet));
     }
 
-    /// The spot-check exploit scenario, replayed against v2: keep one honest walk record but
-    /// grind `final_state`/`pow_value` in pure hashing. Under the 32/256 spot-check this was
-    /// accepted ~88% of the time; under v2 the verifier derives `final_state` from the chunks
-    /// itself, so EVERY forged value is rejected — no probabilistic escape hatch.
+    /// A `final_state` not derived from the chunks is rejected.
     #[test]
-    fn v2_forged_final_state_always_rejected() {
+    fn v2_final_state_mismatch_rejected() {
         let (n, k) = (4096u64, 256u32);
         let seed = pom_seed_state(0xdead);
         let (proof, r_t) = build_v2(n, k, seed, false);
         let pass = [0xffu8; 32];
         assert_eq!(verify_pom_proof_v2(seed, &proof, n, k, &r_t, &pass, fh, false), Ok(()));
 
-        for grind in 0..1000u64 {
-            let forged_state = mix64(proof.final_state ^ grind.wrapping_add(1));
-            let mut forged = proof.clone();
-            forged.final_state = forged_state;
-            forged.pow_value = fh(forged_state); // self-consistent fold, exactly like the exploit
+        for i in 0..1000u64 {
+            let other_state = mix64(proof.final_state ^ i.wrapping_add(1));
+            let mut other = proof.clone();
+            other.final_state = other_state;
+            other.pow_value = fh(other_state);
             assert_eq!(
-                verify_pom_proof_v2(seed, &forged, n, k, &r_t, &pass, fh, false),
+                verify_pom_proof_v2(seed, &other, n, k, &r_t, &pass, fh, false),
                 Err(PomVerifyError::FinalStateMismatch),
-                "forged final_state accepted at grind {grind}"
+                "final_state accepted at {i}"
             );
         }
     }

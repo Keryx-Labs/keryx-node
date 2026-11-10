@@ -229,12 +229,579 @@ mod tests {
         insert(signed_response(&stranger, request_hash, None)).unwrap();
         // The named responder's sealed answer is admitted.
         insert(signed_response(&named, request_hash, Some(body.clone()))).unwrap();
+        // Under the ledger rule, a request still in the mempool admits its named responders only.
+        consensus.set_response_rule(true);
+        assert_eq!(insert(signed_response(&late, request_hash, None)), Err(RuleError::RejectAiResponseNotAwaited(hex::encode(request_hash))));
+        consensus.set_response_rule(false);
 
         // Once the request leaves the mempool (mined), the mempool index forgets it; with no ledger
         // behind the mock, a later body-carrying answer is refused again.
         let block = build_block_transactions(once(request.tx.as_ref()));
         mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block).unwrap();
         assert_eq!(insert(signed_response(&late, request_hash, Some(body))), Err(RuleError::RejectAiResponseBody(hex::encode(request_hash))));
+
+        // Under the ledger rule, a response counts only while the ledger still takes it.
+        consensus.set_response_rule(true);
+        let (fresh, armed) = ([0x33u8; 32], [0x34u8; 32]);
+        let late_key = late.x_only_public_key().0.serialize();
+        // A request a block just carried is not in the ledger yet: its answers still enter.
+        insert(signed_response(&late, request_hash, None)).unwrap();
+        assert_eq!(insert(signed_response(&late, fresh, None)), Err(RuleError::RejectAiResponseNotAwaited(hex::encode(fresh))));
+        consensus.set_unarmed_request(fresh);
+        insert(signed_response(&late, fresh, None)).unwrap();
+        consensus.await_response(armed, late_key, 10);
+        insert(signed_response(&late, armed, None)).unwrap();
+        assert_eq!(insert(signed_response(&stranger, armed, None)), Err(RuleError::RejectAiResponseNotAwaited(hex::encode(armed))));
+    }
+
+    /// Openings are admitted only for a response awaiting one, signed by its escrow key, one per
+    /// piece of a response, feeless, up to the largest opening body.
+    #[test]
+    fn test_ai_opening_admission() {
+        use keryx_consensus_core::collateral::opening_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::{MAX_BODY_LEN, VERSION, VERSION_ATTN, VERSION_RECUR};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        fn opening(keypair: &Keypair, response_txid: [u8; 32], body_len: usize, tamper: bool) -> Transaction {
+            piece(keypair, response_txid, body_len, tamper, VERSION)
+        }
+
+        fn piece(keypair: &Keypair, response_txid: [u8; 32], body_len: usize, tamper: bool, version: u8) -> Transaction {
+            let mut body = vec![0u8; body_len];
+            body[0] = version;
+            body[1..33].copy_from_slice(&response_txid);
+            let sig = keypair.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+            let mut payload = body;
+            payload.extend_from_slice(&keypair.x_only_public_key().0.serialize());
+            payload.extend_from_slice(sig.as_ref());
+            if tamper {
+                payload[40] ^= 1;
+            }
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload)
+        }
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let other = Keypair::from_seckey_slice(SECP256K1, &[2u8; 32]).unwrap();
+        let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let not_awaited = |t: [u8; 32]| Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(t)));
+
+        assert_eq!(insert(opening(&miner, a, 64, false)), not_awaited(a));
+        consensus.await_opening(a, miner.x_only_public_key().0.serialize());
+        consensus.await_opening(b, miner.x_only_public_key().0.serialize());
+        assert_eq!(insert(opening(&other, a, 64, false)), not_awaited(a));
+        assert_eq!(insert(opening(&miner, a, 64, true)), not_awaited(a));
+        insert(opening(&miner, a, 64, false)).unwrap();
+        assert_eq!(insert(opening(&miner, a, 65, false)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(a))));
+        insert(piece(&miner, a, 66, false, VERSION_ATTN)).unwrap();
+        insert(piece(&miner, a, 67, false, VERSION_RECUR)).unwrap();
+        assert_eq!(insert(piece(&miner, a, 68, false, VERSION_ATTN)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(a))));
+        insert(opening(&miner, b, MAX_BODY_LEN, false)).unwrap();
+
+        let phase = |keypair: &Keypair, response_txid: [u8; 32], path: Vec<u64>, filler: u8| {
+            let mut body = keryx_verifiable_inference::opening::AttnOpening { response_txid, path, partials: vec![filler; 8], ..Default::default() }.encode();
+            let sig = keypair.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+            body.extend_from_slice(&keypair.x_only_public_key().0.serialize());
+            body.extend_from_slice(sig.as_ref());
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, body)
+        };
+        let c = [0xC3u8; 32];
+        consensus.await_opening(c, miner.x_only_public_key().0.serialize());
+        assert_eq!(insert(phase(&miner, c, vec![], 1)), not_awaited(c), "no attention phase awaited");
+        consensus.await_attention_path(c, vec![]);
+        insert(phase(&miner, c, vec![], 1)).unwrap();
+        assert_eq!(insert(phase(&miner, c, vec![2], 2)), not_awaited(c), "a path not drawn yet");
+        consensus.await_attention_path(c, vec![2]);
+        insert(phase(&miner, c, vec![2], 2)).unwrap();
+        assert_eq!(insert(phase(&miner, c, vec![3], 3)), not_awaited(c), "another child");
+        assert_eq!(insert(phase(&miner, c, vec![2], 4)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(c))));
+
+        let d = [0xD4u8; 32];
+        consensus.await_opening(d, miner.x_only_public_key().0.serialize());
+        consensus.await_attention_path(d, vec![]);
+        consensus.await_pieces(d, 1);
+        assert_eq!(insert(phase(&miner, d, vec![], 5)), not_awaited(d), "an audit without attention takes no attention phase");
+        assert_eq!(insert(piece(&miner, d, 69, false, VERSION_RECUR)), not_awaited(d), "nor a recurrent piece");
+        insert(opening(&miner, d, 70, false)).unwrap();
+        let e = [0xE5u8; 32];
+        consensus.await_opening(e, miner.x_only_public_key().0.serialize());
+        consensus.await_pieces(e, 2 | 4);
+        assert_eq!(insert(opening(&miner, e, 71, false)), not_awaited(e), "a proven trace piece is not taken again");
+        insert(piece(&miner, e, 72, false, VERSION_RECUR)).unwrap();
+    }
+
+    /// An awaited opening leads the template even when paying transactions fill the block.
+    #[test]
+    fn test_awaited_opening_leads_the_template() {
+        use keryx_consensus_core::collateral::opening_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::{MAX_BODY_LEN, VERSION};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let response_txid = [0xA1u8; 32];
+        consensus.await_opening(response_txid, miner.x_only_public_key().0.serialize());
+        let mut body = vec![0u8; MAX_BODY_LEN];
+        body[0] = VERSION;
+        body[1..33].copy_from_slice(&response_txid);
+        let sig = miner.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+        let mut payload = body;
+        payload.extend_from_slice(&miner.x_only_public_key().0.serialize());
+        payload.extend_from_slice(sig.as_ref());
+        let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+        insert(opening.clone()).unwrap();
+
+        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 2000);
+        for tx in parent_txs {
+            insert(tx).unwrap();
+        }
+        for _ in 0..20 {
+            let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+            assert_eq!(selected[0].id(), opening.id());
+            assert_eq!(selected.iter().filter(|tx| tx.id() == opening.id()).count(), 1);
+            assert!(selected.len() > 1, "paying transactions fill the remaining room");
+        }
+
+        consensus.clear_awaited_opening(&response_txid);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert!(!contained_by(opening.id(), &selected), "fee selection alone leaves the opening out");
+    }
+
+    /// Awaited responses lead the template by deadline, within their share of the block mass.
+    #[test]
+    fn test_awaited_responses_lead_the_template() {
+        use keryx_consensus_core::collateral::responder_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_RESPONSE;
+        use keryx_inference::{AiResponder, AiResponsePayload};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let response = |seed: u8, request_hash: [u8; 32]| {
+            let keypair = Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap();
+            let mut resp = AiResponsePayload::new(request_hash, 1, [0x12u8; 34], 1);
+            let sig = keypair.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+            let escrow_pubkey = keypair.x_only_public_key().0.serialize();
+            resp.responder = Some(AiResponder { escrow_pubkey, signature: *sig.as_ref() });
+            (Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize()), escrow_pubkey)
+        };
+
+        let request_hash = [0x5Au8; 32];
+        let (late, late_key) = response(1, request_hash);
+        let (soon, soon_key) = response(2, request_hash);
+        let (idle, _) = response(3, request_hash);
+        for tx in [late.clone(), soon.clone(), idle.clone()] {
+            insert(tx).unwrap();
+        }
+        consensus.await_response(request_hash, late_key, 50);
+        consensus.await_response(request_hash, soon_key, 10);
+
+        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 4000);
+        for tx in parent_txs {
+            insert(tx).unwrap();
+        }
+
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), soon.id());
+        assert_eq!(selected[1].id(), late.id());
+        assert!(!contained_by(idle.id(), &selected), "a response no audit awaits gets no room");
+
+        consensus.clear_awaited_response(request_hash, soon_key);
+        consensus.clear_awaited_response(request_hash, late_key);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert!(!contained_by(soon.id(), &selected) && !contained_by(late.id(), &selected), "fee selection alone leaves them out");
+    }
+
+    /// A response more urgent than the opening that cannot share its block leads instead.
+    #[test]
+    fn test_an_urgent_response_goes_before_a_heavy_opening() {
+        use keryx_consensus_core::collateral::{opening_signature_message, responder_signature_message};
+        use keryx_consensus_core::subnets::{SUBNETWORK_ID_AI_OPENING, SUBNETWORK_ID_AI_RESPONSE};
+        use keryx_inference::{AiResponder, AiResponsePayload};
+        use keryx_verifiable_inference::opening::{MAX_BODY_LEN, VERSION};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        const SMALL_BLOCK: u64 = 120_000;
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, SMALL_BLOCK, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let key = miner.x_only_public_key().0.serialize();
+        let response_txid = [0xA1u8; 32];
+        consensus.await_opening(response_txid, key);
+        consensus.set_opening_deadline(response_txid, 500);
+        let mut body = vec![0u8; MAX_BODY_LEN];
+        body[0] = VERSION;
+        body[1..33].copy_from_slice(&response_txid);
+        let sig = miner.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+        let mut payload = body;
+        payload.extend_from_slice(&key);
+        payload.extend_from_slice(sig.as_ref());
+        let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+        insert(opening.clone()).unwrap();
+
+        let request_hash = [0x5Au8; 32];
+        let mut resp = AiResponsePayload::new(request_hash, 1, [0x12u8; 34], 1).with_private_body(vec![7u8; 20_000]);
+        let sig = miner.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+        resp.responder = Some(AiResponder { escrow_pubkey: key, signature: *sig.as_ref() });
+        let response = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize());
+        consensus.set_private_recipients(request_hash, vec![key]);
+        insert(response.clone()).unwrap();
+
+        consensus.await_response(request_hash, key, 900);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), opening.id(), "the opening is due first");
+        consensus.await_response(request_hash, key, 100);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), response.id(), "the urgent response that cannot share the block leads");
+        assert!(!selected.iter().any(|tx| tx.id() == opening.id()));
+
+        let light_hash = [0x5Bu8; 32];
+        let mut light = AiResponsePayload::new(light_hash, 1, [0x12u8; 34], 1).with_private_body(vec![7u8; 500]);
+        let sig = miner.sign_schnorr(Message::from_digest(responder_signature_message(&light.signed_bytes())));
+        light.responder = Some(AiResponder { escrow_pubkey: key, signature: *sig.as_ref() });
+        let light = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, light.serialize());
+        consensus.set_private_recipients(light_hash, vec![key]);
+        insert(light.clone()).unwrap();
+        consensus.clear_awaited_response(request_hash, key);
+        consensus.await_response(light_hash, key, 100);
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert_eq!(selected[0].id(), opening.id(), "an urgent response that fits beside the opening does not displace it");
+        assert!(selected.iter().any(|tx| tx.id() == light.id()));
+    }
+
+    /// A full mempool admits openings and responses and never evicts them for a paying transaction.
+    #[test]
+    fn test_full_mempool_keeps_openings_and_responses() {
+        use keryx_consensus_core::collateral::{opening_signature_message, responder_signature_message};
+        use keryx_consensus_core::subnets::{SUBNETWORK_ID_AI_OPENING, SUBNETWORK_ID_AI_RESPONSE};
+        use keryx_inference::{AiResponder, AiResponsePayload};
+        use keryx_verifiable_inference::opening::VERSION;
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 11;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+
+        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 20);
+        let mut paid = parent_txs.into_iter();
+        for tx in paid.by_ref().take(9) {
+            insert(tx).unwrap();
+        }
+
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let response_txid = [0xA1u8; 32];
+        consensus.await_opening(response_txid, miner.x_only_public_key().0.serialize());
+        let mut body = vec![0u8; 64];
+        body[0] = VERSION;
+        body[1..33].copy_from_slice(&response_txid);
+        let sig = miner.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+        let mut payload = body;
+        payload.extend_from_slice(&miner.x_only_public_key().0.serialize());
+        payload.extend_from_slice(sig.as_ref());
+        let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+        let mut resp = AiResponsePayload::new([0x5Au8; 32], 1, [0x12u8; 34], 1);
+        let sig = miner.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+        resp.responder = Some(AiResponder { escrow_pubkey: miner.x_only_public_key().0.serialize(), signature: *sig.as_ref() });
+        let response = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize());
+        consensus.await_response([0x5Au8; 32], miner.x_only_public_key().0.serialize(), 0);
+        let stranger = Keypair::from_seckey_slice(SECP256K1, &[3u8; 32]).unwrap();
+        let mut idle = AiResponsePayload::new([0x5Au8; 32], 1, [0x12u8; 34], 1);
+        let sig = stranger.sign_schnorr(Message::from_digest(responder_signature_message(&idle.signed_bytes())));
+        idle.responder = Some(AiResponder { escrow_pubkey: stranger.x_only_public_key().0.serialize(), signature: *sig.as_ref() });
+        let idle = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, idle.serialize());
+
+        insert(paid.next().unwrap()).unwrap();
+        insert(paid.next().unwrap()).unwrap();
+        insert(opening.clone()).unwrap();
+        insert(response.clone()).unwrap();
+        for tx in paid {
+            insert(tx).unwrap();
+        }
+        assert_eq!(insert(idle), Err(RuleError::RejectMempoolIsFull), "a response no audit awaits does not outbid paying transactions");
+        let selected = mining_manager.build_selector(consensus.as_ref()).select_transactions();
+        assert!(contained_by(opening.id(), &selected));
+        assert!(contained_by(response.id(), &selected));
+    }
+
+    /// A full mempool reads the awaited openings once per virtual score, not once per insertion.
+    #[test]
+    fn test_a_full_mempool_reads_the_awaited_set_once_per_score() {
+        use keryx_consensus_core::collateral::opening_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::VERSION;
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 6;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let response_txid = [0xA1u8; 32];
+        consensus.await_opening(response_txid, miner.x_only_public_key().0.serialize());
+        let mut body = vec![0u8; 64];
+        body[0] = VERSION;
+        body[1..33].copy_from_slice(&response_txid);
+        let sig = miner.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+        let mut payload = body;
+        payload.extend_from_slice(&miner.x_only_public_key().0.serialize());
+        payload.extend_from_slice(sig.as_ref());
+        let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+        insert(opening.clone()).unwrap();
+
+        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 50);
+        let mut paid = parent_txs.into_iter();
+        for tx in paid.by_ref().take(5) {
+            insert(tx).unwrap();
+        }
+        let before = consensus.opening_key_queries();
+        for tx in paid.by_ref().take(35) {
+            insert(tx).unwrap();
+        }
+        assert!(consensus.opening_key_queries() - before <= 1, "{} queries for 35 insertions", consensus.opening_key_queries() - before);
+        assert!(mining_manager.has_transaction(&opening.id(), TransactionQuery::All), "the awaited opening is never evicted");
+
+        consensus.set_virtual_daa_score(1);
+        let before = consensus.opening_key_queries();
+        for tx in paid {
+            insert(tx).unwrap();
+        }
+        assert_eq!(consensus.opening_key_queries() - before, 1, "one read at the new score");
+        assert!(mining_manager.has_transaction(&opening.id(), TransactionQuery::All));
+    }
+
+    /// Templates spread their lead over the openings about due, and keep a lone one in front.
+    #[test]
+    fn test_openings_about_due_share_the_lead() {
+        use keryx_consensus_core::collateral::opening_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::VERSION;
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let opening = |seed: u8, deadline: u64| {
+            let miner = Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap();
+            let response_txid = [seed; 32];
+            consensus.await_opening(response_txid, miner.x_only_public_key().0.serialize());
+            consensus.set_opening_deadline(response_txid, deadline);
+            let mut body = vec![0u8; 64];
+            body[0] = VERSION;
+            body[1..33].copy_from_slice(&response_txid);
+            let sig = miner.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+            let mut payload = body;
+            payload.extend_from_slice(&miner.x_only_public_key().0.serialize());
+            payload.extend_from_slice(sig.as_ref());
+            let tx = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+            .unwrap();
+            tx.id()
+        };
+        consensus.set_virtual_daa_score(10);
+        let (a, b, far, _late) = (opening(1, 50), opening(2, 80), opening(3, 5_000), opening(4, 5));
+        let leads: Vec<TransactionId> = (0..200).map(|_| mining_manager.build_selector(consensus.as_ref()).select_transactions()[0].id()).collect();
+        assert!(leads.iter().all(|id| *id == a || *id == b), "neither an opening far from due nor one past due leads");
+        assert!(leads.contains(&a) && leads.contains(&b), "both openings about due get the lead");
+
+        consensus.set_opening_deadline([2; 32], 3_000);
+        let leads: Vec<TransactionId> = (0..50).map(|_| mining_manager.build_selector(consensus.as_ref()).select_transactions()[0].id()).collect();
+        assert!(leads.iter().all(|id| *id == a), "a lone opening about due always leads");
+        assert!(!leads.contains(&far));
+    }
+
+    /// An opening a block carried enters again while its piece is still awaited.
+    #[test]
+    fn test_an_opening_a_block_carried_enters_again_while_awaited() {
+        use keryx_consensus_core::collateral::opening_signature_message;
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::VERSION;
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let response_txid = [0xA1u8; 32];
+        consensus.await_opening(response_txid, miner.x_only_public_key().0.serialize());
+        let mut body = vec![0u8; 64];
+        body[0] = VERSION;
+        body[1..33].copy_from_slice(&response_txid);
+        let sig = miner.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+        let mut payload = body;
+        payload.extend_from_slice(&miner.x_only_public_key().0.serialize());
+        payload.extend_from_slice(sig.as_ref());
+        let opening = Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload);
+        let (parent_txs, _) = create_arrays_of_parent_and_children_transactions(&consensus, 1);
+        let paid = parent_txs[0].clone();
+        insert(opening.clone()).unwrap();
+        insert(paid.clone()).unwrap();
+
+        let block = build_block_transactions([&opening, &paid].into_iter());
+        mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block).unwrap();
+        assert!(!mining_manager.has_transaction(&opening.id(), TransactionQuery::All));
+        assert_eq!(insert(paid.clone()), Err(RuleError::RejectAlreadyAccepted(paid.id())), "a paying transaction stays accepted");
+        assert_eq!(insert(opening.clone()), Err(RuleError::RejectAlreadyAccepted(opening.id())), "held right after its block");
+        assert!(mining_manager.unknown_transactions(vec![opening.id()]).is_empty(), "not fetched again from peers");
+
+        consensus.set_virtual_daa_score(101);
+        assert_eq!(insert(opening.clone()), Err(RuleError::RejectAlreadyAccepted(opening.id())), "still held one DAA before the end");
+        consensus.set_virtual_daa_score(102);
+        insert(opening.clone()).unwrap();
+
+        mining_manager.handle_new_block_transactions(consensus.as_ref(), 103, &block).unwrap();
+        consensus.set_virtual_daa_score(300);
+        consensus.clear_awaited_opening(&response_txid);
+        assert_eq!(insert(opening), Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(response_txid))), "a proven piece is refused");
+    }
+
+    /// An opening naming its seed block is admitted only when that block gives the awaited draw seed.
+    #[test]
+    fn test_seeded_ai_opening_admission() {
+        use keryx_consensus_core::collateral::{opening_signature_message, trace_seed};
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_OPENING;
+        use keryx_verifiable_inference::opening::{VERSION, VERSION_SEEDED};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        fn opening(keypair: &Keypair, response_txid: [u8; 32], seed_block: Option<[u8; 32]>, filler: u8) -> Transaction {
+            let mut body = vec![filler; 100];
+            body[1..33].copy_from_slice(&response_txid);
+            match seed_block {
+                Some(block) => {
+                    body[0] = VERSION_SEEDED;
+                    body[33..65].copy_from_slice(&block);
+                    body[65] = VERSION;
+                }
+                None => body[0] = VERSION,
+            }
+            let sig = keypair.sign_schnorr(Message::from_digest(opening_signature_message(&body)));
+            let mut payload = body;
+            payload.extend_from_slice(&keypair.x_only_public_key().0.serialize());
+            payload.extend_from_slice(sig.as_ref());
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_OPENING, 0, payload)
+        }
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(
+                consensus.as_ref(),
+                tx,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            ))
+        };
+        let miner = Keypair::from_seckey_slice(SECP256K1, &[1u8; 32]).unwrap();
+        let (a, b) = ([0xA1u8; 32], [0xB2u8; 32]);
+        let (drawn_block, other_block) = ([0x0Du8; 32], [0x0Eu8; 32]);
+        let not_awaited = |t: [u8; 32]| Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(t)));
+        for t in [a, b] {
+            consensus.await_opening(t, miner.x_only_public_key().0.serialize());
+            consensus.await_opening_seed(t, trace_seed(&Hash::from_bytes(drawn_block), &t));
+        }
+
+        assert_eq!(insert(opening(&miner, a, Some(other_block), 1)), not_awaited(a));
+        let first = opening(&miner, a, Some(drawn_block), 2);
+        insert(first.clone()).unwrap();
+        insert(opening(&miner, b, None, 3)).unwrap();
+
+        let mut copy = first.clone();
+        copy.lock_time = 1;
+        copy.finalize();
+        assert!(matches!(insert(copy), Err(RuleError::RejectNonStandard(..))), "a copy outside the signed body");
+
+        consensus.await_opening_seed(a, trace_seed(&Hash::from_bytes(other_block), &a));
+        let redrawn = opening(&miner, a, Some(other_block), 4);
+        insert(redrawn.clone()).unwrap();
+        assert!(!mining_manager.has_transaction(&first.id(), TransactionQuery::All), "the opening of the old draw makes way");
+        assert!(mining_manager.has_transaction(&redrawn.id(), TransactionQuery::All));
+        assert_eq!(insert(opening(&miner, a, Some(other_block), 5)), Err(RuleError::RejectDuplicateAiOpening(hex::encode(a))));
+
+        consensus.await_opening_seed(a, trace_seed(&Hash::from_bytes(drawn_block), &a));
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        assert!(!mining_manager.has_transaction(&redrawn.id(), TransactionQuery::All), "an opening no longer awaited is dropped");
     }
 
     /// Private inference: once the gate is active (the consensus reports a cohort), a request is
@@ -296,7 +863,8 @@ mod tests {
         keys.sort_unstable();
         consensus.set_private_cohort(Some(keys.clone()));
 
-        let request = |funding: u32, prompt: &[u8], pick: &dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]>| {
+        type Pick<'a> = dyn Fn(&[[u8; 32]]) -> Vec<[u8; 32]> + 'a;
+        let request = |funding: u32, prompt: &[u8], pick: &Pick<'_>| {
             let funded = create_transaction_with_utxo_entry(funding, 0);
             let seed = private_cohort_seed(&funded.tx.inputs[0].previous_outpoint);
             let cohort: Vec<Hash> = keys.iter().copied().map(Hash::from_bytes).collect();
@@ -1295,7 +1863,7 @@ mod tests {
 
         // Collect all parent transactions for the next block template.
         // They are ready since they have no parents in the mempool.
-        let transactions = mining_manager.build_selector().select_transactions();
+        let transactions = mining_manager.build_selector(consensus.as_ref()).select_transactions();
         assert_eq!(
             TX_PAIRS_COUNT,
             transactions.len(),

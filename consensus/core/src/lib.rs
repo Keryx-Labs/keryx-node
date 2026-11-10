@@ -37,6 +37,7 @@ pub mod pom;
 pub mod pom_v3;
 pub mod pom_v4;
 pub mod pom_v4_wire;
+pub mod pom_v5;
 pub mod pruning;
 pub mod sign;
 pub mod subnets;

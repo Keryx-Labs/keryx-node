@@ -316,6 +316,10 @@ impl Deref for FlowContext {
     }
 }
 
+fn block_task(block: &Block) -> Option<Vec<u8>> {
+    block.pom_proof.as_ref().and_then(|p| p.task.clone())
+}
+
 impl FlowContext {
     /// PoM guard-rail. A block at/after `pom_activation` MUST carry its possession proof. Serving
     /// it "naked" (proof `None`) is what wedged the network on 2026-06-29: the receiving peer
@@ -371,12 +375,12 @@ impl FlowContext {
         }
         let hash = block.hash();
         if let Some(hit) = self.pom_wire_cache.lock().0.get(&hash) {
-            return EncodedPomProof { legacy: None, deduped: Some(hit.as_ref().clone()) };
+            return EncodedPomProof { legacy: None, deduped: Some(hit.as_ref().clone()), task: block_task(block) };
         }
         let encoded = encode_pom_proof(format, block.header.as_ref(), block.pom_proof.as_ref());
         let Some(bytes) = encoded.deduped else {
             // Compact encoding refused (non-v4 proof, unknown tier, ...). Nothing to cache.
-            return EncodedPomProof { legacy: encoded.legacy, deduped: None };
+            return EncodedPomProof { legacy: encoded.legacy, deduped: None, task: None };
         };
         let shared = Arc::new(bytes);
         {
@@ -391,7 +395,7 @@ impl FlowContext {
                 order.push_back(hash);
             }
         }
-        EncodedPomProof { legacy: None, deduped: Some(shared.as_ref().clone()) }
+        EncodedPomProof { legacy: None, deduped: Some(shared.as_ref().clone()), task: block_task(block) }
     }
 
     /// Queues a block whose possession proof is missing while still within the proof service
@@ -843,6 +847,10 @@ const MINIMUM_KERYXD_PEER_VERSION_H12: (u32, u32, u32) = (1, 6, 0);
 const MINIMUM_KERYXD_PEER_VERSION_H13: (u32, u32, u32) = (1, 6, 1);
 /// Minimum peer version once H14 is active on the local virtual chain.
 const MINIMUM_KERYXD_PEER_VERSION_H14: (u32, u32, u32) = (1, 6, 4);
+/// Minimum peer version once H15 is active on the local virtual chain.
+const MINIMUM_KERYXD_PEER_VERSION_H15: (u32, u32, u32) = (1, 6, 6);
+/// Minimum peer version once H16 is active on the local virtual chain.
+const MINIMUM_KERYXD_PEER_VERSION_H16: (u32, u32, u32) = (1, 6, 7);
 
 /// Extracts the advertised keryxd version from a p2p user-agent string, e.g.
 /// `/keryxd:1.3.42/keryx-labs:0.1/` -> `(1, 3, 42)`. Returns None for non-keryxd agents
@@ -907,7 +915,11 @@ impl ConnectionInitializer for FlowContext {
         // Handshake version gate (local peering policy): reject builds too old to follow our chain
         // before registering any flow — they would only churn IBD noise.
         let virtual_daa = self.consensus().unguarded_session_blocking().get_virtual_daa_score();
-        let min_version = if self.config.private_inference_activation.is_active(virtual_daa) {
+        let min_version = if self.config.uniform_strike_activation.is_active(virtual_daa) {
+            MINIMUM_KERYXD_PEER_VERSION_H16
+        } else if self.config.verifiable_inference_activation.is_active(virtual_daa) {
+            MINIMUM_KERYXD_PEER_VERSION_H15
+        } else if self.config.private_inference_activation.is_active(virtual_daa) {
             MINIMUM_KERYXD_PEER_VERSION_H14
         } else if self.config.exact_verification_activation.is_active(virtual_daa) {
             MINIMUM_KERYXD_PEER_VERSION_H13

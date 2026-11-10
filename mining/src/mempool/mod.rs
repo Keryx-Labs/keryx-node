@@ -13,6 +13,7 @@ use self::{
     tx::Priority,
 };
 use keryx_consensus_core::{
+    api::ConsensusApi,
     block::TemplateTransactionSelector,
     tx::{MutableTransaction, TransactionId},
 };
@@ -30,6 +31,9 @@ pub(crate) mod remove_transaction;
 pub(crate) mod replace_by_fee;
 pub(crate) mod validate_and_insert_transaction;
 
+/// A pending response: its responder escrow key (`None` for an unsigned v1 responder) and tx id.
+type ResponseEntry = (Option<[u8; 32]>, TransactionId);
+
 /// Mempool contains transactions intended to be inserted into a block and mined.
 ///
 /// Some important properties to consider:
@@ -46,6 +50,9 @@ pub(crate) mod validate_and_insert_transaction;
 ///   rebroadcasts them once in a while.
 /// - Transactions received through P2P have **low-priority**. They expire after
 ///   60 seconds and are removed if not inserted in a block for mining.
+/// DAA during which an opening a block carried is refused again.
+const CARRIED_OPENING_HOLD_DAA: u64 = 100;
+
 pub(crate) struct Mempool {
     config: Arc<Config>,
     transaction_pool: TransactionsPool,
@@ -54,15 +61,23 @@ pub(crate) struct Mempool {
     counters: Arc<MiningCounters>,
     /// Deduplication index: request_hash → pending (responder escrow key, tx_id) entries.
     /// One AiResponse per (request, responder); `None` is the unsigned v1 responder.
-    ai_response_index: HashMap<[u8; 32], Vec<(Option<[u8; 32]>, TransactionId)>>,
+    ai_response_index: HashMap<[u8; 32], Vec<ResponseEntry>>,
     /// Deduplication index: response_hash → tx_id. One AiChallenge per response.
     ai_challenge_index: HashMap<[u8; 32], TransactionId>,
+    /// Deduplication index: (response tx id, piece, attention path) → opening tx_id. One opening
+    /// per piece of a response, and per path for an attention phase.
+    ai_opening_index: HashMap<validate_and_insert_transaction::OpeningKey, TransactionId>,
     /// Deduplication index: request_hash → pending (tier, escrow key, tx_id) declarations.
     /// One AiAvail per (request, tier, escrow key).
     ai_avail_index: HashMap<[u8; 32], Vec<(u8, [u8; 32], TransactionId)>>,
     /// Private-inference index: request tx id → the escrow keys the pending AiRequest is sealed
     /// to. Admits a named responder's inline-body AiResponse while its request still sits here.
     ai_private_request_index: HashMap<[u8; 32], Vec<[u8; 32]>>,
+    /// Openings and responses the consensus awaits, as of a virtual DAA score; read when a full
+    /// mempool makes room.
+    awaited_ai_cache: Option<(u64, std::collections::HashSet<TransactionId>)>,
+    /// Openings carried by a recent block, by the DAA score of that block.
+    carried_openings: HashMap<TransactionId, u64>,
 }
 
 impl Mempool {
@@ -78,8 +93,11 @@ impl Mempool {
             counters,
             ai_response_index: HashMap::new(),
             ai_challenge_index: HashMap::new(),
+            ai_opening_index: HashMap::new(),
             ai_avail_index: HashMap::new(),
             ai_private_request_index: HashMap::new(),
+            awaited_ai_cache: None,
+            carried_openings: HashMap::new(),
         }
     }
 
@@ -145,10 +163,16 @@ impl Mempool {
         self.transaction_pool.ready_transaction_total_mass()
     }
 
-    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
-    pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
+    /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier,
+    /// led by an awaited opening if any
+    pub(crate) fn build_selector(&self, consensus: &dyn ConsensusApi) -> Box<dyn TemplateTransactionSelector> {
         let _sw = Stopwatch::<10>::with_threshold("build_selector op");
-        self.transaction_pool.build_selector()
+        let (leads, mass) = self.leading_transactions(consensus);
+        if leads.is_empty() {
+            self.transaction_pool.build_selector()
+        } else {
+            self.transaction_pool.build_selector_leading(leads, mass)
+        }
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier
@@ -176,7 +200,11 @@ impl Mempool {
     pub(crate) fn unknown_transactions(&self, transactions: Vec<TransactionId>) -> Vec<TransactionId> {
         let mut not_in_pools_txs = transactions
             .into_iter()
-            .filter(|transaction_id| !(self.transaction_pool.has(transaction_id) || self.orphan_pool.has(transaction_id)));
+            .filter(|transaction_id| {
+                !(self.transaction_pool.has(transaction_id)
+                    || self.orphan_pool.has(transaction_id)
+                    || self.carried_openings.contains_key(transaction_id))
+            });
         self.accepted_transactions.unaccepted(&mut not_in_pools_txs)
     }
 

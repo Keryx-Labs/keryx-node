@@ -61,6 +61,11 @@ pub trait WindowedProductionPrefixStoreReader {
     }
 }
 
+/// An SPK's window: its cumulative at the window bottom and its `(index, amount)` entries.
+pub type WindowGroup = (ScriptPublicKey, u64, Vec<(u64, u64)>);
+/// A window group keyed by raw bucket bytes, its bottom cumulative not read yet.
+type RawGroup = (Vec<u8>, Option<u64>, Vec<(u64, u64)>);
+
 /// A DB-backed prefix-sum production index. Reads hit committed state directly (no cache layer — the
 /// reverse seek is a single `SeekForPrev` and queries are ~one-per-reward-payout); writes go through
 /// the caller's consensus `WriteBatch` so they commit atomically with the selected-chain change.
@@ -194,7 +199,7 @@ impl DbWindowedProductionPrefixStore {
     /// highest-retained cumulative (see `collapse_below_preserves_queries`). Because it changes no value
     /// the consensus reads, it needs no cross-node coordination (a collapsed and a freshly-built node
     /// return identical `windowed()`), and can never cause a UTXO / consensus divergence.
-    pub fn collapse_below(&self, batch: &mut WriteBatch, floor_index: u64, entry_budget: u64) -> Result<u64, StoreError> {
+    pub fn collapse_below(&self, batch: &mut WriteBatch, floor_index: u64, entry_budget: u64) -> Result<(u64, bool), StoreError> {
         let mut opts = ReadOptions::default();
         opts.set_iterate_range(rocksdb::PrefixRange([self.entries_prefix].as_slice()));
         let it = self.db.iterator_opt(IteratorMode::Start, opts);
@@ -202,8 +207,10 @@ impl DbWindowedProductionPrefixStore {
         // Per-SPK max cumulative among this call's collapsed entries (bucket bytes → cumulative).
         let mut folded: HashMap<Vec<u8>, u64> = HashMap::new();
         let mut deleted = 0u64;
+        let mut complete = true;
         for item in it {
             if deleted >= entry_budget {
+                complete = false;
                 break;
             }
             let (key, value) = item?;
@@ -226,17 +233,17 @@ impl DbWindowedProductionPrefixStore {
             let existing = self.db.get(&fk)?.map(decode_u64).unwrap_or(0);
             batch.put(fk, existing.max(cumulative).to_le_bytes());
         }
-        Ok(deleted)
+        Ok((deleted, complete))
     }
 
     /// Dump, per SPK holding entries in `(bottom, top]`, the cumulative at `bottom` and those
     /// entries, in on-disk bucket order. What a pruning-sample snapshot serializes.
-    pub fn dump_window(&self, bottom: u64, top: u64) -> Result<Vec<(ScriptPublicKey, u64, Vec<(u64, u64)>)>, StoreError> {
+    pub fn dump_window(&self, bottom: u64, top: u64) -> Result<Vec<WindowGroup>, StoreError> {
         let mut opts = ReadOptions::default();
         opts.set_iterate_range(rocksdb::PrefixRange([self.entries_prefix].as_slice()));
         let it = self.db.iterator_opt(IteratorMode::Start, opts);
-        let mut groups: Vec<(Vec<u8>, Option<u64>, Vec<(u64, u64)>)> = Vec::new();
-        let mut cur: Option<(Vec<u8>, Option<u64>, Vec<(u64, u64)>)> = None;
+        let mut groups: Vec<RawGroup> = Vec::new();
+        let mut cur: Option<RawGroup> = None;
         for item in it {
             let (key, value) = item?;
             let index = u64::from_be_bytes(key[key.len() - 8..].try_into().expect("index is 8 bytes"));
@@ -278,7 +285,7 @@ impl DbWindowedProductionPrefixStore {
     /// baseline at the window bottom (written as the floor) and the sparse entries inside it.
     pub fn replace_with_window(
         &self,
-        groups: &[(ScriptPublicKey, u64, Vec<(u64, u64)>)],
+        groups: &[WindowGroup],
         also: impl FnOnce(&mut WriteBatch),
     ) -> Result<(), StoreError> {
         let mut batch = WriteBatch::default();
@@ -521,12 +528,12 @@ mod tests {
         // Tiny budget forces multiple partial passes (incl. mid-bucket cuts).
         loop {
             let mut batch = WriteBatch::default();
-            let n = store.collapse_below(&mut batch, floor_index, 2).unwrap();
+            let (_n, complete) = store.collapse_below(&mut batch, floor_index, 2).unwrap();
             db.write(batch).unwrap();
             for (sb, b, want) in &before {
                 assert_eq!(store.windowed(&spk(*sb), *b, w).unwrap(), *want, "post partial-collapse spk {sb} b {b}");
             }
-            if n == 0 {
+            if complete {
                 break;
             }
         }

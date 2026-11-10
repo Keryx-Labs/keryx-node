@@ -59,7 +59,7 @@ impl DbServiceStrikeStore {
     }
 
     /// The whole log in event order, for the boot load and the refold baseline.
-    pub fn iterator(&self) -> impl Iterator<Item = Result<(Box<[u8]>, StrikeEntry), Box<dyn std::error::Error>>> + '_ {
+    pub fn iterator(&self) -> impl Iterator<Item = super::StoreRow<StrikeEntry>> + '_ {
         self.access.iterator()
     }
 

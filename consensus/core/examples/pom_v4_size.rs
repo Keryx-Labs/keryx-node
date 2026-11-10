@@ -220,6 +220,7 @@ fn v4_proof(tier: u8, tiles: Vec<Vec<u8>>, merkle: Vec<PomV4RangeProof>) -> PomP
         steps_v2: None,
         v3: None,
         v4: Some(PomProofV4 { tier, tiles, merkle }),
+        task: None,
     }
 }
 

@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 
 use crate::mempool::{
     Mempool,
+    model::frontier::feerate_key::FeerateTransactionKey,
     errors::{RuleError, RuleResult},
     model::{
         pool::Pool,
@@ -11,12 +12,24 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::{private_cohort_seed, verify_avail_signature, verify_responder_signature},
+    collateral::{opening_body_piece, private_cohort_seed, trace_seed, verify_avail_signature, verify_opening_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
 use keryx_inference::{AiAvailPayload, AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
+use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
+use rand::{Rng, seq::SliceRandom};
+use std::sync::Arc;
+
+/// Number of awaited openings with the nearest deadlines a template lead is drawn from.
+const LEADING_OPENING_SPREAD: usize = 16;
+
+/// Margin below which the nearest opening deadline leads a template without a draw.
+const LEADING_OPENING_DUE_DAA: u64 = 100;
+
+/// Awaited responses lead a template with at most the block mass over this divisor.
+const LEADING_RESPONSE_MASS_DIVISOR: u64 = 2;
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -30,6 +43,8 @@ impl Mempool {
         transaction.calculated_non_contextual_masses = Some(consensus.calculate_transaction_non_contextual_masses(&transaction.tx));
         self.validate_transaction_in_isolation(&transaction, consensus.get_virtual_daa_score())?;
         self.validate_ai_response_body(consensus, &transaction)?;
+        self.validate_ai_response_awaited(consensus, &transaction)?;
+        self.validate_ai_opening(consensus, &transaction)?;
         self.validate_private_request_coverage(consensus, &transaction)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
         self.populate_mempool_entries(&mut transaction);
@@ -76,6 +91,15 @@ impl Mempool {
         // Perform mempool in-context validations prior to possible RBF replacements
         self.validate_transaction_in_context(&transaction)?;
 
+        if transaction.tx.is_ai_opening() {
+            if let Some(key) = self.awaited_opening_holding_key(consensus, &transaction.tx) {
+                return Err(RuleError::RejectDuplicateAiOpening(hex::encode(key.0)));
+            }
+            if let Some(stale) = ai_opening_key(&transaction.tx.payload).and_then(|key| self.ai_opening_index.get(&key).copied()) {
+                self.remove_transaction(&stale, true, TxRemovalReason::Muted, "")?;
+            }
+        }
+
         // Check double spends and try to remove them if the RBF policy requires it
         let removed_transaction = self.execute_replace_by_fee(&transaction, rbf_policy)?;
 
@@ -89,7 +113,19 @@ impl Mempool {
 
         // Before adding the transaction, check if there is room in the pool
         let transaction_size = transaction.mempool_estimated_bytes();
-        let txs_to_remove = self.transaction_pool.limit_transaction_count(&transaction, transaction_size)?;
+        let awaited = self.ai_tx_awaited(consensus, &transaction.tx);
+        if self.transaction_pool.len() >= self.config.maximum_transaction_count
+            || self.transaction_pool.get_estimated_size() + transaction_size > self.config.mempool_size_limit
+        {
+            let daa = consensus.get_virtual_daa_score();
+            if self.awaited_ai_cache.as_ref().is_none_or(|(at, _)| *at != daa) {
+                self.awaited_ai_cache = Some((daa, self.awaited_ai_ids(consensus)));
+            }
+        }
+        let cache = &self.awaited_ai_cache;
+        let txs_to_remove = self.transaction_pool.limit_transaction_count(&transaction, transaction_size, awaited, |mtx| {
+            cache.as_ref().is_some_and(|(_, ids)| ids.contains(&mtx.id()))
+        })?;
         if !txs_to_remove.is_empty() {
             let transaction_pool_len_before = self.transaction_pool.len();
             for x in txs_to_remove.iter() {
@@ -130,6 +166,10 @@ impl Mempool {
             .mtx
             .tx
             .clone();
+        let now = consensus.get_virtual_daa_score();
+        if awaited && let Some((_, ids)) = self.awaited_ai_cache.as_mut().filter(|(at, _)| *at == now) {
+            ids.insert(accepted_transaction.id());
+        }
 
         // Private-inference requests: remember the named responders while the request is here.
         if accepted_transaction.is_ai_request()
@@ -139,16 +179,21 @@ impl Mempool {
             self.ai_private_request_index.insert(accepted_transaction.id().as_bytes(), envelope.recipient_keys().copied().collect());
         }
         // Register in dedup indexes so no duplicate AI txs for the same hash get in.
-        if accepted_transaction.is_ai_response() {
-            if let Some(resp) = AiResponsePayload::deserialize(&accepted_transaction.payload) {
-                let responder = resp.responder.as_ref().map(|r| r.escrow_pubkey);
-                self.ai_response_index.entry(resp.request_hash).or_default().push((responder, accepted_transaction.id()));
-            }
+        if accepted_transaction.is_ai_response()
+            && let Some(resp) = AiResponsePayload::deserialize(&accepted_transaction.payload)
+        {
+            let responder = resp.responder.as_ref().map(|r| r.escrow_pubkey);
+            self.ai_response_index.entry(resp.request_hash).or_default().push((responder, accepted_transaction.id()));
         }
-        if accepted_transaction.is_ai_challenge() {
-            if let Some(response_hash) = ai_challenge_response_hash(&accepted_transaction.payload) {
-                self.ai_challenge_index.insert(response_hash, accepted_transaction.id());
-            }
+        if accepted_transaction.is_ai_challenge()
+            && let Some(response_hash) = ai_challenge_response_hash(&accepted_transaction.payload)
+        {
+            self.ai_challenge_index.insert(response_hash, accepted_transaction.id());
+        }
+        if accepted_transaction.is_ai_opening()
+            && let Some(key) = ai_opening_key(&accepted_transaction.payload)
+        {
+            self.ai_opening_index.insert(key, accepted_transaction.id());
         }
         if accepted_transaction.is_ai_avail() {
             if let Some(avail) = AiAvailPayload::deserialize(&accepted_transaction.payload) {
@@ -176,36 +221,36 @@ impl Mempool {
         }
 
         // One AiResponse per (request, responder), with a per-request cap. A V2 responder
-        // signature must verify so the dedup key cannot be forged by third parties.
-        if transaction.tx.is_ai_response() {
-            if let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) {
-                // A V3 payload is only block-valid past the model-split gate; admitting one
-                // earlier would put an invalid transaction into every honest template.
-                if resp.is_v3() {
-                    if virtual_daa < self.config.model_split_activation_daa {
-                        return Err(RuleError::RejectAiResponseLinksBeforeActivation(hex::encode(resp.request_hash)));
-                    }
-                    let signed = resp.signed_bytes();
-                    if resp.links.iter().any(|l| !verify_responder_signature(&l.escrow_pubkey, &l.signature, &signed)) {
+        // signature must verify.
+        if transaction.tx.is_ai_response()
+            && let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload)
+        {
+            // A V3 payload is only block-valid past the model-split gate; admitting one
+            // earlier would put an invalid transaction into every honest template.
+            if resp.is_v3() {
+                if virtual_daa < self.config.model_split_activation_daa {
+                    return Err(RuleError::RejectAiResponseLinksBeforeActivation(hex::encode(resp.request_hash)));
+                }
+                let signed = resp.signed_bytes();
+                if resp.links.iter().any(|l| !verify_responder_signature(&l.escrow_pubkey, &l.signature, &signed)) {
+                    return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
+                }
+            }
+            let responder = match resp.responder.as_ref() {
+                Some(r) => {
+                    if !verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()) {
                         return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
                     }
+                    Some(r.escrow_pubkey)
                 }
-                let responder = match resp.responder.as_ref() {
-                    Some(r) => {
-                        if !verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()) {
-                            return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
-                        }
-                        Some(r.escrow_pubkey)
-                    }
-                    None => None,
-                };
-                if let Some(entries) = self.ai_response_index.get(&resp.request_hash) {
-                    if entries.iter().any(|(key, _)| *key == responder) {
-                        return Err(RuleError::RejectDuplicateAiResponse(hex::encode(resp.request_hash)));
-                    }
-                    if entries.len() >= MAX_PENDING_AI_RESPONSES_PER_REQUEST {
-                        return Err(RuleError::RejectAiResponsesSaturated(hex::encode(resp.request_hash)));
-                    }
+                None => None,
+            };
+            if let Some(entries) = self.ai_response_index.get(&resp.request_hash) {
+                if entries.iter().any(|(key, _)| *key == responder) {
+                    return Err(RuleError::RejectDuplicateAiResponse(hex::encode(resp.request_hash)));
+                }
+                if entries.len() >= MAX_PENDING_AI_RESPONSES_PER_REQUEST {
+                    return Err(RuleError::RejectAiResponsesSaturated(hex::encode(resp.request_hash)));
                 }
             }
         }
@@ -230,12 +275,11 @@ impl Mempool {
             }
         }
         // One AiChallenge per response: reject if a challenge for the same response_hash is already pending.
-        if transaction.tx.is_ai_challenge() {
-            if let Some(response_hash) = ai_challenge_response_hash(&transaction.tx.payload) {
-                if self.ai_challenge_index.contains_key(&response_hash) {
-                    return Err(RuleError::RejectDuplicateAiChallenge(hex::encode(response_hash)));
-                }
-            }
+        if transaction.tx.is_ai_challenge()
+            && let Some(response_hash) = ai_challenge_response_hash(&transaction.tx.payload)
+            && self.ai_challenge_index.contains_key(&response_hash)
+        {
+            return Err(RuleError::RejectDuplicateAiChallenge(hex::encode(response_hash)));
         }
 
         if !self.config.accept_non_standard {
@@ -246,8 +290,7 @@ impl Mempool {
 
     /// Admission policy for inline response bodies (private inference): an AiResponse carrying
     /// one is accepted only from a responder its request was sealed to, while that request is
-    /// pending here or in the service ledger. Bodies run up to 32 KiB and AiResponses pay no
-    /// fee, so without this any key could relay large free transactions. Policy only — a block
+    /// pending here or in the service ledger. Policy only — a block
     /// that includes such a response is judged by consensus alone.
     fn validate_ai_response_body(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
         if !transaction.tx.is_ai_response() {
@@ -268,6 +311,178 @@ impl Mempool {
             return Err(RuleError::RejectAiResponseBody(hex::encode(resp.request_hash)));
         }
         Ok(())
+    }
+
+    /// Admission policy for responses once the ledger rule is active: from a responder named by
+    /// a request still pending here, answering a request a block just carried, or one the ledger
+    /// still takes. Policy only.
+    fn validate_ai_response_awaited(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_response() {
+            return Ok(());
+        }
+        let Some(resp) = AiResponsePayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
+        let escrow = resp.responder.as_ref().map(|r| r.escrow_pubkey);
+        if consensus.ai_response_admission(&resp.request_hash, escrow.as_ref()) != Some(false) {
+            return Ok(());
+        }
+        let named_here = escrow.is_some_and(|e| self.ai_private_request_index.get(&resp.request_hash).is_some_and(|keys| keys.contains(&e)));
+        let just_mined = self.accepted_transactions.has(&TransactionId::from_bytes(resp.request_hash));
+        if !named_here && !just_mined {
+            return Err(RuleError::RejectAiResponseNotAwaited(hex::encode(resp.request_hash)));
+        }
+        Ok(())
+    }
+
+    /// Admission policy for openings: signed by the escrow key of a drawn response that still
+    /// awaits its opening, naming, if any, the seed block of that draw, proving a piece the
+    /// response still owes, and for an attention phase, built for the path the response awaits.
+    /// Policy only.
+    fn validate_ai_opening(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_opening() {
+            return Ok(());
+        }
+        if self.carried_openings.get(&transaction.id()).is_some_and(|&at| consensus.get_virtual_daa_score() < at + super::CARRIED_OPENING_HOLD_DAA) {
+            return Err(RuleError::RejectAlreadyAccepted(transaction.id()));
+        }
+        let response_txid = ai_opening_response_txid(&transaction.tx.payload);
+        let awaited = self.opening_awaited(consensus, &transaction.tx)
+            && SignedPayload::split(&transaction.tx.payload).is_some_and(|s| verify_opening_signature(&s.escrow_pubkey, &s.signature, s.body));
+        if !awaited {
+            return Err(RuleError::RejectAiOpeningNotAwaited(hex::encode(response_txid.unwrap_or_default())));
+        }
+        if let Some(key) = self.awaited_opening_holding_key(consensus, &transaction.tx) {
+            return Err(RuleError::RejectDuplicateAiOpening(hex::encode(key.0)));
+        }
+        Ok(())
+    }
+
+    /// Key of `tx` when an opening still awaited already holds it in the mempool.
+    fn awaited_opening_holding_key(&self, consensus: &dyn ConsensusApi, tx: &Transaction) -> Option<OpeningKey> {
+        let key = ai_opening_key(&tx.payload)?;
+        let held = self.ai_opening_index.get(&key).filter(|id| **id != tx.id())?;
+        let held = self.transaction_pool.get(held)?;
+        self.opening_awaited(consensus, &held.mtx.tx).then_some(key)
+    }
+
+    /// Transactions to lead a template, with their total mass: awaited responses by deadline
+    /// within a share of the block mass, ahead of them an awaited opening that fits beside the
+    /// more urgent ones.
+    pub(crate) fn leading_transactions(&self, consensus: &dyn ConsensusApi) -> (Vec<Arc<Transaction>>, u64) {
+        let max_mass = self.config.maximum_mass_per_block;
+        let entries: Vec<(([u8; 32], [u8; 32]), TransactionId)> = self
+            .ai_response_index
+            .iter()
+            .flat_map(|(request_hash, entries)| entries.iter().filter_map(move |(escrow, id)| Some(((*request_hash, (*escrow)?), *id))))
+            .collect();
+        let keys: Vec<([u8; 32], [u8; 32])> = entries.iter().map(|(k, _)| *k).collect();
+        let mut due: Vec<(u64, TransactionId)> =
+            consensus.awaited_response_deadlines(&keys).into_iter().zip(&entries).filter_map(|(d, (_, id))| Some((d?, *id))).collect();
+        due.shuffle(&mut rand::thread_rng());
+        due.sort_by_key(|(deadline, _)| *deadline);
+        let mut responses: Vec<(u64, &MempoolTransaction, u64)> = Vec::new();
+        let mut response_mass = 0;
+        for (deadline, id) in due {
+            let Some(tx) = self.transaction_pool.get(&id).filter(|tx| tx.mtx.tx.inputs.is_empty()) else { continue };
+            let tx_mass = FeerateTransactionKey::from(tx).mass;
+            if response_mass + tx_mass <= max_mass / LEADING_RESPONSE_MASS_DIVISOR {
+                response_mass += tx_mass;
+                responses.push((deadline, tx, tx_mass));
+            }
+        }
+        let fits = |opening_mass: u64, deadline: u64| {
+            opening_mass + responses.iter().filter(|(d, _, _)| *d < deadline).map(|(_, _, m)| m).sum::<u64>() <= max_mass
+        };
+        let opening = self
+            .leading_openings(consensus)
+            .into_iter()
+            .map(|(tx, deadline)| (tx, deadline, FeerateTransactionKey::from(tx).mass))
+            .find(|(_, deadline, m)| fits(*m, *deadline));
+        let mut leads = Vec::new();
+        let mut mass = 0;
+        if let Some((tx, _, m)) = opening {
+            leads.push(tx.mtx.tx.clone());
+            mass += m;
+        }
+        for (_, tx, m) in responses {
+            if mass + m <= max_mass {
+                leads.push(tx.mtx.tx.clone());
+                mass += m;
+            }
+        }
+        (leads, mass)
+    }
+
+    /// Awaited openings to lead a template with their deadlines: first the one drawn among the
+    /// openings about due (among the nearest deadlines when none is), then the others by deadline.
+    fn leading_openings(&self, consensus: &dyn ConsensusApi) -> Vec<(&MempoolTransaction, u64)> {
+        let now = consensus.get_virtual_daa_score();
+        let mut due: Vec<(u64, TransactionId)> = self
+            .ai_opening_index
+            .values()
+            .filter_map(|id| {
+                let tx = self.transaction_pool.get(id).filter(|tx| tx.mtx.tx.inputs.is_empty() && self.opening_awaited(consensus, &tx.mtx.tx))?;
+                let txid = ai_opening_response_txid(&tx.mtx.tx.payload)?;
+                consensus.awaited_opening_deadline(&txid).filter(|&deadline| deadline >= now).map(|deadline| (deadline, *id))
+            })
+            .collect();
+        due.sort_unstable();
+        let soon = now + LEADING_OPENING_DUE_DAA;
+        let urgent = due.iter().take_while(|(deadline, _)| *deadline <= soon).count();
+        let spread = if urgent > 0 { urgent } else { due.len() }.min(LEADING_OPENING_SPREAD);
+        if spread > 1 {
+            let pick = rand::thread_rng().gen_range(0..spread);
+            due[..=pick].rotate_right(1);
+        }
+        due.into_iter().filter_map(|(deadline, id)| self.transaction_pool.get(&id).map(|tx| (tx, deadline))).collect()
+    }
+
+    /// Whether `tx` is an opening or a response the consensus awaits.
+    fn ai_tx_awaited(&self, consensus: &dyn ConsensusApi, tx: &Transaction) -> bool {
+        if tx.is_ai_opening() {
+            return self.opening_awaited(consensus, tx);
+        }
+        if !tx.is_ai_response() {
+            return false;
+        }
+        AiResponsePayload::deserialize(&tx.payload)
+            .and_then(|r| Some((r.request_hash, r.responder?.escrow_pubkey)))
+            .is_some_and(|(rh, escrow)| consensus.awaited_response_deadline(&rh, &escrow).is_some())
+    }
+
+    /// Ids of the openings and responses in the mempool the consensus awaits.
+    fn awaited_ai_ids(&self, consensus: &dyn ConsensusApi) -> std::collections::HashSet<TransactionId> {
+        let mut ids: std::collections::HashSet<TransactionId> = self
+            .ai_opening_index
+            .values()
+            .filter(|id| self.transaction_pool.get(id).is_some_and(|tx| self.opening_awaited(consensus, &tx.mtx.tx)))
+            .copied()
+            .collect();
+        let entries: Vec<(([u8; 32], [u8; 32]), TransactionId)> = self
+            .ai_response_index
+            .iter()
+            .flat_map(|(request_hash, entries)| entries.iter().filter_map(move |(escrow, id)| Some(((*request_hash, (*escrow)?), *id))))
+            .collect();
+        let keys: Vec<([u8; 32], [u8; 32])> = entries.iter().map(|(k, _)| *k).collect();
+        ids.extend(consensus.awaited_response_deadlines(&keys).into_iter().zip(&entries).filter_map(|(d, (_, id))| d.map(|_| *id)));
+        ids
+    }
+
+    /// Openings in the mempool the consensus no longer awaits.
+    pub(crate) fn collect_stale_openings(&self, consensus: &dyn ConsensusApi) -> Vec<TransactionId> {
+        self.ai_opening_index
+            .values()
+            .filter(|id| self.transaction_pool.get(id).is_none_or(|tx| !self.opening_awaited(consensus, &tx.mtx.tx)))
+            .copied()
+            .collect()
+    }
+
+    /// Whether `tx` is an opening the consensus still awaits.
+    fn opening_awaited(&self, consensus: &dyn ConsensusApi, tx: &Transaction) -> bool {
+        let (Some(s), Some(txid)) = (SignedPayload::split(&tx.payload), ai_opening_response_txid(&tx.payload)) else { return false };
+        consensus.awaited_opening_key(&txid) == Some(s.escrow_pubkey)
+            && seed_block(s.body).is_none_or(|b| consensus.awaited_opening_seed(&txid) == Some(trace_seed(&keryx_hashes::Hash::from_bytes(b), &txid)))
+            && attn_path(s.body).is_none_or(|p| consensus.awaited_attention_path(&txid) == Some(p))
+            && consensus.awaited_opening_pieces(&txid).is_some_and(|m| m & opening_body_piece(s.body) != 0)
     }
 
     /// Admission policy for private requests: the envelope must cover the whole target cohort its
@@ -399,4 +614,17 @@ const MAX_PENDING_AI_AVAILS_PER_REQUEST: usize = 1_024;
 
 fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiChallengePayload::deserialize(payload).map(|c| c.response_hash)
+}
+
+pub(crate) fn ai_opening_response_txid(payload: &[u8]) -> Option<[u8; 32]> {
+    SignedPayload::split(payload)?.body.get(1..33)?.try_into().ok()
+}
+
+/// Response, proven piece and attention path of an opening.
+pub(crate) type OpeningKey = ([u8; 32], u8, Vec<u64>);
+
+/// Key of an opening in the mempool: its response, the piece it proves and its attention path.
+pub(crate) fn ai_opening_key(payload: &[u8]) -> Option<OpeningKey> {
+    let body = SignedPayload::split(payload)?.body;
+    Some((body.get(1..33)?.try_into().ok()?, opening_body_piece(body), attn_path(body).unwrap_or_default()))
 }

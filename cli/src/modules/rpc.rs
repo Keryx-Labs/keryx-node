@@ -247,6 +247,10 @@ impl Rpc {
                 let result = rpc.get_network_model_availability_call(None, GetNetworkModelAvailabilityRequest {}).await?;
                 self.println(&ctx, result);
             }
+            RpcApiOps::GetAwaitedOpenings => {
+                let result = rpc.get_awaited_openings_call(None, GetAwaitedOpeningsRequest::default()).await?;
+                self.println(&ctx, result);
+            }
             RpcApiOps::GetServiceProviders => {
                 let result = rpc.get_service_providers_call(None, GetServiceProvidersRequest::default()).await?;
                 self.println(&ctx, result);
