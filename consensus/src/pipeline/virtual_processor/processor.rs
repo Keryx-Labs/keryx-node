@@ -213,6 +213,8 @@ pub struct VirtualStateProcessor {
     pub(super) attention_activation: ForkActivation,
     /// Ratio-reward v3 table activation (see `params.ratio_reward_v3_activation`).
     pub(super) ratio_reward_v3_activation: ForkActivation,
+    /// Ratio-reward probation rule activation (see `params.ratio_probation_activation`).
+    pub(super) ratio_probation_activation: ForkActivation,
     /// Stage-2 trace rule activation (see `params.trace_chain_activation`).
     pub(super) trace_chain_activation: ForkActivation,
     pub(super) finality_depth: u64,
@@ -460,6 +462,7 @@ impl VirtualStateProcessor {
             trace_seed_bind_activation: params.trace_seed_bind_activation,
             attention_activation: params.attention_activation,
             ratio_reward_v3_activation: params.ratio_reward_v3_activation,
+            ratio_probation_activation: params.ratio_probation_activation,
             trace_chain_activation: params.trace_chain_activation,
             finality_depth: params.finality_depth(),
             pruning_point_store: storage.pruning_point_store.clone(),

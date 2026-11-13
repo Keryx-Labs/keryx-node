@@ -2677,3 +2677,176 @@ async fn suspended_non_selected_blue_is_burned() {
     ctx.validate_and_insert_block(burning.block.to_immutable()).await;
     assert_eq!(ctx.consensus.block_status(hash), BlockStatus::StatusUTXOValid);
 }
+
+/// The probation slices resolved with the ratio window match a direct sum over the chain blocks
+/// whose daa lies in each slice, on the committed chain and on a deep side chain, with several
+/// producers and merged parallel blocks so that chain index and daa diverge.
+#[tokio::test]
+async fn ratio_probation_slices_match_direct_sums() {
+    use crate::model::stores::headers::HeaderStoreReader;
+    use crate::model::stores::selected_chain::SelectedChainStoreReader;
+    use crate::pipeline::virtual_processor::utxo_validation::ProductionWindowCtx;
+    use keryx_consensus_core::coinbase::MinerData;
+    use keryx_consensus_core::config::params::{ForkActivation, RATIO_PROBATION_SLICES};
+    use keryx_consensus_core::tx::ScriptPublicKey;
+
+    const WINDOW: u64 = 64;
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_level_activation = ForkActivation::always();
+            p.pom_v3_activation = ForkActivation::always();
+            p.ratio_probation_activation = ForkActivation::always();
+            p.ratio_reward_window_daa = WINDOW;
+        })
+        .build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let producers: Vec<ScriptPublicKey> = (1..=5u8).map(|k| ScriptPublicKey::from_vec(0, vec![k; 3])).collect();
+    let mut nonce = 0u64;
+    let mut add = |hash: Hash, parents: Vec<Hash>| {
+        nonce += 1;
+        let spk = producers[(nonce % producers.len() as u64) as usize].clone();
+        let md = MinerData::new(spk, keryx_inference::gen_opoi_extra_data(0));
+        tc.validate_and_insert_block(tc.build_utxo_valid_block_with_parents(hash, parents, md, vec![]).to_immutable())
+            .virtual_state_task
+    };
+
+    const MAIN: u64 = 7_200_000;
+    const PAR: u64 = 7_250_000;
+    const SIDE: u64 = 7_300_000;
+    let main = |n: u64| Hash::from(MAIN + n);
+    let side = |n: u64| Hash::from(SIDE + n);
+    // Every third step two parallel blocks are merged by the next main block.
+    let mut parent = config.genesis.hash;
+    for n in 1..=200u64 {
+        if n % 3 == 0 {
+            let (a, b) = (Hash::from(PAR + 2 * n), Hash::from(PAR + 2 * n + 1));
+            add(a, vec![parent]).await.unwrap();
+            add(b, vec![parent]).await.unwrap();
+            add(main(n), vec![a, b]).await.unwrap();
+        } else {
+            add(main(n), vec![parent]).await.unwrap();
+        }
+        parent = main(n);
+    }
+    // A long linear branch off main block 100: lighter than the main chain, so its tip stays off it.
+    let fork = main(100);
+    let mut parent = fork;
+    for n in 1..=70u64 {
+        add(side(n), vec![parent]).await.unwrap();
+        parent = side(n);
+    }
+
+    let vp = tc.virtual_processor().clone();
+    let slice = WINDOW / RATIO_PROBATION_SLICES;
+    let daa = |h: Hash| vp.headers_store.get_daa_score(h).unwrap();
+    let sum_over = |blocks: &[Hash], spk: &ScriptPublicKey, lo: u64, hi: u64| -> u64 {
+        blocks
+            .iter()
+            .filter(|h| daa(**h) > lo && daa(**h) <= hi)
+            .map(|h| vp.block_productions(*h).iter().filter(|(s, _)| s == spk).map(|(_, c)| *c).sum::<u64>())
+            .sum()
+    };
+
+    let chain: Vec<Hash> = {
+        let sc = vp.selected_chain_store.read();
+        let (tip_idx, _) = sc.get_tip().unwrap();
+        (1..=tip_idx).map(|i| sc.get_by_index(i).unwrap()).collect()
+    };
+    assert_eq!(chain.last(), Some(&main(200)), "the main chain must stay selected");
+    let tip_idx = chain.len() as u64;
+    assert!(daa(main(200)) > tip_idx + 50, "merged parallel blocks must spread daa away from the chain index");
+
+    let check = |m_sp: Hash, own_chain: &[Hash], case_b: bool, slices_with_side: bool| {
+        let (window, slices) = vp.production_window_ctxs(m_sp, 0, true);
+        let (oldest, latest) = slices.expect("slices are resolved in the daa era");
+        assert_eq!(matches!(window, ProductionWindowCtx::SideChain { .. }), case_b);
+        if let (ProductionWindowCtx::SideChain { side_by_spk, .. }, true) = (&oldest, slices_with_side) {
+            assert!(side_by_spk.values().any(|v| *v > 0), "the oldest slice must reach side blocks");
+        }
+        let top = daa(m_sp);
+        let bottom = top - WINDOW;
+        let mut olds = Vec::new();
+        for spk in producers.iter() {
+            let w = vp.windowed_production_with_ctx(spk, &window);
+            assert_eq!(w, sum_over(own_chain, spk, bottom, top));
+            let o = vp.windowed_production_with_ctx(spk, &oldest);
+            let l = vp.windowed_production_with_ctx(spk, &latest);
+            assert_eq!(o, sum_over(own_chain, spk, bottom, bottom + slice));
+            assert_eq!(l, sum_over(own_chain, spk, top - slice, top));
+            olds.push(o);
+        }
+        assert!(olds.iter().any(|v| *v > 0), "the oldest slice must carry production");
+    };
+
+    for n in [90u64, 120, 150, 199, 200] {
+        check(main(n), &chain, false, false);
+    }
+    let fork_pos = chain.iter().position(|h| *h == fork).unwrap();
+    let mut side_chain: Vec<Hash> = chain[..=fork_pos].to_vec();
+    for n in 1..=70u64 {
+        side_chain.push(side(n));
+        // From 57 side blocks on, the oldest slice reaches above the fork.
+        check(side(n), &side_chain, true, n >= 57);
+    }
+
+    tc.shutdown(handles);
+}
+
+/// Ratio bracket of B's last block, with the probation gate off or on.
+async fn probation_bracket_of_last_block(probation: bool, continuous: bool) -> u64 {
+    use crate::model::stores::virtual_state::VirtualStateStoreReader;
+    use keryx_consensus_core::coinbase::MinerData;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_consensus_core::tx::ScriptPublicKey;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.pom_level_activation = ForkActivation::always();
+            p.pom_v3_activation = ForkActivation::always();
+            p.ratio_reward_activation = ForkActivation::always();
+            p.ratio_reward_v3_activation = ForkActivation::never();
+            p.coin_age_activation = ForkActivation::never();
+            p.ratio_probation_activation = if probation { ForkActivation::always() } else { ForkActivation::never() };
+            p.ratio_reward_window_daa = 64;
+        })
+        .build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+
+    let a = ScriptPublicKey::from_vec(0, vec![0xa1; 3]);
+    let b = ScriptPublicKey::from_vec(0, vec![0xb2; 3]);
+    let mut parent = config.genesis.hash;
+    for n in 1..=503u64 {
+        let spk = if continuous || !(401..=500).contains(&n) { b.clone() } else { a.clone() };
+        let hash = Hash::from(7_400_000 + n);
+        let md = MinerData::new(spk, keryx_inference::gen_opoi_extra_data(0));
+        tc.validate_and_insert_block(tc.build_utxo_valid_block_with_parents(hash, vec![parent], md, vec![]).to_immutable())
+            .virtual_state_task
+            .await
+            .unwrap();
+        parent = hash;
+    }
+
+    let vp = tc.virtual_processor().clone();
+    let state = vp.virtual_stores.read().state.get().unwrap();
+    let map = vp.ratio_bps_by_block(&state.ghostdag_data, &state.mergeset_non_daa, &state.mergeset_rewards, state.daa_score, &[]);
+    let bps = *map.get(&Hash::from(7_400_000 + 503)).expect("the last block is a rewarded blue of the virtual");
+    tc.shutdown(handles);
+    bps
+}
+
+/// The probation gate lowers a returning address's bracket and leaves a continuous producer's unchanged.
+#[tokio::test]
+async fn ratio_probation_lowers_the_bracket_of_a_returning_address_only() {
+    let returning_off = probation_bracket_of_last_block(false, false).await;
+    let returning_on = probation_bracket_of_last_block(true, false).await;
+    assert!(returning_on < returning_off, "returning address: {returning_on} bps with probation, {returning_off} without");
+
+    let continuous_off = probation_bracket_of_last_block(false, true).await;
+    let continuous_on = probation_bracket_of_last_block(true, true).await;
+    assert_eq!(continuous_on, continuous_off, "a continuous producer keeps its bracket");
+}

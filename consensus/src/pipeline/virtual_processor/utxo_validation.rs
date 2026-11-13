@@ -34,7 +34,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, ratio_on_probation, ratio_probation_production, RATIO_PROBATION_FLOOR_BLOCKS, RATIO_PROBATION_SLICES, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -904,7 +904,12 @@ impl VirtualStateProcessor {
         let w = self.ratio_reward_window;
         // Window context depends only on the block's selected parent — resolve it ONCE and share it
         // across every rewarded blue (it embeds the full side-chain aggregation in the Case B shape).
-        let window_ctx = self.production_window_ctx(ghostdag_data.selected_parent, w);
+        let probation_active = self.ratio_probation_activation.is_active(pov_daa_score);
+        let (window_ctx, probation_ctx) = self.production_window_ctxs(ghostdag_data.selected_parent, w, probation_active);
+        let production_floor =
+            if probation_active { prod_floor.saturating_mul(RATIO_PROBATION_FLOOR_BLOCKS) } else { prod_floor };
+        let ratio_debug = std::env::var("KERYX_RATIO_DEBUG").is_ok();
+        let mut debug_prod: BlockHashMap<(u64, bool)> = BlockHashMap::new();
         for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
             // Payout SPK = the blue's own miner cut, already resolved into the reward data.
             if let Some(reward) = mergeset_rewards.get(blue) {
@@ -916,7 +921,18 @@ impl VirtualStateProcessor {
                     let delta: i128 = view_diffs.iter().map(|d| balance_delta_for_spk(d, spk)).sum();
                     (base + delta).max(0) as u64
                 };
-                let production = self.windowed_production_with_ctx(spk, &window_ctx).max(prod_floor);
+                let mut production = self.windowed_production_with_ctx(spk, &window_ctx);
+                let mut on_probation = false;
+                if let Some((oldest, latest)) = &probation_ctx {
+                    let oldest = self.windowed_production_with_ctx(spk, oldest);
+                    let latest = self.windowed_production_with_ctx(spk, latest);
+                    on_probation = ratio_on_probation(oldest, latest, prod_floor);
+                    production = ratio_probation_production(production, oldest, latest, prod_floor);
+                }
+                let production = production.max(production_floor);
+                if ratio_debug {
+                    debug_prod.insert(*blue, (production, on_probation));
+                }
                 // Recalibrated bracket table ships bundled with H4 (one hardfork, one gate).
                 let bps = if self.ratio_reward_v3_activation.is_active(pov_daa_score) {
                     ratio_reward_bps_v3(balance, production)
@@ -937,7 +953,7 @@ impl VirtualStateProcessor {
         // same `sp_idx` ⇒ window/prefix mismatch. NOTE: deliberately NO O(W) direct-sum recompute here —
         // it runs on the build path per template and an 864k-block scan stalls template production (~40s),
         // starving the miner. The prefix value is the cross-node comparison we need.
-        if std::env::var("KERYX_RATIO_DEBUG").is_ok() {
+        if ratio_debug {
             let sc = self.selected_chain_store.read();
             if let Ok(sp_idx) = sc.get_by_hash(ghostdag_data.selected_parent) {
                 for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
@@ -960,10 +976,11 @@ impl VirtualStateProcessor {
                         // external tailer can key `prod_prefix`/`balance` by address without a
                         // separate blue->coinbase lookup. Appended last to keep existing parsers valid.
                         let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
+                        let (prod_eff, probation) = debug_prod.get(blue).copied().unwrap_or((prefix.max(production_floor), false));
                         debug!(
-                            "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={} spk_ver={} spk={}",
-                            pov_daa_score, blue, sp_idx, balance, prefix, prod_floor,
-                            map.get(blue).copied().unwrap_or(0), spk.version(), spk_hex
+                            "RATIO-DEBUG daa={} blue={} sp_idx={} balance={} prod_prefix={} floor={} ratio_bps={} spk_ver={} spk={} prod_eff={} probation={}",
+                            pov_daa_score, blue, sp_idx, balance, prefix, production_floor,
+                            map.get(blue).copied().unwrap_or(0), spk.version(), spk_hex, prod_eff, probation as u8
                         );
                     }
                 }
@@ -1180,12 +1197,28 @@ impl VirtualStateProcessor {
     ///
     /// Both eras keep the pruning-point clamp (option C, see `windowed_production_for_block`).
     pub(super) fn production_window_ctx(&self, m_sp: Hash, w: u64) -> ProductionWindowCtx {
+        self.production_window_ctxs(m_sp, w, false).0
+    }
+
+    /// [`Self::production_window_ctx`] plus, when `slices` is set and the window is daa-sized, the
+    /// contexts of its oldest and latest `1 / RATIO_PROBATION_SLICES` daa slices, resolved under the
+    /// same lock, floor and chain path.
+    pub(super) fn production_window_ctxs(
+        &self,
+        m_sp: Hash,
+        w: u64,
+        slices: bool,
+    ) -> (ProductionWindowCtx, Option<(ProductionWindowCtx, ProductionWindowCtx)>) {
         let (own_pp, sc) = self.retained_pruning_point_and_chain();
         let m_sp_header = self.headers_store.get_header(m_sp).unwrap();
         let h3 = self.pom_level_activation.is_active(m_sp_header.daa_score);
         // H3 window bottom in daa units — entries strictly above this daa are inside the window.
         let daa_bound = m_sp_header.daa_score.saturating_sub(self.ratio_reward_window_daa);
         let pruning_idx = self.reward_window_floor(&*sc, m_sp_header.pruning_point, own_pp, daa_bound);
+        let slices = slices && h3;
+        let slice_daa = self.ratio_reward_window_daa / RATIO_PROBATION_SLICES;
+        let oldest_hi_daa = daa_bound + slice_daa;
+        let latest_lo_daa = m_sp_header.daa_score.saturating_sub(slice_daa);
         if let Ok(m_idx) = sc.get_by_hash(m_sp) {
             // Case A: m_sp is a committed chain block.
             let bottom = if h3 {
@@ -1194,7 +1227,15 @@ impl VirtualStateProcessor {
                 m_idx.saturating_sub(w)
             }
             .max(pruning_idx);
-            return ProductionWindowCtx::OnChain { m_idx, bottom };
+            let slice_ctxs = slices.then(|| {
+                let oldest_top = self.chain_index_at_or_below_daa(&*sc, oldest_hi_daa, m_idx, pruning_idx).max(bottom);
+                let latest_bottom = self.chain_index_at_or_below_daa(&*sc, latest_lo_daa, m_idx, pruning_idx).max(bottom);
+                (
+                    ProductionWindowCtx::OnChain { m_idx: oldest_top, bottom },
+                    ProductionWindowCtx::OnChain { m_idx, bottom: latest_bottom },
+                )
+            });
+            return (ProductionWindowCtx::OnChain { m_idx, bottom }, slice_ctxs);
         }
         // Case B: m_sp is on a side chain. Reconstruct its window = committed-prefix part + side delta.
         let (committed_tip_index, committed_tip) = sc.get_tip().unwrap();
@@ -1209,19 +1250,37 @@ impl VirtualStateProcessor {
         // Side part: added[k] sits at index common+1+k; include those inside the window
         // (legacy: index > lo; H3: the block's own daa above the daa bound).
         let mut side_by_spk: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
+        let mut side_oldest: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
+        let mut side_latest: std::collections::HashMap<ScriptPublicKey, u64> = std::collections::HashMap::new();
         for (k, h) in chain_path.added.iter().enumerate() {
-            let in_window = if h3 {
-                self.headers_store.get_daa_score(*h).unwrap() > daa_bound
-            } else {
-                common + 1 + k as u64 > lo
+            let daa = h3.then(|| self.headers_store.get_daa_score(*h).unwrap());
+            let in_window = match daa {
+                Some(daa) => daa > daa_bound,
+                None => common + 1 + k as u64 > lo,
             };
             if in_window {
+                let in_oldest = slices && daa.is_some_and(|d| d <= oldest_hi_daa);
+                let in_latest = slices && daa.is_some_and(|d| d > latest_lo_daa);
                 for (s, cut) in self.block_productions_cached(*h).iter() {
                     *side_by_spk.entry(s.clone()).or_default() += cut;
+                    if in_oldest {
+                        *side_oldest.entry(s.clone()).or_default() += cut;
+                    }
+                    if in_latest {
+                        *side_latest.entry(s.clone()).or_default() += cut;
+                    }
                 }
             }
         }
-        ProductionWindowCtx::SideChain { common, lo, side_by_spk }
+        let slice_ctxs = slices.then(|| {
+            let oldest_top = self.chain_index_at_or_below_daa(&*sc, oldest_hi_daa, common, pruning_idx).max(lo);
+            let latest_lo = self.chain_index_at_or_below_daa(&*sc, latest_lo_daa, common, pruning_idx).max(lo);
+            (
+                ProductionWindowCtx::SideChain { common: oldest_top, lo, side_by_spk: side_oldest },
+                ProductionWindowCtx::SideChain { common, lo: latest_lo, side_by_spk: side_latest },
+            )
+        });
+        (ProductionWindowCtx::SideChain { common, lo, side_by_spk }, slice_ctxs)
     }
 
     /// Largest selected-chain index in `[search floor, hi_idx]` whose block's daa_score is
