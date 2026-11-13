@@ -85,6 +85,7 @@ static H13_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H15_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H16_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H17_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -541,6 +542,16 @@ impl VirtualStateProcessor {
             info!("    Audit queue   — a new audit pushes back the open audits of the same escrow key");
             info!("  ▶ PROOF-OF-MODEL — more VRAM headroom for the desktop on minimum cards");
             info!("  ▶ MANDATORY UPDATE — node v1.6.7 or newer, miner 0.6.0 or newer");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        if banner_should_fire(self.ratio_probation_activation, header)
+            && H17_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H17 · DAA {} ════════════════", self.ratio_probation_activation.daa_score());
+            info!("  ▶ HOLDER REWARD — the bracket of an address that resumes production follows its recent production");
+            info!("  ▶ MANDATORY UPDATE — node v1.6.8 or newer");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
