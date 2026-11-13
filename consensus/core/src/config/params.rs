@@ -200,6 +200,12 @@ pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
 /// Testnet H16 gate.
 pub const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
+/// Mainnet H17 gate.
+pub const H17_ACTIVATION_DAA: u64 = 153_085_000;
+
+/// Testnet H17 gate.
+pub const TESTNET_H17_ACTIVATION_DAA: u64 = 565_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -2551,7 +2557,7 @@ pub const MAINNET_PARAMS: Params = Params {
     uniform_strike_activation: ForkActivation::new(H16_ACTIVATION_DAA),
     audit_queue_activation: ForkActivation::new(H16_ACTIVATION_DAA),
     pad_margin_activation: ForkActivation::new(H16_ACTIVATION_DAA),
-    ratio_probation_activation: ForkActivation::never(),
+    ratio_probation_activation: ForkActivation::new(H17_ACTIVATION_DAA),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -2705,7 +2711,7 @@ pub const TESTNET_PARAMS: Params = Params {
     uniform_strike_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     audit_queue_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     pad_margin_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
-    ratio_probation_activation: ForkActivation::never(),
+    ratio_probation_activation: ForkActivation::new(TESTNET_H17_ACTIVATION_DAA),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -3106,8 +3112,13 @@ mod pad_table_tests {
     }
 
     #[test]
-    fn ratio_probation_gate_is_off() {
-        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS, &SIMNET_PARAMS, &DEVNET_PARAMS] {
+    fn ratio_probation_gate_is_h17() {
+        assert_eq!(MAINNET_PARAMS.ratio_probation_activation.daa_score(), H17_ACTIVATION_DAA);
+        assert_eq!(TESTNET_PARAMS.ratio_probation_activation.daa_score(), TESTNET_H17_ACTIVATION_DAA);
+        assert!(H17_ACTIVATION_DAA > H16_ACTIVATION_DAA);
+        assert!(TESTNET_H17_ACTIVATION_DAA > TESTNET_H16_ACTIVATION_DAA);
+        assert_eq!(H17_ACTIVATION_DAA, 153_085_000);
+        for p in [&SIMNET_PARAMS, &DEVNET_PARAMS] {
             assert_eq!(p.ratio_probation_activation, ForkActivation::never());
         }
     }
