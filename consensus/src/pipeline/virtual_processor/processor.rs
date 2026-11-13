@@ -238,6 +238,19 @@ pub struct VirtualStateProcessor {
     /// Last coin-age self-check position: (virtual daa score, wall-clock instant). Paces the
     /// periodic `selfcheck_age_buckets_index` (see `maybe_selfcheck_age_buckets`).
     pub(super) age_selfcheck_last: parking_lot::Mutex<Option<(u64, std::time::Instant)>>,
+    /// Set while a coin-age self-check runs in the background.
+    pub(super) age_selfcheck_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Rebuild generation + 1 a divergent self-check ran against (0 = none); consumed by the next commit.
+    pub(super) age_rebuild_requested: Arc<std::sync::atomic::AtomicU64>,
+    /// Number of completed coin-age bucket rebuilds.
+    pub(super) age_rebuild_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Number of coin-age self-checks that ran to completion.
+    pub(super) age_selfcheck_completed: Arc<std::sync::atomic::AtomicU64>,
+    /// Asks a running self-check to stop.
+    pub(super) age_selfcheck_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Holds a running self-check after its snapshot is taken (tests).
+    pub(super) age_selfcheck_pause: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) age_selfcheck_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Gold-standard prefix-sum production index (pure function of the chain): producer payout SPK → Σ
     /// `base_miner_cut` cumulated over the selected chain, kept in lockstep with it. The ratio
     /// denominator (windowed production at a block's selected-parent view) is the difference of two
@@ -479,6 +492,13 @@ impl VirtualStateProcessor {
             age_buckets_store: storage.age_buckets_store.clone(),
             maturation_queue_store: storage.maturation_queue_store.clone(),
             age_selfcheck_last: parking_lot::Mutex::new(None),
+            age_selfcheck_running: Default::default(),
+            age_rebuild_requested: Default::default(),
+            age_rebuild_generation: Default::default(),
+            age_selfcheck_completed: Default::default(),
+            age_selfcheck_cancel: Default::default(),
+            age_selfcheck_pause: Default::default(),
+            age_selfcheck_handle: Default::default(),
             windowed_production_prefix_store: storage.windowed_production_prefix_store.clone(),
             block_production_cache: parking_lot::RwLock::new(BlockHashMap::default()),
             virtual_stores: storage.virtual_stores.clone(),
@@ -591,6 +611,12 @@ impl VirtualStateProcessor {
                     }
                 };
             }
+        }
+
+        self.age_selfcheck_cancel.store(true, Ordering::Release);
+        self.age_selfcheck_pause.store(false, Ordering::Release);
+        if let Some(handle) = self.age_selfcheck_handle.lock().take() {
+            let _ = handle.join();
         }
 
         // Pass the exit signal on to the following processor
@@ -993,7 +1019,9 @@ impl VirtualStateProcessor {
         // retention horizon lands here — the retained promotions were pruned and can't be
         // unwound, so re-derive the coin-age state exactly from the just-committed UTXO set.
         // Shallow drops (routine during IBD catch-up) are demoted in place by the sweep.
-        if coin_age_needs_rebuild {
+        let requested = self.age_rebuild_requested.swap(0, Ordering::AcqRel);
+        let requested = requested != 0 && requested - 1 == self.age_rebuild_generation.load(Ordering::Acquire);
+        if coin_age_needs_rebuild || requested {
             self.rebuild_age_buckets_index();
             // Freshly re-derived ⇒ exact by construction; restart the self-check clock.
             *self.age_selfcheck_last.lock() = Some((new_daa_score, std::time::Instant::now()));
@@ -1093,6 +1121,7 @@ impl VirtualStateProcessor {
         }
         self.maturation_queue_store.set_watermark_batch(&mut batch, daa_score).unwrap();
         self.db.write(batch).unwrap();
+        self.age_rebuild_generation.fetch_add(1, Ordering::AcqRel);
         info!(
             "age-buckets rebuild: done — {} addresses written, {} immature coins queued, {} retained maturities kept (split at d−W).",
             n, queued, retained
@@ -1126,105 +1155,93 @@ impl VirtualStateProcessor {
                     if daa_score.saturating_sub(last_daa) < interval || last_at.elapsed() < AGE_SELFCHECK_MIN_WALL_SPACING {
                         return;
                     }
-                    *last = Some((daa_score, std::time::Instant::now()));
                 }
             }
         }
-        self.selfcheck_age_buckets_index();
+        if self.selfcheck_age_buckets_index() {
+            *self.age_selfcheck_last.lock() = Some((daa_score, std::time::Instant::now()));
+        }
     }
 
-    /// Coin-age self-check: re-derives the bucket aggregates from the virtual UTXO set (the
-    /// authoritative source — the exact computation of `rebuild_age_buckets_index`) and compares
-    /// them to the committed index. The two are comparable only when the committed split sits at
-    /// the current virtual score, which holds right after a commit (the sweep pins the watermark
-    /// there); any other caller is skipped, not failed.
-    ///
-    /// On divergence: the mismatching aggregates are logged per SPK (stored vs derived — the
-    /// forensic record an operator should report), then the index is re-derived in place via
-    /// `rebuild_age_buckets_index`. Same discipline as the utxoindex resync-on-inconsistency:
-    /// a derived index must never be allowed to silently disagree with its source — a divergent
-    /// numerator makes this node compute a different coinbase than the rest of the network, which
-    /// is a block-rejection (chain-split) hazard once ratio verification enforcement is active.
-    pub(crate) fn selfcheck_age_buckets_index(&self) {
-        let started = std::time::Instant::now();
+    /// Coin-age self-check: compares the committed bucket index with the aggregates re-derived from
+    /// the virtual UTXO set, both read from a snapshot taken right after a commit. The comparison
+    /// runs on a background thread; the virtual thread only waits for the snapshot. Skipped when the
+    /// committed split is not at the virtual score, or while a previous check is still running.
+    /// A divergence is logged per SPK and the index is re-derived by the next virtual commit.
+    /// Returns whether a check was started.
+    pub(crate) fn selfcheck_age_buckets_index(&self) -> bool {
         let virtual_read = self.virtual_stores.read();
         let Some(state) = virtual_read.state.get().optional().unwrap() else {
-            return;
+            return false;
         };
         let daa_score = state.daa_score;
         let watermark = self.maturation_queue_store.get_watermark().unwrap().unwrap_or(daa_score);
         if watermark != daa_score {
-            // Committed split not at the virtual score (mid-oscillation POV) — not comparable.
             debug!("coin-age self-check: skipped (watermark {} != virtual {})", watermark, daa_score);
-            return;
+            return false;
         }
+        if self.age_selfcheck_running.swap(true, Ordering::AcqRel) {
+            debug!("coin-age self-check: skipped (previous check still running)");
+            return false;
+        }
+        let utxo_set = virtual_read.utxo_set.clone();
+        let db = self.db.clone();
+        let age_buckets_store = self.age_buckets_store.clone();
         let mature_bound = daa_score.saturating_sub(self.coin_age_maturity_w);
-        let mut derived: HashMap<ScriptPublicKey, AgeBuckets> = HashMap::new();
-        for item in virtual_read.utxo_set.iterator() {
-            let (_, entry) = item.unwrap();
-            let b = derived.entry(entry.script_public_key.clone()).or_default();
-            if entry.effective_daa <= mature_bound {
-                b.b_mat = b.b_mat.saturating_add(entry.amount);
+        let generation = self.age_rebuild_generation.load(Ordering::Acquire);
+        let running = self.age_selfcheck_running.clone();
+        let rebuild_requested = self.age_rebuild_requested.clone();
+        let completed = self.age_selfcheck_completed.clone();
+        let cancel = self.age_selfcheck_cancel.clone();
+        let pause = self.age_selfcheck_pause.clone();
+        let (snapshot_taken, snapshot_ready) = std::sync::mpsc::sync_channel::<()>(1);
+        let spawned = std::thread::Builder::new().name("coin-age-selfcheck".to_string()).spawn(move || {
+            let _running = ResetOnDrop(running);
+            let started = std::time::Instant::now();
+            let snapshot = db.snapshot();
+            let _ = snapshot_taken.send(());
+            while pause.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let Some((derived, utxo_errors)) = derive_age_buckets(utxo_set.snapshot_iterator(&snapshot), mature_bound, &cancel) else {
+                return;
+            };
+            let (stored, bucket_errors) = age_buckets_store.collect_at(&snapshot);
+            drop(snapshot);
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let read_errors = utxo_errors + bucket_errors;
+            let divergent = log_age_bucket_divergences(daa_score, &derived, &stored);
+            if divergent == 0 && read_errors == 0 {
+                info!(
+                    "coin-age self-check: OK — {} addresses verified against the UTXO set in {:.1}s",
+                    derived.len(),
+                    started.elapsed().as_secs_f64()
+                );
             } else {
-                b.b_imm = b.b_imm.saturating_add(entry.amount);
-                b.a_imm = b.a_imm.saturating_add(entry.amount as u128 * entry.effective_daa as u128);
+                warn!(
+                    "coin-age self-check: {} divergent address(es) (first {} logged above), {} unreadable entries — re-deriving the index at the next commit. Please report these lines.",
+                    divergent,
+                    divergent.min(MAX_LOGGED_AGE_DIVERGENCES),
+                    read_errors,
+                );
+                rebuild_requested.store(generation + 1, Ordering::Release);
             }
-        }
-        drop(virtual_read);
-        // Zero-valued aggregates are deleted on write, so both sides hold non-empty entries only.
-        let stored = self.age_buckets_store.collect();
-        const MAX_LOGGED: usize = 50;
-        let mut divergent = 0usize;
-        for (spk, truth) in derived.iter() {
-            let s = stored.get(spk).copied().unwrap_or_default();
-            if s != *truth {
-                divergent += 1;
-                if divergent <= MAX_LOGGED {
-                    let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
-                    warn!(
-                        "coin-age self-check DIVERGENCE daa={} spk={} stored=({},{},{}) derived=({},{},{}) delta=({},{},{})",
-                        daa_score,
-                        spk_hex,
-                        s.b_mat,
-                        s.b_imm,
-                        s.a_imm,
-                        truth.b_mat,
-                        truth.b_imm,
-                        truth.a_imm,
-                        truth.b_mat as i128 - s.b_mat as i128,
-                        truth.b_imm as i128 - s.b_imm as i128,
-                        truth.a_imm as i128 - s.a_imm as i128,
-                    );
-                }
+            completed.fetch_add(1, Ordering::AcqRel);
+        });
+        match spawned {
+            Ok(handle) => {
+                let _ = snapshot_ready.recv();
+                drop(virtual_read);
+                *self.age_selfcheck_handle.lock() = Some(handle);
+                true
             }
-        }
-        // Stored entries with no backing coins at all (address fully spent but aggregate left behind).
-        for (spk, s) in stored.iter() {
-            if !derived.contains_key(spk) {
-                divergent += 1;
-                if divergent <= MAX_LOGGED {
-                    let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
-                    warn!(
-                        "coin-age self-check DIVERGENCE daa={} spk={} stored=({},{},{}) derived=(0,0,0) — no backing coins",
-                        daa_score, spk_hex, s.b_mat, s.b_imm, s.a_imm,
-                    );
-                }
+            Err(e) => {
+                warn!("coin-age self-check: could not start ({})", e);
+                self.age_selfcheck_running.store(false, Ordering::Release);
+                false
             }
-        }
-        if divergent == 0 {
-            info!(
-                "coin-age self-check: OK — {} addresses verified against the UTXO set in {:.1}s",
-                derived.len(),
-                started.elapsed().as_secs_f64()
-            );
-        } else {
-            warn!(
-                "coin-age self-check: {} divergent address(es) (first {} logged above) — re-deriving the index from the UTXO set NOW. Please report these lines.",
-                divergent,
-                divergent.min(MAX_LOGGED),
-            );
-            self.rebuild_age_buckets_index();
-            *self.age_selfcheck_last.lock() = Some((daa_score, std::time::Instant::now()));
         }
     }
 
@@ -2215,4 +2232,94 @@ impl VirtualStateProcessor {
 enum MergesetIncreaseResult {
     Accepted { increase_size: u64 },
     Rejected { new_candidate: Hash },
+}
+
+const MAX_LOGGED_AGE_DIVERGENCES: usize = 50;
+
+/// Clears the wrapped flag when dropped.
+struct ResetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ResetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Coin-age bucket aggregates per SPK of a UTXO set, split at `mature_bound`, with the number of
+/// unreadable entries. `None` when `cancel` is raised.
+fn derive_age_buckets(
+    utxos: impl Iterator<Item = Result<(keryx_consensus_core::tx::TransactionOutpoint, Arc<keryx_consensus_core::tx::UtxoEntry>), Box<dyn std::error::Error>>>,
+    mature_bound: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Option<(HashMap<ScriptPublicKey, AgeBuckets>, usize)> {
+    let mut derived: HashMap<ScriptPublicKey, AgeBuckets> = HashMap::new();
+    let mut errors = 0usize;
+    for (i, item) in utxos.enumerate() {
+        if i % 65_536 == 0 && cancel.load(Ordering::Acquire) {
+            return None;
+        }
+        let entry = match item {
+            Ok((_, entry)) => entry,
+            Err(e) => {
+                errors += 1;
+                if errors <= MAX_LOGGED_AGE_DIVERGENCES {
+                    warn!("coin-age self-check: unreadable UTXO entry ({})", e);
+                }
+                continue;
+            }
+        };
+        let b = derived.entry(entry.script_public_key.clone()).or_default();
+        if entry.effective_daa <= mature_bound {
+            b.b_mat = b.b_mat.saturating_add(entry.amount);
+        } else {
+            b.b_imm = b.b_imm.saturating_add(entry.amount);
+            b.a_imm = b.a_imm.saturating_add(entry.amount as u128 * entry.effective_daa as u128);
+        }
+    }
+    Some((derived, errors))
+}
+
+/// Logs every SPK whose stored aggregates differ from the derived ones; returns how many differ.
+fn log_age_bucket_divergences(
+    daa_score: u64,
+    derived: &HashMap<ScriptPublicKey, AgeBuckets>,
+    stored: &HashMap<ScriptPublicKey, AgeBuckets>,
+) -> usize {
+    let mut divergent = 0usize;
+    for (spk, truth) in derived.iter() {
+        let s = stored.get(spk).copied().unwrap_or_default();
+        if s != *truth {
+            divergent += 1;
+            if divergent <= MAX_LOGGED_AGE_DIVERGENCES {
+                let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
+                warn!(
+                    "coin-age self-check DIVERGENCE daa={} spk={} stored=({},{},{}) derived=({},{},{}) delta=({},{},{})",
+                    daa_score,
+                    spk_hex,
+                    s.b_mat,
+                    s.b_imm,
+                    s.a_imm,
+                    truth.b_mat,
+                    truth.b_imm,
+                    truth.a_imm,
+                    truth.b_mat as i128 - s.b_mat as i128,
+                    truth.b_imm as i128 - s.b_imm as i128,
+                    truth.a_imm as i128 - s.a_imm as i128,
+                );
+            }
+        }
+    }
+    for (spk, s) in stored.iter() {
+        if !derived.contains_key(spk) {
+            divergent += 1;
+            if divergent <= MAX_LOGGED_AGE_DIVERGENCES {
+                let spk_hex: String = spk.script().iter().map(|b| format!("{:02x}", b)).collect();
+                warn!(
+                    "coin-age self-check DIVERGENCE daa={} spk={} stored=({},{},{}) derived=(0,0,0) — no backing coins",
+                    daa_score, spk_hex, s.b_mat, s.b_imm, s.a_imm,
+                );
+            }
+        }
+    }
+    divergent
 }

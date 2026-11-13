@@ -11,6 +11,9 @@ pub use rocksdb_preset::{
 mod conn_builder;
 mod rocksdb_preset;
 
+/// A point-in-time read view of the [`DB`].
+pub type DbSnapshot<'a> = rocksdb::SnapshotWithThreadMode<'a, DBWithThreadMode<MultiThreaded>>;
+
 /// The DB type used for Kaspad stores
 pub struct DB {
     inner: DBWithThreadMode<MultiThreaded>,

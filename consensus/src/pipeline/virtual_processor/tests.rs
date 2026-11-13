@@ -2850,3 +2850,98 @@ async fn ratio_probation_lowers_the_bracket_of_a_returning_address_only() {
     let continuous_on = probation_bracket_of_last_block(true, true).await;
     assert_eq!(continuous_on, continuous_off, "a continuous producer keeps its bracket");
 }
+
+/// The coin-age self-check runs on a snapshot in the background: commits go on while it runs, a
+/// clean index raises no request, a divergent one requests a rebuild that the next commit performs,
+/// and a request made stale by an intermediate rebuild is dropped.
+#[tokio::test]
+async fn coin_age_selfcheck_runs_in_background_and_requests_rebuild() {
+    use crate::model::stores::age_buckets::AgeBuckets;
+    use keryx_consensus_core::coinbase::MinerData;
+    use keryx_consensus_core::config::params::ForkActivation;
+    use keryx_database::prelude::ConnBuilder;
+    use rocksdb::WriteBatch;
+    use std::sync::atomic::Ordering;
+
+    let config = ConfigBuilder::new(MAINNET_PARAMS)
+        .skip_proof_of_work()
+        .edit_consensus_params(|p| {
+            p.coin_age_activation = ForkActivation::always();
+        })
+        .build();
+    let (db_lifetime, db) = keryx_database::create_temp_db!(ConnBuilder::default().with_files_limit(10));
+    let (sender, _receiver) = async_channel::unbounded();
+    let tc = TestConsensus::with_db(db.clone(), &config, sender);
+    std::mem::forget(db_lifetime);
+    let handles = tc.init();
+
+    let miner = ScriptPublicKey::from_vec(0, vec![0xc3; 3]);
+    let add = |n: u64| {
+        let md = MinerData::new(miner.clone(), keryx_inference::gen_opoi_extra_data(0));
+        let parent = if n == 1 { config.genesis.hash } else { Hash::from(7_500_000 + n - 1) };
+        tc.validate_and_insert_block(tc.build_utxo_valid_block_with_parents(Hash::from(7_500_000 + n), vec![parent], md, vec![]).to_immutable())
+            .virtual_state_task
+    };
+    for n in 1..=10u64 {
+        add(n).await.unwrap();
+    }
+    let vp = tc.virtual_processor().clone();
+    let wait = || {
+        for _ in 0..1_000 {
+            if !vp.age_selfcheck_running.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the background self-check did not finish");
+    };
+    let completed = || vp.age_selfcheck_completed.load(Ordering::Acquire);
+    let requested = || vp.age_rebuild_requested.load(Ordering::Acquire);
+    let generation = || vp.age_rebuild_generation.load(Ordering::Acquire);
+    let inject_bogus = |byte: u8| {
+        let mut batch = WriteBatch::default();
+        vp.age_buckets_store.set_batch(&mut batch, &ScriptPublicKey::from_vec(0, vec![byte; 3]), AgeBuckets { b_mat: 7, b_imm: 0, a_imm: 0 }).unwrap();
+        db.write(batch).unwrap();
+    };
+
+    // Commits go on while a check is held, a second check is skipped, and the held snapshot
+    // does not see the later commits.
+    vp.age_selfcheck_pause.store(true, Ordering::Release);
+    assert!(vp.selfcheck_age_buckets_index());
+    assert!(!vp.selfcheck_age_buckets_index(), "a second check while one runs is skipped");
+    for n in 11..=13u64 {
+        add(n).await.unwrap();
+    }
+    assert!(vp.age_selfcheck_running.load(Ordering::Acquire));
+    vp.age_selfcheck_pause.store(false, Ordering::Release);
+    wait();
+    assert_eq!(completed(), 1, "the check ran to completion");
+    assert_eq!(requested(), 0, "a clean index must not request a rebuild");
+
+    // A divergent index requests a rebuild, performed by the next commit.
+    inject_bogus(0xd4);
+    let before = generation();
+    assert!(vp.selfcheck_age_buckets_index());
+    wait();
+    assert_eq!(completed(), 2);
+    assert_ne!(requested(), 0, "a divergent index must request a rebuild");
+    add(14).await.unwrap();
+    assert_eq!(requested(), 0, "the next commit consumes the request");
+    assert_eq!(generation(), before + 1, "the next commit rebuilds once");
+    assert!(!vp.age_buckets_store.collect().contains_key(&ScriptPublicKey::from_vec(0, vec![0xd4; 3])));
+
+    // A request made stale by an intermediate rebuild is dropped.
+    inject_bogus(0xe5);
+    vp.age_selfcheck_pause.store(true, Ordering::Release);
+    assert!(vp.selfcheck_age_buckets_index());
+    vp.rebuild_age_buckets_index();
+    let after_manual = generation();
+    vp.age_selfcheck_pause.store(false, Ordering::Release);
+    wait();
+    assert_ne!(requested(), 0);
+    add(15).await.unwrap();
+    assert_eq!(requested(), 0);
+    assert_eq!(generation(), after_manual, "a stale request does not trigger another rebuild");
+
+    tc.shutdown(handles);
+}
