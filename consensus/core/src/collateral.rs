@@ -1744,7 +1744,8 @@ impl ServiceLedger {
                         entry.early_responders.push(key);
                     }
                 }
-                for d in early_decl {
+                // Only a network-model audit takes declarations (and only its requests snapshot them).
+                for d in early_decl.into_iter().filter(|_| entry.tier >= NETWORK_MODEL_TIER) {
                     if !entry.early_declarations.contains(&d) {
                         entry.early_declarations.push(d);
                     }
@@ -1765,11 +1766,12 @@ impl ServiceLedger {
             match req.audit.as_mut() {
                 Some(audit) if audit.is_pipeline() => audit.declare(*tier, *escrow),
                 Some(_) => {}
-                None => {
+                None if req.tier >= NETWORK_MODEL_TIER => {
                     if !req.early_declarations.contains(&(*tier, *escrow)) {
                         req.early_declarations.push((*tier, *escrow));
                     }
                 }
+                None => {}
             }
         }
 
@@ -5469,6 +5471,32 @@ mod tests {
         assert_eq!(ledger.pending_len(), 0, "unservable: four heads cannot read it");
         let out = ledger.on_chain_block(101 + w + 1, &[], &[], &[], |_| true, cohorts);
         assert!(struck(&out).is_empty());
+    }
+
+    #[test]
+    fn declarations_never_stick_to_a_lineup_request() {
+        let mut ledger = ServiceLedger::default();
+        let a = Hash::from_bytes([1u8; 32]);
+        let t6 = NETWORK_MODEL_TIER + 1;
+        // one declaration beats the lineup request to acceptance, another lands with it
+        let (early, same) = ([0x61u8; 32], [0x62u8; 32]);
+        fold_declarations(&mut ledger, 199, &[(early, t6, shard_id(t6, 0))]);
+        ledger.on_chain_block_with_rewards(
+            200,
+            &[(early, 0, 64), (same, 0, 64)],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[(same, t6, shard_id(t6, 0))],
+            |_| true,
+            cohort_of(&[a]),
+        );
+        for rh in [early, same] {
+            assert!(ledger.pending.get(&rh).unwrap().early_declarations.is_empty());
+        }
+        assert!(ledger.early_declarations.is_empty());
     }
 
     #[test]
