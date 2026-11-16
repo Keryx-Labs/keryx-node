@@ -340,8 +340,7 @@ pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
 ];
 
 /// Per-model minimum inference_reward in sompi once `model_split_activation` is live: the flat
-/// lineup floors (its requests stay valid, they are just no longer assigned), then the network
-/// model, shared by its six signers by VRAM weight.
+/// lineup floors, then the network model, shared by its six signers by VRAM weight.
 pub const INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT: &[([u8; 32], u64)] = &[
     (QWEN3_5_9B_ABLITERATED_MODEL_ID,   50_000_000),
     (GLM_4_9B_0414_MODEL_ID,           100_000_000),

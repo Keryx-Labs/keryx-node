@@ -404,8 +404,8 @@ impl VirtualStateProcessor {
 
     /// Accepted AiRequests `(request_hash, tier)` and AiResponses `(request_hash, verified
     /// responder)` of committed chain block `hash`, across its whole mergeset acceptance data.
-    /// Requests for models outside the mineable tier set are skipped: the lineup before
-    /// `model_split`, the network model and its shards after it. A v1 response or an invalid
+    /// Requests are kept for the lineup, and after `model_split` for the network model too; a
+    /// request naming a shard id is skipped. A v1 response or an invalid
     /// responder signature yields `None` (a volunteer — never serves the assignment). With
     /// `private` set, a request sealed to named responders also yields its recipient set. The
     /// events also carry the verified pipeline links and availability declarations.
@@ -435,7 +435,7 @@ impl VirtualStateProcessor {
                                 .tiers
                                 .iter()
                                 .position(|t| t.model_id == req.model_id)
-                                .filter(|&tier| tier >= NETWORK_MODEL_TIER as usize)
+                                .filter(|&tier| tier <= NETWORK_MODEL_TIER as usize)
                         } else {
                             service_tiers(private).iter().position(|t| t.model_id == req.model_id)
                         }

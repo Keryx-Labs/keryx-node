@@ -499,8 +499,8 @@ mod tests {
         }
         // Genuine block defects still mark invalid in both eras.
         assert!(marks_block_invalid(&RuleError::DuplicateTransactions(Default::default()), true));
-        assert!(marks_block_invalid(&RuleError::PomTierPaused(0), true));
-        assert!(marks_block_invalid(&RuleError::PomTierPaused(4), false));
+        assert!(marks_block_invalid(&RuleError::PomTierPaused(5), true));
+        assert!(marks_block_invalid(&RuleError::PomTierPaused(5), false));
         for pov in [true, false] {
             assert!(marks_block_invalid(&RuleError::AiAvailBeforeActivation(Default::default()), pov));
             assert!(marks_block_invalid(&RuleError::AiResponseLinksBeforeActivation(Default::default()), pov));
