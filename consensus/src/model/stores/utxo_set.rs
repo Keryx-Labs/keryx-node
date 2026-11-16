@@ -172,6 +172,20 @@ impl DbUtxoSetStore {
         })
     }
 
+    /// [`Self::iterator`] read through `snapshot`.
+    pub fn snapshot_iterator<'a>(
+        &self,
+        snapshot: &'a keryx_database::prelude::DbSnapshot<'a>,
+    ) -> impl Iterator<Item = Result<(TransactionOutpoint, Arc<UtxoEntry>), Box<dyn Error>>> + 'a {
+        self.access.snapshot_iterator_with_decode_fallback::<UtxoEntryPreH4>(snapshot).map(|iter_result| match iter_result {
+            Ok((key_bytes, utxo_entry)) => match UtxoKey::try_from(key_bytes.as_ref()) {
+                Ok(utxo_key) => Ok((utxo_key.into(), utxo_entry)),
+                Err(e) => Err(e.into()),
+            },
+            Err(e) => Err(e),
+        })
+    }
+
     /// Clear the store completely in DB and cache
     pub fn clear(&mut self) -> Result<(), StoreError> {
         self.access.delete_all(DirectDbWriter::new(&self.db))

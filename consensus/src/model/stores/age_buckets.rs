@@ -91,6 +91,24 @@ impl DbAgeBucketsStore {
             })
             .collect()
     }
+
+    /// [`Self::collect`] read through `snapshot`, with the number of unreadable entries skipped.
+    pub fn collect_at(
+        &self,
+        snapshot: &keryx_database::prelude::DbSnapshot<'_>,
+    ) -> (std::collections::HashMap<ScriptPublicKey, AgeBuckets>, usize) {
+        let mut out = std::collections::HashMap::new();
+        let mut errors = 0usize;
+        for res in self.access.snapshot_iterator(snapshot) {
+            match res {
+                Ok((key, buckets)) => {
+                    out.insert(ScriptPublicKey::from(ScriptPublicKeyBucket::from_bytes(key.to_vec())), buckets);
+                }
+                Err(_) => errors += 1,
+            }
+        }
+        (out, errors)
+    }
 }
 
 impl AgeBucketsStoreReader for DbAgeBucketsStore {
@@ -141,5 +159,28 @@ mod tests {
         store.set_batch(&mut batch, &a, AgeBuckets::default()).unwrap();
         db.write(batch).unwrap();
         assert_eq!(store.get(&a).unwrap(), AgeBuckets::default());
+    }
+
+    #[test]
+    fn collect_at_reads_the_snapshot_only() {
+        let (_lifetime, db) = create_temp_db!(ConnBuilder::default().with_files_limit(10));
+        let store = DbAgeBucketsStore::new(db.clone(), CachePolicy::Count(16));
+        let a = ScriptPublicKey::from_vec(0, vec![1; 3]);
+        let b = ScriptPublicKey::from_vec(0, vec![2; 3]);
+        let mut batch = WriteBatch::default();
+        store.set_batch(&mut batch, &a, AgeBuckets { b_mat: 1, b_imm: 0, a_imm: 0 }).unwrap();
+        db.write(batch).unwrap();
+        let snapshot = db.snapshot();
+        let mut batch = WriteBatch::default();
+        store.set_batch(&mut batch, &b, AgeBuckets { b_mat: 2, b_imm: 0, a_imm: 0 }).unwrap();
+        store.set_batch(&mut batch, &a, AgeBuckets::default()).unwrap();
+        db.write(batch).unwrap();
+        let (seen, errors) = store.collect_at(&snapshot);
+        assert_eq!(errors, 0);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.get(&a).unwrap().b_mat, 1);
+        drop(snapshot);
+        assert_eq!(store.collect().len(), 1);
+        assert!(store.collect().contains_key(&b));
     }
 }

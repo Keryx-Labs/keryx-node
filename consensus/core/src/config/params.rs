@@ -200,6 +200,12 @@ pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
 /// Testnet H16 gate.
 pub const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
+/// Mainnet H17 gate.
+pub const H17_ACTIVATION_DAA: u64 = 153_085_000;
+
+/// Testnet H17 gate.
+pub const TESTNET_H17_ACTIVATION_DAA: u64 = 565_000;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -1678,6 +1684,37 @@ pub fn ratio_reward_bps_v3(balance: u64, production: u64) -> u64 {
     ratio_bracket_bps(balance, production, &RATIO_REWARD_THRESHOLDS_V3, &RATIO_REWARD_BPS_V3)
 }
 
+/// Number of equal slices the ratio-reward window is cut into for the probation rule.
+pub const RATIO_PROBATION_SLICES: u64 = 8;
+
+/// Blocks of production ignored in the latest slice before it is scaled up.
+pub const RATIO_PROBATION_MARGIN_BLOCKS: u64 = 0;
+
+/// Ratio-reward production floor, in blocks of base miner cut, once the probation rule is active.
+pub const RATIO_PROBATION_FLOOR_BLOCKS: u64 = 4;
+
+/// An address leaves probation once its oldest slice times this factor covers its latest slice.
+pub const RATIO_PROBATION_OLDEST_FACTOR: u64 = 2;
+
+/// Whether an address is on probation: its oldest-slice production, times
+/// `RATIO_PROBATION_OLDEST_FACTOR`, is below its latest-slice production less
+/// `RATIO_PROBATION_MARGIN_BLOCKS` blocks of `block_cut`.
+pub fn ratio_on_probation(oldest_slice: u64, latest_slice: u64, block_cut: u64) -> bool {
+    let base = latest_slice.saturating_sub(RATIO_PROBATION_MARGIN_BLOCKS.saturating_mul(block_cut));
+    (oldest_slice as u128) * (RATIO_PROBATION_OLDEST_FACTOR as u128) < base as u128
+}
+
+/// Ratio-reward production of an address: its windowed production, or, while it is on probation
+/// (`ratio_on_probation`), at least its latest slice less the margin, scaled to the whole window at 90 %.
+pub fn ratio_probation_production(windowed: u64, oldest_slice: u64, latest_slice: u64, block_cut: u64) -> u64 {
+    if !ratio_on_probation(oldest_slice, latest_slice, block_cut) {
+        return windowed;
+    }
+    let base = latest_slice.saturating_sub(RATIO_PROBATION_MARGIN_BLOCKS.saturating_mul(block_cut)) as u128;
+    let rate = base * (RATIO_PROBATION_SLICES as u128) * 9 / 10;
+    windowed.max(rate.min(u64::MAX as u128) as u64)
+}
+
 /// Division-free bracket scan shared by `ratio_reward_bps`/`ratio_reward_bps_v2`: bracket `i` is
 /// reached iff `balance >= thresholds[i] * production`. Thresholds are ascending, so the first
 /// failing bracket ends the scan. `u128` math avoids overflow on the `threshold * production`
@@ -2308,6 +2345,8 @@ pub struct Params {
     pub model_split_activation: ForkActivation,
     /// Model split: the network model of this network (tier table, schedule, minimums, shard classes).
     pub network_model: &'static NetworkModelLayout,
+    /// H17: ratio-reward production of an address on probation, see `ratio_probation_production`.
+    pub ratio_probation_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
     pub service_burnable_window_daa: u64,
@@ -2598,6 +2637,7 @@ impl Params {
             pad_margin_activation: self.pad_margin_activation,
             model_split_activation: self.model_split_activation,
             network_model: self.network_model,
+            ratio_probation_activation: self.ratio_probation_activation,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
@@ -2834,6 +2874,7 @@ pub const MAINNET_PARAMS: Params = Params {
     pad_margin_activation: ForkActivation::new(H16_ACTIVATION_DAA),
     model_split_activation: ForkActivation::never(),
     network_model: &NETWORK_MODEL_MAINNET,
+    ratio_probation_activation: ForkActivation::new(H17_ACTIVATION_DAA),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -2989,6 +3030,7 @@ pub const TESTNET_PARAMS: Params = Params {
     pad_margin_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     model_split_activation: ForkActivation::never(),
     network_model: &NETWORK_MODEL_MAINNET,
+    ratio_probation_activation: ForkActivation::new(TESTNET_H17_ACTIVATION_DAA),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -3107,6 +3149,7 @@ pub const SIMNET_PARAMS: Params = Params {
     pad_margin_activation: ForkActivation::never(),
     model_split_activation: ForkActivation::never(),
     network_model: &NETWORK_MODEL_MAINNET,
+    ratio_probation_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -3220,6 +3263,7 @@ pub const DEVNET_PARAMS: Params = Params {
     model_split_activation: ForkActivation::new(1_000),
     network_model: &NETWORK_MODEL_SPLIT9B,
     service_burnable_window_daa: 6_000,
+    ratio_probation_activation: ForkActivation::never(),
     chain_anchor: None,
     service_state_checkpoint: None,
     ratio_reward_window: 1_000,
@@ -3438,6 +3482,41 @@ mod pad_table_tests {
         assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
         assert!(H16_ACTIVATION_DAA > H15_ACTIVATION_DAA);
         assert_eq!(H16_ACTIVATION_DAA, 147_000_000);
+    }
+
+    #[test]
+    fn ratio_probation_production_rule() {
+        let cut = 100;
+        assert!(!ratio_on_probation(0, 0, cut));
+        assert_eq!(ratio_probation_production(5_000, 0, 0, cut), 5_000);
+        assert!(ratio_on_probation(0, 1, cut));
+        assert_eq!(ratio_probation_production(0, 0, 1, cut), 7);
+        assert_eq!(ratio_probation_production(5_000, 0, 400, cut), 5_000);
+        assert_eq!(ratio_probation_production(1_000, 0, 1_400, cut), 10_080);
+        assert_eq!(ratio_probation_production(9_000, 0, 1_400, cut), 10_080);
+        assert_eq!(ratio_probation_production(0, 0, u64::MAX, 0), u64::MAX);
+        assert!(ratio_on_probation(cut, 40 * cut, cut));
+        assert_eq!(ratio_probation_production(41 * cut, cut, 40 * cut, cut), 40 * 72 * cut / 10);
+        assert!(!ratio_on_probation(36 * cut, 36 * cut, cut));
+        assert_eq!(ratio_probation_production(288 * cut, 36 * cut, 36 * cut, cut), 288 * cut);
+        assert!(!ratio_on_probation(18 * cut, 36 * cut, cut));
+        assert!(ratio_on_probation(18 * cut - 1, 36 * cut, cut));
+        assert!(!ratio_on_probation(18 * cut, 36 * cut, cut));
+        assert!(ratio_on_probation(12 * cut, 36 * cut, cut));
+        assert!(!ratio_on_probation(u64::MAX, u64::MAX, cut));
+        assert!(ratio_on_probation(u64::MAX / 4, u64::MAX, 0));
+    }
+
+    #[test]
+    fn ratio_probation_gate_is_h17() {
+        assert_eq!(MAINNET_PARAMS.ratio_probation_activation.daa_score(), H17_ACTIVATION_DAA);
+        assert_eq!(TESTNET_PARAMS.ratio_probation_activation.daa_score(), TESTNET_H17_ACTIVATION_DAA);
+        assert!(H17_ACTIVATION_DAA > H16_ACTIVATION_DAA);
+        assert!(TESTNET_H17_ACTIVATION_DAA > TESTNET_H16_ACTIVATION_DAA);
+        assert_eq!(H17_ACTIVATION_DAA, 153_085_000);
+        for p in [&SIMNET_PARAMS, &DEVNET_PARAMS] {
+            assert_eq!(p.ratio_probation_activation, ForkActivation::never());
+        }
     }
 
     #[test]

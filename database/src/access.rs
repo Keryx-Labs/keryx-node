@@ -1,4 +1,4 @@
-use crate::{cache::CachePolicy, db::DB, errors::StoreError};
+use crate::{cache::CachePolicy, db::{DB, DbSnapshot}, errors::StoreError};
 
 use super::prelude::{Cache, DbKey, DbWriter};
 use keryx_utils::mem_size::MemSizeEstimator;
@@ -380,6 +380,44 @@ where
                 Ok((key, data_bytes)) => match bincode::deserialize(&data_bytes) {
                     Ok(data) => Ok((key[prefix_key.prefix_len()..].into(), data)),
                     Err(e) => Err(e.into()),
+                },
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    /// [`Self::iterator`] read through `snapshot`.
+    pub fn snapshot_iterator<'a>(&self, snapshot: &'a DbSnapshot<'a>) -> impl Iterator<Item = KeyDataResult<TData>> + 'a
+    where
+        TKey: Clone + AsRef<[u8]>,
+        TData: DeserializeOwned + 'a,
+    {
+        self.snapshot_iterator_with_decode_fallback::<TData>(snapshot)
+    }
+
+    /// [`Self::iterator_with_decode_fallback`] read through `snapshot`.
+    pub fn snapshot_iterator_with_decode_fallback<'a, TDecodeFallback>(
+        &self,
+        snapshot: &'a DbSnapshot<'a>,
+    ) -> impl Iterator<Item = KeyDataResult<TData>> + 'a
+    where
+        TKey: Clone + AsRef<[u8]>,
+        TData: DeserializeOwned + 'a,
+        TDecodeFallback: DeserializeOwned + Into<TData>,
+    {
+        let prefix_key = DbKey::prefix_only(&self.prefix);
+        let prefix_len = prefix_key.prefix_len();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_iterate_range(rocksdb::PrefixRange(prefix_key.as_ref()));
+        read_opts.fill_cache(false);
+        snapshot.iterator_opt(IteratorMode::From(prefix_key.as_ref(), Direction::Forward), read_opts).map(move |iter_result| {
+            match iter_result {
+                Ok((key, data_bytes)) => match bincode::deserialize(&data_bytes) {
+                    Ok(data) => Ok((key[prefix_len..].into(), data)),
+                    Err(e) => match bincode::deserialize::<TDecodeFallback>(&data_bytes) {
+                        Ok(data) => Ok((key[prefix_len..].into(), data.into())),
+                        Err(_) => Err(e.into()),
+                    },
                 },
                 Err(e) => Err(e.into()),
             }
