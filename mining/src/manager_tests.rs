@@ -254,6 +254,56 @@ mod tests {
         assert_eq!(insert(signed_response(&stranger, armed, None)), Err(RuleError::RejectAiResponseNotAwaited(hex::encode(armed))));
     }
 
+    /// Past the model-split gate a V3 response is admitted when every link signed its tier under
+    /// the head and the head signed the links; a link moved to another tier is refused.
+    #[test]
+    fn test_pipeline_response_admission() {
+        use keryx_consensus_core::collateral::{link_signature_message, responder_signature_message};
+        use keryx_consensus_core::subnets::SUBNETWORK_ID_AI_RESPONSE;
+        use keryx_inference::{AiResponder, AiResponseLink, AiResponsePayload};
+        use secp256k1::{Keypair, Message, SECP256K1};
+
+        fn key(seed: u8) -> Keypair {
+            Keypair::from_seckey_slice(SECP256K1, &[seed; 32]).unwrap()
+        }
+        fn link_sig(k: &Keypair, bytes: &[u8]) -> [u8; 64] {
+            *k.sign_schnorr(Message::from_digest(link_signature_message(bytes))).as_ref()
+        }
+        fn v3(request_hash: [u8; 32], head: &Keypair, links: &[(u8, &Keypair)], moved_tier: Option<u8>) -> Transaction {
+            let head_pk = head.x_only_public_key().0.serialize();
+            let base = AiResponsePayload::new(request_hash, 1, [0x12u8; 34], 1);
+            let mut signed: Vec<AiResponseLink> = links
+                .iter()
+                .map(|(tier, k)| AiResponseLink {
+                    tier: *tier,
+                    escrow_pubkey: k.x_only_public_key().0.serialize(),
+                    signature: link_sig(k, &base.link_signed_bytes(*tier, &head_pk)),
+                })
+                .collect();
+            if let Some(t) = moved_tier {
+                signed[0].tier = t;
+            }
+            let mut resp = AiResponsePayload::new_v3(request_hash, 1, [0x12u8; 34], 1, AiResponder { escrow_pubkey: head_pk, signature: [0; 64] }, signed);
+            let sig = head.sign_schnorr(Message::from_digest(responder_signature_message(&resp.signed_bytes())));
+            resp.responder = Some(AiResponder { escrow_pubkey: head_pk, signature: *sig.as_ref() });
+            Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, resp.serialize())
+        }
+
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new_with_extended_config(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, 1.0, 0, None, counters);
+        let insert = |tx: Transaction| {
+            into_mempool_result(mining_manager.validate_and_insert_transaction(consensus.as_ref(), tx, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden))
+        };
+        let (head, a, b) = (key(1), key(2), key(3));
+        insert(v3([0x51; 32], &head, &[(6, &a), (7, &b)], None)).unwrap();
+        // The head re-signed over the moved tier, but the link did not sign that tier.
+        assert_eq!(
+            insert(v3([0x52; 32], &head, &[(6, &a), (7, &b)], Some(8))),
+            Err(RuleError::RejectAiResponderSignature(hex::encode([0x52u8; 32])))
+        );
+    }
+
     /// Openings are admitted only for a response awaiting one, signed by its escrow key, one per
     /// piece of a response, feeless, up to the largest opening body.
     #[test]

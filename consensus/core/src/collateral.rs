@@ -124,10 +124,19 @@ pub const RESPONDER_SIG_DOMAIN: &[u8] = b"KeryxServiceResponderV1";
 /// Domain separator of the AiAvail declaration signature.
 pub const AVAIL_SIG_DOMAIN: &[u8] = b"KeryxServiceAvailV1";
 
+/// Domain separator of a pipeline link signature.
+pub const LINK_SIG_DOMAIN: &[u8] = b"KeryxPipelineLinkV1";
+
 /// The message a V2 responder signs: the domain-tagged blake2b-256 of the payload's signed
 /// bytes (`AiResponsePayload::signed_bytes`).
 pub fn responder_signature_message(signed_bytes: &[u8]) -> [u8; 32] {
     domain_signature_message(RESPONDER_SIG_DOMAIN, signed_bytes)
+}
+
+/// The message a pipeline link signs: the domain-tagged blake2b-256 of
+/// `AiResponsePayload::link_signed_bytes`.
+pub fn link_signature_message(signed_bytes: &[u8]) -> [u8; 32] {
+    domain_signature_message(LINK_SIG_DOMAIN, signed_bytes)
 }
 
 fn domain_signature_message(domain: &[u8], signed_bytes: &[u8]) -> [u8; 32] {
@@ -149,6 +158,12 @@ pub fn verify_responder_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64]
 /// blake2b-256 of the `[request_hash] [tier]` bytes.
 pub fn verify_avail_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
     verify_domain_signature(AVAIL_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
+}
+
+/// Verifies a pipeline link signature: schnorr by `escrow_pubkey` over the domain-tagged
+/// blake2b-256 of `AiResponsePayload::link_signed_bytes`.
+pub fn verify_link_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+    verify_domain_signature(LINK_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
 }
 
 fn verify_domain_signature(domain: &[u8], escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {

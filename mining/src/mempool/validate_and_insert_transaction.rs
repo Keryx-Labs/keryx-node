@@ -12,7 +12,7 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::{opening_body_piece, private_cohort_seed, trace_seed, verify_avail_signature, verify_opening_signature, verify_responder_signature},
+    collateral::{opening_body_piece, private_cohort_seed, trace_seed, verify_avail_signature, verify_link_signature, verify_opening_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
@@ -231,8 +231,8 @@ impl Mempool {
                 if virtual_daa < self.config.model_split_activation_daa {
                     return Err(RuleError::RejectAiResponseLinksBeforeActivation(hex::encode(resp.request_hash)));
                 }
-                let signed = resp.signed_bytes();
-                if resp.links.iter().any(|l| !verify_responder_signature(&l.escrow_pubkey, &l.signature, &signed)) {
+                let head = resp.responder.as_ref().map(|r| r.escrow_pubkey).unwrap_or_default();
+                if resp.links.iter().any(|l| !verify_link_signature(&l.escrow_pubkey, &l.signature, &resp.link_signed_bytes(l.tier, &head))) {
                     return Err(RuleError::RejectAiResponderSignature(hex::encode(resp.request_hash)));
                 }
             }

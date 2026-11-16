@@ -6,7 +6,7 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_avail_signature,
+    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_avail_signature, verify_link_signature,
     verify_responder_signature, EscrowClaim, FoldOutcome, NetworkModelAvailability, PipelineAssignment, PrivateCohortSeed,
     ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
     ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
@@ -48,17 +48,20 @@ fn verified_declaration(avail: &AiAvailPayload) -> Option<(u8, Hash)> {
         .then(|| (avail.tier, escrow_miner_key(&avail.escrow_pubkey)))
 }
 
-/// The `(tier, escrow key)` of every link of a V3 response, iff every link signature verifies
-/// over the v1 payload bytes. `None` for a v1/v2 payload or any bad link signature — a
-/// pipeline response with one unverifiable link is credited to nobody.
+/// The `(tier, escrow key)` of every link of a V3 response, iff every link signed its own tier
+/// under this head. `None` for a v1/v2 payload or any bad link signature — a pipeline response
+/// with one unverifiable link is credited to nobody.
 fn verified_links(resp: &AiResponsePayload) -> Option<Vec<(u8, Hash)>> {
+    let head = resp.responder.as_ref()?.escrow_pubkey;
     if resp.links.is_empty() {
         return None;
     }
-    let signed = resp.signed_bytes();
     resp.links
         .iter()
-        .map(|l| verify_responder_signature(&l.escrow_pubkey, &l.signature, &signed).then(|| (l.tier, escrow_miner_key(&l.escrow_pubkey))))
+        .map(|l| {
+            verify_link_signature(&l.escrow_pubkey, &l.signature, &resp.link_signed_bytes(l.tier, &head))
+                .then(|| (l.tier, escrow_miner_key(&l.escrow_pubkey)))
+        })
         .collect()
 }
 
@@ -1888,8 +1891,69 @@ fn plaintext_answer_len(body: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keryx_consensus_core::collateral::RESPONDER_SIG_DOMAIN;
-    use keryx_inference::AiResponder;
+    use keryx_consensus_core::collateral::{LINK_SIG_DOMAIN, RESPONDER_SIG_DOMAIN};
+    use keryx_inference::{AiResponder, AiResponseLink};
+
+    fn schnorr(seckey: &[u8; 32], domain: &[u8], bytes: &[u8]) -> ([u8; 32], [u8; 64]) {
+        let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, seckey).unwrap();
+        let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
+        hasher.update(domain);
+        hasher.update(bytes);
+        let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
+        (keypair.x_only_public_key().0.serialize(), *keypair.sign_schnorr(msg).as_ref())
+    }
+
+    /// A private V3 response: links sign their tier under the head, then the head signs the whole.
+    fn pipeline_response(head: &[u8; 32], links: &[(u8, [u8; 32])]) -> AiResponsePayload {
+        let base = AiResponsePayload::new([7u8; 32], 900_000, [0x12u8; 34], 128).with_private_body(vec![0xAB; 40]);
+        let (head_pk, _) = schnorr(head, RESPONDER_SIG_DOMAIN, b"");
+        let signed: Vec<AiResponseLink> = links
+            .iter()
+            .map(|(tier, key)| {
+                let (pk, sig) = schnorr(key, LINK_SIG_DOMAIN, &base.link_signed_bytes(*tier, &head_pk));
+                AiResponseLink { tier: *tier, escrow_pubkey: pk, signature: sig }
+            })
+            .collect();
+        let draft = AiResponsePayload::new_v3([7u8; 32], 900_000, [0x12u8; 34], 128, AiResponder { escrow_pubkey: head_pk, signature: [0; 64] }, signed.clone())
+            .with_private_body(vec![0xAB; 40]);
+        let (_, sig) = schnorr(head, RESPONDER_SIG_DOMAIN, &draft.signed_bytes());
+        AiResponsePayload::new_v3([7u8; 32], 900_000, [0x12u8; 34], 128, AiResponder { escrow_pubkey: head_pk, signature: sig }, signed)
+            .with_private_body(vec![0xAB; 40])
+    }
+
+    #[test]
+    fn pipeline_links_and_head_bind_each_other() {
+        let (head, l1, l2) = ([0x31u8; 32], [0x41u8; 32], [0x51u8; 32]);
+        let resp = pipeline_response(&head, &[(6, l1), (7, l2)]);
+        let resp = AiResponsePayload::deserialize(&resp.serialize()).unwrap();
+        assert!(verified_responder(&resp).is_some());
+        assert_eq!(verified_links(&resp).map(|v| v.len()), Some(2));
+
+        // A relayer changing a link's tier breaks that link and the head.
+        let mut swapped = resp.clone();
+        swapped.links[0].tier = 8;
+        assert!(verified_links(&swapped).is_none());
+        assert!(verified_responder(&swapped).is_none());
+
+        // Dropping a link keeps every remaining link valid, but not the head.
+        let mut dropped = resp.clone();
+        dropped.links.pop();
+        assert!(verified_links(&dropped).is_some());
+        assert!(verified_responder(&dropped).is_none());
+
+        // The same link signatures under another head do not verify.
+        let mut other = resp.clone();
+        other.responder = Some(AiResponder { escrow_pubkey: schnorr(&[0x61u8; 32], RESPONDER_SIG_DOMAIN, b"").0, signature: [0; 64] });
+        assert!(verified_links(&other).is_none());
+
+        // A link signature is not a responder signature, and the other way round.
+        let link = resp.links[0];
+        assert!(!verify_responder_signature(&link.escrow_pubkey, &link.signature, &resp.link_signed_bytes(link.tier, &resp.responder.unwrap().escrow_pubkey)));
+        let (pk, v2_sig) = schnorr(&l1, RESPONDER_SIG_DOMAIN, &resp.link_signed_bytes(6, &resp.responder.unwrap().escrow_pubkey));
+        let mut forged = resp.clone();
+        forged.links[0] = AiResponseLink { tier: 6, escrow_pubkey: pk, signature: v2_sig };
+        assert!(verified_links(&forged).is_none());
+    }
 
     fn signed_response(seckey: &[u8; 32], tamper: bool) -> AiResponsePayload {
         let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, seckey).unwrap();
