@@ -1336,6 +1336,9 @@ pub struct ServiceLedger {
     /// The network model of this network; `None` = mainnet. Configuration, like the
     /// activation daas — installed on every fold entry, never snapshotted.
     network_model: Option<&'static NetworkModelLayout>,
+    /// Whether a closed network-model audit strikes its silent members. Off: the network model
+    /// is still on trial and its window is not calibrated. Configuration, never snapshotted.
+    pipeline_sanctions: bool,
     /// Traced responses awaiting their draw or their opening, by response transaction id.
     trace_audits: std::collections::BTreeMap<[u8; 32], TraceAudit>,
     /// Shapes of traced responses whose request was not pending yet, by `(request hash,
@@ -2043,6 +2046,8 @@ impl ServiceLedger {
                     // every chosen identity the served response did without.
                     let silent: Vec<Hash> = if !audit.is_pipeline() {
                         audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)).copied().collect()
+                    } else if !self.pipeline_sanctions {
+                        Vec::new()
                     } else {
                         let declared: Vec<Hash> = audit.declared.iter().map(|(_, id, _)| *id).collect();
                         let mut v: Vec<Hash> =
@@ -2711,6 +2716,11 @@ impl ServiceLedger {
     /// Installs the `service_bond_v2_activation` daa the arming path reads.
     pub fn set_window_v2_activation(&mut self, daa: u64) {
         self.window_v2_activation_daa = Some(daa);
+    }
+
+    #[cfg(test)]
+    fn enable_pipeline_sanctions(&mut self) {
+        self.pipeline_sanctions = true;
     }
 
     /// Installs the network's burnable window.
@@ -5396,8 +5406,22 @@ mod tests {
     }
 
     #[test]
+    fn network_model_silence_strikes_nobody_while_on_trial() {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        let rh = [7u8; 32];
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        fold_declarations(&mut ledger, 102, &declare_one(rh, 0));
+        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
+        assert!(struck(&out).is_empty());
+    }
+
+    #[test]
     fn network_model_silence_strikes_undeclared_members_and_the_chosen_head() {
         let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         let rh = [7u8; 32];
         let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
@@ -5413,6 +5437,7 @@ mod tests {
         assert_eq!(ledger.pending_len(), 0);
         // nobody declared at all: the whole cohort is struck
         let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
         ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
@@ -5423,6 +5448,7 @@ mod tests {
     #[test]
     fn network_model_served_response_credits_every_signer_and_strikes_the_absent_chosen() {
         let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
@@ -5472,6 +5498,7 @@ mod tests {
     #[test]
     fn network_model_undeclared_members_are_struck_after_a_served_response_too() {
         let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         let rh = [7u8; 32];
         let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
@@ -5490,6 +5517,7 @@ mod tests {
     #[test]
     fn network_model_incomplete_or_foreign_responses_are_not_credited() {
         let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
@@ -5536,6 +5564,7 @@ mod tests {
     #[test]
     fn network_model_substitute_head_is_paid_and_the_chosen_head_struck() {
         let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
