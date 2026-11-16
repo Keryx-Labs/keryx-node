@@ -2120,7 +2120,19 @@ impl ServiceLedger {
                     let mut members: Vec<(Hash, u8)> = Vec::new();
                     let mut complete = true;
                     for tier in layout.shard_tiers() {
-                        let set = cohort(tier);
+                        let mut set = cohort(tier);
+                        // A private request is sealed to the heads only, under the lineup's
+                        // coverage rule; the heads it left out cannot read it.
+                        if tier == layout.head_tier() && !req.recipients.is_empty() {
+                            let escrows: Vec<Hash> = set.iter().map(|(_, escrow)| *escrow).collect();
+                            let target = private_target_cohort(&req.cohort_seed, &escrows);
+                            let uncovered = target.iter().filter(|e| req.recipients.binary_search(e).is_err()).count();
+                            if uncovered > private_cohort_tolerance(target.len()) {
+                                set.clear();
+                            } else {
+                                set.retain(|(_, escrow)| req.recipients.binary_search(escrow).is_ok());
+                            }
+                        }
                         if set.is_empty() {
                             complete = false;
                             break;
@@ -5403,6 +5415,45 @@ mod tests {
         ledger.on_chain_block(112, &[], &[], &[], |_| true, shard_cohorts(None));
         assert_eq!(chosen_of(&ledger, &rh2), vec![(t6, shard_id(t6, 1))]);
         assert_eq!(ledger.pending.get(&rh2).unwrap().audit.as_ref().unwrap().declared.len(), 2);
+    }
+
+    #[test]
+    fn a_private_network_model_request_binds_only_the_heads_it_was_sealed_to() {
+        let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
+        ledger.set_window_v2_activation(0);
+        let rh = [9u8; 32];
+        let head = NETWORK_MODEL_HEAD_TIER;
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let recipients = vec![(rh, [1u8; 36], vec![shard_id(head, 0)])];
+        ledger.on_chain_block_with_recipients(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &recipients, &[], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        let out = ledger.on_chain_block(101 + w + 1, &[], &[], &[], |_| true, shard_cohorts(None));
+        let hit = struck(&out);
+        assert!(hit.contains(&shard_id(head, 0)), "the sealed head is bound");
+        assert!(!hit.contains(&shard_id(head, 1)), "a head that cannot read the request is not");
+    }
+
+    #[test]
+    fn a_private_network_model_request_leaving_out_too_many_heads_is_dropped() {
+        let cohorts = |tier: u8| -> Vec<(Hash, Hash)> {
+            let n = if tier == NETWORK_MODEL_HEAD_TIER { 5 } else { 2 };
+            if tier <= NETWORK_MODEL_TIER {
+                return Vec::new();
+            }
+            (0..n).map(|i| (shard_id(tier, i), shard_id(tier, i))).collect()
+        };
+        let mut ledger = ServiceLedger::default();
+        ledger.enable_pipeline_sanctions();
+        ledger.set_window_v2_activation(0);
+        let rh = [10u8; 32];
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let recipients = vec![(rh, [1u8; 36], vec![shard_id(NETWORK_MODEL_HEAD_TIER, 0)])];
+        ledger.on_chain_block_with_recipients(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &recipients, &[], &[], &[], |_| true, cohorts);
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, cohorts);
+        assert_eq!(ledger.pending_len(), 0, "unservable: four heads cannot read it");
+        let out = ledger.on_chain_block(101 + w + 1, &[], &[], &[], |_| true, cohorts);
+        assert!(struck(&out).is_empty());
     }
 
     #[test]

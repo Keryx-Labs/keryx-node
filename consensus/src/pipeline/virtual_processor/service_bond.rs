@@ -748,7 +748,13 @@ impl VirtualStateProcessor {
         if !self.private_inference_activation.is_active(virtual_daa_score) {
             return None;
         }
-        let tier = service_tiers(true).iter().position(|t| t.model_id == *model_id)? as u8;
+        // The network model is read by its pipeline heads only: the shards compute on hidden
+        // states and never open the request.
+        let tier = if self.model_split_activation.is_active(virtual_daa_score) && *model_id == self.network_model.model_id() {
+            self.network_model.head_tier()
+        } else {
+            service_tiers(true).iter().position(|t| t.model_id == *model_id)? as u8
+        };
         let (own_pp, sc) = self.retained_pruning_point_and_chain();
         let sink = sc.get_tip().ok()?.1;
         let cohort: Vec<Hash> = self
