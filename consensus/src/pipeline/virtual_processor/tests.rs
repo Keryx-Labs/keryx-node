@@ -465,6 +465,64 @@ async fn model_split_payloads_invalidate_the_block_before_the_gate() {
     }
 }
 
+/// Model split: past the gate the retired lineup tier is not mined, and a range tier must be the
+/// range assigned to the coinbase escrow key under the header's pruning point.
+#[tokio::test]
+async fn model_split_range_tier_follows_the_chain_assignment() {
+    use crate::errors::RuleError;
+    use keryx_consensus_core::config::params::{ForkActivation, NETWORK_MODEL_TIER, network_model_range};
+    use keryx_consensus_core::pom::PomProof;
+
+    let mut params = MAINNET_PARAMS;
+    params.pom_activation = ForkActivation::always();
+    params.pom_v3_activation = ForkActivation::always();
+    params.model_split_activation = ForkActivation::always();
+    let n_shards = params.network_model.n_shards();
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+
+    let mut miner = new_miner_data();
+    let mut extra = miner.extra_data.to_vec();
+    extra.extend_from_slice(format!("/escrow:{}", "11".repeat(32)).as_bytes());
+    miner.extra_data = extra;
+
+    fn proof_with_tier(tier: u8) -> PomProof {
+        // Contents are irrelevant (check_pom_proof is skipped); only `tier` is persisted/read.
+        PomProof {
+            tier,
+            trace_root: [0; 32],
+            pow_value: [0; 32],
+            final_state: 0,
+            initial_trace_path: vec![],
+            final_trace_path: vec![],
+            openings: vec![],
+            steps_v2: None,
+            v3: None,
+            v4: None,
+            task: None,
+        }
+    }
+
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let genesis = config.genesis.hash;
+    let probe = tc.build_utxo_valid_block_with_parents(1u64.into(), vec![genesis], miner.clone(), vec![]);
+    let assigned = NETWORK_MODEL_TIER + 1 + network_model_range(&probe.header.pruning_point.as_bytes(), &[0x11u8; 32], n_shards);
+    let other = NETWORK_MODEL_TIER + 1 + (assigned - NETWORK_MODEL_TIER) % n_shards as u8;
+
+    for (n, tier) in [(1u64, 4u8), (2, other), (3, assigned)] {
+        let hash: Hash = n.into();
+        let mut mutable = tc.build_utxo_valid_block_with_parents(hash, vec![genesis], miner.clone(), vec![]);
+        mutable.header.pom_tier = tier;
+        let result = tc.validate_and_insert_block(mutable.to_immutable().with_pom_proof(proof_with_tier(tier))).block_task.await;
+        match n {
+            1 => assert!(matches!(result, Err(RuleError::PomTierPaused(4))), "{result:?}"),
+            2 => assert!(matches!(result, Err(RuleError::PomRangeNotAssigned(t, a)) if t == other && a == assigned), "{result:?}"),
+            _ => assert!(result.is_ok(), "{result:?}"),
+        }
+    }
+    tc.shutdown(handles);
+}
+
 /// Private inference: before `private_inference_activation` a block carrying an AiResponse with an
 /// inline body is Invalid, the verdict a node without private inference reaches in isolation; at/after
 /// it the block is accepted.
