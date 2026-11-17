@@ -2051,7 +2051,7 @@ fn check_ai_request_payload_rules(
 ) -> BlockProcessResult<()> {
     if let Some(&(_, base_reward)) = minimums.iter().find(|(id, _)| *id == req.model_id) {
         let token_surcharge = (req.max_tokens as u64).div_ceil(64) * token_step;
-        let effective_min = base_reward + token_surcharge;
+        let effective_min = base_reward.saturating_add(token_surcharge);
         if req.inference_reward < effective_min {
             return Err(AiRequestInferenceRewardBelowMinimum(tx.id(), req.inference_reward, effective_min, hex::encode(req.model_id)));
         }

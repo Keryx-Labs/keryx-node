@@ -5550,7 +5550,7 @@ mod tests {
         ledger.on_chain_block_with_rewards(
             100,
             &[(rh, NETWORK_MODEL_TIER, 256)],
-            &[(rh, 104_000)],
+            &[(rh, 128_000)],
             &[],
             &[],
             &[],
@@ -5570,17 +5570,17 @@ mod tests {
         // pre-arm strikes on the head so its reset is observable
         ledger.strikes.insert(head, StrikeEntry { count: 1, last_daa: 50 });
         let out = fold_response(&mut ledger, 105, rh, head, &signed);
-        // reward split by VRAM: weights 8/12/12/16/24/32 of 104 000
+        // reward split by VRAM: four equal 32 GB weights of 128 000
         assert_eq!(out.rewards.len(), NETWORK_MODEL_SHARDS.len());
         assert_eq!(out.rewards[0].request_hash, rh);
         assert_eq!(out.rewards[0].winner, head);
         assert_eq!(out.rewards[0].amount, 32_000);
         let total: u64 = out.rewards.iter().map(|r| r.amount).sum();
-        assert_eq!(total, 104_000);
+        assert_eq!(total, 128_000);
         for (r, (tier, id)) in out.rewards[1..].iter().zip(signed.iter()) {
             assert_eq!(r.winner, *id);
             assert_eq!(r.request_hash, reward_share_key(&rh, *tier));
-            assert_eq!(r.amount, 104_000 * network_model_tier_weight(*tier) / 104);
+            assert_eq!(r.amount, 128_000 * network_model_tier_weight(*tier) / 128);
         }
         assert!(out.resets.iter().any(|(id, _)| *id == head));
         // window close: the substituted choice alone is struck — everyone else declared
@@ -5666,7 +5666,7 @@ mod tests {
         ledger.on_chain_block_with_rewards(
             100,
             &[(rh, NETWORK_MODEL_TIER, 256)],
-            &[(rh, 1_040)],
+            &[(rh, 1_280)],
             &[],
             &[],
             &[],

@@ -12,7 +12,7 @@ use crate::processes::{
 };
 use keryx_consensus_core::{
     block::Block,
-    config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
+    config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, RETIRED_LINEUP_TIER, pom_tiers},
     errors::consensus::{ConsensusError, ConsensusResult},
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
@@ -52,8 +52,8 @@ impl BlockBodyProcessor {
         // Model split: the lineup tiers stay mineable next to the shards, but the network model itself
         // is a request target, never a mined tier.
         // Keyed on the committed header tier, so the IBD proof skip does not bypass it.
-        if self.model_split_activation.is_active(block.header.daa_score) && block.header.pom_tier == NETWORK_MODEL_TIER {
-            return Err(RuleError::PomTierPaused(block.header.pom_tier));
+        if self.model_split_activation.is_active(block.header.daa_score) {
+            self.check_network_model_tier(block)?;
         }
         if !skip_pom_proof {
             self.check_block_task(block)?;
@@ -204,6 +204,15 @@ impl BlockBodyProcessor {
                     PrivateEraViolation::ResponseWithoutBody => RuleError::AiResponseWithoutPrivateBody(tx.id()),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Past the model-split gate: the network model and the retired lineup tier are not mined.
+    fn check_network_model_tier(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
+        let tier = block.header.pom_tier;
+        if tier == NETWORK_MODEL_TIER || tier == RETIRED_LINEUP_TIER {
+            return Err(RuleError::PomTierPaused(tier));
         }
         Ok(())
     }
