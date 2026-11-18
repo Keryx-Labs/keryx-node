@@ -188,6 +188,7 @@ impl Consensus {
         keryx_consensus_core::pom::init_service_commit_activation(params.pom_v3_activation.daa_score());
         keryx_consensus_core::pom::init_pom_seed_h10_activation(params.h10_activation.daa_score());
         keryx_consensus_core::pom::init_private_inference_activation(params.private_inference_activation.daa_score());
+        keryx_consensus_core::pom::init_model_split_activation(params.model_split_activation.daa_score());
         keryx_consensus_core::pom::init_block_task_activation(params.block_task_activation.daa_score());
 
         //

@@ -61,8 +61,8 @@ pub enum PomWireError {
 /// Both are what [`encode_v4_deduped`]/[`decode_v4_deduped`] need, and both are derivable by any
 /// peer holding the header — which is why the compact form can omit them.
 ///
-/// The tier table is `POM_TIERS_H6` before the private-inference activation, then the network's
-/// model-split table, a superset of `POM_TIERS_H14` with the same indices: `pom_v4_activation` is
+/// The tier table is `POM_TIERS_H6` before the private-inference activation, `POM_TIERS_H14` until
+/// the model-split activation, then the network's model-split table: `pom_v4_activation` is
 /// strictly later than `pom_v3_activation`, and `model_split_activation` is never earlier than
 /// `private_inference_activation`, so every v4 block selects a table this resolves. A tier outside
 /// it is rejected here rather than guessed, and the caller falls back to the legacy encoding; body
@@ -73,12 +73,18 @@ static ACTIVE_TIERS: std::sync::OnceLock<&'static [crate::pom::PomTier]> = std::
 pub fn set_active_tiers(tiers: &'static [crate::pom::PomTier]) {
     let _ = ACTIVE_TIERS.set(tiers);
 }
-pub fn v4_wire_context(header: &Header, tier: u8) -> Result<(u64, u64), PomWireError> {
-    let tiers = if crate::pom::private_inference_active(header.daa_score) {
+fn wire_tiers(private_inference: bool, model_split: bool) -> &'static [crate::pom::PomTier] {
+    if model_split {
         ACTIVE_TIERS.get().copied().unwrap_or(crate::config::params::POM_TIERS_MODEL_SPLIT)
+    } else if private_inference {
+        crate::config::params::POM_TIERS_H14
     } else {
         crate::config::params::POM_TIERS_H6
-    };
+    }
+}
+
+pub fn v4_wire_context(header: &Header, tier: u8) -> Result<(u64, u64), PomWireError> {
+    let tiers = wire_tiers(crate::pom::private_inference_active(header.daa_score), crate::pom::model_split_active(header.daa_score));
     let t = tiers.get(tier as usize).ok_or(PomWireError::UnknownTier(tier))?;
     let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
     Ok((pom_block_seed_rewalk_era(&pre_pow_hash, header.timestamp, header.nonce, header.daa_score), t.chunks))
@@ -345,6 +351,17 @@ pub fn decode_v4_deduped(bytes: &[u8], seed: u64, n_chunks: u64) -> Result<PomPr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_chunk_counts_follow_the_block_era() {
+        use crate::config::params::{POM_TIERS_H14, POM_TIERS_H6, POM_TIERS_MODEL_SPLIT};
+        for t in 0..POM_TIERS_H14.len() {
+            assert_eq!(wire_tiers(true, false)[t].chunks, POM_TIERS_H14[t].chunks);
+            assert_eq!(wire_tiers(false, false)[t].chunks, POM_TIERS_H6[t].chunks);
+        }
+        assert_eq!(wire_tiers(true, true).len(), POM_TIERS_MODEL_SPLIT.len());
+        assert_ne!(wire_tiers(true, true)[0].chunks, POM_TIERS_H14[0].chunks);
+    }
     use crate::pom_v4::{POM_V4_TILE_CHUNKS, v4_prove};
     use rand::{Rng, SeedableRng, rngs::StdRng};
 

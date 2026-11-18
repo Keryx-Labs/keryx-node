@@ -339,14 +339,34 @@ pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
     (KIMI_LINEAR_48B_MODEL_ID,         250_000_000), // 2.5 KRX
 ];
 
-/// Per-model minimum inference_reward in sompi once `model_split_activation` is live: the flat
-/// lineup floors, then the network model, shared by its four signers. Kimi-48B is retired: no
-/// request can meet its floor.
+/// NVIDIA-Nemotron-3.5-Bolt-E4B heretic Q6_K (Losew GGUF, arch gemma4). H18 tier 0. `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS Qmf6tsQ2DDMLSrQKwuL2NfmJUBkeV9GGwZUu8Co9JfJJ4G).
+pub const BOLT_E4B_MODEL_ID: [u8; 32] = [
+    0xf9, 0x10, 0x8e, 0xb1, 0xc6, 0x7b, 0x3e, 0xe0,
+    0xd4, 0x4c, 0x96, 0xf2, 0x59, 0xe3, 0xfd, 0x93,
+    0xee, 0x50, 0x75, 0x19, 0x4b, 0x54, 0x43, 0x61,
+    0x65, 0xcf, 0x19, 0x87, 0xab, 0xaf, 0x5a, 0xc9,
+];
+
+/// Qwen3.5-9B-abliterated Q8_0 (huihui-ai abliteration, mradermacher GGUF). H18 tier 1. `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS QmQtTFMQYvnoZ1ZxNsuth8zzLWoBVKnCDVoW2ViCn8H6na).
+pub const QWEN3_5_9B_Q8_MODEL_ID: [u8; 32] = [
+    0x25, 0xdd, 0x00, 0x1c, 0xa8, 0x01, 0x70, 0x8f,
+    0xa8, 0x2a, 0x9d, 0x2a, 0x77, 0xe7, 0xba, 0xec,
+    0x4f, 0x27, 0x43, 0xae, 0xbe, 0xe9, 0x9d, 0xc6,
+    0x04, 0xc3, 0xbf, 0xbc, 0xf6, 0x71, 0x64, 0x57,
+];
+
+/// Per-model minimum inference_reward in sompi once `model_split_activation` is live: the H18
+/// lineup, then the network model, shared by its four signers. Models that left the lineup keep
+/// an entry no request can meet.
 pub const INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT: &[([u8; 32], u64)] = &[
-    (QWEN3_5_9B_ABLITERATED_MODEL_ID,   50_000_000),
-    (GLM_4_9B_0414_MODEL_ID,           100_000_000),
+    (BOLT_E4B_MODEL_ID,                 50_000_000),
+    (QWEN3_5_9B_Q8_MODEL_ID,           100_000_000),
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000),
     (QWEN3_8_27B_MODEL_ID,             200_000_000),
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  u64::MAX),
+    (GLM_4_9B_0414_MODEL_ID,           u64::MAX),
     (KIMI_LINEAR_48B_MODEL_ID,         u64::MAX),
     (NETWORK_MODEL_V4_FLASH_MODEL_ID,  400_000_000), // 4.0 KRX, four signers
 ];
@@ -621,11 +641,48 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 /// Context pad tiles of each `POM_TIERS_H14` tier from `pad_margin_activation`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
-const _: () = assert!(POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len() && POM_V5_PAD_TILES_H16.len() == POM_TIERS_H14.len());
+/// Context pad tiles of each H18 lineup tier. Tiers 0 and 1 are provisional until measured on their card class.
+pub const POM_V5_PAD_TILES_H18: [u64; 5] = [434_176, 1_863_680, 4_599_808, 6_266_880, 2_245_632];
+
+const _: () = assert!(
+    POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
+        && POM_V5_PAD_TILES_H16.len() == POM_TIERS_H14.len()
+        && POM_V5_PAD_TILES_H18.len() == POM_TIERS_H14.len()
+);
+
+/// Lineup the per-tier rules of tiers 0-4 follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lineup {
+    H14,
+    /// The lineup of `POM_TIERS_MODEL_SPLIT`, from `model_split_activation`.
+    H18,
+}
+
+impl Lineup {
+    /// Possession anchors of tiers 0-4.
+    pub fn tiers(self) -> &'static [crate::pom::PomTier] {
+        match self {
+            Lineup::H14 => POM_TIERS_H14,
+            Lineup::H18 => &POM_TIERS_MODEL_SPLIT[..POM_TIERS_H14.len()],
+        }
+    }
+
+    /// Whether the trace manifests of `tier` describe this lineup's model.
+    fn traced(self, tier: u8) -> bool {
+        match self {
+            Lineup::H14 => true,
+            Lineup::H18 => tier >= 2,
+        }
+    }
+}
 
 /// Context pad tiles of `tier`; 0 = no pad.
-pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool) -> u64 {
-    let table = if pad_margin { &POM_V5_PAD_TILES_H16 } else { &POM_V5_PAD_TILES_H14 };
+pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool, lineup: Lineup) -> u64 {
+    let table = match lineup {
+        Lineup::H18 => &POM_V5_PAD_TILES_H18,
+        Lineup::H14 if pad_margin => &POM_V5_PAD_TILES_H16,
+        Lineup::H14 => &POM_V5_PAD_TILES_H14,
+    };
     table.get(tier as usize).copied().unwrap_or(0)
 }
 
@@ -1149,7 +1206,10 @@ pub struct TraceRules {
 
 /// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests,
 /// `chain` stage 2 and its manifests, `attention` the attention manifests of the tiers that have one.
-pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attention: bool) -> Option<TraceRules> {
+pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attention: bool, lineup: Lineup) -> Option<TraceRules> {
+    if !lineup.traced(tier) {
+        return None;
+    }
     if chain {
         let mut c = TRACE_CHAINS_H15.get(tier as usize)?.clone()?;
         let attn = if attention { *TRACE_ATTN_H_NEXT.get(tier as usize)? } else { None };
@@ -1159,7 +1219,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
             c.ctx.n_recur = n.n_recur;
             c.ctx.seq_heads = n.seq_heads;
         }
-        let t = POM_TIERS_H14.get(tier as usize)?;
+        let t = lineup.tiers().get(tier as usize)?;
         let ctx = keryx_verifiable_inference::verify::TierCtx {
             r_t: t.root,
             n_chunks: t.chunks,
@@ -1171,7 +1231,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
     }
     let manifests = if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 };
     let m = (*manifests.get(tier as usize)?)?;
-    let t = POM_TIERS_H14.get(tier as usize)?;
+    let t = lineup.tiers().get(tier as usize)?;
     let ctx = keryx_verifiable_inference::verify::TierCtx {
         r_t: t.root,
         n_chunks: t.chunks,
@@ -1187,24 +1247,31 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
 /// Must equal the miner's `ctx_floor` per model.
 pub const CONTEXT_FLOORS_H14: [u32; 5] = [8_192, 32_768, 32_768, 32_768, 32_768];
 
+/// Context floor of each tier of the H18 lineup, in tokens. Must equal the miner's `ctx_floor` per model.
+pub const CONTEXT_FLOORS_H18: [u32; 5] = [32_768, 32_768, 32_768, 32_768, 32_768];
+
 /// Positions the chat template and the request prefix add to a prompt, at most.
 pub const CONTEXT_OVERHEAD_TOKENS: u32 = 512;
 
 /// Context floor of `tier`, in tokens.
-pub fn context_floor(tier: u8) -> Option<u32> {
-    CONTEXT_FLOORS_H14.get(tier as usize).copied()
+pub fn context_floor(tier: u8, lineup: Lineup) -> Option<u32> {
+    let table = match lineup {
+        Lineup::H14 => &CONTEXT_FLOORS_H14,
+        Lineup::H18 => &CONTEXT_FLOORS_H18,
+    };
+    table.get(tier as usize).copied()
 }
 
 /// Longest prompt, in bytes, sure to fit the context floor of `tier` under `max_tokens`: a
 /// token spans at least one byte.
-pub fn safe_prompt_len(tier: u8, max_tokens: u32) -> Option<u32> {
-    Some(context_floor(tier)?.saturating_sub(max_tokens.saturating_add(CONTEXT_OVERHEAD_TOKENS)))
+pub fn safe_prompt_len(tier: u8, max_tokens: u32, lineup: Lineup) -> Option<u32> {
+    Some(context_floor(tier, lineup)?.saturating_sub(max_tokens.saturating_add(CONTEXT_OVERHEAD_TOKENS)))
 }
 
 /// Whether a traced prompt of `n_prompt` positions fits the context floor of `tier` with its
 /// `max_tokens` budget.
-pub fn prompt_fits_floor(tier: u8, n_prompt: u32, max_tokens: u32) -> bool {
-    context_floor(tier).is_some_and(|floor| n_prompt.saturating_add(max_tokens) <= floor)
+pub fn prompt_fits_floor(tier: u8, n_prompt: u32, max_tokens: u32, lineup: Lineup) -> bool {
+    context_floor(tier, lineup).is_some_and(|floor| n_prompt.saturating_add(max_tokens) <= floor)
 }
 
 /// Tier lineup of the service ledger and the provider queries: the H14 set once
@@ -1269,12 +1336,26 @@ pub const NETWORK_MODEL_SHARDS: &[([u8; 32], u32, u32)] = &[
     (V4_FLASH_SHARD_3_MODEL_ID, 33, 42),
 ];
 
-/// Model-split tier set: the H14 lineup (tier 4 no longer mined), then the network model (tier 5) and
+/// Model-split tier set: the H18 lineup (tier 4 no longer mined), then the network model (tier 5) and
 /// its four ranges (tiers 6-9, layer order), assigned per block by `network_model_range`. Gated by
 /// `model_split_activation`.
 pub const POM_TIERS_MODEL_SPLIT: &[crate::pom::PomTier] = &[
-    POM_TIERS_H14[0],
-    POM_TIERS_H14[1],
+    crate::pom::PomTier {
+        model_id: BOLT_E4B_MODEL_ID,
+        root: [
+            0xe6, 0x0c, 0x06, 0x62, 0xc6, 0xe1, 0xe4, 0x7f, 0xaf, 0x22, 0x76, 0xc9, 0x48, 0xb4, 0x26, 0x95,
+            0x66, 0xb9, 0xd0, 0x52, 0xa4, 0xf7, 0xfe, 0xc2, 0x48, 0xb1, 0x42, 0x1d, 0x45, 0xf5, 0x9b, 0xca,
+        ],
+        chunks: 192_383_008,
+    },
+    crate::pom::PomTier {
+        model_id: QWEN3_5_9B_Q8_MODEL_ID,
+        root: [
+            0x8d, 0x78, 0x1a, 0xd6, 0x29, 0x21, 0x77, 0xe4, 0x37, 0xae, 0x23, 0xc8, 0x42, 0x4e, 0xc3, 0x05,
+            0x73, 0x03, 0x69, 0x78, 0x26, 0x9f, 0xbb, 0x3b, 0x57, 0x55, 0x2c, 0xa1, 0xe4, 0x3d, 0x67, 0x65,
+        ],
+        chunks: 297_391_680,
+    },
     POM_TIERS_H14[2],
     POM_TIERS_H14[3],
     POM_TIERS_H14[4],
@@ -1420,6 +1501,8 @@ pub struct NetworkModelLayout {
     pub reward_bps: &'static [u64],
     pub minimums: &'static [([u8; 32], u64)],
     pub shard_vram_gb: &'static [u64],
+    /// Lineup the per-tier rules of tiers 0-4 follow once the split is live.
+    pub lineup: Lineup,
 }
 
 impl NetworkModelLayout {
@@ -1456,6 +1539,7 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT,
     minimums: INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
+    lineup: Lineup::H18,
 };
 
 /// The bench network model floor is the 9B flat floor (0.5 KRX).
@@ -1464,6 +1548,7 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
     reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT_9B,
     minimums: INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
+    lineup: Lineup::H14,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -3265,16 +3350,45 @@ mod model_split_tables_tests {
         assert_eq!(POM_TIERS_MODEL_SPLIT.len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
         assert!(POM_TIERS_MODEL_SPLIT.len() >= POM_TIERS_H14.len());
         for (i, t) in POM_TIERS_H14.iter().enumerate() {
-            assert_eq!(POM_TIERS_MODEL_SPLIT[i].model_id, t.model_id);
-            assert_eq!(POM_TIERS_MODEL_SPLIT[i].root, t.root);
-            assert_eq!(POM_TIERS_MODEL_SPLIT[i].chunks, t.chunks);
             assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[i], TIER_REWARD_BPS_H6[i]);
+            if i >= 2 {
+                assert_eq!(POM_TIERS_MODEL_SPLIT[i].model_id, t.model_id);
+                assert_eq!(POM_TIERS_MODEL_SPLIT[i].root, t.root);
+                assert_eq!(POM_TIERS_MODEL_SPLIT[i].chunks, t.chunks);
+            }
         }
+        assert_eq!(POM_TIERS_MODEL_SPLIT[0].model_id, BOLT_E4B_MODEL_ID);
+        assert_eq!(POM_TIERS_MODEL_SPLIT[0].chunks, 192_383_008);
+        assert_eq!(POM_TIERS_MODEL_SPLIT[1].model_id, QWEN3_5_9B_Q8_MODEL_ID);
+        assert_eq!(POM_TIERS_MODEL_SPLIT[1].chunks, 297_391_680);
+        let ids = |t: &[crate::pom::PomTier]| t.iter().map(|x| x.model_id).collect::<Vec<_>>();
+        assert_eq!(ids(Lineup::H18.tiers()), ids(&POM_TIERS_MODEL_SPLIT[..POM_TIERS_H14.len()]));
+        assert_eq!(ids(Lineup::H14.tiers()), ids(POM_TIERS_H14));
         assert_eq!(NETWORK_MODEL_TIER as usize, POM_TIERS_H14.len());
         assert_eq!(pom_tiers(Some(POM_TIERS_MODEL_SPLIT), true, true, true, true, true).len(), POM_TIERS_MODEL_SPLIT.len());
         assert_eq!(pom_tiers(None, true, true, true, true, true).len(), POM_TIERS_H14.len());
         assert_eq!(tier_reward_bps(true, true, Some(&TIER_REWARD_BPS_MODEL_SPLIT)).len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
         assert_eq!(tier_reward_bps(true, true, None).len(), TIER_REWARD_BPS_H6.len());
+    }
+
+    #[test]
+    fn h18_lineup_rules() {
+        for t in 0..POM_TIERS_H14.len() as u8 {
+            assert_eq!(context_floor(t, Lineup::H18), Some(32_768));
+            assert_eq!(pom_v5_pad_tiles(t, true, Lineup::H18), POM_V5_PAD_TILES_H18[t as usize]);
+            assert_eq!(pom_v5_pad_tiles(t, false, Lineup::H18), POM_V5_PAD_TILES_H18[t as usize]);
+        }
+        assert_eq!(context_floor(0, Lineup::H14), Some(8_192));
+        for t in [0u8, 1] {
+            assert!(trace_rules(t, true, true, true, true, Lineup::H18).is_none());
+            assert!(trace_rules(t, true, true, false, false, Lineup::H18).is_none());
+        }
+        for t in [2u8, 3] {
+            let h18 = trace_rules(t, true, true, true, true, Lineup::H18).unwrap();
+            let h14 = trace_rules(t, true, true, true, true, Lineup::H14).unwrap();
+            assert_eq!(h18.ctx.r_t, h14.ctx.r_t);
+            assert_eq!(h18.ctx.m_t, h14.ctx.m_t);
+        }
     }
 
     #[test]
@@ -3298,10 +3412,12 @@ mod model_split_tables_tests {
             assert!(layout.minimums.iter().any(|(id, _)| *id == layout.model_id()));
             assert_eq!(layout.tier_weight(NETWORK_MODEL_TIER), 0);
             assert!(layout.tier_weight(layout.head_tier()) > 0);
-            for (i, t) in POM_TIERS_H14.iter().enumerate() {
+            for (i, t) in layout.lineup.tiers().iter().enumerate() {
                 assert_eq!(layout.tiers[i].model_id, t.model_id);
             }
         }
+        assert_eq!(NETWORK_MODEL_MAINNET.lineup, Lineup::H18);
+        assert_eq!(NETWORK_MODEL_SPLIT9B.lineup, Lineup::H14);
         assert_eq!(NETWORK_MODEL_MAINNET.head_tier(), NETWORK_MODEL_HEAD_TIER);
         assert_eq!(NETWORK_MODEL_MAINNET.model_id(), NETWORK_MODEL_V4_FLASH_MODEL_ID);
     }
@@ -3321,11 +3437,14 @@ mod model_split_tables_tests {
             let class = match gb { 8 => 0, 12 => 1, 16 => 2, 24 => 3, _ => 4 };
             assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize + 1 + k], TIER_REWARD_BPS_H6[class]);
         }
-        // the network model has a floor: the flat lineup with tier 4 retired, plus one entry
-        let n = INFERENCE_REWARD_MINIMUMS_FLAT.len();
-        assert_eq!(&INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT[..n - 1], &INFERENCE_REWARD_MINIMUMS_FLAT[..n - 1]);
-        assert_eq!(INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT[n - 1], (KIMI_LINEAR_48B_MODEL_ID, u64::MAX));
-        assert_eq!(INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.len(), n + 1);
+        // the H18 lineup keeps the flat floors per tier; models that left it cannot be requested
+        let floor = |id: [u8; 32]| INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.iter().find(|(m, _)| *m == id).map(|(_, f)| *f);
+        for (i, t) in Lineup::H18.tiers().iter().enumerate().take(4) {
+            assert_eq!(floor(t.model_id), Some(INFERENCE_REWARD_MINIMUMS_FLAT[i].1));
+        }
+        for retired in [QWEN3_5_9B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, KIMI_LINEAR_48B_MODEL_ID] {
+            assert_eq!(floor(retired), Some(u64::MAX));
+        }
         let min = INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.iter().find(|(id, _)| *id == NETWORK_MODEL_V4_FLASH_MODEL_ID).unwrap().1;
         assert_eq!(min, 400_000_000);
     }
@@ -3457,11 +3576,11 @@ mod pad_table_tests {
         for t in 0..POM_TIERS_H14.len() {
             assert_eq!(POM_V5_PAD_TILES_H16[t], POM_V5_PAD_TILES_H14[t] - 204_800);
             assert!(POM_V5_PAD_TILES_H16[t] > 0);
-            assert_eq!(pom_v5_pad_tiles(t as u8, false), POM_V5_PAD_TILES_H14[t]);
-            assert_eq!(pom_v5_pad_tiles(t as u8, true), POM_V5_PAD_TILES_H16[t]);
+            assert_eq!(pom_v5_pad_tiles(t as u8, false, Lineup::H14), POM_V5_PAD_TILES_H14[t]);
+            assert_eq!(pom_v5_pad_tiles(t as u8, true, Lineup::H14), POM_V5_PAD_TILES_H16[t]);
         }
-        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, false), 0);
-        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, true), 0);
+        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, false, Lineup::H14), 0);
+        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, true, Lineup::H14), 0);
     }
 
     #[test]
@@ -3572,8 +3691,8 @@ mod trace_chain_tests {
     #[test]
     fn attention_switches_only_the_tiers_that_have_a_manifest() {
         for tier in 0..5u8 {
-            let base = trace_rules(tier, true, true, true, false).unwrap();
-            let attn = trace_rules(tier, true, true, true, true).unwrap();
+            let base = trace_rules(tier, true, true, true, false, Lineup::H14).unwrap();
+            let attn = trace_rules(tier, true, true, true, true, Lineup::H14).unwrap();
             assert!(!base.attention && base.chain.unwrap().n_attn == 0);
             match &TRACE_ATTN_H_NEXT[tier as usize] {
                 Some(n) => {
@@ -3585,6 +3704,6 @@ mod trace_chain_tests {
                 None => assert!(!attn.attention && attn.ctx.m_t == base.ctx.m_t),
             }
         }
-        assert!(trace_rules(1, true, true, false, true).is_some_and(|r| !r.attention));
+        assert!(trace_rules(1, true, true, false, true, Lineup::H14).is_some_and(|r| !r.attention));
     }
 }

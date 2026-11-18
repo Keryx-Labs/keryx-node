@@ -102,7 +102,7 @@ impl BlockBodyProcessor {
             return Err(RuleError::BadBlockTask(Fail::Shape));
         }
         let opening = Opening::decode(bytes).ok_or(RuleError::BadBlockTask(Fail::Shape))?;
-        let rules = keryx_consensus_core::config::params::trace_rules(proof.tier, true, false, true, false)
+        let rules = keryx_consensus_core::config::params::trace_rules(proof.tier, true, false, true, false, self.lineup_at(header.daa_score))
             .ok_or(RuleError::BadBlockTask(Fail::Manifest))?;
         let (Some(chain), Some(prefix)) = (rules.chain.as_ref(), rules.prefix.as_ref()) else {
             return Err(RuleError::BadBlockTask(Fail::Manifest));
@@ -227,6 +227,15 @@ impl BlockBodyProcessor {
             return Err(RuleError::PomRangeNotAssigned(tier, assigned));
         }
         Ok(())
+    }
+
+    /// Lineup the per-tier rules of a block at `daa` follow.
+    fn lineup_at(&self, daa: u64) -> keryx_consensus_core::config::params::Lineup {
+        if self.model_split_activation.is_active(daa) {
+            self.network_model.lineup
+        } else {
+            keryx_consensus_core::config::params::Lineup::H14
+        }
     }
 
     /// Before the model-split gate, pipeline responses and availability declarations invalidate
@@ -441,7 +450,11 @@ impl BlockBodyProcessor {
         let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
 
         if self.pom_v5_activation.is_active(header.daa_score) {
-            let n_pad = keryx_consensus_core::config::params::pom_v5_pad_tiles(proof.tier, self.pad_margin_activation.is_active(header.daa_score));
+            let n_pad = keryx_consensus_core::config::params::pom_v5_pad_tiles(
+                proof.tier,
+                self.pad_margin_activation.is_active(header.daa_score),
+                self.lineup_at(header.daa_score),
+            );
             let pad_seed = v5_pad_seed(proof.tier, &tier.model_id, &tier.root);
             return verify_pom_proof_v5_container(seed, proof, tier.chunks, &tier.root, &pad_seed, n_pad, &target, final_hash)
                 .map_err(RuleError::BadPomProofV4);

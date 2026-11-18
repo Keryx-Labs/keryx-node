@@ -100,6 +100,21 @@ pub fn private_inference_active(daa_score: u64) -> bool {
     daa_score >= PRIVATE_INFERENCE_ACTIVATION_DAA.load(Ordering::Relaxed)
 }
 
+/// DAA score at which the model-split tier table applies. u64::MAX means "never" — initialised at
+/// startup from `Params::model_split_activation`, for the paths that only hold a header.
+static MODEL_SPLIT_ACTIVATION_DAA: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Called once at startup with the value from `Params::model_split_activation`.
+pub fn init_model_split_activation(daa_score: u64) {
+    MODEL_SPLIT_ACTIVATION_DAA.store(daa_score, Ordering::Relaxed);
+}
+
+/// Whether the model-split tier table applies to a block at `daa_score`.
+#[inline(always)]
+pub fn model_split_active(daa_score: u64) -> bool {
+    daa_score >= MODEL_SPLIT_ACTIVATION_DAA.load(Ordering::Relaxed)
+}
+
 /// A PoM tier binding: the model whose possession this tier proves, plus its canonical
 /// 32 B-chunk Merkle root `R_T` and chunk count `N` (from the offline `pom-rt-builder`).
 /// Pinned per network in `config::params` (`POM_TIERS`); the tier index is the slice

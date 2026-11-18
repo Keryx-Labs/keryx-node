@@ -13,7 +13,7 @@ use keryx_consensus_core::collateral::{
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
     TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
 };
-use keryx_consensus_core::config::params::{NETWORK_MODEL_TIER, POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
+use keryx_consensus_core::config::params::{Lineup, NETWORK_MODEL_TIER, POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
@@ -313,6 +313,14 @@ impl VirtualStateProcessor {
         };
         if self.private_inference_activation.is_active(seed_header.daa_score) && tier.is_some_and(model_changes_at_h14) {
             daa_bound = daa_bound.max(self.private_inference_activation.daa_score().saturating_sub(1));
+        }
+        let model_changes_at_split = |t: u8| {
+            (t as usize) < POM_TIERS_H14.len()
+                && POM_TIERS_H14.get(t as usize).map(|x| x.model_id)
+                    != self.network_model.lineup.tiers().get(t as usize).map(|x| x.model_id)
+        };
+        if self.model_split_activation.is_active(seed_header.daa_score) && tier.is_some_and(model_changes_at_split) {
+            daa_bound = daa_bound.max(self.model_split_activation.daa_score().saturating_sub(1));
         }
         // A window crossing below retained history only happens while re-validating blocks near
         // the local pruning point (fresh IBD / restart catch-up). Past the ledger gate the part
@@ -644,6 +652,11 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.awaited_attention_path(response_txid)
     }
 
+    /// Lineup the per-tier rules of a request accepted at `at` follow.
+    fn lineup_at(&self, at: u64) -> Lineup {
+        if self.model_split_activation.is_active(at) { self.network_model.lineup } else { Lineup::H14 }
+    }
+
     /// Pieces an audit of `tier` accepted at `at` needs.
     fn required_pieces_at(&self, tier: u8, at: u64) -> u8 {
         let rules = trace_rules(
@@ -652,6 +665,7 @@ impl VirtualStateProcessor {
             self.trace_audit_activation.is_active(at),
             self.trace_chain_activation.is_active(at),
             self.attention_activation.is_active(at),
+            self.lineup_at(at),
         );
         keryx_consensus_core::collateral::required_pieces(rules.as_ref())
     }
@@ -730,7 +744,12 @@ impl VirtualStateProcessor {
         let Ok((_, sink)) = sc.get_tip() else {
             return ServiceProvidersSnapshot { virtual_daa_score, providers };
         };
-        for (tier, model) in service_tiers(self.private_inference_activation.is_active(virtual_daa_score)).iter().enumerate() {
+        let lineup = if self.model_split_activation.is_active(virtual_daa_score) {
+            self.network_model.lineup.tiers()
+        } else {
+            service_tiers(self.private_inference_activation.is_active(virtual_daa_score))
+        };
+        for (tier, model) in lineup.iter().enumerate() {
             for (identity, escrow) in self.service_eligible_miners_in(&*sc, sink, tier as u8, window, own_pp) {
                 providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
             }
@@ -756,7 +775,7 @@ impl VirtualStateProcessor {
         let tier = if self.model_split_activation.is_active(virtual_daa_score) && *model_id == self.network_model.model_id() {
             self.network_model.head_tier()
         } else {
-            service_tiers(true).iter().position(|t| t.model_id == *model_id)? as u8
+            self.lineup_at(virtual_daa_score).tiers().iter().position(|t| t.model_id == *model_id)? as u8
         };
         let (own_pp, sc) = self.retained_pruning_point_and_chain();
         let sink = sc.get_tip().ok()?.1;
@@ -833,6 +852,7 @@ impl VirtualStateProcessor {
         }
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
+        ledger.set_model_split_activation(self.model_split_activation.daa_score());
         ledger.set_network_model(self.network_model);
         ledger.set_burnable_window(self.service_burnable_window_daa);
         let ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses, response_links, declarations } = self
@@ -883,7 +903,7 @@ impl VirtualStateProcessor {
             let chain_at = |at: u64| self.trace_chain_activation.is_active(at);
             let attn_at = |at: u64| self.attention_activation.is_active(at);
             let tier =
-                |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at)) } else { None };
+                |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at), self.lineup_at(at)) } else { None };
             let traces = TraceInputs {
                 chain_hash: hash,
                 responses: &trace_responses,
