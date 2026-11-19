@@ -1,8 +1,9 @@
 use crate::imports::*;
 use keryx_consensus_core::collateral::{PrivateCohortSeed, private_cohort_rank, private_cohort_seed, private_target_cohort};
 use keryx_consensus_core::config::params::{
-    GEMMA_4_12B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, INFERENCE_REWARD_MINIMUMS_FLAT, INFERENCE_REWARD_MINIMUMS_V2_H6,
-    KIMI_LINEAR_48B_MODEL_ID, Params, QWEN3_5_9B_ABLITERATED_MODEL_ID, QWEN3_6_27B_MODEL_ID, QWEN3_8_27B_MODEL_ID, service_tiers,
+    BOLT_E4B_MODEL_ID, GEMMA_4_12B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, INFERENCE_REWARD_MINIMUMS_FLAT,
+    INFERENCE_REWARD_MINIMUMS_V2_H6, KIMI_LINEAR_48B_MODEL_ID, Params, QWEN3_5_9B_ABLITERATED_MODEL_ID, QWEN3_5_9B_Q8_MODEL_ID,
+    QWEN3_6_27B_MODEL_ID, QWEN3_8_27B_MODEL_ID, service_tiers,
 };
 use keryx_consensus_core::constants::{SOMPI_PER_KASPA, TX_VERSION};
 use keryx_consensus_core::sign::{Signed, sign_with_multiple_v2};
@@ -21,8 +22,10 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use workflow_core::task::sleep;
 
-/// Display names of the tier models, H6 and H14 lineups.
-const MODEL_NAMES: [([u8; 32], &str); 6] = [
+/// Display names of the tier models, H6, H14 and H18 lineups.
+const MODEL_NAMES: [([u8; 32], &str); 8] = [
+    (BOLT_E4B_MODEL_ID, "Nemotron-3.5-Bolt-E4B"),
+    (QWEN3_5_9B_Q8_MODEL_ID, "Qwen3.5-9B-Q8_0"),
     (QWEN3_5_9B_ABLITERATED_MODEL_ID, "Qwen3.5-9B"),
     (GLM_4_9B_0414_MODEL_ID, "GLM-4-9B"),
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, "Gemma-4-12B"),
@@ -165,10 +168,7 @@ impl Inference {
             (None, Some(t)) => {
                 let params = Params::from(ctx.wallet().network_id()?);
                 let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
-                service_tiers(params.private_inference_activation.is_active(daa))
-                    .get(t)
-                    .map(|m| m.model_id)
-                    .ok_or_else(|| Error::custom("--tier must be 0-4"))?
+                lineup_tiers(&params, daa).get(t).map(|m| m.model_id).ok_or_else(|| Error::custom("--tier must be 0-4"))?
             }
             (None, None) => return Err(Error::custom("choose the model with --tier <0-4> or --model <hex>")),
         };
@@ -182,7 +182,13 @@ impl Inference {
                 let params = Params::from(ctx.wallet().network_id()?);
                 let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
                 let flat = params.private_inference_activation.is_active(daa);
-                let table = if flat { INFERENCE_REWARD_MINIMUMS_FLAT } else { INFERENCE_REWARD_MINIMUMS_V2_H6 };
+                let table = if params.model_split_activation.is_active(daa) {
+                    params.network_model.minimums
+                } else if flat {
+                    INFERENCE_REWARD_MINIMUMS_FLAT
+                } else {
+                    INFERENCE_REWARD_MINIMUMS_V2_H6
+                };
                 let base = table
                     .iter()
                     .find(|(id, _)| *id == model_id)
@@ -460,16 +466,20 @@ impl Inference {
 /// its tier, completed by rank with the tier's providers of the last `SEAL_WINDOW_DAA` up to the
 /// recipient cap.
 async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32], seed: &PrivateCohortSeed) -> Result<Vec<[u8; 32]>> {
-    let tier = service_tiers(true).iter().position(|t| t.model_id == *model_id).ok_or_else(|| Error::custom("unknown model: no tier serves it"))?
-        as u32;
+    let params = Params::from(ctx.wallet().network_id()?);
     let rpc = ctx.wallet().rpc_api();
+    let current = rpc.get_service_providers(None).await?;
+    let tier = lineup_tiers(&params, current.virtual_daa_score)
+        .iter()
+        .position(|t| t.model_id == *model_id)
+        .ok_or_else(|| Error::custom("unknown model: no tier serves it"))? as u32;
     let keys_of = |resp: &keryx_rpc_core::GetServiceProvidersResponse| -> Vec<[u8; 32]> {
         let mut keys: Vec<[u8; 32]> = resp.providers.iter().filter(|p| p.tier == tier).map(|p| p.escrow_pubkey.as_bytes()).collect();
         keys.sort_unstable();
         keys.dedup();
         keys
     };
-    let cohort: Vec<RpcHash> = keys_of(&rpc.get_service_providers(None).await?).into_iter().map(RpcHash::from_bytes).collect();
+    let cohort: Vec<RpcHash> = keys_of(&current).into_iter().map(RpcHash::from_bytes).collect();
     let mut recipients: Vec<[u8; 32]> = private_target_cohort(seed, &cohort).into_iter().map(|k| k.as_bytes()).collect();
     if recipients.is_empty() {
         return Err(Error::custom("no miner of this tier is eligible right now: the request could not be served"));
@@ -480,6 +490,15 @@ async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32], seed: &Priv
     extra.truncate(MAX_PRIVATE_RECIPIENTS.saturating_sub(recipients.len()));
     recipients.extend(extra);
     Ok(recipients)
+}
+
+/// Models of tiers 0-4 at `daa`.
+fn lineup_tiers(params: &Params, daa: u64) -> &'static [keryx_consensus_core::pom::PomTier] {
+    if params.model_split_activation.is_active(daa) {
+        params.network_model.lineup.tiers()
+    } else {
+        service_tiers(params.private_inference_activation.is_active(daa))
+    }
 }
 
 fn parse_hex32(s: &str, what: &str) -> Result<[u8; 32]> {
