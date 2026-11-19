@@ -34,6 +34,10 @@ pub const LINK_HEAD: u8 = 4;
 pub const LINK_DIRECT: u8 = 5;
 /// Per-head input: head `h` reads `[h * stride, h * stride + k)` of the source output, `stride` = source rows / heads.
 pub const LINK_HEAD_SLICE: u8 = 6;
+/// Input is the layer's residual before its per-layer input, unnormed.
+pub const LINK_RESID_IN: u8 = 7;
+/// Input is `gelu(src output) * per-layer input of the layer`.
+pub const LINK_PLE: u8 = 8;
 
 const TAG_NONE: u8 = 0;
 const TAG_PRODUCT: u8 = 1;
