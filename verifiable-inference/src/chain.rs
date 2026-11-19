@@ -3,7 +3,7 @@
 use crate::draw;
 use crate::manifest::{self, Chain};
 use crate::merkle::{B3_CHUNK, Hash, b3_fold, b3_leaf_from_chunk, b3_verify};
-use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, ExpertIds, LeafBytes, LeafChunk, LinkOpening, PlePoint, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
 use crate::attn::Partial;
 use crate::attn_blocks::{BlockTree, block_params, check_leaf, check_node, check_root_lse, child_weights, decode_partials, lse, open_partial, partial_len, partials_root, root_lse_tol};
 use crate::opening::{AttnOpening, PrefixPoint};
@@ -845,6 +845,11 @@ pub fn verify_resid_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, se
 pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op: &ResidOpening) -> Result<(), Fail> {
     let p = &op.resid;
     verify_resid_point(tier, ctx, resp, seed, p)?;
+    match (&op.ple, ctx.ple_width > 0) {
+        (Some(pp), true) => verify_ple_point(tier, ctx, resp, seed, p, pp)?,
+        (None, false) => {}
+        _ => return Err(Fail::Shape),
+    }
     let n_layers = ctx.n_layers as u64;
     let leaves = PosLeaves::of(tier, ctx);
     let d = draw::point(seed, RESID_POINT);
@@ -891,6 +896,86 @@ pub fn verify_resid_opening(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, 
         (ResidAdd::Moe(_), None) | (_, Some(_)) => Err(Fail::Shape),
         (_, None) => Ok(()),
     }
+}
+
+/// Draw index of the per-layer input point.
+pub const PLE_POINT: u32 = crate::recur::RECUR_POINT + 1;
+/// Relative tolerance of a per-layer input, per element.
+pub const EPS_PLE: f64 = 1e-5;
+
+/// Verify the per-layer input point at the residual point's position: the drawn layer's inputs
+/// from its projection slice, norm and token table slice, and one projection element from its
+/// weight row and the scaled token embedding (input in f32 or rounded to bf16).
+pub fn verify_ple_point(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, rp: &ResidPoint, pp: &PlePoint) -> Result<(), Fail> {
+    let leaves = PosLeaves::of(tier, ctx);
+    let (n_layers, width) = (ctx.n_layers as u64, ctx.ple_width as u64);
+    if !leaves.ple || n_layers == 0 || 4 * width != B3_CHUNK as u64 {
+        return Err(Fail::Shape);
+    }
+    let d = draw::point(seed, RESID_POINT);
+    let (resid_layer, _) = leaves.resid_at(resid_site(d[1], leaves.per_layer() * n_layers));
+    let t = resid_position(ctx, resp, resid_layer, d[0])?;
+    let q = draw::point(seed, PLE_POINT);
+    let (layer, jj) = (q[1] % n_layers, (q[2] % width) as usize);
+    let shape = shape(tier, ctx, rp.tok);
+    let total = 4 * width * n_layers;
+
+    let proj_leaf = chunk_leaf(&pp.proj, total, layer)?;
+    let pos_root = b3_fold(shape.n_leaves, leaves.ple_proj(), &proj_leaf, &pp.proj.leaf_path).ok_or(Fail::Trace)?;
+    if rp.n_ubatch != crate::verify::expected_ubatch(t, resp.n_prompt) {
+        return Err(Fail::Mismatch);
+    }
+    if !b3_verify(&resp.trace_root, resp.n_pos as u64, t, &pos_root, &rp.pos_path)
+        || !b3_verify(&pos_root, shape.n_leaves, shape.meta_index, &shape.meta_hash(t, rp.n_ubatch), &rp.meta_path)
+    {
+        return Err(Fail::Trace);
+    }
+    let proj = finite_f32s(&pp.proj.chunk)?;
+    let inputs = leaf_chunk(&pos_root, &shape, leaves.ple_inputs(), &pp.inputs, total, layer)?;
+    if proj.len() != width as usize || inputs.len() != width as usize {
+        return Err(Fail::Shape);
+    }
+
+    let pe = open_entry(tier, &pp.proj_entry, ctx.ple_entry as u64)?;
+    let pl = match pe.chain {
+        Chain::Ple(pl) if pe.role == manifest::ROLE_PLE_PROJ && pe.n_exp == 1 && pe.m == width * n_layers && pl.width as u64 == width => pl,
+        _ => return Err(Fail::Manifest),
+    };
+    let f = |bits: u32| Some(f32::from_bits(bits)).filter(|v| v.is_finite()).map(|v| v as f64).ok_or(Fail::Manifest);
+    let (embd_scale, proj_scale, out_scale) = (f(pl.embd_scale)?, f(pl.proj_scale)?, f(pl.out_scale)?);
+
+    let w = f32_weights(tier, &pp.norm, pl.norm, width, 0, width)?;
+    let te = open_entry(tier, &pp.table.0, pl.embd as u64)?;
+    if te.role != manifest::ROLE_PLE_EMBD || te.n_exp != 1 || te.k != width * n_layers || rp.tok as u64 >= te.m {
+        return Err(Fail::Manifest);
+    }
+    let (bb, bv) = quant::block_size(te.wtype).ok_or(Fail::Unsupported)?;
+    if !width.is_multiple_of(bv as u64) {
+        return Err(Fail::Shape);
+    }
+    let slice = width / bv as u64 * bb as u64;
+    let bytes = open_bytes(tier, &te, &pp.table.1, rp.tok as u64 * te.row_bytes as u64 + layer * slice, slice)?;
+    let table = quant::dequant_row(te.wtype, &bytes, width as usize).ok_or(Fail::Unsupported)?;
+    let normed = rms_scaled(&proj, ctx.eps, 1.0);
+    for i in 0..width as usize {
+        let pn = normed[i] * w[i] as f64;
+        let e = (table[i] as f64 * embd_scale) as f32 as f64;
+        let want = (pn + e) * out_scale;
+        let tol = EPS_PLE * (pn.abs() + e.abs()) * out_scale.abs() + f32::MIN_POSITIVE as f64;
+        if !((inputs[i] as f64 - want).abs() <= tol) {
+            return Err(Fail::Mismatch);
+        }
+    }
+
+    let row = open_row(tier, &pe, &pp.proj_row, layer * width + jj as u64)?;
+    let wr = quant::dequant_row(pe.wtype, &row, pe.k as usize).ok_or(Fail::Unsupported)?;
+    let x: Vec<f32> = embedding(tier, ctx, &pp.embd, rp.tok, pe.k)?.iter().map(|&v| (v as f64 * ctx.embd_scale) as f32).collect();
+    let dot = |xs: &mut dyn Iterator<Item = f32>| wr.iter().zip(xs).fold((0.0, 0.0), |(y, s), (&a, b)| (y + a as f64 * b as f64, s + (a as f64 * b as f64).abs()));
+    let full = dot(&mut x.iter().copied());
+    let rounded = dot(&mut x.iter().map(|&v| quant::round_bf16(v)));
+    let got = proj[jj] as f64;
+    let close = |(y, s): (f64, f64)| (got - proj_scale * y).abs() <= crate::verify::EPS * proj_scale.abs() * s + f32::MIN_POSITIVE as f64;
+    if close(full) || close(rounded) { Ok(()) } else { Err(Fail::Mismatch) }
 }
 
 /// Checks `y` against row `row` of expert `exp` of product `e` over its committed input, slot

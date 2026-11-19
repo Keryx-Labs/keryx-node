@@ -619,7 +619,7 @@ impl Tier {
             row: self.row_of(product, row).1,
             bias: None,
         };
-        crate::opening::ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: None }
+        crate::opening::ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: None, ple: None }
     }
 }
 
@@ -1435,7 +1435,7 @@ mod moe_tests {
                 x_path: b3_path(&self.pos.hashes, 2),
                 row: self.range(self.exps_off + (id * D + row) * RB, RB),
             };
-            Some(crate::opening::ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: Some(expert) })
+            Some(crate::opening::ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: Some(expert), ple: None })
         }
 
         fn check_piece(&self, seed: &Hash) -> Option<Result<(), crate::verify::Fail>> {

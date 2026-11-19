@@ -7,7 +7,7 @@ use crate::draw;
 use crate::f16;
 use crate::manifest::{self, Chain, Entry, LayerLinks, PleLayer, ProductLink};
 use crate::merkle::{Hash, b3_path, b3_root, rt_range_proof};
-use crate::opening::{ChunkRange, EntryOpening, FeedRow, LinkOpening, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
+use crate::opening::{ChunkRange, EntryOpening, FeedRow, LinkOpening, PlePoint, Point, ResidAdd, ResidOpening, ResidPoint, ResidSrc};
 use crate::q8;
 use crate::quant;
 use crate::testkit::{in_layout, layout_at, q8_1_row, serialize};
@@ -19,6 +19,7 @@ const N_LAYERS: usize = 2;
 const VOCAB: usize = 64;
 const EPS: f64 = 1e-6;
 const SCALE: f32 = 0.75;
+const EMBD_SCALE: f32 = 2.0;
 
 const PER_LAYER: usize = 4;
 const ATTN_OUTPUT: usize = 0;
@@ -28,7 +29,10 @@ const PROJ: usize = 3;
 const N_PRODUCTS: usize = N_LAYERS * PER_LAYER;
 const EMBD: usize = N_PRODUCTS;
 const POST_NORM: usize = EMBD + 1;
-const LAYERS: usize = POST_NORM + N_LAYERS;
+const PLE_NORM: usize = POST_NORM + N_LAYERS;
+const PLE_EMBD: usize = PLE_NORM + 1;
+const PLE_PROJ: usize = PLE_EMBD + 1;
+const LAYERS: usize = PLE_PROJ + 1;
 
 fn rank(l: usize, p: usize) -> usize {
     l * PER_LAYER + p
@@ -58,6 +62,20 @@ pub enum Fault {
     PeIn,
     /// The layer output skips the layer scale.
     OutScale,
+    /// The committed per-layer inputs are off their projection, norm and table.
+    Inputs,
+    /// The committed projection is shifted off its weights (its inputs follow it).
+    Proj,
+    /// The projection reads another token's embedding.
+    ProjToken,
+}
+
+fn proj_scale() -> f32 {
+    1.0 / (D as f32).sqrt()
+}
+
+fn ple_scales() -> (f32, f32) {
+    ((W as f32).sqrt(), 1.0 / 2f32.sqrt())
 }
 
 pub struct PleTier {
@@ -120,6 +138,30 @@ impl PleTier {
             let (off, n) = push(w);
             entries.push(base(format!("blk.{l}.post_norm.weight"), manifest::ROLE_NORM, 0, D, 1, off, n, 4 * D));
         }
+        let w: Vec<u8> = (0..W).flat_map(|j| (0.9 + 0.003 * (j % 29) as f32).to_le_bytes()).collect();
+        let (off, n) = push(w);
+        entries.push(base("per_layer_proj_norm.weight".into(), manifest::ROLE_NORM, 0, W, 1, off, n, 4 * W));
+        let (off, n) = push(q8_0_rows(7, VOCAB, W * N_LAYERS, 0.01));
+        entries.push(base("per_layer_token_embd.weight".into(), manifest::ROLE_PLE_EMBD, quant::Q8_0, W * N_LAYERS, VOCAB, off, n, W * N_LAYERS / 32 * 34));
+        let bf16: Vec<u8> = (0..W * N_LAYERS * D)
+            .flat_map(|i| {
+                let h = blake3::hash(&(i as u64).to_le_bytes());
+                let v = (h.as_bytes()[0] as f32 - 127.5) * 0.0004;
+                ((quant::round_bf16(v).to_bits() >> 16) as u16).to_le_bytes()
+            })
+            .collect();
+        let (off, n) = push(bf16);
+        let mut pe = base("per_layer_model_proj.weight".into(), manifest::ROLE_PLE_PROJ, quant::BF16, D, W * N_LAYERS, off, n, 2 * D);
+        let (es, os) = ple_scales();
+        pe.chain = Chain::Ple(manifest::PleLinks {
+            embd: PLE_EMBD as u32,
+            norm: PLE_NORM as u32,
+            width: W as u32,
+            embd_scale: es.to_bits(),
+            proj_scale: proj_scale().to_bits(),
+            out_scale: os.to_bits(),
+        });
+        entries.push(pe);
         for l in 0..N_LAYERS {
             let mut e = base(format!("blk.{l}"), manifest::ROLE_LAYER, 0, 0, 0, 0, 0, 0);
             e.chain = Chain::Layer(LayerLinks {
@@ -161,13 +203,13 @@ impl PleTier {
             layer_base: LAYERS as u32,
             embd_entry: EMBD as u32,
             eps: EPS,
-            embd_scale: 1.0,
+            embd_scale: EMBD_SCALE as f64,
             trim_last: false,
             n_used: 0,
             n_attn: 0,
             n_recur: 0,
             seq_heads: 0,
-            ple_entry: manifest::NONE,
+            ple_entry: PLE_PROJ as u32,
             ple_width: W as u32,
         }
     }
@@ -197,9 +239,39 @@ impl PleTier {
         self.weights[off..off + e.n_bytes as usize].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
     }
 
-    /// Per-layer inputs of `tok` at `layer`.
-    fn inputs(tok: u32, layer: usize) -> Vec<f32> {
-        (0..W).map(|j| 0.5 + 0.4 * libm::sin((tok as usize * 31 + layer * 7 + j) as f64 * 0.37) as f32).collect()
+    /// The per-layer projection before its norm and the per-layer inputs of every layer, for
+    /// `tok` at a position whose projection input is rounded to bf16 when `rounded`.
+    fn per_layer(&self, tok: u32, rounded: bool, fault: Option<Fault>) -> (Vec<f32>, Vec<f32>) {
+        let from = if fault == Some(Fault::ProjToken) { (tok + 1) % VOCAB as u32 } else { tok };
+        let x: Vec<f32> = quant::dequant_row(quant::Q8_0, self.row(EMBD, from as usize), D)
+            .unwrap()
+            .iter()
+            .map(|&v| v * EMBD_SCALE)
+            .map(|v| if rounded { quant::round_bf16(v) } else { v })
+            .collect();
+        let mut proj: Vec<f32> = (0..W * N_LAYERS)
+            .map(|j| {
+                let w = quant::dequant_row(quant::BF16, self.row(PLE_PROJ, j), D).unwrap();
+                let y: f64 = w.iter().zip(&x).map(|(&a, &b)| a as f64 * b as f64).sum();
+                y as f32 * proj_scale()
+            })
+            .collect();
+        if fault == Some(Fault::Proj) {
+            let shift = 0.1 * proj.iter().map(|v| v.abs()).sum::<f32>() / proj.len() as f32;
+            proj.iter_mut().for_each(|v| *v += shift);
+        }
+        let norm = self.f32_tensor(PLE_NORM);
+        let table = quant::dequant_row(quant::Q8_0, self.row(PLE_EMBD, tok as usize), W * N_LAYERS).unwrap();
+        let (es, os) = ple_scales();
+        let mut inputs = Vec::with_capacity(W * N_LAYERS);
+        for l in 0..N_LAYERS {
+            let normed = chain::rms_norm(&proj[l * W..(l + 1) * W], &norm, EPS);
+            for i in 0..W {
+                let v = ((normed[i] as f32 + table[l * W + i] * es) * os) * if fault == Some(Fault::Inputs) { 1.01 } else { 1.0 };
+                inputs.push(v);
+            }
+        }
+        (proj, inputs)
     }
 
     pub fn trace(&self, tokens: &[u32], n_prompt: u32, fault: Option<Fault>) -> Trace {
@@ -212,8 +284,8 @@ impl PleTier {
         for (t, &tok) in tokens.iter().enumerate() {
             let layout = layout_at(t as u64, n_prompt).1;
             let mut leaves = vec![Vec::new(); lv.n() as usize];
-            let mut h = quant::dequant_row(quant::Q8_0, self.row(EMBD, tok as usize), D).unwrap();
-            let mut all_inputs = Vec::with_capacity(N_LAYERS * W);
+            let mut h: Vec<f32> = quant::dequant_row(quant::Q8_0, self.row(EMBD, tok as usize), D).unwrap().iter().map(|&v| v * EMBD_SCALE).collect();
+            let (proj, all_inputs) = self.per_layer(tok, (t as u32) < n_prompt, fault);
             for l in 0..N_LAYERS {
                 let x_ao = q8_1_row(&chain::rms_norm(&h, &ones, EPS));
                 let y_ao = self.matvec(rank(l, ATTN_OUTPUT), &x_ao);
@@ -227,7 +299,7 @@ impl PleTier {
                 let gate_src: Vec<f64> = f64s(&pe_in).iter().map(|v| if fault == Some(Fault::GateInput) { v * 1.5 } else { *v }).collect();
                 let x_g = q8_1_row(&gate_src);
                 let y_g = self.matvec(rank(l, INP_GATE), &x_g);
-                let inp = Self::inputs(tok, l);
+                let inp = &all_inputs[l * W..(l + 1) * W];
                 let used: Vec<f32> = inp.iter().map(|&v| if fault == Some(Fault::PleInput) { v * 1.3 } else { v }).collect();
                 let mut prod: Vec<f64> = y_g.iter().zip(&used).map(|(&g, &u)| (gelu(g) as f32 * u) as f64).collect();
                 prod.resize(2 * W, 0.0);
@@ -244,10 +316,9 @@ impl PleTier {
                 leaves[lv.resid(l as u64, Resid::Attn) as usize] = bytes(&attn);
                 leaves[lv.resid(l as u64, Resid::PeIn) as usize] = bytes(&pe_in);
                 leaves[lv.resid(l as u64, Resid::Out) as usize] = bytes(&out);
-                all_inputs.extend_from_slice(&inp);
                 h = out;
             }
-            leaves[lv.ple_proj() as usize] = bytes(&all_inputs);
+            leaves[lv.ple_proj() as usize] = bytes(&proj);
             leaves[lv.ple_inputs() as usize] = bytes(&all_inputs);
             leaves[lv.meta() as usize] = chain::meta(t as u32, layout_at(t as u64, n_prompt).0, tok).to_vec();
             let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
@@ -387,7 +458,21 @@ impl PleTier {
         let (_, _, t) = self.resid_draw(trace, seed);
         let pos = &trace.positions[t as usize];
         let feed = FeedRow { x: pos.leaves[2 * product].clone(), x_path: b3_path(&pos.hashes, 2 * product), row: self.row_of(product, row).1, bias: None };
-        ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: None }
+        let q = draw::point(seed, chain::PLE_POINT);
+        let (layer, jj) = (q[1] % N_LAYERS as u64, q[2] % W as u64);
+        let lv = self.leaves();
+        let slice = (W / 32 * 34) as u64;
+        let table_off = pos.tok as u64 * self.entry(PLE_EMBD).row_bytes as u64 + layer * slice;
+        let ple = PlePoint {
+            proj_entry: self.entry_opening(PLE_PROJ),
+            proj_row: self.row_of(PLE_PROJ, layer * W as u64 + jj).1,
+            embd: self.row_of(EMBD, pos.tok as u64),
+            table: (self.entry_opening(PLE_EMBD), self.bytes_range(PLE_EMBD, table_off, slice)),
+            norm: (self.entry_opening(PLE_NORM), self.bytes_range(PLE_NORM, 0, 4 * W as u64)),
+            proj: leaf_chunk(pos, lv.ple_proj(), layer),
+            inputs: leaf_chunk(pos, lv.ple_inputs(), layer),
+        };
+        ResidOpening { response_txid: [0; 32], roots: None, resid, feed, expert: None, ple: Some(ple) }
     }
 }
 
@@ -482,6 +567,44 @@ mod tests {
             }
             assert!(hit > 0, "{fault:?}");
         }
+    }
+
+    #[test]
+    fn a_forged_per_layer_projection_or_input_is_refused() {
+        let tier = PleTier::new();
+        let (tc, cc) = (tier.tier(), tier.chain_ctx());
+        for fault in [Fault::Inputs, Fault::Proj, Fault::ProjToken] {
+            let trace = tier.trace(&tokens(), 8, Some(fault));
+            let rc = resp(&trace);
+            for seed in seeds() {
+                assert_eq!(verify_resid_point(&tc, &cc, &rc, &seed, &tier.open_resid(&trace, &seed)), Ok(()), "{fault:?}");
+                assert_eq!(verify_resid_opening(&tc, &cc, &rc, &seed, &tier.open_resid_piece(&trace, &seed)), Err(Fail::Mismatch), "{fault:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_per_layer_point_is_required_exactly_with_per_layer_inputs() {
+        let tier = PleTier::new();
+        let trace = tier.trace(&tokens(), 8, None);
+        let (tc, cc, rc) = (tier.tier(), tier.chain_ctx(), resp(&trace));
+        for seed in seeds().take(16) {
+            let mut piece = tier.open_resid_piece(&trace, &seed);
+            let b = piece.encode();
+            assert_eq!(ResidOpening::decode(&b).as_ref(), Some(&piece));
+            piece.ple = None;
+            assert_eq!(verify_resid_opening(&tc, &cc, &rc, &seed, &piece), Err(Fail::Shape));
+            assert!(b.len() > piece.encode().len());
+        }
+    }
+
+    #[test]
+    fn prompt_positions_round_the_projection_input_to_bf16() {
+        let tier = PleTier::new();
+        let tok = tokens()[0];
+        let (f32_proj, _) = tier.per_layer(tok, false, None);
+        let (bf16_proj, _) = tier.per_layer(tok, true, None);
+        assert!(f32_proj.iter().zip(&bf16_proj).any(|(a, b)| a != b));
     }
 
     #[test]

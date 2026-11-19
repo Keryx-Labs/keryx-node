@@ -6727,7 +6727,7 @@ mod tests {
             let inline = body(Some((pos_root, seq_root)), Some(resid.clone()));
             assert_eq!(trace_opening_valid(&with, &audit, &[9; 32], &TXID, &inline), Err("residual point in the trace piece"));
 
-            let piece = |roots| ResidOpening { response_txid: TXID, roots, resid: resid.clone(), feed: Default::default(), expert: None }.encode();
+            let piece = |roots| ResidOpening { response_txid: TXID, roots, resid: resid.clone(), feed: Default::default(), expert: None, ple: None }.encode();
             let check = |r, roots| resid_opening_valid(r, &audit, &[9; 32], &TXID, &piece(roots));
             assert_eq!(check(&with, None), Err("sequence root missing"));
             assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));
