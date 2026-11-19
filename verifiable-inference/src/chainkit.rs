@@ -436,11 +436,11 @@ impl Tier {
     }
 }
 
-fn leaf_bytes(pos: &Position, i: u64) -> LeafBytes {
+pub(crate) fn leaf_bytes(pos: &Position, i: u64) -> LeafBytes {
     LeafBytes { bytes: pos.leaves[i as usize].clone(), leaf_path: b3_path(&pos.hashes, i as usize) }
 }
 
-fn leaf_chunk(pos: &Position, i: u64, c: u64) -> LeafChunk {
+pub(crate) fn leaf_chunk(pos: &Position, i: u64, c: u64) -> LeafChunk {
     let b = &pos.leaves[i as usize];
     let n = b.len().div_ceil(B3_CHUNK).max(1);
     let chunk = b[c as usize * B3_CHUNK..((c as usize + 1) * B3_CHUNK).min(b.len())].to_vec();
@@ -453,7 +453,7 @@ fn leaf_chunk(pos: &Position, i: u64, c: u64) -> LeafChunk {
     LeafChunk { total_len: b.len() as u32, index: c as u32, chunk, chunk_path, leaf_path: b3_path(&pos.hashes, i as usize) }
 }
 
-fn n_chunks(len: usize) -> u64 {
+pub(crate) fn n_chunks(len: usize) -> u64 {
     len.div_ceil(B3_CHUNK).max(1) as u64
 }
 
