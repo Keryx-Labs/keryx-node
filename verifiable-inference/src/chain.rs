@@ -1316,7 +1316,7 @@ fn attn_site(tier: &TierCtx, ctx: &ChainCtx, resp: &ResponseCtx, seed: &Hash, op
         Chain::Layer(ll) if le.role == manifest::ROLE_LAYER && ll.layer as u64 == layer => (ll, ll.attn.ok_or(Fail::Shape)?),
         _ => return Err(Fail::Manifest),
     };
-    if a.slot as u64 != slot {
+    if a.slot as u64 != slot || a.kv_slot > a.slot {
         return Err(Fail::Manifest);
     }
     let t = resid_position(ctx, resp, layer, d[0])?;
@@ -1556,8 +1556,8 @@ fn gqa_phase(
     }
     let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
     let sl = seq_layout(ctx);
-    let krows = cache_rows(ctx, &op.seq_root, sl.kcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.kcache)?;
-    let vrows = cache_rows(ctx, &op.seq_root, sl.vcache(s.slot, kv as u64), n_pos, hd, p0, p1, &op.vcache)?;
+    let krows = cache_rows(ctx, &op.seq_root, sl.kcache(a.kv_slot as u64, kv as u64), n_pos, hd, p0, p1, &op.kcache)?;
+    let vrows = cache_rows(ctx, &op.seq_root, sl.vcache(a.kv_slot as u64, kv as u64), n_pos, hd, p0, p1, &op.vcache)?;
     let keys = krows.iter().map(|r| dequant_head(r, hd)).collect::<Result<Vec<_>, _>>()?;
     let values = vrows.iter().map(|r| dequant_head(r, hd)).collect::<Result<Vec<_>, _>>()?;
     let ok = match parent {
@@ -1651,7 +1651,7 @@ fn mla_phase(
     let k_norm = f32_weights(tier, &w, a.k_norm, r as u64, 0, r as u64)?;
     let q = mla_query(tier, ctx, resp, op, s)?;
     let (p0, p1) = s.tree.node(path).ok_or(Fail::Shape)?;
-    let rows = cache_rows(ctx, &op.seq_root, seq_layout(ctx).kcache(s.slot, 0), n_pos, hd, p0, p1, &op.kcache)?;
+    let rows = cache_rows(ctx, &op.seq_root, seq_layout(ctx).kcache(s.a.kv_slot as u64, 0), n_pos, hd, p0, p1, &op.kcache)?;
     let keys = rows.iter().map(|row| dequant_head(row, hd)).collect::<Result<Vec<_>, _>>()?;
     let values: Vec<Vec<f32>> = keys.iter().map(|k| k[..r].to_vec()).collect();
     let scale = f32::from_bits(a.kq_scale) as f64;

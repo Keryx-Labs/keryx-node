@@ -1737,6 +1737,9 @@ mod attn_tests {
         leaves: Vec<Vec<u8>>,
         hashes: Vec<Hash>,
         root: Hash,
+        /// Attention slots holding the caches and the log masses.
+        kv_slot: u64,
+        lse_slot: u64,
     }
 
     /// Log mass leaf of each key/value head: per position, the log mass of each query head of the
@@ -1761,26 +1764,31 @@ mod attn_tests {
 
     impl Seq {
         fn new(heads: usize, kcache: &[Vec<Vec<u8>>], vcache: Option<&[Vec<Vec<u8>>]>, lse: &[Vec<u8>]) -> Seq {
-            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: heads as u64 };
+            Self::with_slots(heads, 1, 0, 0, kcache, vcache, lse)
+        }
+
+        /// A sequence tree of `n_attn` attention slots, the caches at `kv_slot`, the log masses at `lse_slot`.
+        fn with_slots(heads: usize, n_attn: u64, kv_slot: u64, lse_slot: u64, kcache: &[Vec<Vec<u8>>], vcache: Option<&[Vec<Vec<u8>>]>, lse: &[Vec<u8>]) -> Seq {
+            let layout = SeqLayout { n_attn, n_recur: 0, heads: heads as u64 };
             let mut leaves = vec![Vec::new(); layout.n_leaves() as usize];
             for h in 0..kcache[0].len() {
-                leaves[layout.kcache(0, h as u64).unwrap() as usize] = kcache.iter().flat_map(|p| p[h].clone()).collect();
+                leaves[layout.kcache(kv_slot, h as u64).unwrap() as usize] = kcache.iter().flat_map(|p| p[h].clone()).collect();
                 if let Some(v) = vcache {
-                    leaves[layout.vcache(0, h as u64).unwrap() as usize] = v.iter().flat_map(|p| p[h].clone()).collect();
+                    leaves[layout.vcache(kv_slot, h as u64).unwrap() as usize] = v.iter().flat_map(|p| p[h].clone()).collect();
                 }
             }
             for (h, b) in lse.iter().enumerate() {
-                leaves[layout.lse(0, h as u64).unwrap() as usize] = b.clone();
+                leaves[layout.lse(lse_slot, h as u64).unwrap() as usize] = b.clone();
             }
             let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
             let root = b3_root(&hashes);
-            Seq { layout, leaves, hashes, root }
+            Seq { layout, leaves, hashes, root, kv_slot, lse_slot }
         }
 
         /// Span of the log mass of query head `qi` of the group of `g` of head `kv` at `t`.
         fn lse_span(&self, kv: u64, g: usize, t: usize, qi: usize) -> SeqSpan {
             let lo = (t * g + qi) * 4;
-            self.span(self.layout.lse(0, kv).unwrap(), lo, lo + 4)
+            self.span(self.layout.lse(self.lse_slot, kv).unwrap(), lo, lo + 4)
         }
 
         fn span(&self, leaf: u64, lo: usize, hi: usize) -> SeqSpan {
@@ -1867,9 +1875,17 @@ mod attn_tests {
         mixed: bool,
         /// The output is committed without its gate.
         skip_gate: bool,
+        /// The attention layer is slot 1 and reads the cache of slot 0.
+        shared_cache: bool,
+        /// With `shared_cache`, the cache is committed at slot 1 instead.
+        own_slot_cache: bool,
     }
 
-    const GLM: Cfg = Cfg { zero_out: false, forge_cache: false, qk_norm: false, v_norm: false, freqs: false, swa: false, shared_kv: false, gated: false, mixed: false, skip_gate: false };
+    const GLM: Cfg = Cfg {
+        zero_out: false, forge_cache: false, qk_norm: false, v_norm: false, freqs: false, swa: false, shared_kv: false, gated: false, mixed: false,
+        skip_gate: false, shared_cache: false, own_slot_cache: false,
+    };
+    const SHARED: Cfg = Cfg { shared_cache: true, mixed: true, ..GEMMA_SWA };
     const GEMMA_SWA: Cfg = Cfg { qk_norm: true, v_norm: true, freqs: true, swa: true, ..GLM };
     const GEMMA_GLOBAL: Cfg = Cfg { qk_norm: true, v_norm: true, freqs: true, shared_kv: true, ..GLM };
     const QWEN: Cfg = Cfg { qk_norm: true, gated: true, mixed: true, ..GLM };
@@ -1945,7 +1961,7 @@ mod attn_tests {
             q: 0, k: 1, v: if c.shared_kv { 1 } else { 2 }, q_norm: qn, k_norm: kn, n_head: NH as u32, n_head_kv: NKV as u32,
             head_dim: HD as u32, rope_kind: shape(c).rope_kind, n_rot: shape(c).n_rot as u32, rope_base: BASE.to_bits(),
             kq_scale: KQ.to_bits(), swa_window: if c.swa { WINDOW } else { 0 }, softcap: 0, rope_freqs: rf, v_norm: c.v_norm as u32,
-            gated: c.gated as u32, slot: 0, mla_rank: 0, absorb: none, out: none, kv_slot: 0,
+            gated: c.gated as u32, slot: c.shared_cache as u32, mla_rank: 0, absorb: none, out: none, kv_slot: 0,
         };
         let qw = 1 + c.gated as usize;
         let mut entries = vec![
@@ -1977,7 +1993,7 @@ mod attn_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32, ple_entry: manifest::NONE, ple_width: 0 };
+        let ctx = ChainCtx { n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1 + c.shared_cache as u32, n_recur: 0, seq_heads: NKV as u32, ple_entry: manifest::NONE, ple_width: 0 };
         let prep = Prep {
             q_norm: c.qk_norm.then_some(&q_norm[..]),
             k_norm: c.qk_norm.then_some(&k_norm[..]),
@@ -2039,7 +2055,8 @@ mod attn_tests {
         let keys: Vec<Vec<Vec<f32>>> = kcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
         let values: Vec<Vec<Vec<f32>>> = vcache.iter().map(|p| p.iter().map(|r| deq(r)).collect()).collect();
         let masses = lse_leaves(NH / NKV, KQ as f64, |t| window_start(c, t)..=t, &queries, &keys, &values);
-        let seq = Seq::new(NKV, &kcache, Some(&vcache), &masses);
+        let slot = c.shared_cache as u64;
+        let seq = Seq::with_slots(NKV, 1 + slot, (c.own_slot_cache as u64).min(slot), slot, &kcache, Some(&vcache), &masses);
         At { cfg: c, weights, chunk_leaves, entries, entry_leaves, tier, ctx, positions, pos_roots, pos_root, seq, queries, keys, values }
     }
 
@@ -2065,9 +2082,9 @@ mod attn_tests {
 
         /// Spans of the key and value caches of head `kv` over positions `[p0, p1)`.
         fn caches(&self, kv: u64, p0: usize, p1: usize) -> (SeqSpan, SeqSpan) {
-            let layout = SeqLayout { n_attn: 1, n_recur: 0, heads: NKV as u64 };
+            let (layout, slot) = (self.seq.layout, self.seq.kv_slot);
             let bb = HD / 32 * 34;
-            (self.seq.span(layout.kcache(0, kv).unwrap(), p0 * bb, p1 * bb), self.seq.span(layout.vcache(0, kv).unwrap(), p0 * bb, p1 * bb))
+            (self.seq.span(layout.kcache(slot, kv).unwrap(), p0 * bb, p1 * bb), self.seq.span(layout.vcache(slot, kv).unwrap(), p0 * bb, p1 * bb))
         }
 
         fn open(&self, seed: &Hash) -> AttnOpening {
@@ -2186,6 +2203,32 @@ mod attn_tests {
             let a = build(c);
             let deepest = seeds().map(|s| a.walk(&s).unwrap_or_else(|e| panic!("{e:?}"))).max().unwrap();
             assert_eq!(deepest, 2);
+        }
+    }
+
+    /// Seeds drawing attention slot 1.
+    fn slot1_seeds() -> impl Iterator<Item = Hash> {
+        (0..256u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes()).filter(|s| draw::point(s, ATTN_POINT)[1] % 2 == 1).take(40)
+    }
+
+    #[test]
+    fn a_layer_reading_an_earlier_layers_cache_passes() {
+        let a = build(SHARED);
+        let rc = a.resp();
+        for s in slot1_seeds() {
+            assert!(matches!(verify_attn_point(&a.tier, &a.ctx, &rc, &s, &a.open(&s)), Ok(())), "whole point");
+        }
+        set_test_budget(SMALL_BUDGET);
+        let deepest = slot1_seeds().map(|s| a.walk(&s).unwrap_or_else(|e| panic!("{e:?}"))).max().unwrap();
+        assert!(deepest > 0);
+    }
+
+    #[test]
+    fn a_shared_cache_committed_at_the_layers_own_slot_is_refused() {
+        let a = build(Cfg { own_slot_cache: true, ..SHARED });
+        let rc = a.resp();
+        for s in slot1_seeds() {
+            assert!(verify_attn_point(&a.tier, &a.ctx, &rc, &s, &a.open(&s)).is_err());
         }
     }
 
