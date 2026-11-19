@@ -641,8 +641,8 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 /// Context pad tiles of each `POM_TIERS_H14` tier from `pad_margin_activation`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
-/// Context pad tiles of each H18 lineup tier. Tiers 0 and 1 are provisional until measured on their card class.
-pub const POM_V5_PAD_TILES_H18: [u64; 5] = [434_176, 1_863_680, 4_599_808, 6_266_880, 2_245_632];
+/// Context pad tiles of each H18 lineup tier.
+pub const POM_V5_PAD_TILES_H18: [u64; 5] = [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632];
 
 const _: () = assert!(
     POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
@@ -3511,6 +3511,13 @@ mod model_split_tables_tests {
             assert_eq!(pom_v5_pad_tiles(t, false, Lineup::H18), POM_V5_PAD_TILES_H18[t as usize]);
         }
         assert_eq!(context_floor(0, Lineup::H14), Some(8_192));
+        // tiers 0 and 1 keep the H16 weights + pad total, to the MiB
+        for t in 0..2 {
+            let total = |chunks: u64, tiles: u64| chunks * 32 + tiles * 1024;
+            let h16 = total(POM_TIERS_H14[t].chunks, POM_V5_PAD_TILES_H16[t]);
+            let h18 = total(POM_TIERS_MODEL_SPLIT[t].chunks, POM_V5_PAD_TILES_H18[t]);
+            assert!(h16.abs_diff(h18) <= 1 << 20, "tier {t}: {h16} vs {h18}");
+        }
         let t0 = &TRACE_TIERS_H18[0].as_ref().unwrap();
         let bolt = trace_rules(0, true, true, true, true, Lineup::H18).unwrap();
         assert_eq!(bolt.ctx.r_t, POM_TIERS_MODEL_SPLIT[0].root);
