@@ -1207,9 +1207,62 @@ const QWEN3_5_PREFIX: TracePrefix = match TRACE_PREFIXES {
     _ => panic!(),
 };
 
+/// The Gemma 4 tokenizer of H14 tier 2, on the Bolt-E4B manifests.
+const BOLT_E4B_PREFIX: TracePrefix = match TRACE_PREFIXES {
+    [_, _, Some(p), ..] => TracePrefix { embd_entry: 343, norm_entry: 344, embd_scale: 50.59644317626953, ..p },
+    _ => panic!(),
+};
+
 /// Trace data of tiers 0 and 1 of the H18 lineup; `None` = not traced. Later tiers follow the H14 tables.
 pub const TRACE_TIERS_H18: [Option<TraceTierH18>; 2] = [
-    None,
+    Some(TraceTierH18 {
+        prefix_manifest: TraceManifest {
+            m_t: [
+                0x6d, 0x12, 0xb7, 0xa4, 0x77, 0xdf, 0xc7, 0xc4, 0xe1, 0x25, 0xf5, 0x5c, 0xbe, 0x2d, 0x51, 0xc3,
+                0x32, 0xc1, 0xdd, 0x2a, 0x70, 0x6d, 0x7b, 0x21, 0xed, 0x9b, 0x1e, 0xb8, 0x23, 0x7d, 0xdf, 0x8f,
+            ],
+            n_entries: 345,
+            n_products: 343,
+        },
+        chain: TraceChain {
+            manifest: TraceManifest {
+                m_t: [
+                    0x20, 0xf5, 0x9f, 0xb5, 0x7e, 0x2a, 0x54, 0x62, 0xfa, 0x95, 0x20, 0x4e, 0xdc, 0xab, 0xd5, 0x8d,
+                    0x8c, 0x7b, 0x2f, 0x75, 0x2a, 0xc7, 0x65, 0xe1, 0xf4, 0xc8, 0x71, 0x62, 0x46, 0x4a, 0x09, 0x05,
+                ],
+                n_entries: 600,
+                n_products: 343,
+            },
+            ctx: keryx_verifiable_inference::chain::ChainCtx {
+                n_layers: 42,
+                layer_base: 558,
+                embd_entry: 343,
+                eps: 9.999999974752427e-07,
+                embd_scale: 50.59644317626953,
+                trim_last: false,
+                n_used: 0,
+                n_attn: 0,
+                n_recur: 0,
+                seq_heads: 0,
+                ple_entry: 557,
+                ple_width: 256,
+            },
+            prefix: BOLT_E4B_PREFIX,
+        },
+        attn: TraceNext {
+            manifest: TraceManifest {
+                m_t: [
+                    0x24, 0xa7, 0x87, 0xf6, 0x6b, 0x02, 0x1a, 0xb6, 0x45, 0xed, 0x82, 0x88, 0x54, 0xd5, 0x61, 0xff,
+                    0xcb, 0xf5, 0x62, 0xa5, 0xa0, 0xe8, 0x64, 0xaa, 0x97, 0x0d, 0x0f, 0xc1, 0x43, 0x99, 0xf4, 0x09,
+                ],
+                n_entries: 667,
+                n_products: 343,
+            },
+            n_attn: 42,
+            n_recur: 0,
+            seq_heads: 2,
+        },
+    }),
     Some(TraceTierH18 {
         prefix_manifest: TraceManifest {
             m_t: [
@@ -3458,8 +3511,20 @@ mod model_split_tables_tests {
             assert_eq!(pom_v5_pad_tiles(t, false, Lineup::H18), POM_V5_PAD_TILES_H18[t as usize]);
         }
         assert_eq!(context_floor(0, Lineup::H14), Some(8_192));
-        assert!(trace_rules(0, true, true, true, true, Lineup::H18).is_none());
-        assert!(trace_rules(0, true, true, false, false, Lineup::H18).is_none());
+        let t0 = &TRACE_TIERS_H18[0].as_ref().unwrap();
+        let bolt = trace_rules(0, true, true, true, true, Lineup::H18).unwrap();
+        assert_eq!(bolt.ctx.r_t, POM_TIERS_MODEL_SPLIT[0].root);
+        assert_eq!(bolt.ctx.n_chunks, POM_TIERS_MODEL_SPLIT[0].chunks);
+        assert_eq!(bolt.ctx.m_t, t0.attn.manifest.m_t);
+        assert!(bolt.attention);
+        let ch = bolt.chain.unwrap();
+        assert_eq!((ch.n_layers, ch.n_attn, ch.n_recur, ch.seq_heads, ch.ple_entry, ch.ple_width), (42, 42, 0, 2, 557, 256));
+        assert_eq!(trace_rules(0, true, true, true, false, Lineup::H18).unwrap().ctx.m_t, t0.chain.manifest.m_t);
+        assert_eq!(trace_rules(0, true, true, false, false, Lineup::H18).unwrap().ctx.m_t, t0.prefix_manifest.m_t);
+        // tier 0 of H18 is the Gemma 4 tokenizer of H14 tier 2, on its own manifest entries
+        let (p, gemma) = (bolt.prefix.unwrap(), TRACE_PREFIXES[2].clone().unwrap());
+        assert_eq!((p.table, p.offset, p.eps), (gemma.table, gemma.offset, gemma.eps));
+        assert_eq!((p.embd_entry, p.norm_entry), (343, 344));
         assert!(trace_rules(1, false, true, false, false, Lineup::H18).is_none());
         let t1 = &TRACE_TIERS_H18[1].as_ref().unwrap();
         let attn = trace_rules(1, true, true, true, true, Lineup::H18).unwrap();
