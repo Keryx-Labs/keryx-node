@@ -729,7 +729,7 @@ pub const SERVICE_WINDOW_BASE_DAA_V3: u64 = 150;
 pub const SERVICE_WINDOW_RATE_V3: [u64; 5] = [90, 180, 85, 70, 35];
 
 /// The same allowance for the H18 lineup. Tier 0 is provisional until timed on its card class.
-pub const SERVICE_WINDOW_RATE_H18: [u64; 5] = [90, 90, 85, 70, 35];
+pub const SERVICE_WINDOW_RATE_H18: [u64; 5] = [90, 208, 85, 70, 35];
 
 /// Lineup a request follows, from its acceptance daa.
 #[derive(Clone, Copy, Debug)]
@@ -7774,6 +7774,8 @@ mod tests {
             assert_eq!(service_window_daa_v3(4, 5_000, 2_048, Lineup::H14), 150 + 100 + 717);
             assert_eq!(reward_draw_window_daa(4, 5_000, 2_048, Lineup::H14), 484);
             assert_eq!(service_work_daa(1, 0, 4_096, Lineup::H14), service_work_daa(1, 0, 10_000, Lineup::H14));
+            assert_eq!(service_work_daa(1, 5_000, 2_048, Lineup::H18), 100 + 4_260);
+            assert_eq!(service_work_daa(0, 5_000, 2_048, Lineup::H18), service_work_daa(0, 5_000, 2_048, Lineup::H14));
         }
 
         #[test]
