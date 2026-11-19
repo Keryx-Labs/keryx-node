@@ -120,6 +120,10 @@ pub enum LinkOpening {
     Norm { src: LeafBytes, norm: (EntryOpening, ChunkRange) },
     Token { embd: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
     Source { src: EntryOpening, y: LeafChunk, ids: Option<ExpertIds> },
+    /// A chunk of the layer's residual before its per-layer input.
+    Resid(LeafChunk),
+    /// The gate product, a chunk of its output and the matching chunk of the per-layer inputs.
+    Ple { src: EntryOpening, y: LeafChunk, inputs: LeafChunk },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -362,6 +366,16 @@ impl W {
                     None => self.u8(0),
                 }
             }
+            LinkOpening::Resid(c) => {
+                self.u8(4);
+                self.leaf_chunk(c);
+            }
+            LinkOpening::Ple { src, y, inputs } => {
+                self.u8(5);
+                self.entry(src);
+                self.leaf_chunk(y);
+                self.leaf_chunk(inputs);
+            }
         }
     }
     fn resid(&mut self, p: &ResidPoint) {
@@ -487,6 +501,8 @@ impl R<'_> {
                     _ => return None,
                 },
             },
+            4 => LinkOpening::Resid(self.leaf_chunk()?),
+            5 => LinkOpening::Ple { src: self.entry()?, y: self.leaf_chunk()?, inputs: self.leaf_chunk()? },
             _ => return None,
         })
     }
@@ -1107,6 +1123,25 @@ mod resid_opening_tests {
             assert_eq!(b[0], VERSION_ROOTS);
             assert_eq!(Opening::decode(&b), Some(o));
         }
+    }
+
+    #[test]
+    fn per_layer_input_links_round_trip() {
+        let chunk = |s: u8| LeafChunk { total_len: 43_008, index: s as u32, chunk: vec![s; 1024], chunk_path: vec![[s; 32]; 6], leaf_path: vec![[s ^ 1; 32]; 10] };
+        let p = Point { x: vec![1; 576], ..Default::default() };
+        let gate = EntryOpening { index: 7, bytes: vec![7; 60], path: vec![[7; 32]; 10] };
+        let o = Opening {
+            response_txid: [1; 32],
+            points: vec![p.clone(), p],
+            prefix: Some(PrefixPoint::default()),
+            links: vec![(3, LinkOpening::Resid(chunk(2))), (4, LinkOpening::Ple { src: gate, y: chunk(3), inputs: chunk(4) })],
+            experts: vec![None, None],
+            resid: None,
+            roots: None,
+        };
+        let b = o.encode();
+        assert_eq!(Opening::decode(&b), Some(o));
+        assert!(Opening::decode(&b[..b.len() - 1]).is_none());
     }
 }
 

@@ -896,6 +896,8 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             trim_last: false,
             n_used: 0,
             n_attn: 0, n_recur: 0, seq_heads: 0,
+            ple_entry: keryx_verifiable_inference::manifest::NONE,
+            ple_width: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -941,6 +943,8 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             trim_last: true,
             n_used: 0,
             n_attn: 0, n_recur: 0, seq_heads: 0,
+            ple_entry: keryx_verifiable_inference::manifest::NONE,
+            ple_width: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -986,6 +990,8 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             trim_last: false,
             n_used: 0,
             n_attn: 0, n_recur: 0, seq_heads: 0,
+            ple_entry: keryx_verifiable_inference::manifest::NONE,
+            ple_width: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -1031,6 +1037,8 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             trim_last: false,
             n_used: 0,
             n_attn: 0, n_recur: 0, seq_heads: 0,
+            ple_entry: keryx_verifiable_inference::manifest::NONE,
+            ple_width: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -1076,6 +1084,8 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             trim_last: true,
             n_used: 8,
             n_attn: 0, n_recur: 0, seq_heads: 0,
+            ple_entry: keryx_verifiable_inference::manifest::NONE,
+            ple_width: 0,
         },
         prefix: TracePrefix {
             table: [
@@ -1229,6 +1239,8 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; 2] = [
                 n_attn: 0,
                 n_recur: 0,
                 seq_heads: 0,
+                ple_entry: keryx_verifiable_inference::manifest::NONE,
+                ple_width: 0,
             },
             prefix: QWEN3_5_PREFIX,
         },

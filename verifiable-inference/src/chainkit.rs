@@ -249,7 +249,7 @@ impl Tier {
             embd_scale: 1.0,
             trim_last: false,
             n_used: 0,
-            n_attn: 0, n_recur: 0, seq_heads: 0,
+            n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0,
         }
     }
 
@@ -586,6 +586,7 @@ impl Tier {
             }
             Resid::Attn => ResidSrc::Chunk(leaf_chunk(pos, chain::resid_leaf(np, layer - 1, Resid::Out), c)),
             Resid::Out => ResidSrc::Chunk(leaf_chunk(pos, chain::resid_leaf(np, layer, Resid::Attn), c)),
+            Resid::PeIn => unreachable!("no per-layer inputs in the test model"),
         };
         ResidPoint {
             n_ubatch: trace.layout(t).0,
@@ -661,6 +662,7 @@ mod tests {
                     LinkOpening::Token { .. } => 1,
                     LinkOpening::Norm { .. } => 2,
                     LinkOpening::Source { .. } => 3,
+                    LinkOpening::Resid(_) | LinkOpening::Ple { .. } => 4,
                 };
                 links[kind] += 1;
                 verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None).unwrap_or_else(|e| panic!("seed {s} point {i}: {e:?}"));
@@ -1062,7 +1064,7 @@ mod head_link_tests {
             n_entries: NP,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_layers: 1, layer_base: 3, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0 };
         let x0 = q8_1_row(&(0..D).map(|i| (((i * 7) % 23) as f64 * 0.01 - 0.1) * if i / 32 == 3 { spike } else { 1.0 }).collect::<Vec<_>>());
         let y0 = dot_rows(&weights[0], 0..NH * STRIDE, &x0);
         let off = if shift { 32 } else { 0 };
@@ -1309,7 +1311,7 @@ mod moe_tests {
             n_entries: entries.len() as u64,
             n_products: 4,
         };
-        let ctx = ChainCtx { n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0 };
+        let ctx = ChainCtx { n_layers: 1, layer_base: 7, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: batch > 1, n_used: U as u32, n_attn: 0, n_recur: 0, seq_heads: 0, ple_entry: manifest::NONE, ple_width: 0 };
 
         let r = vecf(3, D, 2.0);
         let x = chain::rms_norm(&r, &norm, EPS);
@@ -1975,7 +1977,7 @@ mod attn_tests {
             n_entries: entries.len() as u64,
             n_products: NP,
         };
-        let ctx = ChainCtx { n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32 };
+        let ctx = ChainCtx { n_layers: nl as u32, layer_base: 4, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: NKV as u32, ple_entry: manifest::NONE, ple_width: 0 };
         let prep = Prep {
             q_norm: c.qk_norm.then_some(&q_norm[..]),
             k_norm: c.qk_norm.then_some(&k_norm[..]),
@@ -2502,7 +2504,7 @@ mod attn_tests {
                 n_entries: entries.len() as u64,
                 n_products: NP,
             };
-            let ctx = ChainCtx { n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_layers: 1, layer_base: 5, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1, ple_entry: manifest::NONE, ple_width: 0 };
             let n_leaves = n_pos_leaves(NP, 1, 0) as usize;
             let q: Vec<Vec<f32>> = (0..N_POS).map(|t| vals(100 + t as u64, NH * QW)).collect();
             let kv_a: Vec<Vec<f32>> = (0..N_POS).map(|p| vals(200 + p as u64, HD)).collect();
@@ -2951,7 +2953,7 @@ mod recur_tests {
         };
         let ctx = ChainCtx {
             n_layers: 1, layer_base: np as u32, embd_entry: 0, eps: EPS, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0,
-            n_recur: 1, seq_heads: NV as u32,
+            n_recur: 1, seq_heads: NV as u32, ple_entry: manifest::NONE, ple_width: 0,
         };
 
         // Committed projection outputs per position.
