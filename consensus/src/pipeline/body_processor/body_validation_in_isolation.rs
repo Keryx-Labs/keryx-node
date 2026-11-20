@@ -12,7 +12,7 @@ use crate::processes::{
 };
 use keryx_consensus_core::{
     block::Block,
-    config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, RETIRED_LINEUP_TIER, network_model_range, pom_tiers},
+    config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, network_model_range, pom_tiers},
     errors::consensus::{ConsensusError, ConsensusResult},
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
@@ -208,14 +208,14 @@ impl BlockBodyProcessor {
         Ok(())
     }
 
-    /// Past the model-split gate: the network model and the retired lineup tier are not mined, and a
-    /// range tier must be the one assigned to the coinbase escrow key under the header's pruning point.
+    /// Past the model-split gate: the whole network model is not mined, and a range tier must be the
+    /// one assigned to the coinbase escrow key under the header's pruning point.
     fn check_network_model_tier(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let tier = block.header.pom_tier;
-        if tier == NETWORK_MODEL_TIER || tier == RETIRED_LINEUP_TIER {
+        if tier == NETWORK_MODEL_TIER {
             return Err(RuleError::PomTierPaused(tier));
         }
-        if tier <= NETWORK_MODEL_TIER {
+        if tier < NETWORK_MODEL_TIER {
             return Ok(());
         }
         let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&block.transactions[0].payload).map_err(RuleError::BadCoinbasePayload)?;

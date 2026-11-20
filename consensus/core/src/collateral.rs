@@ -2,7 +2,7 @@ use keryx_hashes::{Hash, Hasher, TransactionHash};
 use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
 
-use crate::config::params::{Lineup, NetworkModelLayout, NETWORK_MODEL_MAINNET, NETWORK_MODEL_TIER};
+use crate::config::params::{Lineup, NetworkModelLayout, NETWORK_MODEL_MAINNET, NETWORK_MODEL_TIER, network_model_request};
 use crate::tx::ScriptPublicKey;
 
 /// Fraction of each accepted block subsidy held in escrow as miner collateral (basis points).
@@ -702,21 +702,21 @@ pub const SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA: u64 = 10;
 /// before it counts as a miss: a fixed base plus a per-requested-token allowance floored at the
 /// generation speed of the tier's model class (measured medians ~7-10 tok/s, ×2 margin).
 pub fn service_window_daa(tier: u8, max_tokens: u32) -> u64 {
-    service_window_daa_at(tier, max_tokens, false)
+    service_window_daa_at(tier, max_tokens, false, Lineup::H14)
 }
 
 /// [`service_window_daa`] with the base selected by whether `service_bond_v2_activation` is
-/// active at the daa the audit arms.
-pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool) -> u64 {
+/// active at the daa the audit arms, under the request's `lineup`.
+pub fn service_window_daa_at(tier: u8, max_tokens: u32, v2: bool, lineup: Lineup) -> u64 {
+    let network = network_model_request(tier, lineup);
     let per_token_daa: u64 = match tier {
+        _ if network => SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA,
         0..=2 => 2, // 0.2 s/token — 5 tok/s floor
         3 => 3,     // 0.3 s/token
-        4 => 4,     // 0.4 s/token — 2.5 tok/s floor
-        t if t >= NETWORK_MODEL_TIER => SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA,
-        _ => 4,
+        _ => 4,     // 0.4 s/token — 2.5 tok/s floor
     };
     let mut base = if v2 { SERVICE_WINDOW_BASE_DAA_V2 } else { SERVICE_WINDOW_BASE_DAA };
-    if tier >= NETWORK_MODEL_TIER {
+    if network {
         base = base.max(SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL);
     }
     base + max_tokens.min(AI_REQUEST_MAX_TOKENS_CAP) as u64 * per_token_daa
@@ -752,7 +752,7 @@ pub const SERVICE_QUEUE_CAP: usize = 64;
 /// sealed bytes, which bound them) and `generated` generated tokens.
 pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32, lineup: Lineup) -> u64 {
     let rates = match lineup {
-        Lineup::H14 => &SERVICE_WINDOW_RATE_V3,
+        Lineup::H14 | Lineup::H14Split => &SERVICE_WINDOW_RATE_V3,
         Lineup::H18 => &SERVICE_WINDOW_RATE_H18,
     };
     let rate = rates[(tier as usize).min(rates.len() - 1)];
@@ -1795,7 +1795,8 @@ impl ServiceLedger {
                     }
                 }
                 // Only a network-model audit takes declarations (and only its requests snapshot them).
-                for d in early_decl.into_iter().filter(|_| entry.tier >= NETWORK_MODEL_TIER) {
+                let network = network_model_request(entry.tier, lg.at(entry.accepted_daa));
+                for d in early_decl.into_iter().filter(|_| network) {
                     push_declaration(&mut entry.early_declarations, d);
                 }
             }
@@ -1826,7 +1827,7 @@ impl ServiceLedger {
             match req.audit.as_mut() {
                 Some(audit) if audit.is_pipeline() => audit.declare(*tier, *escrow),
                 Some(_) => {}
-                None if req.tier >= NETWORK_MODEL_TIER => push_declaration(&mut req.early_declarations, (*tier, *escrow)),
+                None if network_model_request(req.tier, lg.at(req.accepted_daa)) => push_declaration(&mut req.early_declarations, (*tier, *escrow)),
                 None => {}
             }
         }
@@ -2188,7 +2189,16 @@ impl ServiceLedger {
                     self.pending.remove(&rh);
                 }
                 Some(_) => {}
-                None if daa > req.accepted_daa && req.tier == NETWORK_MODEL_TIER => {
+                None if daa > req.accepted_daa
+                    && req.tier == NETWORK_MODEL_TIER
+                    && !lg.at(req.accepted_daa).split()
+                    && lg.at(daa).split() =>
+                {
+                    // A request for the lineup tier the split replaces cannot be served past the gate.
+                    self.pending.remove(&rh);
+                    self.early_shapes.retain(|(h, _), _| *h != rh);
+                }
+                None if daa > req.accepted_daa && network_model_request(req.tier, lg.at(req.accepted_daa)) => {
                     // One cohort per shard tier; a tier nobody produces means the network cannot
                     // assemble the model — the request is dropped, nobody is struck. Responses
                     // that beat the arming are not creditable (they carry no links here);
@@ -2228,7 +2238,7 @@ impl ServiceLedger {
                         delegations.dedup();
                         members.sort_unstable();
                         members.dedup();
-                        let window = service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa));
+                        let window = service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa), lg.at(req.accepted_daa));
                         let req = self.pending.get_mut(&rh).unwrap();
                         req.early_responders.clear();
                         let early = std::mem::take(&mut req.early_declarations);
@@ -2274,7 +2284,7 @@ impl ServiceLedger {
                         delegations.sort_unstable();
                         delegations.dedup();
                         let window =
-                            service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa));
+                            service_window_daa_at(req.tier, req.max_tokens, self.v2_at(daa), lg.at(req.accepted_daa));
                         // Credit whoever answered before the audit existed: same membership test
                         // as the live path, so an early answer and a late one are worth the same.
                         let req_tier = req.tier;
@@ -2473,7 +2483,7 @@ impl ServiceLedger {
             let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
             if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
                 let prompt = if rules.as_ref().is_some_and(|r| r.attention) { attn_first_prompt_daa(a.n_prompt) } else { 0 };
-                let own = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt;
+                let own = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa), lg.at(a.accepted_daa)) + prompt;
                 let work = OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt), lg.at(a.accepted_daa));
                 let start = chain_end.get(&a.escrow_pubkey).map_or(own, |&end| own.max(end + work));
                 self.trace_roots.insert(txid, daa);
@@ -2728,7 +2738,8 @@ impl ServiceLedger {
     /// Whether an availability declaration for `request_hash` can still matter: a network-model
     /// request is pending.
     pub fn declaration_admissible(&self, request_hash: &[u8; 32]) -> bool {
-        self.pending.get(request_hash).is_some_and(|r| r.tier >= NETWORK_MODEL_TIER)
+        let lg = self.lineup_gate();
+        self.pending.get(request_hash).is_some_and(|r| network_model_request(r.tier, lg.at(r.accepted_daa)))
     }
 
     /// Whether a response to `request_hash` signed by `escrow_pubkey` can still count: the
@@ -3391,11 +3402,6 @@ impl ServiceLedgerSnapshot {
                 None => out.push(0),
             }
             put_hashes(&mut out, &r.early_responders);
-            // Network-model requests never exist before the gate, so this adds no byte to a
-            // pre-model-split snapshot.
-            if r.tier >= NETWORK_MODEL_TIER {
-                put_declarations(&mut out, &r.early_declarations);
-            }
         }
         out.extend_from_slice(&(self.early_responses.len() as u32).to_le_bytes());
         for (rh, (seen, keys)) in self.early_responses.iter() {
@@ -3587,11 +3593,20 @@ impl ServiceLedgerSnapshot {
                 out.extend_from_slice(&start.to_le_bytes());
             }
         }
-        if !self.early_declarations.is_empty() {
+        let declared: Vec<(&[u8; 32], &Vec<(u8, Hash)>)> =
+            self.pending.iter().filter(|(_, r)| !r.early_declarations.is_empty()).map(|(rh, r)| (rh, &r.early_declarations)).collect();
+        if !self.early_declarations.is_empty() || !declared.is_empty() {
             out.extend_from_slice(&(self.early_declarations.len() as u32).to_le_bytes());
             for (rh, (seen, decls)) in self.early_declarations.iter() {
                 out.extend_from_slice(rh);
                 out.extend_from_slice(&seen.to_le_bytes());
+                put_declarations(&mut out, decls);
+            }
+        }
+        if !declared.is_empty() {
+            out.extend_from_slice(&(declared.len() as u32).to_le_bytes());
+            for (rh, decls) in declared {
+                out.extend_from_slice(rh);
                 put_declarations(&mut out, decls);
             }
         }
@@ -3686,7 +3701,6 @@ impl ServiceLedgerSnapshot {
                 _ => return Err("malformed audit".into()),
             };
             let early_responders = r.hashes()?;
-            let early_declarations = if tier >= NETWORK_MODEL_TIER { read_declarations(&mut r)? } else { Vec::new() };
             let req = PendingRequest {
                 tier,
                 max_tokens,
@@ -3697,7 +3711,7 @@ impl ServiceLedgerSnapshot {
                 early_responders,
                 recipients: Vec::new(),
                 cohort_seed: [0u8; 36],
-                early_declarations,
+                early_declarations: Vec::new(),
                 prompt_len: 0,
                 fit_proven: false,
                 draw: None,
@@ -4022,7 +4036,7 @@ impl ServiceLedgerSnapshot {
         }
         if r.pos != bytes.len() {
             let n = r.u32()?;
-            if n == 0 {
+            if n == 0 && r.pos == bytes.len() {
                 return Err("malformed early declarations".into());
             }
             for _ in 0..n {
@@ -4031,6 +4045,20 @@ impl ServiceLedgerSnapshot {
                 let decls = read_declarations(&mut r)?;
                 if snap.early_declarations.insert(rh, (seen, decls)).is_some() {
                     return Err("malformed early declarations".into());
+                }
+            }
+        }
+        if r.pos != bytes.len() {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("malformed pending declarations".into());
+            }
+            for _ in 0..n {
+                let rh = r.key()?;
+                let decls = read_declarations(&mut r)?;
+                match snap.pending.get_mut(&rh) {
+                    Some(req) if !decls.is_empty() => req.early_declarations = decls,
+                    _ => return Err("malformed pending declarations".into()),
                 }
             }
         }
@@ -4663,7 +4691,7 @@ mod tests {
         let mut ledger = ServiceLedger::default();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
-        let w = service_window_daa_at(0, 256, true);
+        let w = service_window_daa_at(0, 256, true, crate::config::params::Lineup::H14);
 
         let rh = [7u8; 32];
         let out = ledger.on_chain_block_with_recipients(
@@ -4706,7 +4734,7 @@ mod tests {
         let mut ledger = ServiceLedger::default();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
-        let w = service_window_daa_at(0, 256, true);
+        let w = service_window_daa_at(0, 256, true, crate::config::params::Lineup::H14);
         let rh = [8u8; 32];
         ledger.on_chain_block_with_recipients(100, &[(rh, 0, 256)], &[], &[(rh, [0u8; 36], vec![b])], &[], &[], &[], |_| true, cohort_of(&set));
         ledger.on_chain_block_with_recipients(101, &[], &[], &[], &[], &[], &[], |_| true, cohort_of(&set));
@@ -5160,7 +5188,7 @@ mod tests {
         let set = [a];
         let mut ledger = ServiceLedger::default();
         ledger.set_window_v2_activation(0);
-        let w = service_window_daa_at(0, 256, true);
+        let w = service_window_daa_at(0, 256, true, crate::config::params::Lineup::H14);
         let i = SERVICE_STRIKE_INTERVAL_DAA;
 
         let r1 = [1u8; 32];
@@ -5360,10 +5388,17 @@ mod tests {
         let b = Hash::from_bytes([2u8; 32]);
         let c = Hash::from_bytes([3u8; 32]);
         let e = Hash::from_bytes([9u8; 32]);
-        let recent = [(a, NETWORK_MODEL_TIER + 1, e), (b, NETWORK_MODEL_TIER + 3, e), (c, 4u8, e)];
+        let recent = [(a, NETWORK_MODEL_TIER + 1, e), (b, NETWORK_MODEL_TIER + 3, e), (c, 3u8, e)];
         assert_eq!(eligible_pairs(&recent, NETWORK_MODEL_TIER), vec![(a, e), (b, e)]);
         assert_eq!(eligible_pairs(&recent, NETWORK_MODEL_TIER + 1), vec![(a, e)]);
-        assert_eq!(eligible_pairs(&recent, 4), vec![(c, e)]);
+        assert_eq!(eligible_pairs(&recent, 3), vec![(c, e)]);
+    }
+
+    /// A ledger past the model-split gate from daa 0.
+    fn split_ledger() -> ServiceLedger {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_model_split_activation(0);
+        ledger
     }
 
     /// Per-tier cohorts of a pipeline test network: identity == escrow key, `t*16 + i`.
@@ -5428,7 +5463,7 @@ mod tests {
 
     #[test]
     fn network_model_audit_holds_every_shard_cohort() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         let rh = [7u8; 32];
         ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
         assert!(ledger.pipeline_assignments().is_empty());
@@ -5438,7 +5473,7 @@ mod tests {
         assert_eq!(audit.members.len(), 2 * NETWORK_MODEL_SHARDS.len());
         assert_eq!(audit.cohort.len(), 2 * NETWORK_MODEL_SHARDS.len());
         assert!(audit.declared.is_empty());
-        assert_eq!(audit.window_end_daa, 101 + service_window_daa(NETWORK_MODEL_TIER, 256));
+        assert_eq!(audit.window_end_daa, 101 + service_window_daa_at(NETWORK_MODEL_TIER, 256, false, crate::config::params::Lineup::H18));
         let a = ledger.pipeline_assignments();
         assert_eq!(a.len(), 1);
         assert!(a[0].links.is_empty());
@@ -5446,9 +5481,9 @@ mod tests {
 
     #[test]
     fn network_model_request_with_an_unproduced_shard_is_dropped_without_strikes() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         let rh = [7u8; 32];
-        let w = service_window_daa(NETWORK_MODEL_TIER, 256);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, false, crate::config::params::Lineup::H18);
         ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(Some(NETWORK_MODEL_TIER + 3)));
         let out = ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(Some(NETWORK_MODEL_TIER + 3)));
         assert!(out.misses.is_empty());
@@ -5459,7 +5494,7 @@ mod tests {
 
     #[test]
     fn held_declarations_are_bounded() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         let t6 = NETWORK_MODEL_TIER + 1;
         // fresh keys outside the tier cohort, and a lineup tier, hold no slot
         let rh = [3u8; 32];
@@ -5484,7 +5519,7 @@ mod tests {
 
     #[test]
     fn network_model_declarations_choose_the_first_of_each_tier() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         let rh = [7u8; 32];
         let t6 = NETWORK_MODEL_TIER + 1;
         let t7 = NETWORK_MODEL_TIER + 2;
@@ -5541,12 +5576,12 @@ mod tests {
 
     #[test]
     fn a_private_network_model_request_binds_only_the_heads_it_was_sealed_to() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         let rh = [9u8; 32];
         let head = NETWORK_MODEL_HEAD_TIER;
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         let recipients = vec![(rh, [1u8; 36], vec![shard_id(head, 0)])];
         ledger.on_chain_block_with_recipients(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &recipients, &[], &[], &[], |_| true, shard_cohorts(None));
         ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
@@ -5565,11 +5600,11 @@ mod tests {
             }
             (0..n).map(|i| (shard_id(tier, i), shard_id(tier, i))).collect()
         };
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         let rh = [10u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         let recipients = vec![(rh, [1u8; 36], vec![shard_id(NETWORK_MODEL_HEAD_TIER, 0)])];
         ledger.on_chain_block_with_recipients(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &recipients, &[], &[], &[], |_| true, cohorts);
         ledger.on_chain_block(101, &[], &[], &[], |_| true, cohorts);
@@ -5580,7 +5615,7 @@ mod tests {
 
     #[test]
     fn declarations_never_stick_to_a_lineup_request() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         let a = Hash::from_bytes([1u8; 32]);
         let t6 = NETWORK_MODEL_TIER + 1;
         // one declaration beats the lineup request to acceptance, another lands with it
@@ -5606,10 +5641,10 @@ mod tests {
 
     #[test]
     fn network_model_silence_strikes_nobody_while_on_trial() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.set_window_v2_activation(0);
         let rh = [7u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
         ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
         fold_declarations(&mut ledger, 102, &declare_one(rh, 0));
@@ -5619,11 +5654,11 @@ mod tests {
 
     #[test]
     fn network_model_silence_strikes_undeclared_members_and_the_chosen_head() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         let rh = [7u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
         ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
         // producer 0 of every tier declares, producer 1 stays silent
@@ -5635,7 +5670,7 @@ mod tests {
         assert!(out.misses.iter().all(|m| m.consecutive_misses == 1));
         assert_eq!(ledger.pending_len(), 0);
         // nobody declared at all: the whole cohort is struck
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
@@ -5646,12 +5681,12 @@ mod tests {
 
     #[test]
     fn network_model_served_response_credits_every_signer_and_strikes_the_absent_chosen() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         ledger.on_chain_block_with_rewards(
             100,
             &[(rh, NETWORK_MODEL_TIER, 256)],
@@ -5696,11 +5731,11 @@ mod tests {
 
     #[test]
     fn network_model_undeclared_members_are_struck_after_a_served_response_too() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         let rh = [7u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
         ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
         fold_declarations(&mut ledger, 102, &declare_one(rh, 0));
@@ -5715,12 +5750,12 @@ mod tests {
 
     #[test]
     fn network_model_incomplete_or_foreign_responses_are_not_credited() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         ledger.on_chain_block_with_rewards(
             100,
             &[(rh, NETWORK_MODEL_TIER, 256)],
@@ -5762,7 +5797,7 @@ mod tests {
 
     #[test]
     fn network_model_response_needs_declared_signers() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
@@ -5796,12 +5831,12 @@ mod tests {
 
     #[test]
     fn network_model_substitute_head_is_paid_and_the_chosen_head_struck() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         ledger.on_chain_block_with_rewards(
             100,
             &[(rh, NETWORK_MODEL_TIER, 256)],
@@ -5829,7 +5864,7 @@ mod tests {
 
     #[test]
     fn pipeline_assignments_list_declarations_in_chain_order() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         let rh = [7u8; 32];
         let t6 = NETWORK_MODEL_TIER + 1;
         let one = Hash::from_bytes([1u8; 32]);
@@ -5870,7 +5905,7 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrips_a_pipeline_audit_and_keeps_lineup_bytes() {
-        let mut ledger = ServiceLedger::default();
+        let mut ledger = split_ledger();
         let rh = [7u8; 32];
         let lineup = [8u8; 32];
         let a = Hash::from_bytes([1u8; 32]);
@@ -5900,7 +5935,7 @@ mod tests {
         let bytes = snap.to_bytes();
         let decoded = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, snap);
-        let mut restored = ServiceLedger::default();
+        let mut restored = split_ledger();
         restored.restore_snapshot(&decoded);
         assert_eq!(restored.pipeline_assignments(), ledger.pipeline_assignments());
         assert_eq!(restored.pending, ledger.pending);
@@ -5934,12 +5969,12 @@ mod tests {
             SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA,
         };
         use crate::config::params::NETWORK_MODEL_TIER;
-        assert_eq!(service_window_daa_at(4, 256, true), SERVICE_WINDOW_BASE_DAA_V2 + 256 * 4);
+        assert_eq!(service_window_daa_at(4, 256, true, crate::config::params::Lineup::H14), SERVICE_WINDOW_BASE_DAA_V2 + 256 * 4);
         assert_eq!(
-            service_window_daa_at(NETWORK_MODEL_TIER, 256, true),
+            service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18),
             SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL + 256 * SERVICE_WINDOW_NETWORK_MODEL_PER_TOKEN_DAA
         );
-        assert_eq!(service_window_daa_at(NETWORK_MODEL_TIER + 2, 0, false), SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL);
+        assert_eq!(service_window_daa_at(NETWORK_MODEL_TIER + 2, 0, false, crate::config::params::Lineup::H18), SERVICE_WINDOW_BASE_DAA_NETWORK_MODEL);
     }
 
     #[test]
@@ -6078,7 +6113,7 @@ mod tests {
         let set = [a];
         let mut ledger = ServiceLedger::default();
         ledger.set_window_v2_activation(0);
-        let w = service_window_daa_at(0, 256, true);
+        let w = service_window_daa_at(0, 256, true, crate::config::params::Lineup::H14);
         let claim = |n: u64, daa: u64| EscrowClaim { outpoint: TransactionOutpoint::new(n.into(), 1), value: n, daa };
 
         let escrows: Vec<(Hash, EscrowClaim)> = (1..=7).map(|n| (a, claim(n, 100))).collect();

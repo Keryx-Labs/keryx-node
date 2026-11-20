@@ -642,9 +642,9 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
 /// Context pad tiles of each `POM_TIERS_MODEL_SPLIT` tier: the H18 lineup, the whole network model
-/// (never mined) and its four ranges, each range padded to the 32 GB class total of tier 4.
-pub const POM_V5_PAD_TILES_H18: [u64; 10] =
-    [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240];
+/// (not mined) and its four ranges, each range padded to the 32 GB class total of the H14 tier 4.
+pub const POM_V5_PAD_TILES_H18: [u64; 9] =
+    [780_288, 1_778_688, 4_599_808, 6_266_880, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240];
 
 const _: () = assert!(
     POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
@@ -652,30 +652,45 @@ const _: () = assert!(
         && POM_V5_PAD_TILES_H18.len() == POM_TIERS_MODEL_SPLIT.len()
 );
 
-/// Lineup the per-tier rules of tiers 0-4 follow.
+/// Lineup the per-tier rules of the lineup tiers follow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lineup {
+    /// Tiers 0-4 of `POM_TIERS_H14`, before `model_split_activation`.
     H14,
-    /// The lineup of `POM_TIERS_MODEL_SPLIT`, from `model_split_activation`.
+    /// Tiers 0-3 of `POM_TIERS_MODEL_SPLIT`, from `model_split_activation`.
     H18,
+    /// Tiers 0-3 of `POM_TIERS_H14` next to a network model (bench layout).
+    H14Split,
 }
 
 impl Lineup {
-    /// Possession anchors of tiers 0-4.
+    /// Possession anchors of the lineup tiers.
     pub fn tiers(self) -> &'static [crate::pom::PomTier] {
         match self {
             Lineup::H14 => POM_TIERS_H14,
-            Lineup::H18 => &POM_TIERS_MODEL_SPLIT[..POM_TIERS_H14.len()],
+            Lineup::H18 => &POM_TIERS_MODEL_SPLIT[..NETWORK_MODEL_TIER as usize],
+            Lineup::H14Split => &POM_TIERS_H14[..NETWORK_MODEL_TIER as usize],
         }
     }
+
+    /// Whether a network model sits at `NETWORK_MODEL_TIER` and above.
+    pub fn split(self) -> bool {
+        !matches!(self, Lineup::H14)
+    }
+}
+
+/// Whether a request of `tier` under `lineup` targets the network model.
+pub fn network_model_request(tier: u8, lineup: Lineup) -> bool {
+    lineup.split() && tier >= NETWORK_MODEL_TIER
 }
 
 /// Context pad tiles of `tier`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool, lineup: Lineup) -> u64 {
     let table: &[u64] = match lineup {
         Lineup::H18 => &POM_V5_PAD_TILES_H18,
-        Lineup::H14 if pad_margin => &POM_V5_PAD_TILES_H16,
-        Lineup::H14 => &POM_V5_PAD_TILES_H14,
+        Lineup::H14Split if tier >= NETWORK_MODEL_TIER => return 0,
+        Lineup::H14 | Lineup::H14Split if pad_margin => &POM_V5_PAD_TILES_H16,
+        Lineup::H14 | Lineup::H14Split => &POM_V5_PAD_TILES_H14,
     };
     table.get(tier as usize).copied().unwrap_or(0)
 }
@@ -1382,16 +1397,17 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
 pub const CONTEXT_FLOORS_H14: [u32; 5] = [8_192, 32_768, 32_768, 32_768, 32_768];
 
 /// Context floor of each tier of the H18 lineup, in tokens. Must equal the miner's `ctx_floor` per model.
-pub const CONTEXT_FLOORS_H18: [u32; 5] = [32_768, 32_768, 32_768, 32_768, 32_768];
+pub const CONTEXT_FLOORS_H18: [u32; 4] = [32_768, 32_768, 32_768, 32_768];
 
 /// Positions the chat template and the request prefix add to a prompt, at most.
 pub const CONTEXT_OVERHEAD_TOKENS: u32 = 512;
 
 /// Context floor of `tier`, in tokens.
 pub fn context_floor(tier: u8, lineup: Lineup) -> Option<u32> {
-    let table = match lineup {
+    let table: &[u32] = match lineup {
         Lineup::H14 => &CONTEXT_FLOORS_H14,
         Lineup::H18 => &CONTEXT_FLOORS_H18,
+        Lineup::H14Split => &CONTEXT_FLOORS_H14[..NETWORK_MODEL_TIER as usize],
     };
     table.get(tier as usize).copied()
 }
@@ -1417,7 +1433,7 @@ pub fn service_tiers(private_inference_active: bool) -> &'static [crate::pom::Po
 /// First tier index of the network model (model split). Tier `NETWORK_MODEL_TIER` is the whole model —
 /// the id AiRequests target and pipeline heads declare; nobody mines it. The tiers after it are
 /// its shards, in layer order, each a possession anchor of its own.
-pub const NETWORK_MODEL_TIER: u8 = 5;
+pub const NETWORK_MODEL_TIER: u8 = 4;
 
 /// DeepSeek-V4-Flash-0731 abliterated (huihui-ai, ds4, Q2: IQ2_XXS + Q2_K experts), the network
 /// model. `model_id` = CIDv0[2..34] of the complete GGUF; AiRequests target it and pipeline
@@ -1470,8 +1486,8 @@ pub const NETWORK_MODEL_SHARDS: &[([u8; 32], u32, u32)] = &[
     (V4_FLASH_SHARD_3_MODEL_ID, 33, 42),
 ];
 
-/// Model-split tier set: the H18 lineup (tier 4 no longer mined), then the network model (tier 5) and
-/// its four ranges (tiers 6-9, layer order), assigned per block by `network_model_range`. Gated by
+/// Model-split tier set: the H18 lineup (tiers 0-3), then the network model (tier 4) and its four
+/// ranges (tiers 5-8, layer order), assigned per block by `network_model_range`. Gated by
 /// `model_split_activation`.
 pub const POM_TIERS_MODEL_SPLIT: &[crate::pom::PomTier] = &[
     crate::pom::PomTier {
@@ -1492,7 +1508,6 @@ pub const POM_TIERS_MODEL_SPLIT: &[crate::pom::PomTier] = &[
     },
     POM_TIERS_H14[2],
     POM_TIERS_H14[3],
-    POM_TIERS_H14[4],
     crate::pom::PomTier {
         model_id: NETWORK_MODEL_V4_FLASH_MODEL_ID,
         root: [
@@ -1541,9 +1556,6 @@ pub fn tier_serves(tier: u8, target: u8) -> bool {
     tier == target || (target == NETWORK_MODEL_TIER && tier > NETWORK_MODEL_TIER)
 }
 
-/// Lineup tier retired by the model split: its cards mine a network-model range instead.
-pub const RETIRED_LINEUP_TIER: u8 = 4;
-
 /// Network-model range (0-based) assigned to an escrow key under a pruning point.
 pub fn network_model_range(pruning_point: &[u8; 32], escrow_pubkey: &[u8; 32], n_shards: usize) -> u8 {
     let mut h = blake3::Hasher::new();
@@ -1589,7 +1601,7 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B: &[([u8; 32], u64)] = &[
     (GLM_4_9B_0414_MODEL_ID,           100_000_000),
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000),
     (QWEN3_8_27B_MODEL_ID,             200_000_000),
-    (KIMI_LINEAR_48B_MODEL_ID,         250_000_000),
+    (KIMI_LINEAR_48B_MODEL_ID,         u64::MAX),
     (SPLIT9B_WHOLE_MODEL_ID,            50_000_000),
 ];
 
@@ -1597,13 +1609,13 @@ pub const INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B: &[([u8; 32], u64)] = &[
 pub const NETWORK_MODEL_SHARDS_SPLIT9B: &[([u8; 32], u32, u32)] =
     &[(SPLIT9B_SHARD_0_MODEL_ID, 0, 15), (SPLIT9B_SHARD_1_MODEL_ID, 16, 31)];
 
-/// Bench model-split tier set: the H14 lineup, the 9B as network model (its H6 anchor), two shards.
+/// Bench model-split tier set: tiers 0-3 of the H14 lineup, the 9B as network model (its H6 anchor),
+/// two shards.
 pub const POM_TIERS_MODEL_SPLIT_9B: &[crate::pom::PomTier] = &[
     POM_TIERS_H14[0],
     POM_TIERS_H14[1],
     POM_TIERS_H14[2],
     POM_TIERS_H14[3],
-    POM_TIERS_H14[4],
     crate::pom::PomTier { model_id: SPLIT9B_WHOLE_MODEL_ID, root: POM_TIERS_H6[0].root, chunks: POM_TIERS_H6[0].chunks },
     crate::pom::PomTier {
         model_id: SPLIT9B_SHARD_0_MODEL_ID,
@@ -1623,7 +1635,7 @@ pub const POM_TIERS_MODEL_SPLIT_9B: &[crate::pom::PomTier] = &[
     },
 ];
 
-pub const TIER_REWARD_BPS_MODEL_SPLIT_9B: [u64; 8] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 6_000, 6_000];
+pub const TIER_REWARD_BPS_MODEL_SPLIT_9B: [u64; 7] = [6_000, 7_000, 8_000, 9_000, 6_000, 6_000, 6_000];
 
 pub const NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B: [u64; 2] = [8, 8];
 
@@ -1682,7 +1694,7 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
     reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT_9B,
     minimums: INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
-    lineup: Lineup::H14,
+    lineup: Lineup::H14Split,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -1773,12 +1785,12 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 ///   4  Kimi-48B        0%
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
-/// H18 lineup schedule: 15 points between tiers.
-pub const TIER_REWARD_BPS_H18: [u64; 5] = [4_000, 5_500, 7_000, 8_500, 10_000];
+/// H18 lineup schedule: 15 points between tiers, the network model tier on top.
+pub const TIER_REWARD_BPS_H18: [u64; 4] = [4_000, 5_500, 7_000, 8_500];
 
-/// Model-split schedule: H18 lineup values, the network model itself (nobody mines it: floor), then one
-/// entry per range at the tier-4 rate (32 GB cards).
-pub const TIER_REWARD_BPS_MODEL_SPLIT: [u64; 10] = [4_000, 5_500, 7_000, 8_500, 10_000, 4_000, 10_000, 10_000, 10_000, 10_000];
+/// Model-split schedule: H18 lineup values, then the whole network model and each of its ranges at the
+/// top rate.
+pub const TIER_REWARD_BPS_MODEL_SPLIT: [u64; 9] = [4_000, 5_500, 7_000, 8_500, 10_000, 10_000, 10_000, 10_000, 10_000];
 
 /// Tier-reward schedule for a block at `daa_score`: model split once `model_split_activation` is live,
 /// 5-tier H6 once `pom_v3_activation`, 5-tier H2 once `very_light_activation`, legacy 4-tier
@@ -3486,7 +3498,7 @@ mod model_split_tables_tests {
     fn model_split_tier_tables_stay_aligned() {
         assert_eq!(POM_TIERS_MODEL_SPLIT.len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
         assert!(POM_TIERS_MODEL_SPLIT.len() >= POM_TIERS_H14.len());
-        for (i, t) in POM_TIERS_H14.iter().enumerate() {
+        for (i, t) in POM_TIERS_H14.iter().enumerate().take(NETWORK_MODEL_TIER as usize) {
             assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[i], TIER_REWARD_BPS_H18[i]);
             if i >= 2 {
                 assert_eq!(POM_TIERS_MODEL_SPLIT[i].model_id, t.model_id);
@@ -3499,15 +3511,17 @@ mod model_split_tables_tests {
         assert_eq!(POM_TIERS_MODEL_SPLIT[1].model_id, QWEN3_5_9B_Q8_MODEL_ID);
         assert_eq!(POM_TIERS_MODEL_SPLIT[1].chunks, 297_391_680);
         let ids = |t: &[crate::pom::PomTier]| t.iter().map(|x| x.model_id).collect::<Vec<_>>();
-        assert_eq!(ids(Lineup::H18.tiers()), ids(&POM_TIERS_MODEL_SPLIT[..POM_TIERS_H14.len()]));
+        assert_eq!(ids(Lineup::H18.tiers()), ids(&POM_TIERS_MODEL_SPLIT[..NETWORK_MODEL_TIER as usize]));
         assert_eq!(ids(Lineup::H14.tiers()), ids(POM_TIERS_H14));
-        assert_eq!(NETWORK_MODEL_TIER as usize, POM_TIERS_H14.len());
+        assert_eq!(ids(Lineup::H14Split.tiers()), ids(&POM_TIERS_H14[..NETWORK_MODEL_TIER as usize]));
+        assert_eq!(NETWORK_MODEL_TIER as usize, POM_TIERS_H14.len() - 1);
+        assert_eq!(POM_TIERS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize].model_id, NETWORK_MODEL_V4_FLASH_MODEL_ID);
         assert_eq!(pom_tiers(Some(POM_TIERS_MODEL_SPLIT), true, true, true, true, true).len(), POM_TIERS_MODEL_SPLIT.len());
         assert_eq!(pom_tiers(None, true, true, true, true, true).len(), POM_TIERS_H14.len());
         assert_eq!(tier_reward_bps(true, true, Some(&TIER_REWARD_BPS_MODEL_SPLIT)).len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
         assert_eq!(tier_reward_bps(true, true, None).len(), TIER_REWARD_BPS_H6.len());
         assert_eq!(tier_reward_bps(true, true, None), &TIER_REWARD_BPS_H6);
-        assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize], TIER_REWARD_BPS_H18[0]);
+        assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize], TIER_REWARD_BPS_DIVISOR);
         for w in TIER_REWARD_BPS_H18.windows(2) {
             assert_eq!(w[1] - w[0], 1_500);
         }
@@ -3515,7 +3529,7 @@ mod model_split_tables_tests {
 
     #[test]
     fn h18_lineup_rules() {
-        for t in 0..POM_TIERS_H14.len() as u8 {
+        for t in 0..NETWORK_MODEL_TIER {
             assert_eq!(context_floor(t, Lineup::H18), Some(32_768));
             assert_eq!(pom_v5_pad_tiles(t, true, Lineup::H18), POM_V5_PAD_TILES_H18[t as usize]);
             assert_eq!(pom_v5_pad_tiles(t, false, Lineup::H18), POM_V5_PAD_TILES_H18[t as usize]);
@@ -3587,7 +3601,7 @@ mod model_split_tables_tests {
         assert!(!tier_serves(4, 3));
         assert!(tier_serves(NETWORK_MODEL_TIER + 1, NETWORK_MODEL_TIER));
         assert!(tier_serves(NETWORK_MODEL_TIER + 7, NETWORK_MODEL_TIER));
-        assert!(!tier_serves(4, NETWORK_MODEL_TIER));
+        assert!(!tier_serves(3, NETWORK_MODEL_TIER));
         assert!(!tier_serves(NETWORK_MODEL_TIER + 1, NETWORK_MODEL_TIER + 2));
     }
 
@@ -3607,7 +3621,7 @@ mod model_split_tables_tests {
             }
         }
         assert_eq!(NETWORK_MODEL_MAINNET.lineup, Lineup::H18);
-        assert_eq!(NETWORK_MODEL_SPLIT9B.lineup, Lineup::H14);
+        assert_eq!(NETWORK_MODEL_SPLIT9B.lineup, Lineup::H14Split);
         assert_eq!(NETWORK_MODEL_MAINNET.head_tier(), NETWORK_MODEL_HEAD_TIER);
         assert_eq!(NETWORK_MODEL_MAINNET.model_id(), NETWORK_MODEL_V4_FLASH_MODEL_ID);
     }
@@ -3620,12 +3634,11 @@ mod model_split_tables_tests {
         assert_eq!(network_model_tier_weight(NETWORK_MODEL_TIER + 1), 32);
         assert_eq!(network_model_tier_weight(NETWORK_MODEL_HEAD_TIER), 32);
         assert_eq!(network_model_tier_weight(NETWORK_MODEL_TIER), 0);
-        assert_eq!(network_model_tier_weight(4), 0);
         assert_eq!(network_model_tier_weight(NETWORK_MODEL_HEAD_TIER + 1), 0);
         // each shard is paid at the rate of its card class
         for (k, gb) in NETWORK_MODEL_SHARD_VRAM_GB.iter().enumerate() {
-            let class = match gb { 8 => 0, 12 => 1, 16 => 2, 24 => 3, _ => 4 };
-            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize + 1 + k], TIER_REWARD_BPS_H18[class]);
+            let bps = match gb { 8 => TIER_REWARD_BPS_H18[0], 12 => TIER_REWARD_BPS_H18[1], 16 => TIER_REWARD_BPS_H18[2], 24 => TIER_REWARD_BPS_H18[3], _ => TIER_REWARD_BPS_DIVISOR };
+            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize + 1 + k], bps);
         }
         // the H18 lineup keeps the flat floors per tier; models that left it cannot be requested
         let floor = |id: [u8; 32]| INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.iter().find(|(m, _)| *m == id).map(|(_, f)| *f);
