@@ -44,6 +44,7 @@ impl Mempool {
         self.validate_transaction_in_isolation(&transaction, consensus.get_virtual_daa_score())?;
         self.validate_ai_response_body(consensus, &transaction)?;
         self.validate_ai_response_awaited(consensus, &transaction)?;
+        self.validate_ai_avail_awaited(consensus, &transaction)?;
         self.validate_ai_opening(consensus, &transaction)?;
         self.validate_private_request_coverage(consensus, &transaction)?;
         let feerate_threshold = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
@@ -329,6 +330,23 @@ impl Mempool {
         let just_mined = self.accepted_transactions.has(&TransactionId::from_bytes(resp.request_hash));
         if !named_here && !just_mined {
             return Err(RuleError::RejectAiResponseNotAwaited(hex::encode(resp.request_hash)));
+        }
+        Ok(())
+    }
+
+    /// Admission policy for declarations: for a network-model request the ledger holds, one still
+    /// in this mempool, or one a block just carried. Policy only.
+    fn validate_ai_avail_awaited(&self, consensus: &dyn ConsensusApi, transaction: &MutableTransaction) -> RuleResult<()> {
+        if !transaction.tx.is_ai_avail() {
+            return Ok(());
+        }
+        let Some(avail) = AiAvailPayload::deserialize(&transaction.tx.payload) else { return Ok(()) };
+        if consensus.ai_avail_admission(&avail.request_hash) != Some(false) {
+            return Ok(());
+        }
+        let id = TransactionId::from_bytes(avail.request_hash);
+        if !self.transaction_pool.has(&id) && !self.accepted_transactions.has(&id) {
+            return Err(RuleError::RejectAiAvailNotAwaited(hex::encode(avail.request_hash)));
         }
         Ok(())
     }

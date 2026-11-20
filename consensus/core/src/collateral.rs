@@ -824,6 +824,22 @@ const MAX_EARLY_TRACES: usize = 16_384;
 /// request can be sealed to.
 const EARLY_KEYS_PER_REQUEST: usize = 128;
 
+/// Declarations held for a request not armed yet, per shard tier.
+const EARLY_DECLARATIONS_PER_TIER: usize = 32;
+
+/// Requests not accepted yet whose declarations are held.
+const MAX_EARLY_DECLARATION_HASHES: usize = 256;
+
+/// Holds a declaration for a request not armed yet: once per `(tier, key)`, at most
+/// `EARLY_DECLARATIONS_PER_TIER` per tier.
+fn push_declaration(held: &mut Vec<(u8, Hash)>, d: (u8, Hash)) {
+    if !held.contains(&d)
+        && held.iter().filter(|(t, _)| *t == d.0).count() < EARLY_DECLARATIONS_PER_TIER
+    {
+        held.push(d);
+    }
+}
+
 /// Penalty applied to a miner for a missed service assignment, by consecutive-miss count.
 /// A successful serve resets the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1632,8 +1648,18 @@ impl ServiceLedger {
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
         traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
-        mut cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
+        mut cohort_of: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
+        // A tier's cohort is fixed within a fold: computed once, shared by declarations and arming.
+        let mut cohort_cache: Vec<(u8, Vec<(Hash, Hash)>)> = Vec::new();
+        let mut cohort = move |tier: u8| -> Vec<(Hash, Hash)> {
+            if let Some((_, set)) = cohort_cache.iter().find(|(t, _)| *t == tier) {
+                return set.clone();
+            }
+            let set = cohort_of(tier);
+            cohort_cache.push((tier, set.clone()));
+            set
+        };
         let lg = self.lineup_gate();
         let layout = self.layout();
         let warmup = warmup_burned.is_some();
@@ -1770,31 +1796,37 @@ impl ServiceLedger {
                 }
                 // Only a network-model audit takes declarations (and only its requests snapshot them).
                 for d in early_decl.into_iter().filter(|_| entry.tier >= NETWORK_MODEL_TIER) {
-                    if !entry.early_declarations.contains(&d) {
-                        entry.early_declarations.push(d);
-                    }
+                    push_declaration(&mut entry.early_declarations, d);
                 }
             }
         }
 
         // A declaration lands on its armed pipeline audit, waits on its request until the audit
         // arms, or waits for the request itself.
-        for (rh, tier, escrow) in declarations {
+        // Only a key of a tier's eligible cohort can hold a declaration slot.
+        let eligible: Vec<(u8, Vec<Hash>)> = if declarations.is_empty() {
+            Vec::new()
+        } else {
+            self.layout()
+                .shard_tiers()
+                .map(|t| {
+                    let mut keys: Vec<Hash> = cohort(t).into_iter().map(|(_, escrow)| escrow).collect();
+                    keys.sort_unstable();
+                    (t, keys)
+                })
+                .collect()
+        };
+        let eligible_for = |tier: u8, escrow: &Hash| eligible.iter().any(|(t, keys)| *t == tier && keys.binary_search(escrow).is_ok());
+        for (rh, tier, escrow) in declarations.iter().filter(|(_, t, e)| eligible_for(*t, e)) {
             let Some(req) = self.pending.get_mut(rh) else {
                 let entry = self.early_declarations.entry(*rh).or_insert((daa, Vec::new()));
-                if !entry.1.contains(&(*tier, *escrow)) {
-                    entry.1.push((*tier, *escrow));
-                }
+                push_declaration(&mut entry.1, (*tier, *escrow));
                 continue;
             };
             match req.audit.as_mut() {
                 Some(audit) if audit.is_pipeline() => audit.declare(*tier, *escrow),
                 Some(_) => {}
-                None if req.tier >= NETWORK_MODEL_TIER => {
-                    if !req.early_declarations.contains(&(*tier, *escrow)) {
-                        req.early_declarations.push((*tier, *escrow));
-                    }
-                }
+                None if req.tier >= NETWORK_MODEL_TIER => push_declaration(&mut req.early_declarations, (*tier, *escrow)),
                 None => {}
             }
         }
@@ -1907,11 +1939,16 @@ impl ServiceLedger {
                     }
                 } else {
                     // A pipeline response counts only complete: the head holds the head tier and
-                    // every other shard tier is signed by exactly one link holding it. Anything
-                    // else is no response at all — the drawn head answers for it at window close.
+                    // every other shard tier is signed by exactly one link holding it, each signer
+                    // having declared for its tier. Anything else is no response at all — the drawn
+                    // head answers for it at window close.
                     let Some((_, _, links)) = response_links.iter().find(|(h, k, _)| h == rh && k == r) else { continue };
-                    let head_ids: Vec<Hash> =
-                        matched.iter().copied().filter(|id| audit.members.binary_search(&(*id, layout.head_tier())).is_ok()).collect();
+                    let declared = |tier: u8, id: &Hash| audit.declared.iter().any(|(t, i, _)| *t == tier && i == id);
+                    let head_ids: Vec<Hash> = matched
+                        .iter()
+                        .copied()
+                        .filter(|id| audit.members.binary_search(&(*id, layout.head_tier())).is_ok() && declared(layout.head_tier(), id))
+                        .collect();
                     let Some(head) = head_ids.first().copied() else { continue };
                     let mut expected: Vec<u8> = layout.shard_tiers().filter(|t| *t != layout.head_tier()).collect();
                     let mut signed: Vec<u8> = links.iter().map(|(t, _)| *t).collect();
@@ -1928,7 +1965,7 @@ impl ServiceLedger {
                             .iter()
                             .filter(|(e, _)| e == key)
                             .map(|(_, id)| *id)
-                            .find(|id| audit.members.binary_search(&(*id, *tier)).is_ok());
+                            .find(|id| audit.members.binary_search(&(*id, *tier)).is_ok() && declared(*tier, id));
                         match holder {
                             Some(id) => link_ids.push((*tier, id)),
                             None => {
@@ -2032,7 +2069,7 @@ impl ServiceLedger {
                 self.award_draw(&rh, &draw, reward, &tr.chain_hash, warmup, &mut outcome);
             }
         }
-        while self.early_declarations.len() > MAX_EARLY_RESPONSE_HASHES {
+        while self.early_declarations.len() > MAX_EARLY_DECLARATION_HASHES {
             let victim =
                 self.early_declarations.iter().min_by_key(|(hash, (seen, _))| (*seen, **hash)).map(|(hash, _)| *hash).unwrap();
             self.early_declarations.remove(&victim);
@@ -2686,6 +2723,12 @@ impl ServiceLedger {
             return Some(Some(0));
         }
         Some(self.awaited_response_deadline(request_hash, escrow_pubkey))
+    }
+
+    /// Whether an availability declaration for `request_hash` can still matter: a network-model
+    /// request is pending.
+    pub fn declaration_admissible(&self, request_hash: &[u8; 32]) -> bool {
+        self.pending.get(request_hash).is_some_and(|r| r.tier >= NETWORK_MODEL_TIER)
     }
 
     /// Whether a response to `request_hash` signed by `escrow_pubkey` can still count: the
@@ -5415,6 +5458,31 @@ mod tests {
     }
 
     #[test]
+    fn held_declarations_are_bounded() {
+        let mut ledger = ServiceLedger::default();
+        let t6 = NETWORK_MODEL_TIER + 1;
+        // fresh keys outside the tier cohort, and a lineup tier, hold no slot
+        let rh = [3u8; 32];
+        let flood: Vec<([u8; 32], u8, Hash)> = (0..1_000u32)
+            .map(|i| (rh, t6, Hash::from_u64_word(i as u64 + 1)))
+            .chain([(rh, 0, Hash::from_u64_word(7)), (rh, t6, shard_id(t6, 1))])
+            .collect();
+        fold_declarations(&mut ledger, 100, &flood);
+        assert_eq!(ledger.early_declarations.get(&rh).unwrap().1, vec![(t6, shard_id(t6, 1))]);
+        // the number of requests held is bounded
+        let many: Vec<([u8; 32], u8, Hash)> = (0..1_000u32)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                h[31] = 0xee;
+                (h, t6, shard_id(t6, 0))
+            })
+            .collect();
+        fold_declarations(&mut ledger, 103, &many);
+        assert!(ledger.early_declarations.len() <= super::MAX_EARLY_DECLARATION_HASHES);
+    }
+
+    #[test]
     fn network_model_declarations_choose_the_first_of_each_tier() {
         let mut ledger = ServiceLedger::default();
         let rh = [7u8; 32];
@@ -5690,6 +5758,40 @@ mod tests {
         // nothing was credited and everyone declared: the chosen head is struck alone
         let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
         assert_eq!(struck(&out), vec![head]);
+    }
+
+    #[test]
+    fn network_model_response_needs_declared_signers() {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_window_v2_activation(0);
+        ledger.set_reward_routing_activation(0);
+        let rh = [7u8; 32];
+        ledger.on_chain_block_with_rewards(
+            100,
+            &[(rh, NETWORK_MODEL_TIER, 256)],
+            &[(rh, 1_280)],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            |_| true,
+            shard_cohorts(None),
+        );
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        // only producer 0 declares; producer 1 holds every tier too but never declared
+        fold_declarations(&mut ledger, 102, &declare_one(rh, 0));
+        let chosen = chosen_of(&ledger, &rh);
+        let full = pipeline_links(&chosen, None);
+        // an undeclared link holding its tier does not complete the response
+        let mut undeclared = full.clone();
+        undeclared[0].1 = shard_id(undeclared[0].0, 1);
+        assert!(fold_response(&mut ledger, 103, rh, shard_id(NETWORK_MODEL_HEAD_TIER, 0), &undeclared).rewards.is_empty());
+        // nor does an undeclared head
+        assert!(fold_response(&mut ledger, 104, rh, shard_id(NETWORK_MODEL_HEAD_TIER, 1), &full).rewards.is_empty());
+        // the declared pipeline is paid
+        let out = fold_response(&mut ledger, 105, rh, shard_id(NETWORK_MODEL_HEAD_TIER, 0), &full);
+        assert_eq!(out.rewards[0].winner, shard_id(NETWORK_MODEL_HEAD_TIER, 0));
     }
 
     #[test]

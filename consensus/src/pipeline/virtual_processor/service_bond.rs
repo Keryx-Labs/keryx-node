@@ -715,6 +715,13 @@ impl VirtualStateProcessor {
         Some(escrow_pubkey.is_some_and(|e| self.service_ledger.lock().ledger.response_admissible(request_hash, e)))
     }
 
+    pub(crate) fn ai_avail_admission(&self, request_hash: &[u8; 32], virtual_daa_score: u64) -> Option<bool> {
+        if !self.model_split_activation.is_active(virtual_daa_score) {
+            return None;
+        }
+        Some(self.service_ledger.lock().ledger.declaration_admissible(request_hash))
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
@@ -887,8 +894,19 @@ impl VirtualStateProcessor {
         } else {
             SERVICE_ELIGIBILITY_WINDOW_DAA
         };
+        // Shard tiers share one walk of the window: no shard tier has a model change to floor it.
+        let shard_recent: std::cell::OnceCell<Vec<(Hash, u8, Hash)>> = std::cell::OnceCell::new();
         let cohort = |tier: u8| {
-            let set = self.service_eligible_miners_in(sc, hash, tier, eligibility_window, own_pp);
+            let set = if tier > NETWORK_MODEL_TIER {
+                let recent = shard_recent.get_or_init(|| self.service_recent_producers_in(sc, hash, eligibility_window, own_pp, None));
+                let set = eligible_pairs(recent, tier);
+                if set.is_empty() {
+                    log_empty_cohort(hash, tier, "no bonded producer of this tier in the window");
+                }
+                set
+            } else {
+                self.service_eligible_miners_in(sc, hash, tier, eligibility_window, own_pp)
+            };
             // Only the live fold logs: a refold replays the same armings.
             if live {
                 info!("service-bond: audit armed at daa {}, tier {}, cohort {}", daa, tier, set.len());

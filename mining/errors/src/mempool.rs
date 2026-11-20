@@ -102,6 +102,9 @@ pub enum RuleError {
     #[error("the AiResponse for request {0} is not awaited from its responder")]
     RejectAiResponseNotAwaited(String),
 
+    #[error("the AiAvail for request {0} names no pending network-model request")]
+    RejectAiAvailNotAwaited(String),
+
     #[error("the private AiRequest is not sealed to {0} of the {1} escrow keys of its tier cohort")]
     RejectPrivateRequestCoverage(usize, usize),
 

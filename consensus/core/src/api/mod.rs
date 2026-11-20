@@ -199,6 +199,13 @@ pub trait ConsensusApi: Send + Sync {
         None
     }
 
+    /// Whether the ledger still takes availability declarations for `request_hash`: a
+    /// network-model request is pending. `None` while the model split is not active.
+    fn ai_avail_admission(&self, request_hash: &[u8; 32]) -> Option<bool> {
+        let _ = request_hash;
+        None
+    }
+
     /// The escrow key expected to sign the opening of a drawn response; `None` when no opening
     /// is awaited for it.
     fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {

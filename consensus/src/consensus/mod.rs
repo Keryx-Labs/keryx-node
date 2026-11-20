@@ -754,6 +754,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.ai_response_admission(request_hash, escrow_pubkey, self.get_virtual_daa_score())
     }
 
+    fn ai_avail_admission(&self, request_hash: &[u8; 32]) -> Option<bool> {
+        self.virtual_processor.ai_avail_admission(request_hash, self.get_virtual_daa_score())
+    }
+
     fn awaited_opening_key(&self, response_txid: &[u8; 32]) -> Option<[u8; 32]> {
         self.virtual_processor.awaited_opening_key(response_txid)
     }
