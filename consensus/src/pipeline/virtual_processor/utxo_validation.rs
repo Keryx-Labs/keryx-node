@@ -10,7 +10,7 @@ use crate::{
             AiResponseV2BeforeActivation,
             BadAcceptedIDMerkleRoot,
             BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot, MissingServiceLedgerSnapshot,
-            WrongHeaderPruningPoint,
+            UnknownHeaderPruningPoint, WrongHeaderPruningPoint,
         },
     },
     model::stores::{
@@ -336,6 +336,10 @@ impl VirtualStateProcessor {
             )?;
         }
 
+        // Verify the header pruning point. It must precede every read keyed on it.
+        let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
+        ctx.pruning_sample_from_pov = Some(reply.pruning_sample);
+
         // Sealed service-state commitment: the header must commit the canonical service state
         // at its own pruning point. This runs in chain order (the local flush frontier is at
         // least finality-deep past the pruning point), and is skipped in the same trust windows
@@ -348,10 +352,6 @@ impl VirtualStateProcessor {
         {
             return Err(BadServiceStateCommitment(header.hash, header.service_state_hash, expected));
         }
-
-        // Verify the header pruning point
-        let reply = self.verify_header_pruning_point(header, ctx.ghostdag_data.to_compact())?;
-        ctx.pruning_sample_from_pov = Some(reply.pruning_sample);
 
         // SALT v2 hardfork: log once at the exact activation DAA score.
         if header.daa_score == self.pow_salt_v2_activation.daa_score() {
@@ -823,7 +823,7 @@ impl VirtualStateProcessor {
     /// point older than every ledger snapshot this node holds: the snapshot cannot be re-derived
     /// locally, so the check is skipped for that header.
     pub(super) fn expected_service_state_hash(&self, header: &Header) -> BlockProcessResult<Option<Hash>> {
-        let pp_daa = self.headers_store.get_daa_score(header.pruning_point).unwrap();
+        let pp_daa = self.headers_store.get_daa_score(header.pruning_point).map_err(|_| UnknownHeaderPruningPoint(header.pruning_point))?;
         let rows = self.service_commit_index.commitment_at(pp_daa);
         if !self.service_ledger_activation.is_active(header.daa_score) {
             return Ok(Some(rows));

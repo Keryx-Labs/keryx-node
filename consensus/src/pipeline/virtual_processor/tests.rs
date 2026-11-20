@@ -773,6 +773,11 @@ async fn service_state_check_skips_pruning_points_below_the_snapshot_floor() {
         vp.expected_service_state_hash(&header_committing_to(25)),
         Err(RuleError::MissingServiceLedgerSnapshot(pp)) if pp == Hash::from(25u64)
     ));
+    // A pruning point that is not a known header is an error, never a panic.
+    assert!(matches!(
+        vp.expected_service_state_hash(&header_committing_to(999)),
+        Err(RuleError::UnknownHeaderPruningPoint(pp)) if pp == Hash::from(999u64)
+    ));
     drop(vp);
     tc.shutdown(handles);
 }
