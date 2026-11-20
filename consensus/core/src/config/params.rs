@@ -1773,9 +1773,12 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 ///   4  Kimi-48B        0%
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
-/// Model-split schedule: H6 values, the network model itself (nobody mines it: floor), then one entry
-/// per range at the tier-4 rate (32 GB cards).
-pub const TIER_REWARD_BPS_MODEL_SPLIT: [u64; 10] = [6_000, 7_000, 8_000, 9_000, 10_000, 6_000, 10_000, 10_000, 10_000, 10_000];
+/// H18 lineup schedule: 15 points between tiers.
+pub const TIER_REWARD_BPS_H18: [u64; 5] = [4_000, 5_500, 7_000, 8_500, 10_000];
+
+/// Model-split schedule: H18 lineup values, the network model itself (nobody mines it: floor), then one
+/// entry per range at the tier-4 rate (32 GB cards).
+pub const TIER_REWARD_BPS_MODEL_SPLIT: [u64; 10] = [4_000, 5_500, 7_000, 8_500, 10_000, 4_000, 10_000, 10_000, 10_000, 10_000];
 
 /// Tier-reward schedule for a block at `daa_score`: model split once `model_split_activation` is live,
 /// 5-tier H6 once `pom_v3_activation`, 5-tier H2 once `very_light_activation`, legacy 4-tier
@@ -3484,7 +3487,7 @@ mod model_split_tables_tests {
         assert_eq!(POM_TIERS_MODEL_SPLIT.len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
         assert!(POM_TIERS_MODEL_SPLIT.len() >= POM_TIERS_H14.len());
         for (i, t) in POM_TIERS_H14.iter().enumerate() {
-            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[i], TIER_REWARD_BPS_H6[i]);
+            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[i], TIER_REWARD_BPS_H18[i]);
             if i >= 2 {
                 assert_eq!(POM_TIERS_MODEL_SPLIT[i].model_id, t.model_id);
                 assert_eq!(POM_TIERS_MODEL_SPLIT[i].root, t.root);
@@ -3503,6 +3506,11 @@ mod model_split_tables_tests {
         assert_eq!(pom_tiers(None, true, true, true, true, true).len(), POM_TIERS_H14.len());
         assert_eq!(tier_reward_bps(true, true, Some(&TIER_REWARD_BPS_MODEL_SPLIT)).len(), TIER_REWARD_BPS_MODEL_SPLIT.len());
         assert_eq!(tier_reward_bps(true, true, None).len(), TIER_REWARD_BPS_H6.len());
+        assert_eq!(tier_reward_bps(true, true, None), &TIER_REWARD_BPS_H6);
+        assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize], TIER_REWARD_BPS_H18[0]);
+        for w in TIER_REWARD_BPS_H18.windows(2) {
+            assert_eq!(w[1] - w[0], 1_500);
+        }
     }
 
     #[test]
@@ -3617,7 +3625,7 @@ mod model_split_tables_tests {
         // each shard is paid at the rate of its card class
         for (k, gb) in NETWORK_MODEL_SHARD_VRAM_GB.iter().enumerate() {
             let class = match gb { 8 => 0, 12 => 1, 16 => 2, 24 => 3, _ => 4 };
-            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize + 1 + k], TIER_REWARD_BPS_H6[class]);
+            assert_eq!(TIER_REWARD_BPS_MODEL_SPLIT[NETWORK_MODEL_TIER as usize + 1 + k], TIER_REWARD_BPS_H18[class]);
         }
         // the H18 lineup keeps the flat floors per tier; models that left it cannot be requested
         let floor = |id: [u8; 32]| INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.iter().find(|(m, _)| *m == id).map(|(_, f)| *f);
