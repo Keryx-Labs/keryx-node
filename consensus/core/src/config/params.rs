@@ -641,13 +641,15 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 /// Context pad tiles of each `POM_TIERS_H14` tier from `pad_margin_activation`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
-/// Context pad tiles of each H18 lineup tier.
-pub const POM_V5_PAD_TILES_H18: [u64; 5] = [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632];
+/// Context pad tiles of each `POM_TIERS_MODEL_SPLIT` tier: the H18 lineup, the whole network model
+/// (never mined) and its four ranges, each range padded to the 32 GB class total of tier 4.
+pub const POM_V5_PAD_TILES_H18: [u64; 10] =
+    [780_288, 1_778_688, 4_599_808, 6_266_880, 2_245_632, 0, 10_003_456, 9_996_288, 9_966_592, 11_914_240];
 
 const _: () = assert!(
     POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
         && POM_V5_PAD_TILES_H16.len() == POM_TIERS_H14.len()
-        && POM_V5_PAD_TILES_H18.len() == POM_TIERS_H14.len()
+        && POM_V5_PAD_TILES_H18.len() == POM_TIERS_MODEL_SPLIT.len()
 );
 
 /// Lineup the per-tier rules of tiers 0-4 follow.
@@ -670,7 +672,7 @@ impl Lineup {
 
 /// Context pad tiles of `tier`; 0 = no pad.
 pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool, lineup: Lineup) -> u64 {
-    let table = match lineup {
+    let table: &[u64] = match lineup {
         Lineup::H18 => &POM_V5_PAD_TILES_H18,
         Lineup::H14 if pad_margin => &POM_V5_PAD_TILES_H16,
         Lineup::H14 => &POM_V5_PAD_TILES_H14,
@@ -3511,6 +3513,17 @@ mod model_split_tables_tests {
             assert_eq!(pom_v5_pad_tiles(t, false, Lineup::H18), POM_V5_PAD_TILES_H18[t as usize]);
         }
         assert_eq!(context_floor(0, Lineup::H14), Some(8_192));
+        // every mined tier of the split carries a pad; each range keeps the tier 4 total, to the MiB
+        let total = |chunks: u64, tiles: u64| chunks * 32 + tiles * 1024;
+        let t4 = total(POM_TIERS_H14[4].chunks, POM_V5_PAD_TILES_H16[4]);
+        for t in 0..POM_TIERS_MODEL_SPLIT.len() {
+            let pad = pom_v5_pad_tiles(t as u8, true, Lineup::H18);
+            assert_eq!(pad == 0, t == NETWORK_MODEL_TIER as usize, "tier {t}");
+            if t > NETWORK_MODEL_TIER as usize {
+                let range = total(POM_TIERS_MODEL_SPLIT[t].chunks, pad);
+                assert!(range <= t4 && t4 - range < 1 << 20, "tier {t}: {range} vs {t4}");
+            }
+        }
         // tiers 0 and 1 keep the H16 weights + pad total, to the MiB
         for t in 0..2 {
             let total = |chunks: u64, tiles: u64| chunks * 32 + tiles * 1024;
