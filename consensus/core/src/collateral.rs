@@ -3,6 +3,7 @@ use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
 
 use crate::config::params::{Lineup, NetworkModelLayout, NETWORK_MODEL_MAINNET, NETWORK_MODEL_TIER, network_model_request};
+use crate::range_assignment::{RangeTable, RANGE_TABLES_KEPT};
 use crate::tx::ScriptPublicKey;
 
 /// Fraction of each accepted block subsidy held in escrow as miner collateral (basis points).
@@ -3169,9 +3170,15 @@ pub struct ServiceLedgerSnapshot {
     early_traces: std::collections::BTreeMap<([u8; 32], Hash), EarlyTrace>,
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
     held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
+    /// Non-empty range tables by epoch, ascending, at most [`RANGE_TABLES_KEPT`].
+    pub range_tables: Vec<(u64, RangeTable)>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
+/// Tags of the optional sections closing the encoding, each written only when non-empty, ascending.
+const TRAILER_EARLY_DECLARATIONS: u8 = 1;
+const TRAILER_PENDING_DECLARATIONS: u8 = 2;
+const TRAILER_RANGE_TABLES: u8 = 3;
 /// Encoding 1 plus a trailing private-recipient section (`[n: u32] n × [request_hash: 32]
 /// [cohort seed: 36] [k: u32] [k × escrow key: 32]`, pending order, ascending keys). Emitted only when a pending
 /// request carries recipients, so every snapshot without one keeps its historical bytes and
@@ -3595,7 +3602,8 @@ impl ServiceLedgerSnapshot {
         }
         let declared: Vec<(&[u8; 32], &Vec<(u8, Hash)>)> =
             self.pending.iter().filter(|(_, r)| !r.early_declarations.is_empty()).map(|(rh, r)| (rh, &r.early_declarations)).collect();
-        if !self.early_declarations.is_empty() || !declared.is_empty() {
+        if !self.early_declarations.is_empty() {
+            out.push(TRAILER_EARLY_DECLARATIONS);
             out.extend_from_slice(&(self.early_declarations.len() as u32).to_le_bytes());
             for (rh, (seen, decls)) in self.early_declarations.iter() {
                 out.extend_from_slice(rh);
@@ -3604,10 +3612,23 @@ impl ServiceLedgerSnapshot {
             }
         }
         if !declared.is_empty() {
+            out.push(TRAILER_PENDING_DECLARATIONS);
             out.extend_from_slice(&(declared.len() as u32).to_le_bytes());
             for (rh, decls) in declared {
                 out.extend_from_slice(rh);
                 put_declarations(&mut out, decls);
+            }
+        }
+        if !self.range_tables.is_empty() {
+            out.push(TRAILER_RANGE_TABLES);
+            out.extend_from_slice(&(self.range_tables.len() as u32).to_le_bytes());
+            for (epoch, table) in self.range_tables.iter() {
+                out.extend_from_slice(&epoch.to_le_bytes());
+                out.extend_from_slice(&(table.entries().len() as u32).to_le_bytes());
+                for (key, range) in table.entries() {
+                    out.extend_from_slice(&key.as_bytes());
+                    out.push(*range);
+                }
             }
         }
         out
@@ -4034,32 +4055,60 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
-        if r.pos != bytes.len() {
-            let n = r.u32()?;
-            if n == 0 && r.pos == bytes.len() {
-                return Err("malformed early declarations".into());
+        let mut last_tag = 0u8;
+        while r.pos != bytes.len() {
+            let tag = r.u8()?;
+            if tag <= last_tag {
+                return Err("trailer sections out of order".into());
             }
-            for _ in 0..n {
-                let rh = r.key()?;
-                let seen = r.u64()?;
-                let decls = read_declarations(&mut r)?;
-                if snap.early_declarations.insert(rh, (seen, decls)).is_some() {
-                    return Err("malformed early declarations".into());
-                }
-            }
-        }
-        if r.pos != bytes.len() {
+            last_tag = tag;
             let n = r.u32()?;
             if n == 0 {
-                return Err("malformed pending declarations".into());
+                return Err("empty trailer section".into());
             }
-            for _ in 0..n {
-                let rh = r.key()?;
-                let decls = read_declarations(&mut r)?;
-                match snap.pending.get_mut(&rh) {
-                    Some(req) if !decls.is_empty() => req.early_declarations = decls,
-                    _ => return Err("malformed pending declarations".into()),
+            match tag {
+                TRAILER_EARLY_DECLARATIONS => {
+                    for _ in 0..n {
+                        let rh = r.key()?;
+                        let seen = r.u64()?;
+                        let decls = read_declarations(&mut r)?;
+                        if snap.early_declarations.insert(rh, (seen, decls)).is_some() {
+                            return Err("malformed early declarations".into());
+                        }
+                    }
                 }
+                TRAILER_PENDING_DECLARATIONS => {
+                    for _ in 0..n {
+                        let rh = r.key()?;
+                        let decls = read_declarations(&mut r)?;
+                        match snap.pending.get_mut(&rh) {
+                            Some(req) if !decls.is_empty() => req.early_declarations = decls,
+                            _ => return Err("malformed pending declarations".into()),
+                        }
+                    }
+                }
+                TRAILER_RANGE_TABLES => {
+                    if n as u64 > RANGE_TABLES_KEPT {
+                        return Err("too many range tables".into());
+                    }
+                    for _ in 0..n {
+                        let epoch = r.u64()?;
+                        if snap.range_tables.last().is_some_and(|(e, _)| *e >= epoch) {
+                            return Err("range tables out of order".into());
+                        }
+                        let k = r.u32()?;
+                        if k == 0 {
+                            return Err("empty range table".into());
+                        }
+                        let mut entries = Vec::with_capacity((k as usize).min(1 << 16));
+                        for _ in 0..k {
+                            let key = Hash::from_bytes(r.key()?);
+                            entries.push((key, r.u8()?));
+                        }
+                        snap.range_tables.push((epoch, RangeTable::from_entries(entries)?));
+                    }
+                }
+                _ => return Err("unknown trailer section".into()),
             }
         }
         if r.pos != bytes.len() {
@@ -4323,6 +4372,7 @@ impl ServiceLedger {
             audited: self.audited.clone(),
             producer_spk: self.producer_spk.clone(),
             recent_producers: Vec::new(),
+            range_tables: Vec::new(),
             trace_audits: self.trace_audits.clone(),
             early_shapes: self.early_shapes.clone(),
             early_traces: self.early_traces.clone(),
@@ -5960,6 +6010,48 @@ mod tests {
         assert_eq!(&old_bytes[..expected.len()], expected.as_slice());
         // the last pre-model-split section (recent_producers, empty) closes the encoding: no trailer
         assert_eq!(&old_bytes[old_bytes.len() - 4..], 0u32.to_le_bytes().as_slice());
+    }
+
+    #[test]
+    fn range_tables_close_the_encoding_and_parse_strictly() {
+        use crate::range_assignment::RangeTable;
+        let k = |b: u8| Hash::from_bytes([b; 32]);
+        let plain = ServiceLedgerSnapshot::default().to_bytes();
+        let mut snap = ServiceLedgerSnapshot::default();
+        snap.range_tables = vec![
+            (7, RangeTable::from_entries(vec![(k(1), 0), (k(2), 3)]).unwrap()),
+            (8, RangeTable::from_entries(vec![(k(1), 1)]).unwrap()),
+        ];
+        let bytes = snap.to_bytes();
+        assert_eq!(&bytes[..plain.len()], plain.as_slice());
+        assert_eq!(bytes[plain.len()], super::TRAILER_RANGE_TABLES);
+        assert_eq!(ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), snap);
+
+        let section = |tables: &[(u64, &[(u8, u8)])]| {
+            let mut out = plain.clone();
+            out.push(super::TRAILER_RANGE_TABLES);
+            out.extend_from_slice(&(tables.len() as u32).to_le_bytes());
+            for (epoch, entries) in tables {
+                out.extend_from_slice(&epoch.to_le_bytes());
+                out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                for (b, r) in entries.iter() {
+                    out.extend_from_slice(&[*b; 32]);
+                    out.push(*r);
+                }
+            }
+            out
+        };
+        assert!(ServiceLedgerSnapshot::from_bytes(&section(&[(8, &[(1, 0)]), (7, &[(1, 0)])])).is_err());
+        assert!(ServiceLedgerSnapshot::from_bytes(&section(&[(7, &[])])).is_err());
+        assert!(ServiceLedgerSnapshot::from_bytes(&section(&[(7, &[(2, 0), (1, 0)])])).is_err());
+        assert!(ServiceLedgerSnapshot::from_bytes(&section(&[(1, &[(1, 0)]), (2, &[(1, 0)]), (3, &[(1, 0)]), (4, &[(1, 0)])])).is_err());
+        assert!(ServiceLedgerSnapshot::from_bytes(&section(&[])).is_err());
+        let mut repeated = section(&[(7, &[(1, 0)])]);
+        repeated.extend_from_slice(&section(&[(8, &[(1, 0)])])[plain.len()..]);
+        assert!(ServiceLedgerSnapshot::from_bytes(&repeated).is_err());
+        let mut unknown = plain.clone();
+        unknown.extend_from_slice(&[9, 1, 0, 0, 0]);
+        assert!(ServiceLedgerSnapshot::from_bytes(&unknown).is_err());
     }
 
     #[test]

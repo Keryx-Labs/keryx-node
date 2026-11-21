@@ -164,6 +164,13 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    /// Current and next network-model range of an escrow key for a block at `blue_score` /
+    /// `daa_score`; `None` before the model-split gate.
+    fn get_range_assignment(&self, escrow: Hash, blue_score: u64, daa_score: u64) -> Option<(u8, Option<u8>)> {
+        let _ = (escrow, blue_score, daa_score);
+        unimplemented!()
+    }
+
     /// Eligible producers per shard tier at the sink (model split).
     fn get_network_model_availability(&self) -> crate::collateral::NetworkModelAvailability {
         unimplemented!()

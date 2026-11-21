@@ -171,15 +171,20 @@ pub struct GetBlockTemplateResponse {
     /// Model split: the armed network-model audits, `;`-separated `PipelineAssignment::encode` entries
     /// (`hash:accepted:window_end:tier-escrowhex,...`). Empty when none.
     pub pipeline_assignments: String,
+
+    /// Model split: network-model range of the template's escrow key, `current:next` (next empty
+    /// until known). Empty before the gate.
+    pub range_assignment: String,
 }
 
 impl Serializer for GetBlockTemplateResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &3, writer)?;
+        store!(u16, &4, writer)?;
         serialize!(RpcRawBlock, &self.block, writer)?;
         store!(bool, &self.is_synced, writer)?;
         store!(String, &self.inference_challenge, writer)?;
         store!(String, &self.pipeline_assignments, writer)?;
+        store!(String, &self.range_assignment, writer)?;
 
         Ok(())
     }
@@ -192,8 +197,9 @@ impl Deserializer for GetBlockTemplateResponse {
         let is_synced = load!(bool, reader)?;
         let inference_challenge = if version >= 2 { load!(String, reader)? } else { String::new() };
         let pipeline_assignments = if version >= 3 { load!(String, reader)? } else { String::new() };
+        let range_assignment = if version >= 4 { load!(String, reader)? } else { String::new() };
 
-        Ok(Self { block, is_synced, inference_challenge, pipeline_assignments })
+        Ok(Self { block, is_synced, inference_challenge, pipeline_assignments, range_assignment })
     }
 }
 

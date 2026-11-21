@@ -741,7 +741,8 @@ impl VirtualStateProcessor {
         let miner_data = self.coinbase_manager.deserialize_coinbase_payload(&coinbase.payload).unwrap().miner_data;
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
         let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
-        let suspended_blues = self.suspended_blues(ghostdag_data, mergeset_non_daa, daa_score);
+        let mut suspended_blues = self.suspended_blues(ghostdag_data, mergeset_non_daa, daa_score);
+        suspended_blues.extend(self.misranged_blues(ghostdag_data, mergeset_non_daa, daa_score));
         let reward_mints = self.service_reward_mints_for(ghostdag_data.selected_parent);
         let expected_coinbase = self
             .coinbase_manager

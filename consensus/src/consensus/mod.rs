@@ -729,6 +729,10 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.pipeline_assignments()
     }
 
+    fn get_range_assignment(&self, escrow: Hash, blue_score: u64, daa_score: u64) -> Option<(u8, Option<u8>)> {
+        self.virtual_processor.range_assignment(&escrow, blue_score, daa_score)
+    }
+
     fn get_network_model_availability(&self) -> keryx_consensus_core::collateral::NetworkModelAvailability {
         let state = self.lkg_virtual_state.load();
         self.virtual_processor.network_model_availability(state.ghostdag_data.selected_parent, state.daa_score)

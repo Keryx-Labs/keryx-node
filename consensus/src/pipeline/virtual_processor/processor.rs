@@ -170,6 +170,8 @@ pub struct VirtualStateProcessor {
     pub(super) production_index_hashes: RwLock<HashMap<Hash, (Hash, Hash)>>,
     /// Producers below the pruning point, from the snapshot imported (or persisted) at it.
     pub(super) service_imported_producers: RwLock<Vec<(u64, Hash, u8, Hash)>>,
+    /// Range table by epoch, with the sample block that computed it when folded here.
+    pub(super) service_range_tables: RwLock<std::collections::BTreeMap<u64, (Option<Hash>, keryx_consensus_core::range_assignment::RangeTable)>>,
     /// Recent producers at the last sink the mempool asked about (see `service_bond.rs`).
     pub(super) service_recent_at_sink: parking_lot::Mutex<Option<(Hash, std::sync::Arc<Vec<(Hash, u8, Hash)>>)>>,
     pub(super) service_ledger_activation: ForkActivation,
@@ -454,6 +456,7 @@ impl VirtualStateProcessor {
             service_ledger_hashes: Default::default(),
             production_index_hashes: Default::default(),
             service_imported_producers: Default::default(),
+            service_range_tables: Default::default(),
             service_recent_at_sink: Default::default(),
             service_ledger_activation: params.service_ledger_activation,
             production_index_activation: params.production_index_activation,
@@ -1942,8 +1945,9 @@ impl VirtualStateProcessor {
             virtual_state.daa_score,
             &[],
         );
-        let suspended_blues =
+        let mut suspended_blues =
             self.suspended_blues(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score);
+        suspended_blues.extend(self.misranged_blues(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score));
         let reward_mints = self.service_reward_mints_for(virtual_state.ghostdag_data.selected_parent);
         let coinbase = self
             .coinbase_manager

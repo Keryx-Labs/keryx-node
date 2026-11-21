@@ -12,7 +12,7 @@ use crate::processes::{
 };
 use keryx_consensus_core::{
     block::Block,
-    config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, network_model_range, pom_tiers},
+    config::params::{NETWORK_MODEL_TIER, POM_OPENINGS, POM_WALK_STEPS, pom_tiers},
     errors::consensus::{ConsensusError, ConsensusResult},
     hashing::header::hash_override_nonce_time,
     mass::{ContextualMasses, Mass, NonContextualMasses},
@@ -208,8 +208,8 @@ impl BlockBodyProcessor {
         Ok(())
     }
 
-    /// Past the model-split gate: the whole network model is not mined, and a range tier must be the
-    /// one assigned to the coinbase escrow key under the header's pruning point.
+    /// Past the model-split gate: the whole network model is not mined, and a range tier must be a
+    /// range of the model, mined under an escrow key.
     fn check_network_model_tier(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let tier = block.header.pom_tier;
         if tier == NETWORK_MODEL_TIER {
@@ -218,14 +218,11 @@ impl BlockBodyProcessor {
         if tier < NETWORK_MODEL_TIER {
             return Ok(());
         }
-        let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&block.transactions[0].payload).map_err(RuleError::BadCoinbasePayload)?;
-        let escrow_pubkey =
-            keryx_consensus_core::collateral::parse_escrow_pubkey(coinbase.miner_data.extra_data).ok_or(RuleError::MissingEscrowDelegation)?;
-        let range = network_model_range(&block.header.pruning_point.as_bytes(), &escrow_pubkey, self.network_model.n_shards());
-        let assigned = NETWORK_MODEL_TIER + 1 + range;
-        if tier != assigned {
-            return Err(RuleError::PomRangeNotAssigned(tier, assigned));
+        if (tier - NETWORK_MODEL_TIER) as usize > self.network_model.n_shards() {
+            return Err(RuleError::PomRangeOutOfBounds(tier));
         }
+        let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&block.transactions[0].payload).map_err(RuleError::BadCoinbasePayload)?;
+        keryx_consensus_core::collateral::parse_escrow_pubkey(coinbase.miner_data.extra_data).ok_or(RuleError::MissingEscrowDelegation)?;
         Ok(())
     }
 

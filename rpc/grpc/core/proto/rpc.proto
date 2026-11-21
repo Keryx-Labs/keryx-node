@@ -205,6 +205,10 @@ message GetBlockTemplateResponseMessage {
   // "hash:accepted:window_end:tier-escrowhex,..." entries. Empty when none.
   string pipelineAssignments = 11;
 
+  // Model split: network-model range of the template's escrow key, "current:next" (next empty
+  // until known). Empty before the gate.
+  string rangeAssignment = 12;
+
   RPCError error = 1000;
 }
 

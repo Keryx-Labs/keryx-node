@@ -166,6 +166,7 @@ from!(item: RpcResult<&keryx_rpc_core::GetBlockTemplateResponse>, protowire::Get
         is_synced: item.is_synced,
         inference_challenge: item.inference_challenge.clone(),
         pipeline_assignments: item.pipeline_assignments.clone(),
+        range_assignment: item.range_assignment.clone(),
         error: None,
     }
 });
@@ -768,6 +769,7 @@ try_from!(item: &protowire::GetBlockTemplateResponseMessage, RpcResult<keryx_rpc
         is_synced: item.is_synced,
         inference_challenge: item.inference_challenge.clone(),
         pipeline_assignments: item.pipeline_assignments.clone(),
+        range_assignment: item.range_assignment.clone(),
     }
 });
 

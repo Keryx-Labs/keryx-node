@@ -419,6 +419,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                 ));
             }
         }
+        let template_escrow = keryx_consensus_core::collateral::parse_escrow_pubkey(&extra_data_bytes);
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data_bytes);
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 
@@ -541,11 +542,25 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             String::new()
         };
 
+        let header = &block_template.block.header;
+        let range_assignment = template_escrow
+            .and_then(|pubkey| {
+                let session = self.consensus_manager.consensus().unguarded_session();
+                session.get_range_assignment(
+                    keryx_consensus_core::collateral::escrow_miner_key(&pubkey),
+                    header.blue_score,
+                    header.daa_score,
+                )
+            })
+            .map(|(current, next)| format!("{current}:{}", next.map(|n| n.to_string()).unwrap_or_default()))
+            .unwrap_or_default();
+
         Ok(GetBlockTemplateResponse {
             block: block_template.block.into(),
             is_synced,
             inference_challenge,
             pipeline_assignments,
+            range_assignment,
         })
     }
 

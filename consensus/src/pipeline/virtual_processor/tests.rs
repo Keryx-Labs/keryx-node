@@ -470,7 +470,8 @@ async fn model_split_payloads_invalidate_the_block_before_the_gate() {
 #[tokio::test]
 async fn model_split_range_tier_follows_the_chain_assignment() {
     use crate::errors::RuleError;
-    use keryx_consensus_core::config::params::{ForkActivation, NETWORK_MODEL_TIER, network_model_range};
+    use keryx_consensus_core::config::params::{ForkActivation, NETWORK_MODEL_TIER};
+    use keryx_consensus_core::range_assignment::home_range;
     use keryx_consensus_core::pom::PomProof;
 
     let mut params = MAINNET_PARAMS;
@@ -505,21 +506,69 @@ async fn model_split_range_tier_follows_the_chain_assignment() {
     let tc = TestConsensus::new(&config);
     let handles = tc.init();
     let genesis = config.genesis.hash;
-    let probe = tc.build_utxo_valid_block_with_parents(1u64.into(), vec![genesis], miner.clone(), vec![]);
-    let assigned = NETWORK_MODEL_TIER + 1 + network_model_range(&probe.header.pruning_point.as_bytes(), &[0x11u8; 32], n_shards);
-    let other = NETWORK_MODEL_TIER + 1 + (assigned - NETWORK_MODEL_TIER) % n_shards as u8;
+    let home = NETWORK_MODEL_TIER + 1 + home_range(&Hash::from_bytes([0x11u8; 32]), n_shards);
+    let other = NETWORK_MODEL_TIER + 1 + (home - NETWORK_MODEL_TIER) % n_shards as u8;
+    let beyond = NETWORK_MODEL_TIER + 1 + n_shards as u8;
 
-    for (n, tier) in [(1u64, 4u8), (2, other), (3, assigned)] {
+    for (n, tier) in [(1u64, 4u8), (2, beyond), (3, other), (4, home)] {
         let hash: Hash = n.into();
         let mut mutable = tc.build_utxo_valid_block_with_parents(hash, vec![genesis], miner.clone(), vec![]);
         mutable.header.pom_tier = tier;
         let result = tc.validate_and_insert_block(mutable.to_immutable().with_pom_proof(proof_with_tier(tier))).block_task.await;
         match n {
             1 => assert!(matches!(result, Err(RuleError::PomTierPaused(4))), "{result:?}"),
-            2 => assert!(matches!(result, Err(RuleError::PomRangeNotAssigned(t, a)) if t == other && a == assigned), "{result:?}"),
+            2 => assert!(matches!(result, Err(RuleError::PomRangeOutOfBounds(t)) if t == beyond), "{result:?}"),
             _ => assert!(result.is_ok(), "{result:?}"),
         }
     }
+    // the block mined off its range is valid, but its miner cut is burned by the merging block
+    use crate::model::stores::virtual_state::VirtualStateStoreReader;
+    let vp = tc.virtual_processor().clone();
+    let state = vp.virtual_stores.read().state.get().unwrap();
+    let burned = vp.misranged_blues(&state.ghostdag_data, &state.mergeset_non_daa, state.daa_score);
+    assert_eq!(burned, [Hash::from(3u64)].into_iter().collect());
+    tc.shutdown(handles);
+}
+
+/// The range table of an epoch is computed at its sample from the previous one, judges the next
+/// epoch, and reloads from the sample snapshot.
+#[tokio::test]
+async fn range_tables_are_computed_at_the_sample_and_judge_the_next_epoch() {
+    use keryx_consensus_core::collateral::ServiceLedgerSnapshot;
+    use keryx_consensus_core::config::params::{ForkActivation, NETWORK_MODEL_TIER};
+    use keryx_consensus_core::range_assignment::home_range;
+
+    let mut params = MAINNET_PARAMS;
+    params.model_split_activation = ForkActivation::always();
+    let config = ConfigBuilder::new(params).skip_proof_of_work().build();
+    let tc = TestConsensus::new(&config);
+    let handles = tc.init();
+    let genesis = config.genesis.hash;
+    let vp = tc.virtual_processor().clone();
+    let (fd, n) = (vp.finality_depth, vp.network_model.n_shards());
+    let k = |b: u8| Hash::from_bytes([b; 32]);
+
+    let mut snap = ServiceLedgerSnapshot::default();
+    snap.recent_producers = (1..=4u8)
+        .flat_map(|b| (0..5u64).map(move |i| (i, Hash::from_bytes([0xA0 + b; 32]), NETWORK_MODEL_TIER + 1, Hash::from_bytes([b; 32]))))
+        .collect();
+    snap.recent_producers.push((9, k(0xEE), 0, k(0xEE)));
+    vp.attach_range_tables(&mut snap, genesis, 0);
+    let t0 = vp.service_range_tables.read().get(&0).unwrap().1.clone();
+    assert_eq!(snap.range_tables, vec![(0, t0.clone())]);
+    assert_eq!(t0.get(&k(0xEE)), None);
+    let mut ranges: Vec<u8> = (1..=4).map(|b| t0.get(&k(b)).unwrap()).collect();
+    ranges.sort();
+    assert_eq!(ranges, vec![0, 1, 2, 3]);
+
+    let r1 = t0.get(&k(1)).unwrap();
+    assert_eq!(vp.range_assignment(&k(1), 0, 0), Some((home_range(&k(1), n), Some(r1))));
+    assert_eq!(vp.range_assignment(&k(1), fd, 0), Some((r1, None)));
+    assert_eq!(vp.range_assignment(&k(9), fd, 0).unwrap().0, home_range(&k(9), n));
+
+    vp.service_range_tables.write().clear();
+    vp.load_range_tables(&mut vp.service_range_tables.write(), genesis, &snap);
+    assert_eq!(vp.service_range_tables.read().get(&0), Some(&(Some(genesis), t0)));
     tc.shutdown(handles);
 }
 

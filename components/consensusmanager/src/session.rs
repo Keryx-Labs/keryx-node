@@ -220,6 +220,10 @@ impl ConsensusSessionOwned {
         self.consensus.get_pipeline_assignments()
     }
 
+    pub fn get_range_assignment(&self, escrow: Hash, blue_score: u64, daa_score: u64) -> Option<(u8, Option<u8>)> {
+        self.consensus.get_range_assignment(escrow, blue_score, daa_score)
+    }
+
     pub fn get_network_model_availability(&self) -> keryx_consensus_core::collateral::NetworkModelAvailability {
         self.consensus.get_network_model_availability()
     }

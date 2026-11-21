@@ -1487,7 +1487,7 @@ pub const NETWORK_MODEL_SHARDS: &[([u8; 32], u32, u32)] = &[
 ];
 
 /// Model-split tier set: the H18 lineup (tiers 0-3), then the network model (tier 4) and its four
-/// ranges (tiers 5-8, layer order), assigned per block by `network_model_range`. Gated by
+/// ranges (tiers 5-8, layer order), assigned per escrow key by the range table. Gated by
 /// `model_split_activation`.
 pub const POM_TIERS_MODEL_SPLIT: &[crate::pom::PomTier] = &[
     crate::pom::PomTier {
@@ -1554,16 +1554,6 @@ pub const POM_TIERS_MODEL_SPLIT: &[crate::pom::PomTier] = &[
 /// the network model when the target is the network model.
 pub fn tier_serves(tier: u8, target: u8) -> bool {
     tier == target || (target == NETWORK_MODEL_TIER && tier > NETWORK_MODEL_TIER)
-}
-
-/// Network-model range (0-based) assigned to an escrow key under a pruning point.
-pub fn network_model_range(pruning_point: &[u8; 32], escrow_pubkey: &[u8; 32], n_shards: usize) -> u8 {
-    let mut h = blake3::Hasher::new();
-    h.update(b"KeryxRangeV1");
-    h.update(pruning_point);
-    h.update(escrow_pubkey);
-    let word = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
-    (word % n_shards.max(1) as u64) as u8
 }
 
 /// Tier of the pipeline head: the last shard, which also carries the embeddings and the output
@@ -3650,26 +3640,6 @@ mod model_split_tables_tests {
         }
         let min = INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT.iter().find(|(id, _)| *id == NETWORK_MODEL_V4_FLASH_MODEL_ID).unwrap().1;
         assert_eq!(min, 400_000_000);
-    }
-
-    #[test]
-    fn network_model_range_is_keyed_on_pruning_point_and_escrow_key() {
-        let n = NETWORK_MODEL_SHARDS.len();
-        let pp = [3u8; 32];
-        let key = [9u8; 32];
-        let r = network_model_range(&pp, &key, n);
-        assert!((r as usize) < n);
-        assert_eq!(network_model_range(&pp, &key, n), r);
-        let mut seen = [0usize; 4];
-        for i in 0..400u32 {
-            let mut k = [0u8; 32];
-            k[..4].copy_from_slice(&i.to_le_bytes());
-            seen[network_model_range(&pp, &k, n) as usize] += 1;
-        }
-        assert!(seen.iter().all(|&c| c > 50), "{seen:?}");
-        let moved = (0..64u8).filter(|&b| network_model_range(&[b; 32], &key, n) != r).count();
-        assert!(moved > 0);
-        assert_eq!(network_model_range(&pp, &key, 1), 0);
     }
 }
 

@@ -13,9 +13,10 @@ use keryx_consensus_core::collateral::{
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
     TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
 };
+use keryx_consensus_core::range_assignment::{home_range, judging_table_epoch, next_range_table, RANGE_TABLES_KEPT};
 use keryx_consensus_core::config::params::{Lineup, NETWORK_MODEL_TIER, POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
-use keryx_consensus_core::ChainPath;
+use keryx_consensus_core::{ChainPath, HashMapCustomHasher};
 use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{error, info, warn};
 use keryx_hashes::Hash;
@@ -1164,6 +1165,7 @@ impl VirtualStateProcessor {
             if !warmup && self.is_pruning_sample_block(hash) && !self.service_ledger_hashes.read().contains_key(&hash) {
                 let mut snapshot = ledger.snapshot();
                 snapshot.recent_producers = self.recent_producers_below(sc, i, daa, pruning_point);
+                self.attach_range_tables(&mut snapshot, hash, daa);
                 let bytes = snapshot.to_bytes();
                 let snapshot_hash = ServiceLedgerSnapshot::hash_of_bytes(&bytes);
                 self.service_ledger_hashes.write().insert(hash, snapshot_hash);
@@ -1245,6 +1247,9 @@ impl VirtualStateProcessor {
         }
         sync.snapshots.split_off(&(common + 1));
         sync.undo.split_off(&(common + 1));
+        if !chain_path.removed.is_empty() {
+            self.service_range_tables.write().retain(|_, (sample, _)| !sample.is_some_and(|s| chain_path.removed.contains(&s)));
+        }
         for removed in chain_path.removed.iter() {
             if self.service_ledger_hashes.write().remove(removed).is_some() {
                 self.service_ledger_snapshot_store.delete(*removed).unwrap();
@@ -1283,6 +1288,7 @@ impl VirtualStateProcessor {
             if self.is_pruning_sample_block(*h) {
                 let mut snapshot = sync.ledger.snapshot();
                 snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa, pruning_point);
+                self.attach_range_tables(&mut snapshot, *h, daa);
                 let bytes = snapshot.to_bytes();
                 self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
@@ -1410,6 +1416,99 @@ impl VirtualStateProcessor {
         if let Some(daa) = sealing_daa {
             self.service_commit_index.seal(daa);
         }
+    }
+
+    /// Past the model-split gate, computes the range table of `sample`'s epoch from the previous
+    /// one and the snapshot's range-tier producers, and attaches the kept tables to the snapshot.
+    pub(super) fn attach_range_tables(&self, snapshot: &mut ServiceLedgerSnapshot, sample: Hash, daa: u64) {
+        if !self.model_split_activation.is_active(daa) {
+            return;
+        }
+        let epoch = self.headers_store.get_blue_score(sample).unwrap() / self.finality_depth;
+        let n = self.network_model.n_shards();
+        let mut tables = self.service_range_tables.write();
+        let prev = epoch.checked_sub(1).and_then(|e| tables.get(&e)).map(|(_, t)| t.clone()).unwrap_or_default();
+        let producers = snapshot
+            .recent_producers
+            .iter()
+            .filter(|(_, _, tier, _)| range_of_tier(*tier, n).is_some())
+            .map(|(_, _, _, escrow)| *escrow);
+        let table = next_range_table(&prev, producers, n);
+        tables.insert(epoch, (Some(sample), table));
+        let low = (epoch + 1).saturating_sub(RANGE_TABLES_KEPT);
+        tables.retain(|e, _| *e >= low);
+        snapshot.range_tables =
+            tables.range(low..=epoch).filter(|(_, (_, t))| !t.is_empty()).map(|(e, (_, t))| (*e, t.clone())).collect();
+    }
+
+    /// Installs the range tables of the snapshot taken at `sample`.
+    pub(super) fn load_range_tables(
+        &self,
+        tables: &mut std::collections::BTreeMap<u64, (Option<Hash>, keryx_consensus_core::range_assignment::RangeTable)>,
+        sample: Hash,
+        snapshot: &ServiceLedgerSnapshot,
+    ) {
+        let Ok(blue) = self.headers_store.get_blue_score(sample) else { return };
+        let own = blue / self.finality_depth;
+        for (epoch, table) in snapshot.range_tables.iter() {
+            if *epoch == own {
+                tables.insert(*epoch, (Some(sample), table.clone()));
+            } else {
+                tables.entry(*epoch).or_insert_with(|| (None, table.clone()));
+            }
+        }
+    }
+
+    /// Range `escrow` must mine for a blue of epoch `blue_epoch` merged at chain epoch `chain_epoch`.
+    fn assigned_range(&self, escrow: &Hash, blue_epoch: u64, chain_epoch: u64) -> u8 {
+        let n = self.network_model.n_shards();
+        let tables = self.service_range_tables.read();
+        match judging_table_epoch(blue_epoch, chain_epoch).and_then(|e| tables.get(&e)) {
+            Some((_, table)) => table.range_of(escrow, n),
+            None => home_range(escrow, n),
+        }
+    }
+
+    /// Paid blues of a chain block (ghostdag data at `pov_daa_score`) mined on a range other
+    /// than the one assigned to their escrow key: their miner cut is burned.
+    pub(super) fn misranged_blues(
+        &self,
+        ghostdag_data: &crate::model::stores::ghostdag::GhostdagData,
+        mergeset_non_daa: &keryx_consensus_core::BlockHashSet,
+        pov_daa_score: u64,
+    ) -> keryx_consensus_core::BlockHashSet {
+        let mut set = keryx_consensus_core::BlockHashSet::new();
+        if !self.model_split_activation.is_active(pov_daa_score) {
+            return set;
+        }
+        let n = self.network_model.n_shards();
+        let chain_epoch = ghostdag_data.blue_score / self.finality_depth;
+        for blue in ghostdag_data.mergeset_blues.iter().filter(|h| !mergeset_non_daa.contains(h)) {
+            let header = self.headers_store.get_header(*blue).unwrap();
+            let Some(range) = range_of_tier(header.pom_tier, n) else { continue };
+            let txs = self.block_transactions_store.get(*blue).unwrap();
+            let coinbase = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
+            let Some(pubkey) = crate::processes::coinbase::parse_escrow_pubkey_from_extra_data(coinbase.miner_data.extra_data) else {
+                set.insert(*blue);
+                continue;
+            };
+            if range != self.assigned_range(&escrow_miner_key(&pubkey), header.blue_score / self.finality_depth, chain_epoch) {
+                set.insert(*blue);
+            }
+        }
+        set
+    }
+
+    /// Current and next range of `escrow` for a block mined on top of a virtual at `blue_score`;
+    /// `None` before the gate. The next range is unknown until the epoch's sample is folded.
+    pub(crate) fn range_assignment(&self, escrow: &Hash, blue_score: u64, daa_score: u64) -> Option<(u8, Option<u8>)> {
+        if !self.model_split_activation.is_active(daa_score) {
+            return None;
+        }
+        let epoch = blue_score / self.finality_depth;
+        let current = self.assigned_range(escrow, epoch, epoch);
+        let next = self.service_range_tables.read().get(&epoch).map(|(_, t)| t.range_of(escrow, self.network_model.n_shards()));
+        Some((current, next))
     }
 
     /// Producers of the chain blocks with daa in `(daa − SERVICE_ELIGIBILITY_WINDOW_DAA, daa]`
@@ -1670,6 +1769,11 @@ impl VirtualStateProcessor {
         self.service_ledger_hashes.write().insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
         self.service_ledger_snapshot_store.set(sample, bytes).unwrap();
         *self.service_imported_producers.write() = snapshot.recent_producers.clone();
+        {
+            let mut tables = self.service_range_tables.write();
+            tables.clear();
+            self.load_range_tables(&mut tables, sample, &snapshot);
+        }
         let mut sync = self.service_ledger.lock();
         let mut ledger = ServiceLedger::default();
         ledger.restore_snapshot(&snapshot);
@@ -1806,11 +1910,13 @@ impl VirtualStateProcessor {
         self.upgrade_legacy_production_snapshots(own_pp, legacy);
         let mut hashes = self.service_ledger_hashes.write();
         hashes.clear();
+        let mut tables = self.service_range_tables.write();
+        tables.clear();
         for (sample, bytes) in self.service_ledger_snapshot_store.entries() {
             hashes.insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
-            if Some(sample) == own_pp
-                && let Ok(snapshot) = ServiceLedgerSnapshot::from_bytes(&bytes)
-            {
+            let Ok(snapshot) = ServiceLedgerSnapshot::from_bytes(&bytes) else { continue };
+            self.load_range_tables(&mut tables, sample, &snapshot);
+            if Some(sample) == own_pp {
                 *self.service_imported_producers.write() = snapshot.recent_producers;
             }
         }
@@ -1881,6 +1987,12 @@ impl VirtualStateProcessor {
             deadlines.last().is_some_and(|&until| suspension_covers(until, daa_score))
         }
     }
+}
+
+/// Range index of a range tier, `None` for any other tier.
+fn range_of_tier(tier: u8, n_ranges: usize) -> Option<u8> {
+    let k = tier.checked_sub(NETWORK_MODEL_TIER + 1)?;
+    ((k as usize) < n_ranges).then_some(k)
 }
 
 /// Whether the suspension ending at `until` is in force at `daa_score`.
