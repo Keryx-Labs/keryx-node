@@ -1107,6 +1107,55 @@ impl Audit {
         }
     }
 
+    /// Escrow keys declared for `tier`, chain order, each once.
+    fn tier_keys(&self, tier: u8) -> Vec<Hash> {
+        let mut out: Vec<Hash> = Vec::new();
+        for (t, _, escrow) in self.declared.iter() {
+            if *t == tier && !out.contains(escrow) {
+                out.push(*escrow);
+            }
+        }
+        out
+    }
+
+    /// Pipelines the declarations make up: the fewest keys declared for any shard tier.
+    fn pipeline_count(&self, layout: &NetworkModelLayout) -> usize {
+        layout.shard_tiers().map(|t| self.tier_keys(t).len()).min().unwrap_or(0)
+    }
+
+    /// The identities of a complete pipeline response headed by `head_key`. Pipeline `i` is the
+    /// `i`-th key declared for each tier: its head must be the `i`-th head key of a complete
+    /// pipeline, and each link a key declared for its tier at rank `i` or later. No member may
+    /// already count in another response.
+    fn pipeline_response(&self, layout: &NetworkModelLayout, head_key: &Hash, links: &[(u8, Hash)]) -> Option<(Hash, Vec<(u8, Hash)>)> {
+        let head_tier = layout.head_tier();
+        let rank = self.tier_keys(head_tier).iter().position(|e| e == head_key)?;
+        if rank >= self.pipeline_count(layout) {
+            return None;
+        }
+        let mut expected: Vec<u8> = layout.shard_tiers().filter(|t| *t != head_tier).collect();
+        let mut signed: Vec<u8> = links.iter().map(|(t, _)| *t).collect();
+        expected.sort_unstable();
+        signed.sort_unstable();
+        if signed != expected {
+            return None;
+        }
+        let holder = |tier: u8, key: &Hash| self.declared.iter().find(|(t, _, e)| *t == tier && e == key).map(|(_, id, _)| *id);
+        let head = holder(head_tier, head_key)?;
+        let mut link_ids: Vec<(u8, Hash)> = Vec::with_capacity(links.len());
+        for (tier, key) in links {
+            let at = self.tier_keys(*tier).iter().position(|e| e == key)?;
+            if at < rank {
+                return None;
+            }
+            link_ids.push((*tier, holder(*tier, key)?));
+        }
+        if std::iter::once(&head).chain(link_ids.iter().map(|(_, id)| id)).any(|id| self.responded.contains(id)) {
+            return None;
+        }
+        Some((head, link_ids))
+    }
+
     /// The first declared identity of each tier, in tier order of first declaration.
     fn chosen(&self) -> Vec<(u8, Hash)> {
         let mut out: Vec<(u8, Hash)> = Vec::new();
@@ -1201,39 +1250,6 @@ impl NetworkModelAvailability {
     pub fn missing_tier(&self) -> Option<u8> {
         self.shards.iter().find(|s| s.producers == 0).map(|s| s.tier)
     }
-}
-
-/// Domain of the derived reward keys of a pipeline response's link shares.
-const REWARD_SHARE_DOMAIN: &[u8] = b"KeryxRewardShareV1";
-
-/// Reward-store key of the share paid to the link of `tier` for `request_hash`. The head's share
-/// keeps the request hash itself as its key.
-pub fn reward_share_key(request_hash: &[u8; 32], tier: u8) -> [u8; 32] {
-    let mut hasher = blake2b_simd::Params::new().hash_length(32).to_state();
-    hasher.update(REWARD_SHARE_DOMAIN);
-    hasher.update(request_hash);
-    hasher.update(&[tier]);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(hasher.finalize().as_bytes());
-    out
-}
-
-/// VRAM-weighted split of `reward` between the head and its links: `(identity, amount)` per
-/// signer, the head first and carrying the rounding remainder.
-pub fn split_pipeline_reward(layout: &NetworkModelLayout, reward: u64, head: (u8, Hash), links: &[(u8, Hash)]) -> Vec<(Hash, u64)> {
-    let total: u128 = layout.tier_weight(head.0) as u128 + links.iter().map(|(t, _)| layout.tier_weight(*t) as u128).sum::<u128>();
-    if total == 0 {
-        return vec![(head.1, reward)];
-    }
-    let mut out = Vec::with_capacity(links.len() + 1);
-    let mut paid: u64 = 0;
-    for (tier, identity) in links {
-        let amount = (reward as u128 * layout.tier_weight(*tier) as u128 / total) as u64;
-        paid += amount;
-        out.push((*identity, amount));
-    }
-    out.insert(0, (head.1, reward - paid));
-    out
 }
 
 /// Per-member state of an audit armed under the v3 window.
@@ -1899,7 +1915,6 @@ impl ServiceLedger {
                 continue;
             }
             let mut served: Vec<Hash> = Vec::new();
-            let mut pipeline: Option<(Hash, Vec<(u8, Hash)>)> = None;
             let req_tier: u8;
             let req_accepted: u64;
             {
@@ -1940,52 +1955,16 @@ impl ServiceLedger {
                         }
                     }
                 } else {
-                    // A pipeline response counts only complete: the head holds the head tier and
-                    // every other shard tier is signed by exactly one link holding it, each signer
-                    // having declared for its tier. Anything else is no response at all — the drawn
-                    // head answers for it at window close.
+                    // A pipeline response counts only complete and in its own pipeline (see
+                    // `Audit::pipeline_response`); anything else is no response at all.
                     let Some((_, _, links)) = response_links.iter().find(|(h, k, _)| h == rh && k == r) else { continue };
-                    let declared = |tier: u8, id: &Hash| audit.declared.iter().any(|(t, i, _)| *t == tier && i == id);
-                    let head_ids: Vec<Hash> = matched
-                        .iter()
-                        .copied()
-                        .filter(|id| audit.members.binary_search(&(*id, layout.head_tier())).is_ok() && declared(layout.head_tier(), id))
-                        .collect();
-                    let Some(head) = head_ids.first().copied() else { continue };
-                    let mut expected: Vec<u8> = layout.shard_tiers().filter(|t| *t != layout.head_tier()).collect();
-                    let mut signed: Vec<u8> = links.iter().map(|(t, _)| *t).collect();
-                    signed.sort_unstable();
-                    expected.sort_unstable();
-                    if signed != expected {
-                        continue;
-                    }
-                    let mut link_ids: Vec<(u8, Hash)> = Vec::with_capacity(links.len());
-                    let mut complete = true;
-                    for (tier, key) in links {
-                        let holder = audit
-                            .delegations
-                            .iter()
-                            .filter(|(e, _)| e == key)
-                            .map(|(_, id)| *id)
-                            .find(|id| audit.members.binary_search(&(*id, *tier)).is_ok() && declared(*tier, id));
-                        match holder {
-                            Some(id) => link_ids.push((*tier, id)),
-                            None => {
-                                complete = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !complete {
-                        continue;
-                    }
-                    for identity in head_ids.iter().chain(link_ids.iter().map(|(_, id)| id)) {
+                    let Some((head, link_ids)) = audit.pipeline_response(layout, r, links) else { continue };
+                    for identity in std::iter::once(&head).chain(link_ids.iter().map(|(_, id)| id)) {
                         if !audit.responded.contains(identity) {
                             audit.responded.push(*identity);
                             served.push(*identity);
                         }
                     }
-                    pipeline = Some((head, link_ids));
                 }
                 if let Some(w) = audit.v3.as_mut() {
                     let shape = traces
@@ -2010,11 +1989,8 @@ impl ServiceLedger {
                 (tr.tier)(req_tier, req_accepted).is_some_and(|rules| rules.audit_all)
                     && !tr.responses.iter().any(|ev| ev.request_hash == *rh && ev.responder == *r)
             });
-            if let Some((head, link_ids)) = pipeline.take() {
-                self.maybe_award_pipeline(rh, head, &link_ids, warmup, &mut outcome);
-            } else {
-                self.credit_reward(rh, if untraced { &[] } else { &served }, daa, draw_rule, warmup, &mut outcome);
-            }
+            // every member of every valid pipeline is a candidate of the same draw
+            self.credit_reward(rh, if untraced { &[] } else { &served }, daa, draw_rule, warmup, &mut outcome);
             // Under the sanction rule a response on an audited tier resets the streak at its
             // accepted opening, not here.
             let reset_at_opening = self.reset_waits_for_opening(traces, rh, r, req_tier, daa);
@@ -2867,32 +2843,6 @@ impl ServiceLedger {
         req.winner = Some(identity);
         if !warmup {
             outcome.rewards.push(ServiceReward { request_hash: *rh, winner: identity, amount: req.reward, spk });
-        }
-    }
-
-    /// Awards a served pipeline response: the vaulted reward split by shard VRAM between the
-    /// head (the recorded winner, keyed by the request hash) and its links (keyed by
-    /// [`reward_share_key`]). Same routing and once-only rules as [`Self::maybe_award`].
-    fn maybe_award_pipeline(&mut self, rh: &[u8; 32], head: Hash, links: &[(u8, Hash)], warmup: bool, outcome: &mut FoldOutcome) {
-        let layout = self.layout();
-        if self.reward_routing_daa.is_none() {
-            return;
-        }
-        let routed_from = self.reward_routing_daa.unwrap();
-        let Some(req) = self.pending.get_mut(rh) else { return };
-        if req.accepted_daa < routed_from || req.winner.is_some() || req.reward == 0 {
-            return;
-        }
-        req.winner = Some(head);
-        let reward = req.reward;
-        if warmup {
-            return;
-        }
-        let shares = split_pipeline_reward(layout, reward, (layout.head_tier(), head), links);
-        for (i, (identity, amount)) in shares.into_iter().enumerate() {
-            let key = if i == 0 { *rh } else { reward_share_key(rh, links[i - 1].0) };
-            let spk = self.producer_spk.get(&identity).cloned();
-            outcome.rewards.push(ServiceReward { request_hash: key, winner: identity, amount, spk });
         }
     }
 
@@ -4585,10 +4535,10 @@ mod tests {
     use keryx_hashes::Hash;
 
     use crate::config::params::{
-        network_model_shard_tiers, network_model_tier_weight, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_MAINNET, NETWORK_MODEL_SHARDS,
+        network_model_shard_tiers, NETWORK_MODEL_HEAD_TIER, NETWORK_MODEL_MAINNET, NETWORK_MODEL_SHARDS,
         NETWORK_MODEL_TIER,
     };
-    use super::{reward_share_key, split_pipeline_reward, PipelineAssignment, ServiceLedgerSnapshot};
+    use super::{Audit, PipelineAssignment, ServiceLedgerSnapshot};
 
     // Identity == escrow key in most tests; the delegation mapping itself is covered by
     // `response_credits_the_delegating_identity`.
@@ -5760,18 +5710,13 @@ mod tests {
         // pre-arm strikes on the head so its reset is observable
         ledger.strikes.insert(head, StrikeEntry { count: 1, last_daa: 50 });
         let out = fold_response(&mut ledger, 105, rh, head, &signed);
-        // reward split by VRAM: four equal 32 GB weights of 128 000
-        assert_eq!(out.rewards.len(), NETWORK_MODEL_SHARDS.len());
+        // without the draw rule the head of the first complete pipeline takes the whole reward
+        assert_eq!(out.rewards.len(), 1);
         assert_eq!(out.rewards[0].request_hash, rh);
         assert_eq!(out.rewards[0].winner, head);
-        assert_eq!(out.rewards[0].amount, 32_000);
-        let total: u64 = out.rewards.iter().map(|r| r.amount).sum();
-        assert_eq!(total, 128_000);
-        for (r, (tier, id)) in out.rewards[1..].iter().zip(signed.iter()) {
-            assert_eq!(r.winner, *id);
-            assert_eq!(r.request_hash, reward_share_key(&rh, *tier));
-            assert_eq!(r.amount, 128_000 * network_model_tier_weight(*tier) / 128);
-        }
+        assert_eq!(out.rewards[0].amount, 128_000);
+        let responded = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().responded.clone();
+        assert_eq!(responded.len(), NETWORK_MODEL_SHARDS.len(), "every signer is credited");
         assert!(out.resets.iter().any(|(id, _)| *id == head));
         // window close: the substituted choice alone is struck — everyone else declared
         let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
@@ -5880,13 +5825,11 @@ mod tests {
     }
 
     #[test]
-    fn network_model_substitute_head_is_paid_and_the_chosen_head_struck() {
+    fn network_model_second_pipeline_is_credited_with_its_own_links() {
         let mut ledger = split_ledger();
-        ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
         ledger.set_reward_routing_activation(0);
         let rh = [7u8; 32];
-        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
         ledger.on_chain_block_with_rewards(
             100,
             &[(rh, NETWORK_MODEL_TIER, 256)],
@@ -5901,15 +5844,80 @@ mod tests {
         );
         ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
         fold_declarations(&mut ledger, 102, &declare_all(rh, 0));
-        let chosen = chosen_of(&ledger, &rh);
-        let chosen_head = shard_id(NETWORK_MODEL_HEAD_TIER, 0);
-        let other_head = shard_id(NETWORK_MODEL_HEAD_TIER, 1);
-        let full = pipeline_links(&chosen, None);
-        let out = fold_response(&mut ledger, 105, rh, other_head, &full);
-        assert_eq!(out.rewards[0].winner, other_head);
-        assert_eq!(out.rewards[0].amount, 320);
-        let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
-        assert_eq!(struck(&out), vec![chosen_head]);
+        let second_head = shard_id(NETWORK_MODEL_HEAD_TIER, 1);
+        let own = |i: u8| -> Vec<(u8, Hash)> { network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).map(|t| (t, shard_id(t, i))).collect() };
+        // the second head cannot take the first pipeline's links
+        assert!(fold_response(&mut ledger, 104, rh, second_head, &own(0)).rewards.is_empty());
+        let out = fold_response(&mut ledger, 105, rh, second_head, &own(1));
+        assert_eq!(out.rewards[0].winner, second_head);
+        assert_eq!(out.rewards[0].amount, 1_280);
+    }
+
+    fn pipeline_audit(per_tier: &[(u8, u8)]) -> Audit {
+        let tiers: Vec<u8> = network_model_shard_tiers().collect();
+        let mut declared = Vec::new();
+        let mut members = Vec::new();
+        let mut delegations = Vec::new();
+        for i in 0..3u8 {
+            for t in tiers.iter() {
+                let n = per_tier.iter().find(|(pt, _)| pt == t).map_or(2, |(_, n)| *n);
+                if i < n {
+                    declared.push((*t, shard_id(*t, i), shard_id(*t, i)));
+                    members.push((shard_id(*t, i), *t));
+                    delegations.push((shard_id(*t, i), shard_id(*t, i)));
+                }
+            }
+        }
+        members.sort_unstable();
+        Audit {
+            cohort: members.iter().map(|(id, _)| *id).collect(),
+            delegations,
+            responded: Vec::new(),
+            window_end_daa: 1_000,
+            v3: None,
+            members,
+            declared,
+        }
+    }
+
+    #[test]
+    fn pipelines_are_made_of_the_declarations_in_arrival_order() {
+        let layout = &NETWORK_MODEL_MAINNET;
+        let ht = layout.head_tier();
+        let t5 = NETWORK_MODEL_TIER + 1;
+        // two keys on every tier, a third on the first range: two pipelines and a spare
+        let mut audit = pipeline_audit(&[(t5, 3)]);
+        assert_eq!(audit.pipeline_count(layout), 2);
+        let links = |i: u8, spare: Option<u8>| -> Vec<(u8, Hash)> {
+            network_model_shard_tiers()
+                .filter(|t| *t != ht)
+                .map(|t| (t, shard_id(t, if t == t5 { spare.unwrap_or(i) } else { i })))
+                .collect()
+        };
+        let head = |i: u8| shard_id(ht, i);
+        assert!(audit.pipeline_response(layout, &head(0), &links(0, None)).is_some());
+        assert!(audit.pipeline_response(layout, &head(1), &links(1, None)).is_some());
+        // a later pipeline's links and the spare serve an earlier head, not the other way round
+        assert!(audit.pipeline_response(layout, &head(0), &links(1, None)).is_some());
+        assert!(audit.pipeline_response(layout, &head(1), &links(0, None)).is_none());
+        assert!(audit.pipeline_response(layout, &head(1), &links(1, Some(2))).is_some());
+        // a head without a complete pipeline, or undeclared, has no response
+        assert!(audit.pipeline_response(layout, &shard_id(ht, 2), &links(1, None)).is_none());
+        assert!(audit.pipeline_response(layout, &shard_id(t5, 0), &links(0, None)).is_none());
+        // a missing tier, or a member already counted elsewhere, voids the whole response
+        let mut short = links(0, None);
+        short.pop();
+        assert!(audit.pipeline_response(layout, &head(0), &short).is_none());
+        audit.responded.push(shard_id(t5, 2));
+        assert!(audit.pipeline_response(layout, &head(1), &links(1, Some(2))).is_none());
+        assert!(audit.pipeline_response(layout, &head(1), &links(1, None)).is_some());
+        // a late declaration never moves the earlier ranks
+        let mut grown = pipeline_audit(&[(t5, 3)]);
+        for t in network_model_shard_tiers().filter(|t| *t != t5) {
+            grown.declared.push((t, shard_id(t, 2), shard_id(t, 2)));
+        }
+        assert_eq!(grown.pipeline_count(layout), 3);
+        assert!(grown.pipeline_response(layout, &head(1), &links(1, None)).is_some());
     }
 
     #[test]
@@ -5937,20 +5945,6 @@ mod tests {
         let wire = a[0].encode();
         assert_eq!(PipelineAssignment::decode(&wire).unwrap(), a[0]);
         assert!(PipelineAssignment::decode("zz:1:2:").is_none());
-    }
-
-    #[test]
-    fn pipeline_reward_split_keeps_the_remainder_on_the_head() {
-        let head = (NETWORK_MODEL_HEAD_TIER, shard_id(NETWORK_MODEL_HEAD_TIER, 0));
-        let links: Vec<(u8, Hash)> =
-            network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).map(|t| (t, shard_id(t, 0))).collect();
-        let shares = split_pipeline_reward(&NETWORK_MODEL_MAINNET, 1_000_003, head, &links);
-        assert_eq!(shares.len(), NETWORK_MODEL_SHARDS.len());
-        assert_eq!(shares.iter().map(|(_, a)| *a).sum::<u64>(), 1_000_003);
-        assert_eq!(shares[0].0, head.1);
-        assert!(shares[0].1 > shares[1].1);
-        // no weights at all: everything to the head
-        assert_eq!(split_pipeline_reward(&NETWORK_MODEL_MAINNET, 5, (4, head.1), &[]), vec![(head.1, 5)]);
     }
 
     #[test]
