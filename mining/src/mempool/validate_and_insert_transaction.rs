@@ -345,7 +345,13 @@ impl Mempool {
             return Ok(());
         }
         let id = TransactionId::from_bytes(avail.request_hash);
-        if !self.transaction_pool.has(&id) && !self.accepted_transactions.has(&id) {
+        // the pooled transaction must be a request to the network model, not any transaction
+        let pooled_request = self.transaction_pool.get(&id).is_some_and(|t| {
+            t.mtx.tx.is_ai_request()
+                && AiRequestPayload::deserialize(&t.mtx.tx.payload)
+                    .is_some_and(|r| r.model_id == consensus.get_network_model_availability().model_id)
+        });
+        if !pooled_request && !self.accepted_transactions.has(&id) {
             return Err(RuleError::RejectAiAvailNotAwaited(hex::encode(avail.request_hash)));
         }
         Ok(())

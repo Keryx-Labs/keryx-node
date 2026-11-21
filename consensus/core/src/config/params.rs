@@ -679,6 +679,13 @@ impl Lineup {
     }
 }
 
+/// Whether `tier` mines another model under `to` than under `from`: a request accepted under
+/// `from` cannot be served once `to` applies.
+pub fn lineup_tier_replaced(tier: u8, from: Lineup, to: Lineup) -> bool {
+    let model = |l: Lineup| l.tiers().get(tier as usize).map(|t| t.model_id);
+    from != to && (model(from) != model(to) || network_model_request(tier, from) != network_model_request(tier, to))
+}
+
 /// Whether a request of `tier` under `lineup` targets the network model.
 pub fn network_model_request(tier: u8, lineup: Lineup) -> bool {
     lineup.split() && tier >= NETWORK_MODEL_TIER

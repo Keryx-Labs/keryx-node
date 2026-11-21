@@ -18,7 +18,7 @@ use keryx_consensus_core::config::params::{Lineup, NETWORK_MODEL_TIER, POM_TIERS
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::{ChainPath, HashMapCustomHasher};
 use keryx_consensus_core::blockhash::BlockHashExtensions;
-use keryx_core::{error, info, warn};
+use keryx_core::{debug, error, info, warn};
 use keryx_hashes::Hash;
 use keryx_inference::private::PRIVATE_TAG_LEN;
 use keryx_inference::{AiAvailPayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope, PrivateResponseEnvelope};
@@ -908,8 +908,11 @@ impl VirtualStateProcessor {
             } else {
                 self.service_eligible_miners_in(sc, hash, tier, eligibility_window, own_pp)
             };
-            // Only the live fold logs: a refold replays the same armings.
-            if live {
+            // Only the live fold logs: a refold replays the same armings. A shard tier's cohort is
+            // also read to check declarations, so it does not mean an audit was armed.
+            if live && tier > NETWORK_MODEL_TIER {
+                debug!("service-bond: shard tier {} cohort at daa {}: {}", tier, daa, set.len());
+            } else if live {
                 info!("service-bond: audit armed at daa {}, tier {}, cohort {}", daa, tier, set.len());
             }
             set

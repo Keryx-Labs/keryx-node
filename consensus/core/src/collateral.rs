@@ -2,7 +2,7 @@ use keryx_hashes::{Hash, Hasher, TransactionHash};
 use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
 
-use crate::config::params::{Lineup, NetworkModelLayout, NETWORK_MODEL_MAINNET, NETWORK_MODEL_TIER, network_model_request};
+use crate::config::params::{lineup_tier_replaced, Lineup, NetworkModelLayout, NETWORK_MODEL_MAINNET, network_model_request};
 use crate::range_assignment::{RangeTable, RANGE_TABLES_KEPT};
 use crate::tx::ScriptPublicKey;
 
@@ -2058,6 +2058,13 @@ impl ServiceLedger {
         let mut armed_v3: Vec<[u8; 32]> = Vec::new();
         for rh in hashes {
             let req = self.pending.get(&rh).unwrap();
+            // A request whose tier mines another model past the gate cannot be served there: it is
+            // dropped, armed or not, and nobody is struck.
+            if daa > req.accepted_daa && lineup_tier_replaced(req.tier, lg.at(req.accepted_daa), lg.at(daa)) {
+                self.pending.remove(&rh);
+                self.early_shapes.retain(|(h, _), _| *h != rh);
+                continue;
+            }
             match &req.audit {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
@@ -2166,15 +2173,6 @@ impl ServiceLedger {
                     self.pending.remove(&rh);
                 }
                 Some(_) => {}
-                None if daa > req.accepted_daa
-                    && req.tier == NETWORK_MODEL_TIER
-                    && !lg.at(req.accepted_daa).split()
-                    && lg.at(daa).split() =>
-                {
-                    // A request for the lineup tier the split replaces cannot be served past the gate.
-                    self.pending.remove(&rh);
-                    self.early_shapes.retain(|(h, _), _| *h != rh);
-                }
                 None if daa > req.accepted_daa && network_model_request(req.tier, lg.at(req.accepted_daa)) => {
                     // One cohort per shard tier; a tier nobody produces means the network cannot
                     // assemble the model — the request is dropped, nobody is struck. Responses
@@ -3242,12 +3240,16 @@ fn put_declarations(out: &mut Vec<u8>, decls: &[(u8, Hash)]) {
     }
 }
 
+/// Reads a held declaration list; more than the fold keeps for one tier is malformed.
 fn read_declarations(r: &mut Reader<'_>) -> Result<Vec<(u8, Hash)>, String> {
     let n = r.u32()? as usize;
-    let mut out = Vec::with_capacity(n.min(1 << 16));
+    let mut out: Vec<(u8, Hash)> = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
         let t = r.u8()?;
         let e = r.hash()?;
+        if out.iter().filter(|(ht, _)| *ht == t).count() >= EARLY_DECLARATIONS_PER_TIER {
+            return Err("too many held declarations".into());
+        }
         out.push((t, e));
     }
     Ok(out)
@@ -4018,6 +4020,9 @@ impl ServiceLedgerSnapshot {
             }
             match tag {
                 TRAILER_EARLY_DECLARATIONS => {
+                    if n as usize > MAX_EARLY_DECLARATION_HASHES {
+                        return Err("too many early declaration hashes".into());
+                    }
                     for _ in 0..n {
                         let rh = r.key()?;
                         let seen = r.u64()?;
@@ -5650,6 +5655,59 @@ mod tests {
         fold_declarations(&mut ledger, 102, &declare_one(rh, 0));
         let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
         assert!(struck(&out).is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_holding_more_declarations_than_the_fold_keeps_is_rejected() {
+        let t = NETWORK_MODEL_TIER + 1;
+        let decls = |n: u64| -> Vec<(u8, Hash)> { (0..n).map(|i| (t, Hash::from_u64_word(i + 1))).collect() };
+        let with = |entries: Vec<([u8; 32], Vec<(u8, Hash)>)>| {
+            let mut snap = ServiceLedger::default().snapshot();
+            for (rh, d) in entries {
+                snap.early_declarations.insert(rh, (5, d));
+            }
+            ServiceLedgerSnapshot::from_bytes(&snap.to_bytes())
+        };
+        let full = super::EARLY_DECLARATIONS_PER_TIER as u64;
+        assert!(with(vec![([1u8; 32], decls(full))]).is_ok());
+        assert!(with(vec![([1u8; 32], decls(full + 1))]).is_err());
+        let hashes = |n: usize| -> Vec<([u8; 32], Vec<(u8, Hash)>)> {
+            (0..n)
+                .map(|i| {
+                    let mut h = [0u8; 32];
+                    h[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                    (h, decls(1))
+                })
+                .collect()
+        };
+        assert!(with(hashes(super::MAX_EARLY_DECLARATION_HASHES)).is_ok());
+        assert!(with(hashes(super::MAX_EARLY_DECLARATION_HASHES + 1)).is_err());
+    }
+
+    #[test]
+    fn requests_of_a_replaced_tier_are_dropped_at_the_gate_without_strikes() {
+        use crate::config::params::{lineup_tier_replaced, Lineup};
+        for t in [0u8, 1, NETWORK_MODEL_TIER] {
+            assert!(lineup_tier_replaced(t, Lineup::H14, Lineup::H18), "tier {t}");
+        }
+        for t in [2u8, 3] {
+            assert!(!lineup_tier_replaced(t, Lineup::H14, Lineup::H18), "tier {t}");
+        }
+        assert!(!lineup_tier_replaced(0, Lineup::H18, Lineup::H18));
+
+        let mut ledger = ServiceLedger::default();
+        ledger.set_model_split_activation(200);
+        let a = Hash::from_bytes([1u8; 32]);
+        let (r0, r2, r4) = ([0x10u8; 32], [0x12u8; 32], [0x14u8; 32]);
+        ledger.on_chain_block(100, &[(r0, 0, 64), (r2, 2, 64), (r4, NETWORK_MODEL_TIER, 64)], &[], &[], |_| true, cohort_of(&[a]));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, cohort_of(&[a]));
+        assert_eq!(ledger.pending_len(), 3);
+        assert!(ledger.pending.values().all(|r| r.audit.is_some()));
+        // first block past the gate: the replaced tiers go, armed as they are, and nobody is struck
+        let out = ledger.on_chain_block(201, &[], &[], &[], |_| true, cohort_of(&[a]));
+        assert!(out.misses.is_empty());
+        assert_eq!(ledger.pending_len(), 1);
+        assert!(ledger.pending.contains_key(&r2));
     }
 
     #[test]
