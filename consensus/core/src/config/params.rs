@@ -1636,6 +1636,63 @@ pub const TIER_REWARD_BPS_MODEL_SPLIT_9B: [u64; 7] = [6_000, 7_000, 8_000, 9_000
 
 pub const NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B: [u64; 2] = [8, 8];
 
+/// Devnet network model: DeepSeek V4-Flash 0731 cut to its first 4 layers, in two ranges (layers
+/// 0-2, then layer 3 with the head), next to the H18 lineup. `model_id` of a range = CIDv0[2..34]
+/// of its GGUF; the whole model's is the packed head's digest, unique to this bench.
+pub const V4T_RANGE_0_MODEL_ID: [u8; 32] = [
+        0x31, 0xf5, 0x12, 0xb8, 0x11, 0x30, 0x81, 0x92, 0xea, 0x59, 0xb0, 0x01, 0x80, 0xc5, 0x60, 0x76,
+        0x04, 0x2d, 0xc9, 0x6e, 0xd3, 0x74, 0x68, 0xac, 0x7e, 0xca, 0x38, 0x07, 0x89, 0x59, 0x71, 0xf5,
+    ];
+pub const V4T_RANGE_1_MODEL_ID: [u8; 32] = [
+        0x97, 0x2d, 0xe9, 0xd9, 0x4b, 0xd9, 0x82, 0xed, 0x84, 0x58, 0x4c, 0x1d, 0x20, 0xd6, 0x94, 0x31,
+        0x72, 0x79, 0x75, 0x0a, 0x24, 0x66, 0x42, 0x44, 0x0c, 0x90, 0x0c, 0x54, 0x92, 0x30, 0x76, 0x96,
+    ];
+pub const V4T_WHOLE_MODEL_ID: [u8; 32] = [
+        0x49, 0xb0, 0x30, 0x75, 0x40, 0x32, 0x91, 0x73, 0xa2, 0xb0, 0xad, 0xd6, 0x77, 0x2b, 0xc5, 0x46,
+        0x6d, 0x7a, 0x5d, 0x4c, 0xd1, 0x0e, 0xee, 0x63, 0xd6, 0x2b, 0x41, 0xa8, 0x4b, 0xa2, 0x31, 0xd0,
+    ];
+
+/// H18 lineup, the truncated V4 as network model (never mined whole), two ranges.
+pub const POM_TIERS_MODEL_SPLIT_V4T: &[crate::pom::PomTier] = &[
+    POM_TIERS_MODEL_SPLIT[0],
+    POM_TIERS_MODEL_SPLIT[1],
+    POM_TIERS_MODEL_SPLIT[2],
+    POM_TIERS_MODEL_SPLIT[3],
+    crate::pom::PomTier { model_id: V4T_WHOLE_MODEL_ID, root: POM_TIERS_MODEL_SPLIT[4].root, chunks: POM_TIERS_MODEL_SPLIT[4].chunks },
+    crate::pom::PomTier {
+        model_id: V4T_RANGE_0_MODEL_ID,
+        root: [
+            0x37, 0xd4, 0xcd, 0x63, 0xb5, 0x73, 0xbb, 0x75, 0xb6, 0xdd, 0xb6, 0x68, 0x73, 0x59, 0xbd, 0xbe,
+            0xf5, 0xaa, 0x8c, 0xfd, 0xda, 0x5c, 0x4e, 0x81, 0x12, 0x30, 0x95, 0x21, 0xf9, 0x90, 0xc8, 0xda,
+        ],
+        chunks: 184_864_826,
+    },
+    crate::pom::PomTier {
+        model_id: V4T_RANGE_1_MODEL_ID,
+        root: [
+            0x19, 0x85, 0xb4, 0x19, 0x2f, 0xc3, 0x5b, 0xbe, 0x06, 0x8a, 0xf3, 0x5f, 0x18, 0x54, 0x77, 0xdb,
+            0x41, 0x00, 0x34, 0x4a, 0xb6, 0xf2, 0x87, 0x9b, 0x32, 0x10, 0xec, 0xef, 0x30, 0x61, 0x36, 0x46,
+        ],
+        chunks: 61_392_174,
+    },
+];
+
+pub const TIER_REWARD_BPS_MODEL_SPLIT_V4T: [u64; 7] = [4_000, 5_500, 7_000, 8_500, 10_000, 10_000, 10_000];
+
+/// The H18 floors plus the bench network model at 0.5 KRX.
+pub const INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT_V4T: &[([u8; 32], u64)] = &[
+    (BOLT_E4B_MODEL_ID,                 50_000_000),
+    (QWEN3_5_9B_Q8_MODEL_ID,           100_000_000),
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000),
+    (QWEN3_8_27B_MODEL_ID,             200_000_000),
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  u64::MAX),
+    (GLM_4_9B_0414_MODEL_ID,           u64::MAX),
+    (KIMI_LINEAR_48B_MODEL_ID,         u64::MAX),
+    (V4T_WHOLE_MODEL_ID,                50_000_000),
+];
+
+pub const NETWORK_MODEL_SHARD_VRAM_GB_V4T: [u64; 2] = [32, 32];
+
 /// The network model of one network: its model-split tier table (lineup, whole model, shards), the
 /// matching reward schedule and request minimums, and the card class of each shard.
 #[derive(Debug)]
@@ -1692,6 +1749,15 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
     minimums: INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
     lineup: Lineup::H14Split,
+};
+
+/// Devnet bench: the truncated V4-Flash in two ranges, H18 lineup.
+pub static NETWORK_MODEL_V4T: NetworkModelLayout = NetworkModelLayout {
+    tiers: POM_TIERS_MODEL_SPLIT_V4T,
+    reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT_V4T,
+    minimums: INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT_V4T,
+    shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_V4T,
+    lineup: Lineup::H18,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -3471,8 +3537,8 @@ pub const DEVNET_PARAMS: Params = Params {
     uniform_strike_activation: ForkActivation::never(),
     audit_queue_activation: ForkActivation::never(),
     pad_margin_activation: ForkActivation::never(),
-    model_split_activation: ForkActivation::new(1_000),
-    network_model: &NETWORK_MODEL_SPLIT9B,
+    model_split_activation: ForkActivation::new(1),
+    network_model: &NETWORK_MODEL_V4T,
     service_burnable_window_daa: 6_000,
     ratio_probation_activation: ForkActivation::never(),
     chain_anchor: None,
