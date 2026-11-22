@@ -438,9 +438,7 @@ async fn model_split_payloads_invalidate_the_block_before_the_gate() {
     let responder = AiResponder { escrow_pubkey: [0x33u8; 32], signature: [0x44u8; 64] };
     let link = AiResponseLink { tier: 6, escrow_pubkey: [0x55u8; 32], signature: [0x66u8; 64] };
     let v3 = AiResponsePayload::new_v3([7u8; 32], 1, [0x12u8; 34], 1, responder, vec![link]).serialize();
-    let mut avail = vec![7u8; 32];
-    avail.push(6);
-    avail.extend_from_slice(&[0x33u8; 96]);
+    let avail = keryx_inference::AiAvailPayload::new([7u8; 32], 6, 0, [0x33u8; 32], [0x33u8; 64]).serialize();
     let cases = [
         (Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_RESPONSE, 0, v3), true),
         (Transaction::new(TX_VERSION, vec![], vec![], 0, SUBNETWORK_ID_AI_AVAIL, 0, avail), false),

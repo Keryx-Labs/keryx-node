@@ -77,11 +77,15 @@ pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN
     + AI_RESPONSE_TRACE_TOKENS_LEN;
 
 /// Binary payload layout for `SUBNETWORK_ID_AI_AVAIL` transactions:
-/// `[request_hash: 32] [tier: 1] [escrow_pubkey: 32] [schnorr_signature: 64]`
-/// Fixed 129 bytes — a shard holder declaring itself available for a network-model request.
-/// The signature covers the 33 `[request_hash] [tier]` bytes.
-pub const AI_AVAIL_PAYLOAD_LEN: usize = 32 + 1 + 32 + 64;
-pub const AI_AVAIL_SIGNED_LEN: usize = 33;
+/// `[request_hash: 32] [tier: 1] [zone: 1] [escrow_pubkey: 32] [schnorr_signature: 64]`
+/// Fixed 130 bytes — a shard holder declaring itself available for a network-model request.
+/// The signature covers the 34 `[request_hash] [tier] [zone]` bytes.
+pub const AI_AVAIL_PAYLOAD_LEN: usize = 32 + 1 + 1 + 32 + 64;
+pub const AI_AVAIL_SIGNED_LEN: usize = 34;
+
+/// Declared zones: 0 Europe, 1 North America, 2 South America, 3 Asia, 4 Oceania,
+/// 5 Africa and Middle East.
+pub const NETWORK_ZONES: u8 = 6;
 
 /// Failure report on the same subnetwork: `[request_hash: 32] [link_tier: 1] [link_escrow_pubkey: 32]
 /// [head_escrow_pubkey: 32] [schnorr_signature: 64]`, signed by the head over the first 65 bytes.
@@ -495,20 +499,22 @@ impl AiResponsePayload {
 pub struct AiAvailPayload {
     pub request_hash: [u8; 32],
     pub tier: u8,
+    pub zone: u8,
     pub escrow_pubkey: [u8; 32],
     pub signature: [u8; 64],
 }
 
 impl AiAvailPayload {
-    pub fn new(request_hash: [u8; 32], tier: u8, escrow_pubkey: [u8; 32], signature: [u8; 64]) -> Self {
-        Self { request_hash, tier, escrow_pubkey, signature }
+    pub fn new(request_hash: [u8; 32], tier: u8, zone: u8, escrow_pubkey: [u8; 32], signature: [u8; 64]) -> Self {
+        Self { request_hash, tier, zone, escrow_pubkey, signature }
     }
 
-    /// The 33 bytes the declaration signature covers.
+    /// The 34 bytes the declaration signature covers.
     pub fn signed_bytes(&self) -> [u8; AI_AVAIL_SIGNED_LEN] {
         let mut out = [0u8; AI_AVAIL_SIGNED_LEN];
         out[..32].copy_from_slice(&self.request_hash);
         out[32] = self.tier;
+        out[33] = self.zone;
         out
     }
 
@@ -521,14 +527,15 @@ impl AiAvailPayload {
     }
 
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() != AI_AVAIL_PAYLOAD_LEN {
+        if data.len() != AI_AVAIL_PAYLOAD_LEN || data[33] >= NETWORK_ZONES {
             return None;
         }
         Some(Self {
             request_hash: data[0..32].try_into().ok()?,
             tier: data[32],
-            escrow_pubkey: data[33..65].try_into().ok()?,
-            signature: data[65..129].try_into().ok()?,
+            zone: data[33],
+            escrow_pubkey: data[34..66].try_into().ok()?,
+            signature: data[66..130].try_into().ok()?,
         })
     }
 
@@ -588,7 +595,8 @@ impl AiFailPayload {
 /// Request hash of a `SUBNETWORK_ID_AI_AVAIL` payload, declaration or failure report.
 pub fn ai_avail_request_hash(data: &[u8]) -> Option<[u8; 32]> {
     match data.len() {
-        AI_AVAIL_PAYLOAD_LEN | AI_FAIL_PAYLOAD_LEN => data[0..32].try_into().ok(),
+        AI_AVAIL_PAYLOAD_LEN if data[33] < NETWORK_ZONES => data[0..32].try_into().ok(),
+        AI_FAIL_PAYLOAD_LEN => data[0..32].try_into().ok(),
         _ => None,
     }
 }
@@ -900,7 +908,7 @@ mod tests {
 
     #[test]
     fn ai_avail_roundtrip_is_exact_length() {
-        let avail = AiAvailPayload::new([7u8; 32], 9, [0x33u8; 32], [0x44u8; 64]);
+        let avail = AiAvailPayload::new([7u8; 32], 9, 3, [0x33u8; 32], [0x44u8; 64]);
         let bytes = avail.serialize();
         assert_eq!(bytes.len(), AI_AVAIL_PAYLOAD_LEN);
         assert_eq!(AiAvailPayload::deserialize(&bytes), Some(avail));
@@ -911,6 +919,10 @@ mod tests {
         let mut long = bytes.clone();
         long.push(0);
         assert!(AiAvailPayload::deserialize(&long).is_none());
+        let mut zoned = bytes.clone();
+        zoned[33] = NETWORK_ZONES;
+        assert!(AiAvailPayload::deserialize(&zoned).is_none());
+        assert!(ai_avail_request_hash(&zoned).is_none());
     }
 
     #[test]
@@ -921,7 +933,7 @@ mod tests {
         assert_eq!(AiFailPayload::deserialize(&bytes), Some(fail));
         assert_eq!(&bytes[..AI_FAIL_SIGNED_LEN], fail.signed_bytes().as_slice());
         assert!(AiAvailPayload::deserialize(&bytes).is_none());
-        assert!(AiFailPayload::deserialize(&AiAvailPayload::new([7u8; 32], 6, [0x33u8; 32], [0x44u8; 64]).serialize()).is_none());
+        assert!(AiFailPayload::deserialize(&AiAvailPayload::new([7u8; 32], 6, 0, [0x33u8; 32], [0x44u8; 64]).serialize()).is_none());
         assert_eq!(ai_avail_request_hash(&bytes), Some([7u8; 32]));
         assert!(ai_avail_request_hash(&bytes[..100]).is_none());
     }

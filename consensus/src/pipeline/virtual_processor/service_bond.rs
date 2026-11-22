@@ -43,6 +43,8 @@ fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
     verify_responder_signature(&r.escrow_pubkey, &r.signature, &resp.signed_bytes()).then(|| escrow_miner_key(&r.escrow_pubkey))
 }
 
+const _: () = assert!(keryx_inference::NETWORK_ZONES == keryx_consensus_core::collateral::NETWORK_ZONES);
+
 /// The `(tier, escrow key)` of a declaration, iff its signature verifies.
 fn verified_declaration(avail: &AiAvailPayload) -> Option<(u8, Hash)> {
     verify_avail_signature(&avail.escrow_pubkey, &avail.signature, &avail.signed_bytes())
@@ -488,7 +490,7 @@ impl VirtualStateProcessor {
                     && let Some(avail) = AiAvailPayload::deserialize(&tx.payload)
                     && let Some((tier, escrow)) = verified_declaration(&avail)
                 {
-                    declarations.push((avail.request_hash, tier, escrow));
+                    declarations.push((avail.request_hash, tier, escrow, avail.zone));
                 } else if model_split
                     && tx.is_ai_avail()
                     && let Some(fail) = AiFailPayload::deserialize(&tx.payload)
@@ -2048,7 +2050,7 @@ struct ServiceEvents {
     response_links: Vec<ResponseLinks>,
     /// Verified availability declarations `(request_hash, tier, escrow key)`, past the
     /// model-split gate only.
-    declarations: Vec<([u8; 32], u8, Hash)>,
+    declarations: Vec<keryx_consensus_core::collateral::PipelineDeclaration>,
     /// Verified pipeline failure reports, past the model-split gate only.
     failures: Vec<PipelineFailure>,
 }
