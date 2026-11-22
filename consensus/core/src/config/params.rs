@@ -200,6 +200,9 @@ pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
 /// Testnet H16 gate.
 pub const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 
+/// Devnet H18 gate (`model_split_activation`); every earlier gate is live from genesis. Node and miner.
+pub const DEVNET_H18_ACTIVATION_DAA: u64 = 5_000;
+
 /// Mainnet H17 gate.
 pub const H17_ACTIVATION_DAA: u64 = 153_085_000;
 
@@ -1703,6 +1706,18 @@ pub struct NetworkModelLayout {
     pub shard_vram_gb: &'static [u64],
     /// Lineup the per-tier rules of tiers 0-4 follow once the split is live.
     pub lineup: Lineup,
+    /// Whether the ranges carry their PoM v5 context pad.
+    pub range_pads: bool,
+}
+
+impl NetworkModelLayout {
+    /// Context pad tiles of `tier` under this layout once the split is live.
+    pub fn pad_tiles(&self, tier: u8, pad_margin: bool) -> u64 {
+        if tier >= NETWORK_MODEL_TIER && !self.range_pads {
+            return 0;
+        }
+        pom_v5_pad_tiles(tier, pad_margin, self.lineup)
+    }
 }
 
 impl NetworkModelLayout {
@@ -1740,6 +1755,7 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     minimums: INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
     lineup: Lineup::H18,
+    range_pads: true,
 };
 
 /// The bench network model floor is the 9B flat floor (0.5 KRX).
@@ -1749,6 +1765,7 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
     minimums: INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
     lineup: Lineup::H14Split,
+    range_pads: false,
 };
 
 /// Devnet bench: the truncated V4-Flash in two ranges, H18 lineup.
@@ -1758,6 +1775,7 @@ pub static NETWORK_MODEL_V4T: NetworkModelLayout = NetworkModelLayout {
     minimums: INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT_V4T,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_V4T,
     lineup: Lineup::H18,
+    range_pads: false,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -3492,7 +3510,7 @@ pub const DEVNET_PARAMS: Params = Params {
     pow_salt_v4_activation: ForkActivation::new(0),
     pom_maxlevel_v4_activation: ForkActivation::new(1),
     pom_v4_activation: ForkActivation::new(1),
-    pom_v5_activation: ForkActivation::never(),
+    pom_v5_activation: ForkActivation::new(1),
     h10_activation: ForkActivation::new(1),
     ratio_reward_activation: ForkActivation::new(0),
     ratio_verification_activation: ForkActivation::new(0), // verify all (no corrupted history)
@@ -3513,34 +3531,34 @@ pub const DEVNET_PARAMS: Params = Params {
     service_bond_v2_activation: ForkActivation::new(0),
     reward_routing_activation: ForkActivation::new(0),
     private_inference_activation: ForkActivation::new(1),
-    verifiable_inference_activation: ForkActivation::never(),
-    trace_shape_activation: ForkActivation::never(),
-    trace_prefix_activation: ForkActivation::never(),
-    trace_audit_activation: ForkActivation::never(),
-    trace_sanction_activation: ForkActivation::never(),
-    trace_context_activation: ForkActivation::never(),
-    reward_draw_activation: ForkActivation::never(),
-    service_window_v3_activation: ForkActivation::never(),
-    trace_dedup_activation: ForkActivation::never(),
-    ratio_reward_v3_activation: ForkActivation::never(),
-    trace_chain_activation: ForkActivation::never(),
+    verifiable_inference_activation: ForkActivation::new(1),
+    trace_shape_activation: ForkActivation::new(1),
+    trace_prefix_activation: ForkActivation::new(1),
+    trace_audit_activation: ForkActivation::new(1),
+    trace_sanction_activation: ForkActivation::new(1),
+    trace_context_activation: ForkActivation::new(1),
+    reward_draw_activation: ForkActivation::new(1),
+    service_window_v3_activation: ForkActivation::new(1),
+    trace_dedup_activation: ForkActivation::new(1),
+    ratio_reward_v3_activation: ForkActivation::new(1),
+    trace_chain_activation: ForkActivation::new(1),
     block_task_activation: ForkActivation::never(),
-    trace_seed_bind_activation: ForkActivation::never(),
-    attention_activation: ForkActivation::never(),
+    trace_seed_bind_activation: ForkActivation::new(1),
+    attention_activation: ForkActivation::new(1),
     service_ledger_activation: ForkActivation::new(1),
     production_index_activation: ForkActivation::new(500),
     exact_verification_activation: ForkActivation::new(1),
-    suspension_pov_activation: ForkActivation::never(),
-    untraced_response_activation: ForkActivation::never(),
-    answer_shape_window_activation: ForkActivation::never(),
-    one_miss_per_request_activation: ForkActivation::never(),
-    uniform_strike_activation: ForkActivation::never(),
-    audit_queue_activation: ForkActivation::never(),
-    pad_margin_activation: ForkActivation::never(),
-    model_split_activation: ForkActivation::new(1),
+    suspension_pov_activation: ForkActivation::new(1),
+    untraced_response_activation: ForkActivation::new(1),
+    answer_shape_window_activation: ForkActivation::new(1),
+    one_miss_per_request_activation: ForkActivation::new(1),
+    uniform_strike_activation: ForkActivation::new(1),
+    audit_queue_activation: ForkActivation::new(1),
+    pad_margin_activation: ForkActivation::new(1),
+    model_split_activation: ForkActivation::new(DEVNET_H18_ACTIVATION_DAA),
     network_model: &NETWORK_MODEL_V4T,
     service_burnable_window_daa: 6_000,
-    ratio_probation_activation: ForkActivation::never(),
+    ratio_probation_activation: ForkActivation::new(1),
     chain_anchor: None,
     service_state_checkpoint: None,
     ratio_reward_window: 1_000,
@@ -3881,9 +3899,37 @@ mod pad_table_tests {
         assert!(H17_ACTIVATION_DAA > H16_ACTIVATION_DAA);
         assert!(TESTNET_H17_ACTIVATION_DAA > TESTNET_H16_ACTIVATION_DAA);
         assert_eq!(H17_ACTIVATION_DAA, 153_085_000);
-        for p in [&SIMNET_PARAMS, &DEVNET_PARAMS] {
-            assert_eq!(p.ratio_probation_activation, ForkActivation::never());
+        assert_eq!(SIMNET_PARAMS.ratio_probation_activation, ForkActivation::never());
+    }
+
+    #[test]
+    fn devnet_ranges_carry_no_pad() {
+        let v4t = DEVNET_PARAMS.network_model;
+        for t in (NETWORK_MODEL_TIER + 1)..v4t.tiers.len() as u8 {
+            assert_eq!(v4t.pad_tiles(t, true), 0);
         }
+        for t in 0..NETWORK_MODEL_TIER {
+            assert_eq!(v4t.pad_tiles(t, true), POM_V5_PAD_TILES_H18[t as usize]);
+        }
+        assert_eq!(NETWORK_MODEL_MAINNET.pad_tiles(NETWORK_MODEL_TIER + 1, true), POM_V5_PAD_TILES_H18[NETWORK_MODEL_TIER as usize + 1]);
+    }
+
+    #[test]
+    fn devnet_starts_past_h17_and_crosses_h18() {
+        let p = &DEVNET_PARAMS;
+        let early = [
+            p.pom_v5_activation,
+            p.verifiable_inference_activation,
+            p.trace_sanction_activation,
+            p.reward_draw_activation,
+            p.attention_activation,
+            p.one_miss_per_request_activation,
+            p.pad_margin_activation,
+            p.ratio_probation_activation,
+        ];
+        assert!(early.iter().all(|g| g.daa_score() <= 1));
+        assert_eq!(p.model_split_activation.daa_score(), DEVNET_H18_ACTIVATION_DAA);
+        assert!(DEVNET_H18_ACTIVATION_DAA > p.production_index_activation.daa_score());
     }
 
     #[test]

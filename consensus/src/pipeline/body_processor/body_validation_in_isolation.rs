@@ -447,11 +447,12 @@ impl BlockBodyProcessor {
         let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
 
         if self.pom_v5_activation.is_active(header.daa_score) {
-            let n_pad = keryx_consensus_core::config::params::pom_v5_pad_tiles(
-                proof.tier,
-                self.pad_margin_activation.is_active(header.daa_score),
-                self.lineup_at(header.daa_score),
-            );
+            let pad_margin = self.pad_margin_activation.is_active(header.daa_score);
+            let n_pad = if self.model_split_activation.is_active(header.daa_score) {
+                self.network_model.pad_tiles(proof.tier, pad_margin)
+            } else {
+                keryx_consensus_core::config::params::pom_v5_pad_tiles(proof.tier, pad_margin, self.lineup_at(header.daa_score))
+            };
             let pad_seed = v5_pad_seed(proof.tier, &tier.model_id, &tier.root);
             return verify_pom_proof_v5_container(seed, proof, tier.chunks, &tier.root, &pad_seed, n_pad, &target, final_hash)
                 .map_err(RuleError::BadPomProofV4);
