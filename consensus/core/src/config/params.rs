@@ -203,6 +203,9 @@ pub const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
 /// Devnet H18 gate (`model_split_activation`); every earlier gate is live from genesis. Node and miner.
 pub const DEVNET_H18_ACTIVATION_DAA: u64 = 5_000;
 
+/// PoM v5 context pad tiles of each devnet range. Node and miner.
+pub const DEVNET_RANGE_PAD_TILES: u64 = 65_536;
+
 /// Mainnet H17 gate.
 pub const H17_ACTIVATION_DAA: u64 = 153_085_000;
 
@@ -1706,15 +1709,15 @@ pub struct NetworkModelLayout {
     pub shard_vram_gb: &'static [u64],
     /// Lineup the per-tier rules of tiers 0-4 follow once the split is live.
     pub lineup: Lineup,
-    /// Whether the ranges carry their PoM v5 context pad.
-    pub range_pads: bool,
+    /// PoM v5 context pad tiles of every range, in place of the lineup table.
+    pub range_pad_tiles: Option<u64>,
 }
 
 impl NetworkModelLayout {
     /// Context pad tiles of `tier` under this layout once the split is live.
     pub fn pad_tiles(&self, tier: u8, pad_margin: bool) -> u64 {
-        if tier >= NETWORK_MODEL_TIER && !self.range_pads {
-            return 0;
+        if let Some(n) = self.range_pad_tiles.filter(|_| tier > NETWORK_MODEL_TIER) {
+            return n;
         }
         pom_v5_pad_tiles(tier, pad_margin, self.lineup)
     }
@@ -1755,7 +1758,7 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     minimums: INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
     lineup: Lineup::H18,
-    range_pads: true,
+    range_pad_tiles: None,
 };
 
 /// The bench network model floor is the 9B flat floor (0.5 KRX).
@@ -1765,7 +1768,7 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
     minimums: INFERENCE_REWARD_MINIMUMS_V2_SPLIT9B,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
     lineup: Lineup::H14Split,
-    range_pads: false,
+    range_pad_tiles: None,
 };
 
 /// Devnet bench: the truncated V4-Flash in two ranges, H18 lineup.
@@ -1775,7 +1778,7 @@ pub static NETWORK_MODEL_V4T: NetworkModelLayout = NetworkModelLayout {
     minimums: INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT_V4T,
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_V4T,
     lineup: Lineup::H18,
-    range_pads: false,
+    range_pad_tiles: Some(DEVNET_RANGE_PAD_TILES),
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -3903,11 +3906,12 @@ mod pad_table_tests {
     }
 
     #[test]
-    fn devnet_ranges_carry_no_pad() {
+    fn devnet_ranges_carry_a_small_pad() {
         let v4t = DEVNET_PARAMS.network_model;
         for t in (NETWORK_MODEL_TIER + 1)..v4t.tiers.len() as u8 {
-            assert_eq!(v4t.pad_tiles(t, true), 0);
+            assert_eq!(v4t.pad_tiles(t, true), DEVNET_RANGE_PAD_TILES);
         }
+        assert_eq!(v4t.pad_tiles(NETWORK_MODEL_TIER, true), 0);
         for t in 0..NETWORK_MODEL_TIER {
             assert_eq!(v4t.pad_tiles(t, true), POM_V5_PAD_TILES_H18[t as usize]);
         }
