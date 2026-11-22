@@ -65,7 +65,7 @@ pub const X_F32: u8 = 4;
 /// Unquantized input of a float-weight product, rounded to f16.
 pub const X_F16: u8 = 5;
 
-/// fp16 partial sums of the unquantized input over the first 96 values of each 128-value block.
+/// Partial sums of a D2S6 row.
 pub fn d2s6_sums(leaf: &[u8], k: usize) -> Option<Vec<f32>> {
     if leaf.len() < k.div_ceil(128) * 144 {
         return None;

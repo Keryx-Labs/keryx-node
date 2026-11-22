@@ -60,8 +60,7 @@ pub const AI_RESPONSE_EXT_TRACE: u8 = 0x81;
 pub const AI_RESPONSE_TRACE_LEN: usize = 32 + 4 + 4 + 1;
 /// The trace commitment followed by `[tokens_root: 32]`.
 pub const AI_RESPONSE_TRACE_TOKENS_LEN: usize = AI_RESPONSE_TRACE_LEN + 32;
-/// Extension kind: the trace roots of a pipeline's link ranges and of the junctions between
-/// ranges. Follows the trace commitment.
+/// Extension kind: the link range traces. Follows the trace commitment.
 pub const AI_RESPONSE_EXT_RANGES: u8 = 0x82;
 /// `[n: 1] n × ([tier: 1] [trace_root: 32]) n × [boundary_root: 32]`, `n` the link count.
 pub fn ai_response_ranges_len(n: usize) -> usize {
@@ -294,8 +293,7 @@ pub struct AiResponsePayload {
     pub ranges: Option<RangeTraces>,
 }
 
-/// Trace roots of the link ranges of a pipeline response, in link order, and the roots of the
-/// residual crossing each junction: `boundaries[i]` is the input of the range of link `i`.
+/// Trace roots of the link ranges of a pipeline response, in link order, and of the output of each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeTraces {
     pub roots: Vec<(u8, [u8; 32])>,

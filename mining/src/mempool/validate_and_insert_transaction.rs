@@ -294,7 +294,6 @@ impl Mempool {
                     }
                 }
             } else if let Some((rh, marker, link)) = dispute_index_key(&transaction.tx.payload) {
-                // One pending demand, and one pending answer, per (request, link key).
                 if virtual_daa < self.config.model_split_activation_daa {
                     return Err(RuleError::RejectAiAvailBeforeActivation(hex::encode(rh)));
                 }

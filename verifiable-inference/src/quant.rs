@@ -214,7 +214,7 @@ pub fn k_tile_form(wtype: u32, row: &[u8], k: usize) -> Option<(Vec<f32>, Vec<f3
     Some((w_eff, b_h))
 }
 
-/// Q2_K row in tiled form: 2-bit values, and the fp16 scale and min of each 16-value group.
+/// Q2_K row in tiled form.
 pub fn q2k_tile_form(row: &[u8], k: usize) -> Option<(Vec<u8>, Vec<f32>, Vec<f32>)> {
     if !k.is_multiple_of(256) || row.len() < k / 256 * 84 {
         return None;

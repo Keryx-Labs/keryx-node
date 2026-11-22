@@ -39,7 +39,7 @@ impl std::fmt::Display for VerifiableEraViolation {
     }
 }
 
-/// Link range traces, and the response size they need, only exist from `model_split_activation`.
+/// Link range traces only exist from `model_split_activation`.
 pub fn check_range_traces_era(tx: &Transaction, daa_score: u64, model_split_activation: ForkActivation) -> Result<(), VerifiableEraViolation> {
     if !tx.is_ai_response() || model_split_activation.is_active(daa_score) {
         return Ok(());

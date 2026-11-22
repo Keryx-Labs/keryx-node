@@ -1214,8 +1214,7 @@ impl PipelineEvent {
     }
 }
 
-/// What the close of a pipeline audit decides: the struck identities, which also lose their
-/// draw ticket.
+/// The verdict of a pipeline audit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PipelineVerdict {
     struck: Vec<Hash>,
@@ -1319,10 +1318,7 @@ impl Audit {
         Some((head, link_ids))
     }
 
-    /// Whether the head `head_key` may force a step on the link `(tier, key)` at `daa`: ranks
-    /// drawn, its pipeline unserved, the link its pipeline's key for another shard tier or a
-    /// surplus key, no earlier demand on that link, room left for the answer, and an input of the
-    /// tier's form at the position the link's receipt reaches (position 0 without one).
+    /// Whether the head `head_key` may force a step on the link `(tier, key)` at `daa`.
     fn demand_admissible(&self, layout: &NetworkModelLayout, ev: &PipelineEvent, daa: u64) -> bool {
         let PipelineEvent::Demand { head, tier, link, pos, receipt_end, input_len, input_ok, .. } = ev else { return false };
         let head_tier = layout.head_tier();
@@ -1351,17 +1347,14 @@ impl Audit {
         })
     }
 
-    /// Whether the head `head_key` may give its pipeline up after a forced step the link
-    /// `(tier, key)` answered: unserved, not reported yet.
+    /// Whether the head `head_key` may report the link `(tier, key)` as failed.
     fn failure_admissible(&self, head_key: &Hash, tier: u8, key: &Hash) -> bool {
         self.disputes.iter().any(|d| d.head == *head_key && d.tier == tier && d.link == *key && d.answered)
             && !self.pipelines.iter().any(|(h, _)| h == head_key)
             && !self.failures.iter().any(|(h, _, _)| h == head_key)
     }
 
-    /// The close of a pipeline audit. A member that never declared is struck, and so is every
-    /// link that left a forced step unanswered. The head of an unserved pipeline is struck
-    /// unless it left a forced step unanswered or reported after an answered one.
+    /// The verdict of a pipeline audit at its close.
     fn pipeline_verdict(&self, layout: &NetworkModelLayout) -> PipelineVerdict {
         let head_tier = layout.head_tier();
         let mut v = PipelineVerdict::default();
@@ -2144,7 +2137,6 @@ impl ServiceLedger {
                 None => {}
             }
         }
-        // Demands first, then answers, then reports: a block may carry a demand and its answer.
         for kind in 0..3 {
             for ev in pipeline_events.iter() {
                 let Some(audit) = self.pending.get_mut(ev.request_hash()).and_then(|r| r.audit.as_mut()).filter(|a| a.is_pipeline() && daa <= a.window_end_daa)
@@ -2738,7 +2730,6 @@ impl ServiceLedger {
         a.max_tokens = req.max_tokens;
         if audit.is_pipeline() {
             let layout = self.layout();
-            // The head's own trace covers the head range; each link range has its own audit.
             let tier = range_tier.unwrap_or_else(|| layout.head_tier());
             a.tier = tier;
             a.identities = audit.holder(tier, &Hash::from_bytes(a.escrow_pubkey)).into_iter().collect();
@@ -2771,7 +2762,6 @@ impl ServiceLedger {
         let lg = self.lineup_gate();
         let mut audited: std::collections::HashSet<([u8; 32], Hash)> =
             if tr.sanction { self.trace_audits.values().map(|a| (a.request_hash, a.responder)).collect() } else { Default::default() };
-        // A link range follows its head's trace and is recorded only when the head's is.
         let mut head_kept: Option<[u8; 32]> = None;
         for ev in tr.responses.iter().chain(parked) {
             if let Some(t) = ev.range_tier
@@ -6309,7 +6299,6 @@ mod tests {
         let responded = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().responded.clone();
         assert_eq!(responded.len(), NETWORK_MODEL_SHARDS.len(), "every signer is credited");
         assert!(out.resets.iter().any(|(id, _)| *id == head));
-        // window close: only the other head, which neither served nor forced a step; a replacement strikes nobody
         let out = ledger.on_chain_block(closing_daa(), &[], &[], &[], |_| true, cohorts);
         assert_eq!(struck(&out), vec![head_of(other)]);
         assert_eq!(ledger.pending_len(), 0);
@@ -6413,11 +6402,9 @@ mod tests {
             fold_events(&mut ledger, RANKED, &[demand(rh, head_of(&p), t, link), answer(rh, head_of(&p), t, link)]);
             (ledger, p, link)
         };
-        // answered in the same block: the head that then neither serves nor reports is struck
         let (mut ledger, p, link) = setup();
         assert!(disputes_of(&ledger, &rh)[0].answered);
         assert_eq!(close(&mut ledger), vec![head_of(&p)]);
-        // reported after the answer: nobody
         let (mut ledger, p, link2) = setup();
         assert_eq!(link, link2);
         let fail = PipelineEvent::Fail { request_hash: rh, head: head_of(&p), tier: t, link };
@@ -6456,7 +6443,6 @@ mod tests {
         let t = NETWORK_MODEL_TIER + 3;
         let t1 = NETWORK_MODEL_TIER + 1;
         let ht = NETWORK_MODEL_HEAD_TIER;
-        // before the ranks are drawn nothing can be forced
         let mut early = split_ledger();
         early.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
         early.on_chain_block(ARMED, &[], &[], &[], |_| true, shard_cohorts(None));
@@ -6494,7 +6480,6 @@ mod tests {
         assert!(!ok(&ledger, PipelineEvent::Demand { request_hash: rh, head: key_of(&p, t), tier: t1, link: key_of(&p, t1), pos: 0, receipt_end: None, input_len: 4, input_ok: true }));
         let end = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().window_end_daa;
         assert!(!ledger.pipeline_event_admissible(&with(0, None, r, true, t, key_of(&p, t)), end - PIPELINE_ANSWER_WINDOW_DAA + 1));
-        // a failure report needs an answered forced step
         let fail = PipelineEvent::Fail { request_hash: rh, head: h, tier: t, link: key_of(&p, t) };
         assert!(!ok(&ledger, fail));
         // one demand per (head, link)
@@ -6735,7 +6720,6 @@ mod tests {
         let links: Vec<(u8, Hash)> = p.iter().filter(|(t, _)| *t != NETWORK_MODEL_HEAD_TIER).copied().collect();
         let mut responses = vec![ev(txid, head, None)];
         responses.extend(links.iter().map(|(t, k)| ev(range_audit_id(&txid, *t), *k, Some(*t))));
-        // a range without its head, and a range held by an undeclared key, are not audited
         let orphan = [0x52u8; 32];
         responses.push(ev(range_audit_id(&orphan, links[0].0), links[0].1, Some(links[0].0)));
         let stranger = ev(range_audit_id(&[0x53u8; 32], links[0].0), Hash::from_bytes([0xeeu8; 32]), Some(links[0].0));
@@ -6792,18 +6776,15 @@ mod tests {
         // nobody answers: the silent member and both heads
         let v = audit.pipeline_verdict(layout);
         assert_eq!(v.struck, sorted(vec![silent, hp, hq]));
-        // p is served with the spare; q forced its t7 link, which stayed silent
         audit.pipelines.push((head_of(&p), with_link(&p, t5, f.surplus[0].1)));
         let q7 = id(&q, t7);
         let open = super::Dispute { head: head_of(&q), tier: t7, link: q7, pos: 0, opened_daa: 500, answered: false };
         audit.disputes.push(open);
         assert_eq!(audit.pipeline_verdict(layout).struck, sorted(vec![silent, q7]));
-        // the link answered: q's head is struck again, unless it reports after the answer
         audit.disputes[0].answered = true;
         assert_eq!(audit.pipeline_verdict(layout).struck, sorted(vec![silent, hq]));
         audit.failures.push((head_of(&q), t7, q7));
         assert_eq!(audit.pipeline_verdict(layout).struck, vec![silent]);
-        // a silent forced link of a served pipeline is struck too
         audit.disputes.push(super::Dispute { head: head_of(&p), tier: t7, link: id(&p, t7), ..open });
         assert_eq!(audit.pipeline_verdict(layout).struck, sorted(vec![silent, id(&p, t7)]));
     }

@@ -1713,7 +1713,7 @@ pub struct NetworkModelLayout {
     pub range_pad_tiles: Option<u64>,
     /// Values a range passes on per position.
     pub residual_values: usize,
-    /// Trace manifest of each range, in shard order; a range without one is not audited.
+    /// Trace manifest of each range, in shard order.
     pub range_manifests: &'static [Option<TraceManifest>],
 }
 
@@ -1737,7 +1737,7 @@ impl NetworkModelLayout {
         NETWORK_MODEL_TIER + self.n_shards() as u8
     }
 
-    /// Audit rules of the range served at shard `tier`: its products against its own weight root.
+    /// Audit rules of the range served at shard `tier`.
     pub fn range_trace_rules(&self, tier: u8, audit_all: bool) -> Option<TraceRules> {
         if !self.shard_tiers().contains(&tier) {
             return None;
@@ -1773,6 +1773,42 @@ impl NetworkModelLayout {
     }
 }
 
+/// Stage-1a trace manifests of the V4-Flash ranges, in shard order.
+pub const RANGE_MANIFESTS_MAINNET: [Option<TraceManifest>; 4] = [
+    Some(TraceManifest {
+        m_t: [
+            0xcb, 0x17, 0x93, 0xc5, 0x21, 0x24, 0xb1, 0xe4, 0x05, 0x71, 0xb6, 0xfe, 0x9f, 0x6d, 0xff, 0x5d,
+            0x47, 0xac, 0xb8, 0x9b, 0x8a, 0x07, 0x35, 0xda, 0xdb, 0xd7, 0xc7, 0x49, 0x06, 0x72, 0xe7, 0x20,
+        ],
+        n_entries: 181,
+        n_products: 181,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x2a, 0xe3, 0xa3, 0x56, 0x41, 0x50, 0xad, 0x9c, 0xd4, 0xa3, 0x72, 0xa7, 0x87, 0xf0, 0x2a, 0x38,
+            0xe2, 0xfd, 0xa3, 0x40, 0x65, 0x2d, 0x82, 0x52, 0x90, 0x09, 0x69, 0x4e, 0xa9, 0xef, 0x6b, 0x5f,
+        ],
+        n_entries: 185,
+        n_products: 185,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x05, 0x5b, 0xfa, 0x4b, 0xc2, 0x5d, 0xf4, 0x9c, 0xe2, 0x55, 0x49, 0xb4, 0x8b, 0x0e, 0xcd, 0x2d,
+            0xab, 0x3b, 0x8a, 0xcd, 0x79, 0xaf, 0xed, 0x01, 0x84, 0xc2, 0x39, 0x7b, 0xf3, 0x2b, 0x80, 0x66,
+        ],
+        n_entries: 189,
+        n_products: 189,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0x79, 0xf6, 0x2b, 0x9d, 0xf5, 0x97, 0x1c, 0x11, 0x6c, 0xba, 0x39, 0x45, 0xbd, 0xd1, 0xbd, 0x99,
+            0x50, 0x93, 0x8b, 0x8b, 0xdc, 0xd4, 0xfa, 0x8d, 0x34, 0x80, 0xfc, 0x43, 0x20, 0x3b, 0x00, 0xc9,
+        ],
+        n_entries: 170,
+        n_products: 170,
+    }),
+];
+
 pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     tiers: POM_TIERS_MODEL_SPLIT,
     reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT,
@@ -1781,7 +1817,7 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     lineup: Lineup::H18,
     range_pad_tiles: None,
     residual_values: 16_384,
-    range_manifests: &[],
+    range_manifests: &RANGE_MANIFESTS_MAINNET,
 };
 
 /// The bench network model floor is the 9B flat floor (0.5 KRX).
@@ -1797,6 +1833,26 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
 };
 
 /// Devnet bench: the truncated V4-Flash in two ranges, H18 lineup.
+/// Stage-1a trace manifests of the devnet ranges, in shard order.
+pub const RANGE_MANIFESTS_V4T: [Option<TraceManifest>; 2] = [
+    Some(TraceManifest {
+        m_t: [
+            0xa5, 0xe6, 0xc2, 0x23, 0xa6, 0xdb, 0xca, 0xae, 0x8b, 0x45, 0x8a, 0x61, 0x26, 0xcb, 0xe0, 0x10,
+            0xd1, 0x7d, 0xa7, 0xb8, 0x3f, 0xe9, 0x5d, 0x1b, 0x3e, 0x41, 0x2d, 0x0b, 0xf1, 0x10, 0x8c, 0xac,
+        ],
+        n_entries: 46,
+        n_products: 45,
+    }),
+    Some(TraceManifest {
+        m_t: [
+            0xea, 0x09, 0xc7, 0x06, 0xbe, 0x45, 0xbc, 0x59, 0x6e, 0x07, 0x9d, 0x6d, 0xa9, 0x4d, 0xfa, 0x7a,
+            0xf2, 0x49, 0x93, 0x34, 0x12, 0x3d, 0x69, 0x5f, 0x8c, 0x34, 0x4a, 0xf0, 0x43, 0xe4, 0x92, 0x0d,
+        ],
+        n_entries: 15,
+        n_products: 15,
+    }),
+];
+
 pub static NETWORK_MODEL_V4T: NetworkModelLayout = NetworkModelLayout {
     tiers: POM_TIERS_MODEL_SPLIT_V4T,
     reward_bps: &TIER_REWARD_BPS_MODEL_SPLIT_V4T,
@@ -1805,7 +1861,7 @@ pub static NETWORK_MODEL_V4T: NetworkModelLayout = NetworkModelLayout {
     lineup: Lineup::H18,
     range_pad_tiles: Some(DEVNET_RANGE_PAD_TILES),
     residual_values: 16_384,
-    range_manifests: &[],
+    range_manifests: &RANGE_MANIFESTS_V4T,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.
@@ -3943,6 +3999,33 @@ mod pad_table_tests {
             assert_eq!(v4t.pad_tiles(t, true), POM_V5_PAD_TILES_H18[t as usize]);
         }
         assert_eq!(NETWORK_MODEL_MAINNET.pad_tiles(NETWORK_MODEL_TIER + 1, true), POM_V5_PAD_TILES_H18[NETWORK_MODEL_TIER as usize + 1]);
+    }
+
+    #[test]
+    fn devnet_ranges_are_audited_against_their_own_roots() {
+        let l = &NETWORK_MODEL_V4T;
+        for (i, t) in l.shard_tiers().enumerate() {
+            let r = l.range_trace_rules(t, false).unwrap();
+            let m = RANGE_MANIFESTS_V4T[i].unwrap();
+            assert_eq!((r.ctx.r_t, r.ctx.n_chunks, r.ctx.m_t, r.ctx.n_products), (l.tiers[t as usize].root, l.tiers[t as usize].chunks, m.m_t, m.n_products));
+            assert!(r.prefix.is_none() && r.chain.is_none());
+        }
+        assert!(l.range_trace_rules(NETWORK_MODEL_TIER, false).is_none());
+        assert!(l.range_trace_rules(l.head_tier() + 1, false).is_none());
+        assert!(NETWORK_MODEL_SPLIT9B.range_trace_rules(NETWORK_MODEL_TIER + 1, false).is_none());
+    }
+
+    #[test]
+    fn mainnet_ranges_are_audited_against_their_own_roots() {
+        let l = &NETWORK_MODEL_MAINNET;
+        assert_eq!(l.shard_tiers().count(), RANGE_MANIFESTS_MAINNET.len());
+        for (i, t) in l.shard_tiers().enumerate() {
+            let r = l.range_trace_rules(t, false).unwrap();
+            let m = RANGE_MANIFESTS_MAINNET[i].unwrap();
+            assert_eq!((r.ctx.r_t, r.ctx.n_chunks, r.ctx.m_t, r.ctx.n_products), (l.tiers[t as usize].root, l.tiers[t as usize].chunks, m.m_t, m.n_products));
+        }
+        assert!(l.range_trace_rules(NETWORK_MODEL_TIER, false).is_none());
+        assert!(std::ptr::eq(TESTNET_PARAMS.network_model, &NETWORK_MODEL_MAINNET));
     }
 
     #[test]

@@ -581,8 +581,6 @@ impl VirtualStateProcessor {
                         tokens: trace.tokens_root.is_some(),
                         range_tier: None,
                     });
-                    // Each link range is audited on its own, under an id of its own; the link
-                    // signatures over these roots were checked with the head's.
                     if let Some(ranges) = resp.ranges.as_ref().filter(|_| verified_links(&resp).is_some()) {
                         for ((t, root), l) in ranges.roots.iter().zip(&resp.links) {
                             responses.push(TraceResponseEvent {
@@ -2184,7 +2182,6 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // a receipt signed by someone else, or for another request, voids the demand
         let mut forged = d.clone();
         forged.receipt.as_mut().unwrap().signature = schnorr(&head_sk, RECEIPT_SIG_DOMAIN, &receipt.signed_bytes()).1;
         forged.signature = schnorr(&head_sk, DEMAND_SIG_DOMAIN, &forged.signed_bytes()).1;
