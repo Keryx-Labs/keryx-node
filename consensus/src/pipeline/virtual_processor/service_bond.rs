@@ -6,9 +6,9 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_avail_signature, verify_link_signature,
+    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_avail_signature, verify_fail_signature, verify_link_signature,
     verify_responder_signature, EscrowClaim, FoldOutcome, NetworkModelAvailability, PipelineAssignment, PrivateCohortSeed,
-    ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
+    PipelineFailure, ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
     ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
     TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
@@ -21,7 +21,7 @@ use keryx_consensus_core::blockhash::BlockHashExtensions;
 use keryx_core::{debug, error, info, warn};
 use keryx_hashes::Hash;
 use keryx_inference::private::PRIVATE_TAG_LEN;
-use keryx_inference::{AiAvailPayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope, PrivateResponseEnvelope};
+use keryx_inference::{AiAvailPayload, AiFailPayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope, PrivateResponseEnvelope};
 use keryx_txscript::script_class::ScriptClass;
 
 const _: () = assert!(keryx_consensus_core::collateral::PRIVATE_COHORT_TARGET == keryx_inference::private::MAX_PRIVATE_RECIPIENTS);
@@ -432,6 +432,7 @@ impl VirtualStateProcessor {
         let mut responses = Vec::new();
         let mut response_links = Vec::new();
         let mut declarations = Vec::new();
+        let mut failures = Vec::new();
         let acceptance = self.acceptance_data_store.get(hash).unwrap();
         for mbad in acceptance.iter() {
             let txs = self.block_transactions_store.get(mbad.block_hash).unwrap();
@@ -488,10 +489,21 @@ impl VirtualStateProcessor {
                     && let Some((tier, escrow)) = verified_declaration(&avail)
                 {
                     declarations.push((avail.request_hash, tier, escrow));
+                } else if model_split
+                    && tx.is_ai_avail()
+                    && let Some(fail) = AiFailPayload::deserialize(&tx.payload)
+                    && verify_fail_signature(&fail.head_escrow_pubkey, &fail.signature, &fail.signed_bytes())
+                {
+                    failures.push((
+                        fail.request_hash,
+                        escrow_miner_key(&fail.head_escrow_pubkey),
+                        fail.link_tier,
+                        escrow_miner_key(&fail.link_escrow_pubkey),
+                    ));
                 }
             }
         }
-        ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses, response_links, declarations }
+        ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses, response_links, declarations, failures }
     }
 
     /// Traced responses with a verified responder, and correctly signed openings, accepted by
@@ -723,6 +735,16 @@ impl VirtualStateProcessor {
         Some(self.service_ledger.lock().ledger.declaration_admissible(request_hash))
     }
 
+    /// Whether `escrow` holds `tier` in the armed pipeline audit of `request_hash`.
+    pub(crate) fn is_declaration_member(&self, request_hash: &[u8; 32], tier: u8, escrow: &Hash) -> bool {
+        self.service_ledger.lock().ledger.declaration_member(request_hash, tier, escrow)
+    }
+
+    /// Whether a failure report can still count on the armed pipeline audit of `request_hash`.
+    pub(crate) fn is_failure_report_admissible(&self, request_hash: &[u8; 32], head: &Hash, tier: u8, key: &Hash) -> bool {
+        self.service_ledger.lock().ledger.failure_report_admissible(request_hash, head, tier, key)
+    }
+
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
         let sync = self.service_ledger.lock();
         sync.ledger.private_recipients(request_hash).map(|keys| keys.iter().map(|k| k.as_bytes()).collect())
@@ -863,7 +885,7 @@ impl VirtualStateProcessor {
         ledger.set_model_split_activation(self.model_split_activation.daa_score());
         ledger.set_network_model(self.network_model);
         ledger.set_burnable_window(self.service_burnable_window_daa);
-        let ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses, response_links, declarations } = self
+        let ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses, response_links, declarations, failures } = self
             .service_events_of_chain_block(
                 hash,
                 self.reward_routing_activation.is_active(daa),
@@ -957,6 +979,7 @@ impl VirtualStateProcessor {
                     &producers,
                     &response_links,
                     &declarations,
+                    &failures,
                     Some(&traces),
                     &|op| burned.contains_key(op),
                     cohort,
@@ -973,6 +996,7 @@ impl VirtualStateProcessor {
                 &producers,
                 &response_links,
                 &declarations,
+                &failures,
                 Some(&traces),
                 |id| self.service_standing_at(id, daa),
                 cohort,
@@ -1020,6 +1044,7 @@ impl VirtualStateProcessor {
                 &producers,
                 &response_links,
                 &declarations,
+                &failures,
                 None,
                 &|op| burned.contains_key(op),
                 cohort,
@@ -1036,6 +1061,7 @@ impl VirtualStateProcessor {
                 &producers,
                 &response_links,
                 &declarations,
+                &failures,
                 None,
                 |id| self.service_standing_at(id, daa),
                 cohort,
@@ -2023,6 +2049,8 @@ struct ServiceEvents {
     /// Verified availability declarations `(request_hash, tier, escrow key)`, past the
     /// model-split gate only.
     declarations: Vec<([u8; 32], u8, Hash)>,
+    /// Verified pipeline failure reports, past the model-split gate only.
+    failures: Vec<PipelineFailure>,
 }
 
 /// Plaintext length of a request prompt: the sealed length without the envelope, else the bytes.

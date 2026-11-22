@@ -83,6 +83,11 @@ pub const MAX_AI_RESPONSE_PAYLOAD_LEN: usize = AI_RESPONSE_PAYLOAD_V2_LEN
 pub const AI_AVAIL_PAYLOAD_LEN: usize = 32 + 1 + 32 + 64;
 pub const AI_AVAIL_SIGNED_LEN: usize = 33;
 
+/// Failure report on the same subnetwork: `[request_hash: 32] [link_tier: 1] [link_escrow_pubkey: 32]
+/// [head_escrow_pubkey: 32] [schnorr_signature: 64]`, signed by the head over the first 65 bytes.
+pub const AI_FAIL_PAYLOAD_LEN: usize = 32 + 1 + 32 + 32 + 64;
+pub const AI_FAIL_SIGNED_LEN: usize = 65;
+
 /// Binary payload layout for `SUBNETWORK_ID_AI_CHALLENGE` transactions:
 /// `[response_hash: 32] [challenger_deposit: 8 LE] [challenger_spk_version: 2 LE] [challenger_spk: 32] [proof_data…]`
 /// `proof_data` is empty for Phase 3 A2b stubs; 32 bytes (request_hash) for Phase 3 C re-execution.
@@ -533,6 +538,61 @@ impl AiAvailPayload {
     }
 }
 
+/// Failure report of a pipeline head on a `SUBNETWORK_ID_AI_AVAIL` transaction: the link of
+/// its rank that failed it, signed by the head's escrow key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiFailPayload {
+    pub request_hash: [u8; 32],
+    pub link_tier: u8,
+    pub link_escrow_pubkey: [u8; 32],
+    pub head_escrow_pubkey: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl AiFailPayload {
+    pub fn new(request_hash: [u8; 32], link_tier: u8, link_escrow_pubkey: [u8; 32], head_escrow_pubkey: [u8; 32], signature: [u8; 64]) -> Self {
+        Self { request_hash, link_tier, link_escrow_pubkey, head_escrow_pubkey, signature }
+    }
+
+    /// The 65 bytes the head signature covers.
+    pub fn signed_bytes(&self) -> [u8; AI_FAIL_SIGNED_LEN] {
+        let mut out = [0u8; AI_FAIL_SIGNED_LEN];
+        out[..32].copy_from_slice(&self.request_hash);
+        out[32] = self.link_tier;
+        out[33..65].copy_from_slice(&self.link_escrow_pubkey);
+        out
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(AI_FAIL_PAYLOAD_LEN);
+        out.extend_from_slice(&self.signed_bytes());
+        out.extend_from_slice(&self.head_escrow_pubkey);
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() != AI_FAIL_PAYLOAD_LEN {
+            return None;
+        }
+        Some(Self {
+            request_hash: data[0..32].try_into().ok()?,
+            link_tier: data[32],
+            link_escrow_pubkey: data[33..65].try_into().ok()?,
+            head_escrow_pubkey: data[65..97].try_into().ok()?,
+            signature: data[97..161].try_into().ok()?,
+        })
+    }
+}
+
+/// Request hash of a `SUBNETWORK_ID_AI_AVAIL` payload, declaration or failure report.
+pub fn ai_avail_request_hash(data: &[u8]) -> Option<[u8; 32]> {
+    match data.len() {
+        AI_AVAIL_PAYLOAD_LEN | AI_FAIL_PAYLOAD_LEN => data[0..32].try_into().ok(),
+        _ => None,
+    }
+}
+
 /// Payload of a `SUBNETWORK_ID_AI_CHALLENGE` transaction.
 ///
 /// Submitted by anyone who believes a miner published a fraudulent AiResponse.
@@ -851,6 +911,19 @@ mod tests {
         let mut long = bytes.clone();
         long.push(0);
         assert!(AiAvailPayload::deserialize(&long).is_none());
+    }
+
+    #[test]
+    fn ai_fail_roundtrip_is_exact_length() {
+        let fail = AiFailPayload::new([7u8; 32], 6, [0x55u8; 32], [0x33u8; 32], [0x44u8; 64]);
+        let bytes = fail.serialize();
+        assert_eq!(bytes.len(), AI_FAIL_PAYLOAD_LEN);
+        assert_eq!(AiFailPayload::deserialize(&bytes), Some(fail));
+        assert_eq!(&bytes[..AI_FAIL_SIGNED_LEN], fail.signed_bytes().as_slice());
+        assert!(AiAvailPayload::deserialize(&bytes).is_none());
+        assert!(AiFailPayload::deserialize(&AiAvailPayload::new([7u8; 32], 6, [0x33u8; 32], [0x44u8; 64]).serialize()).is_none());
+        assert_eq!(ai_avail_request_hash(&bytes), Some([7u8; 32]));
+        assert!(ai_avail_request_hash(&bytes[..100]).is_none());
     }
 
     #[test]

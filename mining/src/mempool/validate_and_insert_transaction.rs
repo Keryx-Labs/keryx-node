@@ -12,12 +12,12 @@ use crate::mempool::{
 };
 use keryx_consensus_core::{
     api::ConsensusApi,
-    collateral::{opening_body_piece, private_cohort_seed, trace_seed, verify_avail_signature, verify_link_signature, verify_opening_signature, verify_responder_signature},
+    collateral::{opening_body_piece, private_cohort_seed, trace_seed, verify_avail_signature, verify_fail_signature, verify_link_signature, verify_opening_signature, verify_responder_signature},
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use keryx_core::{debug, info};
-use keryx_inference::{AiAvailPayload, AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
+use keryx_inference::{AiAvailPayload, AiFailPayload, AiChallengePayload, AiRequestPayload, AiResponsePayload, PrivateRequestEnvelope};
 use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
 use rand::{Rng, seq::SliceRandom};
 use std::sync::Arc;
@@ -199,6 +199,8 @@ impl Mempool {
         if accepted_transaction.is_ai_avail() {
             if let Some(avail) = AiAvailPayload::deserialize(&accepted_transaction.payload) {
                 self.ai_avail_index.entry(avail.request_hash).or_default().push((avail.tier, avail.escrow_pubkey, accepted_transaction.id()));
+            } else if let Some(fail) = AiFailPayload::deserialize(&accepted_transaction.payload) {
+                self.ai_avail_index.entry(fail.request_hash).or_default().push((FAIL_INDEX_TIER, fail.head_escrow_pubkey, accepted_transaction.id()));
             }
         }
 
@@ -271,6 +273,22 @@ impl Mempool {
                     }
                     if entries.len() >= MAX_PENDING_AI_AVAILS_PER_REQUEST {
                         return Err(RuleError::RejectAiAvailsSaturated(hex::encode(avail.request_hash)));
+                    }
+                }
+            } else if let Some(fail) = AiFailPayload::deserialize(&transaction.tx.payload) {
+                // One failure report per (request, head key).
+                if virtual_daa < self.config.model_split_activation_daa {
+                    return Err(RuleError::RejectAiAvailBeforeActivation(hex::encode(fail.request_hash)));
+                }
+                if !verify_fail_signature(&fail.head_escrow_pubkey, &fail.signature, &fail.signed_bytes()) {
+                    return Err(RuleError::RejectAiAvailSignature(hex::encode(fail.request_hash)));
+                }
+                if let Some(entries) = self.ai_avail_index.get(&fail.request_hash) {
+                    if entries.iter().any(|(t, k, _)| *t == FAIL_INDEX_TIER && *k == fail.head_escrow_pubkey) {
+                        return Err(RuleError::RejectDuplicateAiAvail(hex::encode(fail.request_hash)));
+                    }
+                    if entries.len() >= MAX_PENDING_AI_AVAILS_PER_REQUEST {
+                        return Err(RuleError::RejectAiAvailsSaturated(hex::encode(fail.request_hash)));
                     }
                 }
             }
@@ -635,6 +653,9 @@ const MAX_PENDING_AI_RESPONSES_PER_REQUEST: usize = 256;
 
 /// Distinct pending AiAvails allowed per request: every eligible producer of every shard tier.
 const MAX_PENDING_AI_AVAILS_PER_REQUEST: usize = 1_024;
+
+/// Index tier of a failure report: never a shard tier.
+const FAIL_INDEX_TIER: u8 = u8::MAX;
 
 fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiChallengePayload::deserialize(payload).map(|c| c.response_hash)

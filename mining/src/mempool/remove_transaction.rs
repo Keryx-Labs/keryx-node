@@ -5,7 +5,7 @@ use crate::mempool::{
 };
 use keryx_consensus_core::tx::TransactionId;
 use keryx_core::debug;
-use keryx_inference::{AiAvailPayload, AiChallengePayload, AiResponsePayload};
+use keryx_inference::{AiChallengePayload, AiResponsePayload};
 use keryx_utils::iter::IterExtensions;
 
 impl Mempool {
@@ -50,7 +50,7 @@ impl Mempool {
                 self.ai_challenge_index.remove(&rh);
             }
             if tx.mtx.tx.is_ai_avail() {
-                if let Some(rh) = AiAvailPayload::deserialize(&tx.mtx.tx.payload).map(|a| a.request_hash) {
+                if let Some(rh) = keryx_inference::ai_avail_request_hash(&tx.mtx.tx.payload) {
                     if let Some(entries) = self.ai_avail_index.get_mut(&rh) {
                         entries.retain(|(_, _, id)| id != tx_id);
                         if entries.is_empty() {

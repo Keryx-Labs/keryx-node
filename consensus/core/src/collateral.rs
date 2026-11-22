@@ -128,6 +128,9 @@ pub const AVAIL_SIG_DOMAIN: &[u8] = b"KeryxServiceAvailV1";
 /// Domain separator of a pipeline link signature.
 pub const LINK_SIG_DOMAIN: &[u8] = b"KeryxPipelineLinkV1";
 
+/// Domain separator of a pipeline head's failure report.
+pub const FAIL_SIG_DOMAIN: &[u8] = b"KeryxPipelineFailV1";
+
 /// The message a V2 responder signs: the domain-tagged blake2b-256 of the payload's signed
 /// bytes (`AiResponsePayload::signed_bytes`).
 pub fn responder_signature_message(signed_bytes: &[u8]) -> [u8; 32] {
@@ -165,6 +168,12 @@ pub fn verify_avail_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], si
 /// blake2b-256 of `AiResponsePayload::link_signed_bytes`.
 pub fn verify_link_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
     verify_domain_signature(LINK_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
+}
+
+/// Verifies a pipeline failure report: schnorr by the head's `escrow_pubkey` over the
+/// domain-tagged blake2b-256 of `AiFailPayload::signed_bytes`.
+pub fn verify_fail_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+    verify_domain_signature(FAIL_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
 }
 
 fn verify_domain_signature(domain: &[u8], escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
@@ -1082,8 +1091,13 @@ struct Audit {
     /// lineup audit.
     members: Vec<(Hash, u8)>,
     /// Network-model audits only: `(tier, identity, escrow key)` of the availability
-    /// declarations folded so far, chain order. The first of each tier is its chosen one.
+    /// declarations folded so far, chain order, one per `(tier, escrow key)`. The `i`-th key of
+    /// each tier makes up pipeline `i`.
     declared: Vec<(u8, Hash, Hash)>,
+    /// Network-model audits only: head key and `(tier, link key)` of every counted response.
+    pipelines: Vec<(Hash, Vec<(u8, Hash)>)>,
+    /// Network-model audits only: `(head key, link tier, link key)` of every accepted failure report.
+    failures: Vec<(Hash, u8, Hash)>,
 }
 
 impl Audit {
@@ -1091,20 +1105,29 @@ impl Audit {
         !self.members.is_empty()
     }
 
+    /// The member holding `tier` that `escrow` delegates from.
+    fn member_of(&self, tier: u8, escrow: &Hash) -> Option<Hash> {
+        self.delegations.iter().filter(|(e, _)| e == escrow).map(|(_, id)| *id).find(|id| self.members.binary_search(&(*id, tier)).is_ok())
+    }
+
     /// Records `escrow`'s declaration for `tier` when it delegates from a member holding that
-    /// tier; one declaration per `(tier, identity)`.
+    /// tier; one declaration per `(tier, escrow key)`.
     fn declare(&mut self, tier: u8, escrow: Hash) {
-        let holder = self
-            .delegations
-            .iter()
-            .filter(|(e, _)| *e == escrow)
-            .map(|(_, id)| *id)
-            .find(|id| self.members.binary_search(&(*id, tier)).is_ok());
-        if let Some(id) = holder {
-            if !self.declared.iter().any(|(t, i, _)| *t == tier && *i == id) {
+        if let Some(id) = self.member_of(tier, &escrow) {
+            if !self.declared.iter().any(|(t, _, e)| *t == tier && *e == escrow) {
                 self.declared.push((tier, id, escrow));
             }
         }
+    }
+
+    /// Identity behind the declaration of `(tier, key)`.
+    fn holder(&self, tier: u8, key: &Hash) -> Option<Hash> {
+        self.declared.iter().find(|(t, _, e)| *t == tier && e == key).map(|(_, id, _)| *id)
+    }
+
+    /// Whether `(tier, key)` already counts in a response.
+    fn place_used(&self, layout: &NetworkModelLayout, tier: u8, key: &Hash) -> bool {
+        self.pipelines.iter().any(|(head, links)| (tier == layout.head_tier() && head == key) || links.iter().any(|(t, k)| *t == tier && k == key))
     }
 
     /// Escrow keys declared for `tier`, chain order, each once.
@@ -1125,7 +1148,7 @@ impl Audit {
 
     /// The identities of a complete pipeline response headed by `head_key`. Pipeline `i` is the
     /// `i`-th key declared for each tier: its head must be the `i`-th head key of a complete
-    /// pipeline, and each link a key declared for its tier at rank `i` or later. No member may
+    /// pipeline, and each link a key declared for its tier at rank `i` or later. No place may
     /// already count in another response.
     fn pipeline_response(&self, layout: &NetworkModelLayout, head_key: &Hash, links: &[(u8, Hash)]) -> Option<(Hash, Vec<(u8, Hash)>)> {
         let head_tier = layout.head_tier();
@@ -1140,37 +1163,68 @@ impl Audit {
         if signed != expected {
             return None;
         }
-        let holder = |tier: u8, key: &Hash| self.declared.iter().find(|(t, _, e)| *t == tier && e == key).map(|(_, id, _)| *id);
-        let head = holder(head_tier, head_key)?;
+        let head = self.holder(head_tier, head_key)?;
         let mut link_ids: Vec<(u8, Hash)> = Vec::with_capacity(links.len());
         for (tier, key) in links {
             let at = self.tier_keys(*tier).iter().position(|e| e == key)?;
             if at < rank {
                 return None;
             }
-            link_ids.push((*tier, holder(*tier, key)?));
+            link_ids.push((*tier, self.holder(*tier, key)?));
         }
-        if std::iter::once(&head).chain(link_ids.iter().map(|(_, id)| id)).any(|id| self.responded.contains(id)) {
+        if std::iter::once((head_tier, head_key)).chain(links.iter().map(|(t, k)| (*t, k))).any(|(t, k)| self.place_used(layout, t, k)) {
             return None;
         }
         Some((head, link_ids))
     }
 
-    /// The first declared identity of each tier, in tier order of first declaration.
-    fn chosen(&self) -> Vec<(u8, Hash)> {
-        let mut out: Vec<(u8, Hash)> = Vec::new();
-        for (tier, id, _) in self.declared.iter() {
-            if !out.iter().any(|(t, _)| t == tier) {
-                out.push((*tier, *id));
+    /// Whether the head `head_key` may report the link `(tier, key)` of its rank as failed: its
+    /// pipeline is complete and unserved, the link is the key of its rank for a shard tier other
+    /// than the head's, and the head has not reported yet.
+    fn failure_admissible(&self, layout: &NetworkModelLayout, head_key: &Hash, tier: u8, key: &Hash) -> bool {
+        let head_tier = layout.head_tier();
+        if tier == head_tier || !layout.shard_tiers().any(|t| t == tier) {
+            return false;
+        }
+        let Some(rank) = self.tier_keys(head_tier).iter().position(|e| e == head_key) else { return false };
+        rank < self.pipeline_count(layout)
+            && self.tier_keys(tier).get(rank) == Some(key)
+            && !self.pipelines.iter().any(|(h, _)| h == head_key)
+            && !self.failures.iter().any(|(h, _, _)| h == head_key)
+    }
+
+    /// Identities struck at the close of a pipeline audit: every member that neither declared
+    /// nor served, then for each complete pipeline `i`: when served, the holder of every key of
+    /// rank `i` its response did without; else the link its head reported, or the head. An
+    /// identity that served is never struck.
+    fn pipeline_misses(&self, layout: &NetworkModelLayout) -> Vec<Hash> {
+        let head_tier = layout.head_tier();
+        let declared: Vec<Hash> = self.declared.iter().map(|(_, id, _)| *id).collect();
+        let mut v: Vec<Hash> = self.cohort.iter().filter(|m| !declared.contains(m)).copied().collect();
+        let heads = self.tier_keys(head_tier);
+        for (rank, head_key) in heads.iter().enumerate().take(self.pipeline_count(layout)) {
+            if let Some((_, links)) = self.pipelines.iter().find(|(h, _)| h == head_key) {
+                for tier in layout.shard_tiers().filter(|t| *t != head_tier) {
+                    let Some(expected) = self.tier_keys(tier).get(rank).copied() else { continue };
+                    if !links.iter().any(|(t, k)| *t == tier && *k == expected) {
+                        v.extend(self.holder(tier, &expected));
+                    }
+                }
+            } else if let Some((_, tier, key)) = self.failures.iter().find(|(h, _, _)| h == head_key) {
+                v.extend(self.holder(*tier, key));
+            } else {
+                v.extend(self.holder(head_tier, head_key));
             }
         }
-        out
+        v.retain(|id| !self.responded.contains(id));
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 }
 
 /// An armed network-model audit as the pipeline head needs it: the availability declarations
-/// received so far, chain order. The first escrow key of each tier is the chosen one, the
-/// following ones its substitutes.
+/// received so far, chain order. The `i`-th escrow key of each tier makes up pipeline `i`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineAssignment {
     pub request_hash: [u8; 32],
@@ -1219,6 +1273,9 @@ impl PipelineAssignment {
 /// A pipeline response's verified links, keyed to its `(request_hash, head escrow key)`
 /// response entry: `(shard tier, link escrow key)` per signing link.
 pub type ResponseLinks = ([u8; 32], Hash, Vec<(u8, Hash)>);
+
+/// A pipeline failure report: `(request hash, head key, link tier, link key)`.
+pub type PipelineFailure = ([u8; 32], Hash, u8, Hash);
 
 /// Eligible producers of one shard tier at the virtual: how many would be audited by a
 /// network-model request accepted now.
@@ -1452,7 +1509,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], None, None, is_established, cohort)
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], &[], None, None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block`] with the reward-routing inputs: per-request vaulted amounts and
@@ -1473,7 +1530,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, None, None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, &[], None, None, is_established, cohort)
     }
 
     /// [`Self::on_chain_block_with_rewards`] with the private-inference input: per-request
@@ -1491,7 +1548,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], None, None, is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], &[], None, None, is_established, cohort)
     }
 
     /// Every fold input at once: reward routing, private-inference recipients, pipeline links,
@@ -1508,6 +1565,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[([u8; 32], u8, Hash)],
+        failures: &[PipelineFailure],
         traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
@@ -1522,6 +1580,7 @@ impl ServiceLedger {
             producers,
             response_links,
             declarations,
+            failures,
             None,
             traces,
             is_established,
@@ -1544,7 +1603,7 @@ impl ServiceLedger {
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) -> FoldOutcome {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], None, Some(traces), is_established, cohort)
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], &[], None, Some(traces), is_established, cohort)
     }
 
     /// Folds a chain block whose strike events are already persisted (daa at or below the store
@@ -1560,7 +1619,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], Some(is_burned), None, |_| true, cohort);
+        self.fold_inner(daa, requests, &[], &[], responses, escrows, &[], &[], &[], &[], Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup`] with the reward-routing inputs.
@@ -1578,7 +1637,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, Some(is_burned), None, |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, &[], responses, escrows, producers, response_links, declarations, &[], Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_warmup_with_rewards`] with the private-inference input.
@@ -1595,7 +1654,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], Some(is_burned), None, |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], &[], Some(is_burned), None, |_| true, cohort);
     }
 
     /// [`Self::on_chain_block_with_pipeline`] for a warmup fold.
@@ -1611,6 +1670,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[([u8; 32], u8, Hash)],
+        failures: &[PipelineFailure],
         traces: Option<&TraceInputs>,
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
@@ -1625,6 +1685,7 @@ impl ServiceLedger {
             producers,
             response_links,
             declarations,
+            failures,
             Some(is_burned),
             traces,
             |_| true,
@@ -1647,7 +1708,7 @@ impl ServiceLedger {
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
     ) {
-        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], Some(is_burned), Some(traces), |_| true, cohort);
+        self.fold_inner(daa, requests, request_rewards, request_recipients, responses, escrows, producers, &[], &[], &[], Some(is_burned), Some(traces), |_| true, cohort);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1662,6 +1723,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[([u8; 32], u8, Hash)],
+        failures: &[PipelineFailure],
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
         traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
@@ -1835,17 +1897,29 @@ impl ServiceLedger {
                 .collect()
         };
         let eligible_for = |tier: u8, escrow: &Hash| eligible.iter().any(|(t, keys)| *t == tier && keys.binary_search(escrow).is_ok());
-        for (rh, tier, escrow) in declarations.iter().filter(|(_, t, e)| eligible_for(*t, e)) {
+        // An armed audit takes the declaration of any of its members, eligible now or not.
+        for (rh, tier, escrow) in declarations.iter() {
             let Some(req) = self.pending.get_mut(rh) else {
-                let entry = self.early_declarations.entry(*rh).or_insert((daa, Vec::new()));
-                push_declaration(&mut entry.1, (*tier, *escrow));
+                if eligible_for(*tier, escrow) {
+                    let entry = self.early_declarations.entry(*rh).or_insert((daa, Vec::new()));
+                    push_declaration(&mut entry.1, (*tier, *escrow));
+                }
                 continue;
             };
             match req.audit.as_mut() {
                 Some(audit) if audit.is_pipeline() => audit.declare(*tier, *escrow),
                 Some(_) => {}
-                None if network_model_request(req.tier, lg.at(req.accepted_daa)) => push_declaration(&mut req.early_declarations, (*tier, *escrow)),
+                None if network_model_request(req.tier, lg.at(req.accepted_daa)) && eligible_for(*tier, escrow) => {
+                    push_declaration(&mut req.early_declarations, (*tier, *escrow))
+                }
                 None => {}
+            }
+        }
+        for (rh, head, tier, key) in failures.iter() {
+            if let Some(audit) = self.pending.get_mut(rh).and_then(|r| r.audit.as_mut()).filter(|a| a.is_pipeline() && daa <= a.window_end_daa) {
+                if audit.failure_admissible(layout, head, *tier, key) {
+                    audit.failures.push((*head, *tier, *key));
+                }
             }
         }
 
@@ -1959,6 +2033,7 @@ impl ServiceLedger {
                     // `Audit::pipeline_response`); anything else is no response at all.
                     let Some((_, _, links)) = response_links.iter().find(|(h, k, _)| h == rh && k == r) else { continue };
                     let Some((head, link_ids)) = audit.pipeline_response(layout, r, links) else { continue };
+                    audit.pipelines.push((*r, links.clone()));
                     for identity in std::iter::once(&head).chain(link_ids.iter().map(|(_, id)| id)) {
                         if !audit.responded.contains(identity) {
                             audit.responded.push(*identity);
@@ -2104,26 +2179,13 @@ impl ServiceLedger {
                         self.close_or_hold_draw(&rh, &tr.chain_hash, &awaiting, warmup, &mut outcome);
                     }
                     let one_miss = traces.is_some_and(|tr| tr.one_miss);
-                    // Lineup: every silent or late cohort member. Pipeline: every member that neither
-                    // declared nor served, plus the chosen head when nothing was served, else
-                    // every chosen identity the served response did without.
+                    // Lineup: every silent or late cohort member. Pipeline: see `Audit::pipeline_misses`.
                     let silent: Vec<Hash> = if !audit.is_pipeline() {
                         audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)).copied().collect()
                     } else if !self.pipeline_sanctions {
                         Vec::new()
                     } else {
-                        let declared: Vec<Hash> = audit.declared.iter().map(|(_, id, _)| *id).collect();
-                        let mut v: Vec<Hash> =
-                            audit.cohort.iter().filter(|m| !declared.contains(m) && !audit.responded.contains(m)).copied().collect();
-                        let chosen = audit.chosen();
-                        if audit.responded.is_empty() {
-                            v.extend(chosen.iter().filter(|(t, _)| *t == layout.head_tier()).map(|(_, id)| *id));
-                        } else {
-                            v.extend(chosen.iter().filter(|(_, id)| !audit.responded.contains(id)).map(|(_, id)| *id));
-                        }
-                        v.sort_unstable();
-                        v.dedup();
-                        v
+                        audit.pipeline_misses(layout)
                     };
                     for miner in silent.iter() {
                         let is_late = late.contains(miner);
@@ -2224,6 +2286,8 @@ impl ServiceLedger {
                             window_end_daa: daa + window,
                             members,
                             declared: Vec::new(),
+                            pipelines: Vec::new(),
+                            failures: Vec::new(),
                             v3: None,
                         };
                         for (tier, escrow) in early {
@@ -2306,7 +2370,7 @@ impl ServiceLedger {
                             armed_v3.push(rh);
                             QueuedWindow { arm_daa: daa, queue: Vec::new(), answers }
                         });
-                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window, members: Vec::new(), declared: Vec::new(), v3 });
+                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window, members: Vec::new(), declared: Vec::new(), pipelines: Vec::new(), failures: Vec::new(), v3 });
                         self.credit_reward(&rh, &drawable, daa, draw_rule, warmup, &mut outcome);
                     }
                 }
@@ -2715,6 +2779,24 @@ impl ServiceLedger {
     pub fn declaration_admissible(&self, request_hash: &[u8; 32]) -> bool {
         let lg = self.lineup_gate();
         self.pending.get(request_hash).is_some_and(|r| network_model_request(r.tier, lg.at(r.accepted_daa)))
+    }
+
+    /// Whether `escrow` is a member holding `tier` in the armed pipeline audit of `request_hash`.
+    pub fn declaration_member(&self, request_hash: &[u8; 32], tier: u8, escrow: &Hash) -> bool {
+        self.pending
+            .get(request_hash)
+            .and_then(|r| r.audit.as_ref())
+            .is_some_and(|a| a.is_pipeline() && a.member_of(tier, escrow).is_some())
+    }
+
+    /// Whether a failure report by the head `head` against the link `(tier, key)` can still
+    /// count on the armed pipeline audit of `request_hash`.
+    pub fn failure_report_admissible(&self, request_hash: &[u8; 32], head: &Hash, tier: u8, key: &Hash) -> bool {
+        let layout = self.layout();
+        self.pending
+            .get(request_hash)
+            .and_then(|r| r.audit.as_ref())
+            .is_some_and(|a| a.is_pipeline() && a.failure_admissible(layout, head, tier, key))
     }
 
     /// Whether a response to `request_hash` signed by `escrow_pubkey` can still count: the
@@ -3356,6 +3438,21 @@ impl ServiceLedgerSnapshot {
                             out.extend_from_slice(&id.as_bytes());
                             out.extend_from_slice(&e.as_bytes());
                         }
+                        out.extend_from_slice(&(a.pipelines.len() as u32).to_le_bytes());
+                        for (head, links) in a.pipelines.iter() {
+                            out.extend_from_slice(&head.as_bytes());
+                            out.push(links.len() as u8);
+                            for (t, k) in links.iter() {
+                                out.push(*t);
+                                out.extend_from_slice(&k.as_bytes());
+                            }
+                        }
+                        out.extend_from_slice(&(a.failures.len() as u32).to_le_bytes());
+                        for (head, t, k) in a.failures.iter() {
+                            out.extend_from_slice(&head.as_bytes());
+                            out.push(*t);
+                            out.extend_from_slice(&k.as_bytes());
+                        }
                     }
                 }
                 None => out.push(0),
@@ -3651,6 +3748,8 @@ impl ServiceLedgerSnapshot {
                     let window_end_daa = r.u64()?;
                     let mut members = Vec::new();
                     let mut declared = Vec::new();
+                    let mut pipelines = Vec::new();
+                    let mut failures = Vec::new();
                     if flag == 2 {
                         let m = r.u32()? as usize;
                         if m == 0 {
@@ -3668,8 +3767,31 @@ impl ServiceLedgerSnapshot {
                             let e = r.hash()?;
                             declared.push((t, id, e));
                         }
+                        let p = r.u32()? as usize;
+                        if p > declared.len() {
+                            return Err("malformed audit pipelines".into());
+                        }
+                        for _ in 0..p {
+                            let head = r.hash()?;
+                            let l = r.u8()? as usize;
+                            let mut links = Vec::with_capacity(l);
+                            for _ in 0..l {
+                                let t = r.u8()?;
+                                links.push((t, r.hash()?));
+                            }
+                            pipelines.push((head, links));
+                        }
+                        let f = r.u32()? as usize;
+                        if f > declared.len() {
+                            return Err("malformed audit failures".into());
+                        }
+                        for _ in 0..f {
+                            let head = r.hash()?;
+                            let t = r.u8()?;
+                            failures.push((head, t, r.hash()?));
+                        }
                     }
-                    Some(Audit { cohort, delegations, responded, window_end_daa, members, declared, v3: None })
+                    Some(Audit { cohort, delegations, responded, window_end_daa, members, declared, pipelines, failures, v3: None })
                 }
                 _ => return Err("malformed audit".into()),
             };
@@ -5440,8 +5562,16 @@ mod tests {
         ledger.on_chain_block_with_rewards(daa, &[], &[], &[(rh, Some(head))], &[], &[], &links, &[], |_| true, shard_cohorts(None))
     }
 
+    /// The rank-0 identity of each tier, in tier order of first declaration.
     fn chosen_of(ledger: &ServiceLedger, rh: &[u8; 32]) -> Vec<(u8, Hash)> {
-        ledger.pending.get(rh).unwrap().audit.as_ref().unwrap().chosen()
+        let audit = ledger.pending.get(rh).unwrap().audit.as_ref().unwrap();
+        let mut out: Vec<(u8, Hash)> = Vec::new();
+        for (tier, id, _) in audit.declared.iter() {
+            if !out.iter().any(|(t, _)| t == tier) {
+                out.push((*tier, *id));
+            }
+        }
+        out
     }
 
     /// A complete pipeline response with the chosen link of every non-head tier, unless
@@ -5711,7 +5841,7 @@ mod tests {
     }
 
     #[test]
-    fn network_model_silence_strikes_undeclared_members_and_the_chosen_head() {
+    fn network_model_silence_strikes_undeclared_members_and_the_head() {
         let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
@@ -5738,7 +5868,7 @@ mod tests {
     }
 
     #[test]
-    fn network_model_served_response_credits_every_signer_and_strikes_the_absent_chosen() {
+    fn network_model_served_response_credits_every_signer_and_strikes_the_replaced_link() {
         let mut ledger = split_ledger();
         ledger.enable_pipeline_sanctions();
         ledger.set_window_v2_activation(0);
@@ -5776,9 +5906,9 @@ mod tests {
         let responded = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().responded.clone();
         assert_eq!(responded.len(), NETWORK_MODEL_SHARDS.len(), "every signer is credited");
         assert!(out.resets.iter().any(|(id, _)| *id == head));
-        // window close: the substituted choice alone is struck — everyone else declared
+        // window close: the replaced rank-0 link, and the second head that neither served nor reported
         let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
-        assert_eq!(struck(&out), vec![shard_id(sub_tier, 0)]);
+        assert_eq!(struck(&out), sorted(vec![shard_id(sub_tier, 0), shard_id(NETWORK_MODEL_HEAD_TIER, 1)]));
         assert_eq!(ledger.pending_len(), 0);
     }
 
@@ -5843,9 +5973,144 @@ mod tests {
         let fake_head = shard_id(NETWORK_MODEL_TIER + 1, 0);
         let out = fold_response(&mut ledger, 106, rh, fake_head, &full);
         assert!(out.rewards.is_empty());
-        // nothing was credited and everyone declared: the chosen head is struck alone
+        // nothing was credited and everyone declared: the head of each complete pipeline
         let out = ledger.on_chain_block(102 + w, &[], &[], &[], |_| true, shard_cohorts(None));
-        assert_eq!(struck(&out), vec![head]);
+        assert_eq!(struck(&out), sorted(vec![head, shard_id(NETWORK_MODEL_HEAD_TIER, 1)]));
+    }
+
+    fn fold_failure(ledger: &mut ServiceLedger, daa: u64, rh: [u8; 32], head: Hash, tier: u8, key: Hash) -> FoldOutcome {
+        ledger.on_chain_block_with_pipeline(daa, &[], &[], &[], &[], &[], &[], &[], &[], &[(rh, head, tier, key)], None, |_| true, shard_cohorts(None))
+    }
+
+    /// A pipeline-sanction ledger with `rh` armed at 101 and every producer of every tier declared.
+    fn armed_two_pipelines(rh: [u8; 32]) -> (ServiceLedger, u64) {
+        let mut ledger = split_ledger();
+        ledger.enable_pipeline_sanctions();
+        ledger.set_window_v2_activation(0);
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        fold_declarations(&mut ledger, 102, &declare_all(rh, 0));
+        (ledger, 101 + w)
+    }
+
+    fn own_links(i: u8) -> Vec<(u8, Hash)> {
+        network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).map(|t| (t, shard_id(t, i))).collect()
+    }
+
+    #[test]
+    fn network_model_failure_report_moves_the_strike_to_the_named_link() {
+        let rh = [7u8; 32];
+        let (mut ledger, end) = armed_two_pipelines(rh);
+        let head = |i: u8| shard_id(NETWORK_MODEL_HEAD_TIER, i);
+        let t = NETWORK_MODEL_TIER + 3;
+        // the head of pipeline 0 names its rank-0 link; pipeline 1 is served
+        fold_failure(&mut ledger, 103, rh, head(0), t, shard_id(t, 0));
+        fold_response(&mut ledger, 104, rh, head(1), &own_links(1));
+        let out = ledger.on_chain_block(end + 1, &[], &[], &[], |_| true, shard_cohorts(None));
+        assert_eq!(struck(&out), vec![shard_id(t, 0)]);
+    }
+
+    #[test]
+    fn network_model_failure_reports_are_bounded() {
+        let rh = [7u8; 32];
+        let head = |i: u8| shard_id(NETWORK_MODEL_HEAD_TIER, i);
+        let t = NETWORK_MODEL_TIER + 3;
+        let t2 = NETWORK_MODEL_TIER + 2;
+        let audit_of = |l: &ServiceLedger| l.pending.get(&rh).unwrap().audit.as_ref().unwrap().failures.clone();
+        let (mut ledger, end) = armed_two_pipelines(rh);
+        // a link of another rank, the head tier itself, a key that is no head
+        fold_failure(&mut ledger, 103, rh, head(0), t, shard_id(t, 1));
+        fold_failure(&mut ledger, 103, rh, head(0), NETWORK_MODEL_HEAD_TIER, head(0));
+        fold_failure(&mut ledger, 103, rh, shard_id(t, 0), t2, shard_id(t2, 0));
+        assert!(audit_of(&ledger).is_empty());
+        assert!(!ledger.failure_report_admissible(&rh, &head(0), t, &shard_id(t, 1)));
+        assert!(ledger.failure_report_admissible(&rh, &head(0), t, &shard_id(t, 0)));
+        // one report per head: the second one is ignored
+        fold_failure(&mut ledger, 104, rh, head(0), t, shard_id(t, 0));
+        fold_failure(&mut ledger, 105, rh, head(0), t2, shard_id(t2, 0));
+        assert_eq!(audit_of(&ledger), vec![(head(0), t, shard_id(t, 0))]);
+        // a served pipeline cannot report
+        fold_response(&mut ledger, 106, rh, head(1), &own_links(1));
+        fold_failure(&mut ledger, 107, rh, head(1), t, shard_id(t, 1));
+        assert_eq!(audit_of(&ledger).len(), 1);
+        // nor a report past the window
+        let (mut late, end2) = armed_two_pipelines(rh);
+        assert_eq!(end, end2);
+        fold_failure(&mut late, end + 1, rh, head(0), t, shard_id(t, 0));
+        assert!(late.pending.get(&rh).is_none_or(|r| r.audit.as_ref().is_none_or(|a| a.failures.is_empty())));
+    }
+
+    #[test]
+    fn network_model_identity_that_served_is_never_struck() {
+        let rh = [7u8; 32];
+        let (mut ledger, end) = armed_two_pipelines(rh);
+        let head = |i: u8| shard_id(NETWORK_MODEL_HEAD_TIER, i);
+        let t = NETWORK_MODEL_TIER + 3;
+        // pipeline 0 takes the rank-1 link of tier t as a spare; pipeline 1 names it as failed
+        let mut spare = own_links(0);
+        spare.iter_mut().filter(|(lt, _)| *lt == t).for_each(|l| l.1 = shard_id(t, 1));
+        fold_response(&mut ledger, 103, rh, head(0), &spare);
+        fold_failure(&mut ledger, 104, rh, head(1), t, shard_id(t, 1));
+        let out = ledger.on_chain_block(end + 1, &[], &[], &[], |_| true, shard_cohorts(None));
+        // only the replaced rank-0 link: the named link served pipeline 0
+        assert_eq!(struck(&out), vec![shard_id(t, 0)]);
+    }
+
+    #[test]
+    fn network_model_places_are_per_escrow_key() {
+        let mut ledger = split_ledger();
+        ledger.enable_pipeline_sanctions();
+        ledger.set_window_v2_activation(0);
+        let rh = [7u8; 32];
+        let farm = Hash::from_bytes([0xF0; 32]);
+        let rig = |i: u8| Hash::from_bytes([0xE0 + i; 32]);
+        // one identity behind two keys on every tier
+        let cohorts = move |tier: u8| -> Vec<(Hash, Hash)> {
+            if tier <= NETWORK_MODEL_TIER {
+                return Vec::new();
+            }
+            vec![(farm, rig(0)), (farm, rig(1))]
+        };
+        let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, cohorts);
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, cohorts);
+        let decls: Vec<([u8; 32], u8, Hash)> = network_model_shard_tiers().flat_map(|t| [(rh, t, rig(0)), (rh, t, rig(1))]).collect();
+        ledger.on_chain_block_with_rewards(102, &[], &[], &[], &[], &[], &[], &decls, |_| true, cohorts);
+        let audit = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap();
+        assert_eq!(audit.pipeline_count(&NETWORK_MODEL_MAINNET), 2);
+        // the first pipeline is served, the second is not: the identity served, so no strike
+        let links: Vec<(u8, Hash)> = network_model_shard_tiers().filter(|t| *t != NETWORK_MODEL_HEAD_TIER).map(|t| (t, rig(0))).collect();
+        let resp = vec![(rh, rig(0), links)];
+        ledger.on_chain_block_with_rewards(103, &[], &[], &[(rh, Some(rig(0)))], &[], &[], &resp, &[], |_| true, cohorts);
+        assert_eq!(ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().responded, vec![farm]);
+        let out = ledger.on_chain_block(101 + w + 1, &[], &[], &[], |_| true, cohorts);
+        assert!(out.misses.is_empty());
+    }
+
+    #[test]
+    fn network_model_member_declares_after_losing_eligibility() {
+        let mut ledger = split_ledger();
+        ledger.set_window_v2_activation(0);
+        let rh = [7u8; 32];
+        ledger.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, shard_cohorts(None));
+        let t = NETWORK_MODEL_TIER + 3;
+        // producer 1 of tier t left the cohort after the arming
+        let shrunk = move |tier: u8| -> Vec<(Hash, Hash)> {
+            let mut set = shard_cohorts(None)(tier);
+            if tier == t {
+                set.retain(|(id, _)| *id != shard_id(t, 1));
+            }
+            set
+        };
+        assert!(ledger.declaration_member(&rh, t, &shard_id(t, 1)));
+        ledger.on_chain_block_with_rewards(102, &[], &[], &[], &[], &[], &[], &[(rh, t, shard_id(t, 1))], |_| true, shrunk);
+        let audit = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap();
+        assert_eq!(audit.tier_keys(t), vec![shard_id(t, 1)]);
+        // a key outside the arming never declares
+        let outsider = Hash::from_bytes([0xAB; 32]);
+        assert!(!ledger.declaration_member(&rh, t, &outsider));
     }
 
     #[test]
@@ -5935,6 +6200,8 @@ mod tests {
             v3: None,
             members,
             declared,
+            pipelines: Vec::new(),
+            failures: Vec::new(),
         }
     }
 
@@ -5962,12 +6229,15 @@ mod tests {
         // a head without a complete pipeline, or undeclared, has no response
         assert!(audit.pipeline_response(layout, &shard_id(ht, 2), &links(1, None)).is_none());
         assert!(audit.pipeline_response(layout, &shard_id(t5, 0), &links(0, None)).is_none());
-        // a missing tier, or a member already counted elsewhere, voids the whole response
+        // a missing tier, or a place already counted elsewhere, voids the whole response
         let mut short = links(0, None);
         short.pop();
         assert!(audit.pipeline_response(layout, &head(0), &short).is_none());
-        audit.responded.push(shard_id(t5, 2));
+        audit.pipelines.push((head(0), links(0, Some(2))));
         assert!(audit.pipeline_response(layout, &head(1), &links(1, Some(2))).is_none());
+        assert!(audit.pipeline_response(layout, &head(1), &links(1, None)).is_some());
+        // an identity that already served still counts through another of its places
+        audit.responded.push(shard_id(t5, 1));
         assert!(audit.pipeline_response(layout, &head(1), &links(1, None)).is_some());
         // a late declaration never moves the earlier ranks
         let mut grown = pipeline_audit(&[(t5, 3)]);

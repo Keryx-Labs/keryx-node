@@ -1662,18 +1662,31 @@ impl VirtualStateProcessor {
             if !self.model_split_activation.is_active(virtual_daa_score) {
                 return Err(TxRuleError::AiAvailRule("before the model-split activation".into()));
             }
-            let Some(avail) = keryx_inference::AiAvailPayload::deserialize(&mutable_tx.tx.payload) else {
-                return Err(TxRuleError::AiAvailRule("malformed payload".into()));
-            };
-            if !keryx_consensus_core::collateral::verify_avail_signature(&avail.escrow_pubkey, &avail.signature, &avail.signed_bytes()) {
-                return Err(TxRuleError::AiAvailRule("invalid signature".into()));
-            }
-            if !self.network_model.shard_tiers().contains(&avail.tier) {
-                return Err(TxRuleError::AiAvailRule(format!("tier {} is not a shard tier", avail.tier)));
-            }
-            let escrow = keryx_consensus_core::collateral::escrow_miner_key(&avail.escrow_pubkey);
-            if !self.is_declaration_eligible(sink, virtual_daa_score, avail.tier, escrow) {
-                return Err(TxRuleError::AiAvailRule(format!("escrow key is not an eligible producer of tier {}", avail.tier)));
+            if let Some(fail) = keryx_inference::AiFailPayload::deserialize(&mutable_tx.tx.payload) {
+                if !keryx_consensus_core::collateral::verify_fail_signature(&fail.head_escrow_pubkey, &fail.signature, &fail.signed_bytes()) {
+                    return Err(TxRuleError::AiAvailRule("invalid signature".into()));
+                }
+                let head = keryx_consensus_core::collateral::escrow_miner_key(&fail.head_escrow_pubkey);
+                let link = keryx_consensus_core::collateral::escrow_miner_key(&fail.link_escrow_pubkey);
+                if !self.is_failure_report_admissible(&fail.request_hash, &head, fail.link_tier, &link) {
+                    return Err(TxRuleError::AiAvailRule("failure report not admissible".into()));
+                }
+            } else {
+                let Some(avail) = keryx_inference::AiAvailPayload::deserialize(&mutable_tx.tx.payload) else {
+                    return Err(TxRuleError::AiAvailRule("malformed payload".into()));
+                };
+                if !keryx_consensus_core::collateral::verify_avail_signature(&avail.escrow_pubkey, &avail.signature, &avail.signed_bytes()) {
+                    return Err(TxRuleError::AiAvailRule("invalid signature".into()));
+                }
+                if !self.network_model.shard_tiers().contains(&avail.tier) {
+                    return Err(TxRuleError::AiAvailRule(format!("tier {} is not a shard tier", avail.tier)));
+                }
+                let escrow = keryx_consensus_core::collateral::escrow_miner_key(&avail.escrow_pubkey);
+                if !self.is_declaration_member(&avail.request_hash, avail.tier, &escrow)
+                    && !self.is_declaration_eligible(sink, virtual_daa_score, avail.tier, escrow)
+                {
+                    return Err(TxRuleError::AiAvailRule(format!("escrow key is not an eligible producer of tier {}", avail.tier)));
+                }
             }
         }
         // Private inference: the block rule, evaluated at the virtual score.
