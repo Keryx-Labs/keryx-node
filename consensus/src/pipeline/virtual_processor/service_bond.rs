@@ -6,9 +6,9 @@ use crate::model::stores::{
     selected_chain::SelectedChainStoreReader,
 };
 use keryx_consensus_core::collateral::{
-    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_avail_signature, verify_fail_signature, verify_link_signature,
+    eligible_pairs, escrow_miner_key, miner_key, private_cohort_seed, private_target_cohort, verify_answer_signature, verify_avail_signature, verify_demand_signature, verify_fail_signature, verify_link_signature, verify_receipt_signature,
     verify_responder_signature, EscrowClaim, FoldOutcome, NetworkModelAvailability, PipelineAssignment, PrivateCohortSeed,
-    PipelineFailure, ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
+    PipelineEvent, ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
     ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
     TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
@@ -44,6 +44,53 @@ fn verified_responder(resp: &AiResponsePayload) -> Option<Hash> {
 }
 
 const _: () = assert!(keryx_inference::NETWORK_ZONES == keryx_consensus_core::collateral::NETWORK_ZONES);
+
+/// The pipeline dispute event of an AiAvail payload (failure report, forced step or answer),
+/// iff every signature it carries verifies.
+pub(crate) fn verified_pipeline_event(data: &[u8]) -> Option<PipelineEvent> {
+    if let Some(fail) = AiFailPayload::deserialize(data) {
+        return verify_fail_signature(&fail.head_escrow_pubkey, &fail.signature, &fail.signed_bytes()).then(|| PipelineEvent::Fail {
+            request_hash: fail.request_hash,
+            head: escrow_miner_key(&fail.head_escrow_pubkey),
+            tier: fail.link_tier,
+            link: escrow_miner_key(&fail.link_escrow_pubkey),
+        });
+    }
+    if let Some(d) = keryx_inference::AiDemandPayload::deserialize(data) {
+        if !verify_demand_signature(&d.head_escrow_pubkey, &d.signature, &d.signed_bytes()) {
+            return None;
+        }
+        let receipt_end = match d.receipt.as_ref() {
+            Some(r) => {
+                if r.request_hash != d.request_hash || !verify_receipt_signature(&d.link_escrow_pubkey, &r.signature, &r.signed_bytes()) {
+                    return None;
+                }
+                Some(r.end()?)
+            }
+            None => None,
+        };
+        return Some(PipelineEvent::Demand {
+            request_hash: d.request_hash,
+            head: escrow_miner_key(&d.head_escrow_pubkey),
+            tier: d.link_tier,
+            link: escrow_miner_key(&d.link_escrow_pubkey),
+            pos: d.pos,
+            receipt_end,
+            input_len: d.input.len(),
+            input_ok: keryx_inference::bf16_all_finite(&d.input),
+        });
+    }
+    let a = keryx_inference::AiAnswerPayload::deserialize(data)?;
+    verify_answer_signature(&a.link_escrow_pubkey, &a.signature, &a.signed_bytes()).then(|| PipelineEvent::Answer {
+        request_hash: a.request_hash,
+        head: escrow_miner_key(&a.head_escrow_pubkey),
+        tier: a.link_tier,
+        link: escrow_miner_key(&a.link_escrow_pubkey),
+        pos: a.pos,
+        output_len: a.output.len(),
+        output_ok: keryx_inference::bf16_all_finite(&a.output),
+    })
+}
 
 /// The `(tier, escrow key)` of a declaration, iff its signature verifies.
 fn verified_declaration(avail: &AiAvailPayload) -> Option<(u8, Hash)> {
@@ -493,15 +540,9 @@ impl VirtualStateProcessor {
                     declarations.push((avail.request_hash, tier, escrow, avail.zone));
                 } else if model_split
                     && tx.is_ai_avail()
-                    && let Some(fail) = AiFailPayload::deserialize(&tx.payload)
-                    && verify_fail_signature(&fail.head_escrow_pubkey, &fail.signature, &fail.signed_bytes())
+                    && let Some(ev) = verified_pipeline_event(&tx.payload)
                 {
-                    failures.push((
-                        fail.request_hash,
-                        escrow_miner_key(&fail.head_escrow_pubkey),
-                        fail.link_tier,
-                        escrow_miner_key(&fail.link_escrow_pubkey),
-                    ));
+                    failures.push(ev);
                 }
             }
         }
@@ -742,9 +783,9 @@ impl VirtualStateProcessor {
         self.service_ledger.lock().ledger.declaration_member(request_hash, tier, escrow)
     }
 
-    /// Whether a failure report can still count on the armed pipeline audit of `request_hash`.
-    pub(crate) fn is_failure_report_admissible(&self, request_hash: &[u8; 32], head: &Hash, tier: u8, key: &Hash) -> bool {
-        self.service_ledger.lock().ledger.failure_report_admissible(request_hash, head, tier, key)
+    /// Whether a pipeline dispute event can still count on its armed pipeline audit at `daa`.
+    pub(crate) fn is_pipeline_event_admissible(&self, ev: &PipelineEvent, daa: u64) -> bool {
+        self.service_ledger.lock().ledger.pipeline_event_admissible(ev, daa)
     }
 
     pub(crate) fn private_request_recipients(&self, request_hash: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
@@ -2052,7 +2093,7 @@ struct ServiceEvents {
     /// model-split gate only.
     declarations: Vec<keryx_consensus_core::collateral::PipelineDeclaration>,
     /// Verified pipeline failure reports, past the model-split gate only.
-    failures: Vec<PipelineFailure>,
+    failures: Vec<PipelineEvent>,
 }
 
 /// Plaintext length of a request prompt: the sealed length without the envelope, else the bytes.
@@ -2084,6 +2125,67 @@ mod tests {
         hasher.update(bytes);
         let msg = secp256k1::Message::from_digest_slice(hasher.finalize().as_bytes()).unwrap();
         (keypair.x_only_public_key().0.serialize(), *keypair.sign_schnorr(msg).as_ref())
+    }
+
+    #[test]
+    fn pipeline_disputes_verify_every_signature() {
+        use keryx_consensus_core::collateral::{ANSWER_SIG_DOMAIN, DEMAND_SIG_DOMAIN, FAIL_SIG_DOMAIN, RECEIPT_SIG_DOMAIN};
+        use keryx_inference::{AiAnswerPayload, AiDemandPayload, AiStepReceipt};
+        let (head_sk, link_sk) = ([0x11u8; 32], [0x22u8; 32]);
+        let (head, _) = schnorr(&head_sk, b"", b"");
+        let (link, _) = schnorr(&link_sk, b"", b"");
+        let rh = [7u8; 32];
+        let mut receipt =
+            AiStepReceipt { request_hash: rh, pos0: 0, n: 5, input_hash: [1; 32], output_hash: [2; 32], trace_root: [3; 32], previous: [0; 32], signature: [0; 64] };
+        receipt.signature = schnorr(&link_sk, RECEIPT_SIG_DOMAIN, &receipt.signed_bytes()).1;
+        let mut input = vec![0u8; 64];
+        input[1] = 0x3F;
+        let mut d = AiDemandPayload {
+            request_hash: rh,
+            link_tier: 7,
+            link_escrow_pubkey: link,
+            head_escrow_pubkey: head,
+            pos: 5,
+            receipt: Some(receipt),
+            input,
+            signature: [0; 64],
+        };
+        d.signature = schnorr(&head_sk, DEMAND_SIG_DOMAIN, &d.signed_bytes()).1;
+        match verified_pipeline_event(&d.serialize()) {
+            Some(PipelineEvent::Demand { head: h, link: l, tier: 7, pos: 5, receipt_end: Some(5), input_len: 64, input_ok: true, .. }) => {
+                assert_eq!((h, l), (escrow_miner_key(&head), escrow_miner_key(&link)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // a receipt signed by someone else, or for another request, voids the demand
+        let mut forged = d.clone();
+        forged.receipt.as_mut().unwrap().signature = schnorr(&head_sk, RECEIPT_SIG_DOMAIN, &receipt.signed_bytes()).1;
+        forged.signature = schnorr(&head_sk, DEMAND_SIG_DOMAIN, &forged.signed_bytes()).1;
+        assert!(verified_pipeline_event(&forged.serialize()).is_none());
+        let mut other = d.clone();
+        other.request_hash = [8u8; 32];
+        other.signature = schnorr(&head_sk, DEMAND_SIG_DOMAIN, &other.signed_bytes()).1;
+        assert!(verified_pipeline_event(&other.serialize()).is_none());
+        let mut unsigned = d.clone();
+        unsigned.pos = 6;
+        assert!(verified_pipeline_event(&unsigned.serialize()).is_none());
+        let mut a = AiAnswerPayload {
+            request_hash: rh,
+            link_tier: 7,
+            link_escrow_pubkey: link,
+            head_escrow_pubkey: head,
+            pos: 5,
+            trace_root: [3; 32],
+            output: vec![0x80, 0x7F],
+            signature: [0; 64],
+        };
+        a.signature = schnorr(&link_sk, ANSWER_SIG_DOMAIN, &a.signed_bytes()).1;
+        assert!(matches!(verified_pipeline_event(&a.serialize()), Some(PipelineEvent::Answer { output_len: 2, output_ok: false, pos: 5, .. })));
+        a.signature = schnorr(&head_sk, ANSWER_SIG_DOMAIN, &a.signed_bytes()).1;
+        assert!(verified_pipeline_event(&a.serialize()).is_none(), "an answer the link did not sign");
+        let mut f = AiFailPayload::new(rh, 7, link, head, [0; 64]);
+        f.signature = schnorr(&head_sk, FAIL_SIG_DOMAIN, &f.signed_bytes()).1;
+        assert!(matches!(verified_pipeline_event(&f.serialize()), Some(PipelineEvent::Fail { tier: 7, .. })));
     }
 
     /// A private V3 response: links sign their tier under the head, then the head signs the whole.

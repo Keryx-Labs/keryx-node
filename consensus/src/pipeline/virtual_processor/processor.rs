@@ -1662,14 +1662,12 @@ impl VirtualStateProcessor {
             if !self.model_split_activation.is_active(virtual_daa_score) {
                 return Err(TxRuleError::AiAvailRule("before the model-split activation".into()));
             }
-            if let Some(fail) = keryx_inference::AiFailPayload::deserialize(&mutable_tx.tx.payload) {
-                if !keryx_consensus_core::collateral::verify_fail_signature(&fail.head_escrow_pubkey, &fail.signature, &fail.signed_bytes()) {
-                    return Err(TxRuleError::AiAvailRule("invalid signature".into()));
-                }
-                let head = keryx_consensus_core::collateral::escrow_miner_key(&fail.head_escrow_pubkey);
-                let link = keryx_consensus_core::collateral::escrow_miner_key(&fail.link_escrow_pubkey);
-                if !self.is_failure_report_admissible(&fail.request_hash, &head, fail.link_tier, &link) {
-                    return Err(TxRuleError::AiAvailRule("failure report not admissible".into()));
+            if mutable_tx.tx.payload.len() != keryx_inference::AI_AVAIL_PAYLOAD_LEN {
+                let Some(ev) = super::service_bond::verified_pipeline_event(&mutable_tx.tx.payload) else {
+                    return Err(TxRuleError::AiAvailRule("invalid pipeline dispute".into()));
+                };
+                if !self.is_pipeline_event_admissible(&ev, virtual_daa_score) {
+                    return Err(TxRuleError::AiAvailRule("pipeline dispute not admissible".into()));
                 }
             } else {
                 let Some(avail) = keryx_inference::AiAvailPayload::deserialize(&mutable_tx.tx.payload) else {

@@ -1711,6 +1711,8 @@ pub struct NetworkModelLayout {
     pub lineup: Lineup,
     /// PoM v5 context pad tiles of every range, in place of the lineup table.
     pub range_pad_tiles: Option<u64>,
+    /// Values a range passes on per position.
+    pub residual_values: usize,
 }
 
 impl NetworkModelLayout {
@@ -1759,6 +1761,7 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB,
     lineup: Lineup::H18,
     range_pad_tiles: None,
+    residual_values: 16_384,
 };
 
 /// The bench network model floor is the 9B flat floor (0.5 KRX).
@@ -1769,6 +1772,7 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_SPLIT9B,
     lineup: Lineup::H14Split,
     range_pad_tiles: None,
+    residual_values: 4_096,
 };
 
 /// Devnet bench: the truncated V4-Flash in two ranges, H18 lineup.
@@ -1779,6 +1783,7 @@ pub static NETWORK_MODEL_V4T: NetworkModelLayout = NetworkModelLayout {
     shard_vram_gb: &NETWORK_MODEL_SHARD_VRAM_GB_V4T,
     lineup: Lineup::H18,
     range_pad_tiles: Some(DEVNET_RANGE_PAD_TILES),
+    residual_values: 16_384,
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.

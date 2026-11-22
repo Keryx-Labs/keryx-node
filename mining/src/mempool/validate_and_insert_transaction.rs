@@ -201,6 +201,8 @@ impl Mempool {
                 self.ai_avail_index.entry(avail.request_hash).or_default().push((avail.tier, avail.escrow_pubkey, accepted_transaction.id()));
             } else if let Some(fail) = AiFailPayload::deserialize(&accepted_transaction.payload) {
                 self.ai_avail_index.entry(fail.request_hash).or_default().push((FAIL_INDEX_TIER, fail.head_escrow_pubkey, accepted_transaction.id()));
+            } else if let Some((rh, marker, link)) = dispute_index_key(&accepted_transaction.payload) {
+                self.ai_avail_index.entry(rh).or_default().push((marker, link, accepted_transaction.id()));
             }
         }
 
@@ -289,6 +291,22 @@ impl Mempool {
                     }
                     if entries.len() >= MAX_PENDING_AI_AVAILS_PER_REQUEST {
                         return Err(RuleError::RejectAiAvailsSaturated(hex::encode(fail.request_hash)));
+                    }
+                }
+            } else if let Some((rh, marker, link)) = dispute_index_key(&transaction.tx.payload) {
+                // One pending demand, and one pending answer, per (request, link key).
+                if virtual_daa < self.config.model_split_activation_daa {
+                    return Err(RuleError::RejectAiAvailBeforeActivation(hex::encode(rh)));
+                }
+                if !dispute_signed(&transaction.tx.payload) {
+                    return Err(RuleError::RejectAiAvailSignature(hex::encode(rh)));
+                }
+                if let Some(entries) = self.ai_avail_index.get(&rh) {
+                    if entries.iter().any(|(t, k, _)| *t == marker && *k == link) {
+                        return Err(RuleError::RejectDuplicateAiAvail(hex::encode(rh)));
+                    }
+                    if entries.len() >= MAX_PENDING_AI_AVAILS_PER_REQUEST {
+                        return Err(RuleError::RejectAiAvailsSaturated(hex::encode(rh)));
                     }
                 }
             }
@@ -656,6 +674,26 @@ const MAX_PENDING_AI_AVAILS_PER_REQUEST: usize = 1_024;
 
 /// Index tier of a failure report: never a shard tier.
 const FAIL_INDEX_TIER: u8 = u8::MAX;
+const DEMAND_INDEX_TIER: u8 = u8::MAX - 1;
+const ANSWER_INDEX_TIER: u8 = u8::MAX - 2;
+
+/// `(request hash, index marker, link key)` of a forced step or of its answer.
+fn dispute_index_key(payload: &[u8]) -> Option<([u8; 32], u8, [u8; 32])> {
+    if let Some(d) = keryx_inference::AiDemandPayload::deserialize(payload) {
+        return Some((d.request_hash, DEMAND_INDEX_TIER, d.link_escrow_pubkey));
+    }
+    keryx_inference::AiAnswerPayload::deserialize(payload).map(|a| (a.request_hash, ANSWER_INDEX_TIER, a.link_escrow_pubkey))
+}
+
+/// Whether a forced step is signed by its head (and its receipt by its link), or an answer by its link.
+fn dispute_signed(payload: &[u8]) -> bool {
+    use keryx_consensus_core::collateral::{verify_answer_signature, verify_demand_signature, verify_receipt_signature};
+    if let Some(d) = keryx_inference::AiDemandPayload::deserialize(payload) {
+        return verify_demand_signature(&d.head_escrow_pubkey, &d.signature, &d.signed_bytes())
+            && d.receipt.is_none_or(|r| verify_receipt_signature(&d.link_escrow_pubkey, &r.signature, &r.signed_bytes()));
+    }
+    keryx_inference::AiAnswerPayload::deserialize(payload).is_some_and(|a| verify_answer_signature(&a.link_escrow_pubkey, &a.signature, &a.signed_bytes()))
+}
 
 fn ai_challenge_response_hash(payload: &[u8]) -> Option<[u8; 32]> {
     AiChallengePayload::deserialize(payload).map(|c| c.response_hash)

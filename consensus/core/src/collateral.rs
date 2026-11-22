@@ -131,6 +131,15 @@ pub const LINK_SIG_DOMAIN: &[u8] = b"KeryxPipelineLinkV1";
 /// Domain separator of a pipeline head's failure report.
 pub const FAIL_SIG_DOMAIN: &[u8] = b"KeryxPipelineFailV1";
 
+/// Domain separator of a link's step receipt.
+pub const RECEIPT_SIG_DOMAIN: &[u8] = b"KeryxPipelineReceiptV1";
+
+/// Domain separator of a head's forced step.
+pub const DEMAND_SIG_DOMAIN: &[u8] = b"KeryxPipelineDemandV1";
+
+/// Domain separator of a link's answer to a forced step.
+pub const ANSWER_SIG_DOMAIN: &[u8] = b"KeryxPipelineAnswerV1";
+
 /// The message a V2 responder signs: the domain-tagged blake2b-256 of the payload's signed
 /// bytes (`AiResponsePayload::signed_bytes`).
 pub fn responder_signature_message(signed_bytes: &[u8]) -> [u8; 32] {
@@ -174,6 +183,21 @@ pub fn verify_link_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], sig
 /// domain-tagged blake2b-256 of `AiFailPayload::signed_bytes`.
 pub fn verify_fail_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
     verify_domain_signature(FAIL_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
+}
+
+/// Verifies a link's step receipt, signed by the link's `escrow_pubkey`.
+pub fn verify_receipt_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+    verify_domain_signature(RECEIPT_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
+}
+
+/// Verifies a head's forced step, signed by the head's `escrow_pubkey`.
+pub fn verify_demand_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+    verify_domain_signature(DEMAND_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
+}
+
+/// Verifies a link's answer to a forced step, signed by the link's `escrow_pubkey`.
+pub fn verify_answer_signature(escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
+    verify_domain_signature(ANSWER_SIG_DOMAIN, escrow_pubkey, signature, signed_bytes)
 }
 
 fn verify_domain_signature(domain: &[u8], escrow_pubkey: &[u8; 32], signature: &[u8; 64], signed_bytes: &[u8]) -> bool {
@@ -1106,6 +1130,8 @@ struct Audit {
     pipelines: Vec<(Hash, Vec<(u8, Hash)>)>,
     /// Network-model audits only: `(head key, link tier, link key)` of every accepted failure report.
     failures: Vec<(Hash, u8, Hash)>,
+    /// Network-model audits only: every forced step, chain order.
+    disputes: Vec<Dispute>,
     /// Network-model audits only: last daa a declaration is folded at.
     declare_end_daa: u64,
     /// Network-model audits only: hash of the chain block the ranks were drawn on, once past
@@ -1141,13 +1167,46 @@ impl Formation {
     }
 }
 
-/// What the close of a pipeline audit decides: struck identities, `(accused, accuser)`
-/// identity pairs, and the identities that lose their draw ticket.
+/// Daa a link has to answer a forced step on chain.
+pub const PIPELINE_ANSWER_WINDOW_DAA: u64 = 50;
+
+/// A forced step: the head key, the link `(tier, key)` it forced, the position, the daa the
+/// demand was folded at, and whether the link answered in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Dispute {
+    head: Hash,
+    tier: u8,
+    link: Hash,
+    pos: u32,
+    opened_daa: u64,
+    answered: bool,
+}
+
+/// A verified pipeline dispute event of a chain block (signatures checked by the caller).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PipelineEvent {
+    /// A head forcing position `pos` on the link `(tier, link)`. `receipt_end` is the end of the
+    /// link's signed receipt the demand carries; `input_len` and `input_ok` (finite) its input.
+    Demand { request_hash: [u8; 32], head: Hash, tier: u8, link: Hash, pos: u32, receipt_end: Option<u32>, input_len: usize, input_ok: bool },
+    /// The link's answer, with its output's length and whether every value is finite.
+    Answer { request_hash: [u8; 32], head: Hash, tier: u8, link: Hash, pos: u32, output_len: usize, output_ok: bool },
+    /// A head giving its pipeline up after a forced step the link answered.
+    Fail { request_hash: [u8; 32], head: Hash, tier: u8, link: Hash },
+}
+
+impl PipelineEvent {
+    pub fn request_hash(&self) -> &[u8; 32] {
+        match self {
+            Self::Demand { request_hash, .. } | Self::Answer { request_hash, .. } | Self::Fail { request_hash, .. } => request_hash,
+        }
+    }
+}
+
+/// What the close of a pipeline audit decides: the struck identities, which also lose their
+/// draw ticket.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PipelineVerdict {
     struck: Vec<Hash>,
-    accusations: Vec<(Hash, Hash)>,
-    unpaid: Vec<Hash>,
 }
 
 impl Audit {
@@ -1248,47 +1307,67 @@ impl Audit {
         Some((head, link_ids))
     }
 
-    /// Whether the head `head_key` may report the link `(tier, key)` of its pipeline as failed:
-    /// the pipeline is unserved, the link is its key for a shard tier other than the head's,
-    /// and the head has not reported yet.
-    fn failure_admissible(&self, layout: &NetworkModelLayout, head_key: &Hash, tier: u8, key: &Hash) -> bool {
+    /// Whether the head `head_key` may force a step on the link `(tier, key)` at `daa`: ranks
+    /// drawn, its pipeline unserved, the link its pipeline's key for another shard tier or a
+    /// surplus key, no earlier demand on that link, room left for the answer, and an input of the
+    /// tier's form at the position the link's receipt reaches (position 0 without one).
+    fn demand_admissible(&self, layout: &NetworkModelLayout, ev: &PipelineEvent, daa: u64) -> bool {
+        let PipelineEvent::Demand { head, tier, link, pos, receipt_end, input_len, input_ok, .. } = ev else { return false };
         let head_tier = layout.head_tier();
-        if tier == head_tier {
+        if *tier == head_tier || !layout.shard_tiers().any(|t| t == *tier) {
             return false;
         }
-        self.formation(layout).headed_by(head_tier, head_key).is_some_and(|p| p.contains(&(tier, *key)))
+        let first = layout.shard_tiers().next() == Some(*tier);
+        let input_fits = if first { *input_len == 4 } else { *input_len == 2 * layout.residual_values && *input_ok };
+        let formation = self.formation(layout);
+        input_fits
+            && *pos == receipt_end.unwrap_or(0)
+            && daa + PIPELINE_ANSWER_WINDOW_DAA <= self.window_end_daa
+            && formation.headed_by(head_tier, head).is_some_and(|p| p.contains(&(*tier, *link)) || formation.surplus.contains(&(*tier, *link)))
+            && !self.pipelines.iter().any(|(h, _)| h == head)
+            && !self.disputes.iter().any(|d| d.head == *head && d.tier == *tier && d.link == *link)
+    }
+
+    /// The open dispute `ev` answers at `daa`, when its output has the residual form.
+    fn answered_dispute(&self, layout: &NetworkModelLayout, ev: &PipelineEvent, daa: u64) -> Option<usize> {
+        let PipelineEvent::Answer { head, tier, link, pos, output_len, output_ok, .. } = ev else { return None };
+        if *output_len != 2 * layout.residual_values || !*output_ok {
+            return None;
+        }
+        self.disputes.iter().position(|d| {
+            d.head == *head && d.tier == *tier && d.link == *link && d.pos == *pos && !d.answered && daa <= d.opened_daa + PIPELINE_ANSWER_WINDOW_DAA
+        })
+    }
+
+    /// Whether the head `head_key` may give its pipeline up after a forced step the link
+    /// `(tier, key)` answered: unserved, not reported yet.
+    fn failure_admissible(&self, head_key: &Hash, tier: u8, key: &Hash) -> bool {
+        self.disputes.iter().any(|d| d.head == *head_key && d.tier == tier && d.link == *key && d.answered)
             && !self.pipelines.iter().any(|(h, _)| h == head_key)
             && !self.failures.iter().any(|(h, _, _)| h == head_key)
     }
 
-    /// The close of a pipeline audit, place by place. A member that never declared is struck.
-    /// Per pipeline: served, each of its links the response did without is accused by the
-    /// head; reported, the named link is accused and the head goes unpaid; else the head is
-    /// struck. Struck and accused identities go unpaid.
+    /// The close of a pipeline audit. A member that never declared is struck, and so is every
+    /// link that left a forced step unanswered. The head of an unserved pipeline is struck
+    /// unless it left a forced step unanswered or reported after an answered one.
     fn pipeline_verdict(&self, layout: &NetworkModelLayout) -> PipelineVerdict {
         let head_tier = layout.head_tier();
         let mut v = PipelineVerdict::default();
         v.struck.extend(self.cohort.iter().filter(|m| !self.declared.iter().any(|(_, id, _, _)| id == *m)).copied());
+        for d in self.disputes.iter().filter(|d| !d.answered) {
+            v.struck.extend(self.holder(d.tier, &d.link));
+        }
         for pipeline in self.formation(layout).pipelines.iter() {
             let Some((_, head_key)) = pipeline.iter().find(|(t, _)| *t == head_tier) else { continue };
             let Some(head) = self.holder(head_tier, head_key) else { continue };
-            if let Some((_, links)) = self.pipelines.iter().find(|(h, _)| h == head_key) {
-                for (tier, key) in pipeline.iter().filter(|(t, k)| *t != head_tier && !links.contains(&(*t, *k))) {
-                    v.accusations.extend(self.holder(*tier, key).map(|id| (id, head)));
-                }
-            } else if let Some((_, tier, key)) = self.failures.iter().find(|(h, _, _)| h == head_key) {
-                v.accusations.extend(self.holder(*tier, key).map(|id| (id, head)));
-                v.unpaid.push(head);
-            } else {
+            let served = self.pipelines.iter().any(|(h, _)| h == head_key);
+            let excused = self.disputes.iter().any(|d| d.head == *head_key && !d.answered) || self.failures.iter().any(|(h, _, _)| h == head_key);
+            if !served && !excused {
                 v.struck.push(head);
             }
         }
-        v.unpaid.extend(v.struck.iter().copied());
-        v.unpaid.extend(v.accusations.iter().map(|(id, _)| *id));
-        for list in [&mut v.struck, &mut v.unpaid] {
-            list.sort_unstable();
-            list.dedup();
-        }
+        v.struck.sort_unstable();
+        v.struck.dedup();
         v
     }
 }
@@ -1312,6 +1391,8 @@ pub struct PipelineAssignment {
     pub declare_end_daa: u64,
     /// `(shard tier, escrow pubkey, slot)`, chain order of declaration.
     pub links: Vec<(u8, [u8; 32], PipelineSlot)>,
+    /// Forced steps, chain order: `(head key, link tier, link key, position, answer deadline, answered)`.
+    pub disputes: Vec<([u8; 32], u8, [u8; 32], u32, u64, bool)>,
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -1330,7 +1411,8 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
 }
 
 impl PipelineAssignment {
-    /// Wire form for the block template: `hash:accepted:window_end:declare_end:tier-escrowhex-slot,...`,
+    /// Wire form for the block template:
+    /// `hash:accepted:window_end:declare_end:tier-escrowhex-slot,...:headhex-tier-linkhex-pos-deadline-answered,...`,
     /// slot a pipeline index, `s` for surplus or `u` before the rank draw.
     pub fn encode(&self) -> String {
         let links: Vec<String> = self
@@ -1345,7 +1427,20 @@ impl PipelineAssignment {
                 format!("{}-{}-{}", t, hex32(k), slot)
             })
             .collect();
-        format!("{}:{}:{}:{}:{}", hex32(&self.request_hash), self.accepted_daa, self.window_end_daa, self.declare_end_daa, links.join(","))
+        let disputes: Vec<String> = self
+            .disputes
+            .iter()
+            .map(|(h, t, l, pos, end, answered)| format!("{}-{}-{}-{}-{}-{}", hex32(h), t, hex32(l), pos, end, *answered as u8))
+            .collect();
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            hex32(&self.request_hash),
+            self.accepted_daa,
+            self.window_end_daa,
+            self.declare_end_daa,
+            links.join(","),
+            disputes.join(",")
+        )
     }
 
     pub fn decode(s: &str) -> Option<Self> {
@@ -1369,10 +1464,21 @@ impl PipelineAssignment {
             }
             links.push((t, k, slot));
         }
+        let mut disputes = Vec::new();
+        for item in parts.next()?.split(',').filter(|i| !i.is_empty()) {
+            let f: Vec<&str> = item.split('-').collect();
+            let [h, t, l, pos, end, answered] = f.as_slice() else { return None };
+            let answered = match *answered {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            };
+            disputes.push((unhex32(h)?, t.parse().ok()?, unhex32(l)?, pos.parse().ok()?, end.parse().ok()?, answered));
+        }
         if parts.next().is_some() {
             return None;
         }
-        Some(Self { request_hash, accepted_daa, window_end_daa, declare_end_daa, links })
+        Some(Self { request_hash, accepted_daa, window_end_daa, declare_end_daa, links, disputes })
     }
 }
 
@@ -1383,8 +1489,6 @@ pub type ResponseLinks = ([u8; 32], Hash, Vec<(u8, Hash)>);
 /// An availability declaration: `(request hash, tier, escrow key, zone)`.
 pub type PipelineDeclaration = ([u8; 32], u8, Hash, u8);
 
-/// A pipeline failure report: `(request hash, head key, link tier, link key)`.
-pub type PipelineFailure = ([u8; 32], Hash, u8, Hash);
 
 /// Eligible producers of one shard tier at the virtual: how many would be audited by a
 /// network-model request accepted now.
@@ -1524,7 +1628,6 @@ pub struct LightSnapshot {
     early_traces: std::collections::BTreeMap<([u8; 32], Hash), EarlyTrace>,
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
     held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
-    accusations: std::collections::BTreeMap<Hash, (Hash, u64)>,
 }
 
 /// Request-lifecycle ledger, folded once per selected-chain block. Deterministic: state is a pure
@@ -1541,8 +1644,6 @@ pub struct ServiceLedger {
     /// Availability declarations whose request is not pending yet, by request hash: the daa
     /// they were first seen at and the `(tier, escrow key)` declared, chain order.
     early_declarations: std::collections::BTreeMap<[u8; 32], (u64, Vec<HeldDeclaration>)>,
-    /// Pipeline accusations inside the strike interval: accused identity to its last `(accuser, daa)`.
-    accusations: std::collections::BTreeMap<Hash, (Hash, u64)>,
     /// Strike delta folded since the anchor; overlays `base` (delta wins, `count: 0` tombstones).
     strikes: std::collections::BTreeMap<Hash, StrikeEntry>,
     /// Per-miner still-locked escrow claims, chain order (newest at the back).
@@ -1677,7 +1778,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[PipelineDeclaration],
-        failures: &[PipelineFailure],
+        pipeline_events: &[PipelineEvent],
         traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
@@ -1692,7 +1793,7 @@ impl ServiceLedger {
             producers,
             response_links,
             declarations,
-            failures,
+            pipeline_events,
             None,
             traces,
             is_established,
@@ -1782,7 +1883,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[PipelineDeclaration],
-        failures: &[PipelineFailure],
+        pipeline_events: &[PipelineEvent],
         traces: Option<&TraceInputs>,
         is_burned: &dyn Fn(&crate::tx::TransactionOutpoint) -> bool,
         cohort: impl FnMut(u8) -> Vec<(Hash, Hash)>,
@@ -1797,7 +1898,7 @@ impl ServiceLedger {
             producers,
             response_links,
             declarations,
-            failures,
+            pipeline_events,
             Some(is_burned),
             traces,
             |_| true,
@@ -1835,7 +1936,7 @@ impl ServiceLedger {
         producers: &[(Hash, crate::tx::ScriptPublicKey)],
         response_links: &[ResponseLinks],
         declarations: &[PipelineDeclaration],
-        failures: &[PipelineFailure],
+        pipeline_events: &[PipelineEvent],
         warmup_burned: Option<&dyn Fn(&crate::tx::TransactionOutpoint) -> bool>,
         traces: Option<&TraceInputs>,
         is_established: impl Fn(&Hash) -> bool,
@@ -1885,7 +1986,6 @@ impl ServiceLedger {
         self.pending.retain(|_, r| r.accepted_daa + SERVICE_LEDGER_HORIZON_DAA > daa);
         self.early_responses.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
         self.early_declarations.retain(|_, (seen, _)| *seen + SERVICE_EARLY_RESPONSE_HORIZON_DAA > daa);
-        self.accusations.retain(|_, (_, at)| *at + SERVICE_STRIKE_INTERVAL_DAA > daa);
         let early_hashes: std::collections::BTreeSet<[u8; 32]> = self.early_responses.keys().copied().collect();
         let keep_shapes = traces.is_some_and(|tr| tr.context || tr.window_v3);
         let pending = &self.pending;
@@ -2031,10 +2131,30 @@ impl ServiceLedger {
                 None => {}
             }
         }
-        for (rh, head, tier, key) in failures.iter() {
-            if let Some(audit) = self.pending.get_mut(rh).and_then(|r| r.audit.as_mut()).filter(|a| a.is_pipeline() && daa <= a.window_end_daa) {
-                if audit.failure_admissible(layout, head, *tier, key) {
-                    audit.failures.push((*head, *tier, *key));
+        // Demands first, then answers, then reports: a block may carry a demand and its answer.
+        for kind in 0..3 {
+            for ev in pipeline_events.iter() {
+                let Some(audit) = self.pending.get_mut(ev.request_hash()).and_then(|r| r.audit.as_mut()).filter(|a| a.is_pipeline() && daa <= a.window_end_daa)
+                else {
+                    continue;
+                };
+                match ev {
+                    PipelineEvent::Demand { head, tier, link, pos, .. } if kind == 0 => {
+                        if audit.demand_admissible(layout, ev, daa) {
+                            audit.disputes.push(Dispute { head: *head, tier: *tier, link: *link, pos: *pos, opened_daa: daa, answered: false });
+                        }
+                    }
+                    PipelineEvent::Answer { .. } if kind == 1 => {
+                        if let Some(i) = audit.answered_dispute(layout, ev, daa) {
+                            audit.disputes[i].answered = true;
+                        }
+                    }
+                    PipelineEvent::Fail { head, tier, link, .. } if kind == 2 => {
+                        if audit.failure_admissible(head, *tier, link) {
+                            audit.failures.push((*head, *tier, *link));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2301,7 +2421,7 @@ impl ServiceLedger {
                         && crate::config::params::safe_prompt_len(req.tier, req.max_tokens, lg.at(req.accepted_daa)).is_some_and(|safe| req.prompt_len > safe);
                     let verdict = (audit.is_pipeline() && self.pipeline_sanctions).then(|| audit.pipeline_verdict(layout));
                     if let Some(v) = verdict.as_ref() {
-                        self.drop_draw_candidates(&rh, &v.unpaid);
+                        self.drop_draw_candidates(&rh, &v.struck);
                     }
                     self.drop_draw_candidates(&rh, &late);
                     if let Some(tr) = traces {
@@ -2312,11 +2432,7 @@ impl ServiceLedger {
                     let silent: Vec<Hash> = if !audit.is_pipeline() {
                         audit.cohort.iter().filter(|m| !audit.responded.contains(m) || late.contains(m)).copied().collect()
                     } else if let Some(v) = verdict {
-                        let mut struck = v.struck;
-                        struck.extend(self.accuse(&v.accusations, daa));
-                        struck.sort_unstable();
-                        struck.dedup();
-                        struck
+                        v.struck
                     } else {
                         Vec::new()
                     };
@@ -2422,6 +2538,7 @@ impl ServiceLedger {
                             declared: Vec::new(),
                             pipelines: Vec::new(),
                             failures: Vec::new(),
+                            disputes: Vec::new(),
                             declare_end_daa,
                             rank_seed: None,
                             v3: None,
@@ -2506,7 +2623,7 @@ impl ServiceLedger {
                             armed_v3.push(rh);
                             QueuedWindow { arm_daa: daa, queue: Vec::new(), answers }
                         });
-                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window, members: Vec::new(), declared: Vec::new(), pipelines: Vec::new(), failures: Vec::new(), declare_end_daa: 0, rank_seed: None, v3 });
+                        req.audit = Some(Audit { cohort: ids, delegations, responded, window_end_daa: daa + window, members: Vec::new(), declared: Vec::new(), pipelines: Vec::new(), failures: Vec::new(), disputes: Vec::new(), declare_end_daa: 0, rank_seed: None, v3 });
                         self.credit_reward(&rh, &drawable, daa, draw_rule, warmup, &mut outcome);
                     }
                 }
@@ -2533,21 +2650,6 @@ impl ServiceLedger {
     /// Whether a strike on `miner` at `daa` falls inside the interval of its last strike.
     fn within_strike_interval(&self, miner: &Hash, daa: u64) -> bool {
         self.strike_state(miner).is_some_and(|e| e.last_daa > 0 && daa < e.last_daa + SERVICE_STRIKE_INTERVAL_DAA)
-    }
-
-    /// Records each `(accused, accuser)` pair and returns the accused that two distinct
-    /// accusers now name within the strike interval; their record is consumed.
-    fn accuse(&mut self, accusations: &[(Hash, Hash)], daa: u64) -> Vec<Hash> {
-        let mut out: Vec<Hash> = Vec::new();
-        for (accused, accuser) in accusations.iter().filter(|(a, b)| a != b) {
-            if self.accusations.get(accused).is_some_and(|(by, _)| by != accuser) {
-                self.accusations.remove(accused);
-                out.push(*accused);
-            } else {
-                self.accusations.insert(*accused, (*accuser, daa));
-            }
-        }
-        out
     }
 
     /// Takes `identity` out of every other judgement of `request_hash`: its trace audits and its
@@ -2593,12 +2695,18 @@ impl ServiceLedger {
                         (*tier, escrow.as_bytes(), slot)
                     })
                     .collect();
+                let disputes = audit
+                    .disputes
+                    .iter()
+                    .map(|d| (d.head.as_bytes(), d.tier, d.link.as_bytes(), d.pos, d.opened_daa + PIPELINE_ANSWER_WINDOW_DAA, d.answered))
+                    .collect();
                 Some(PipelineAssignment {
                     request_hash: *rh,
                     accepted_daa: req.accepted_daa,
                     window_end_daa: audit.window_end_daa,
                     declare_end_daa: audit.declare_end_daa,
                     links,
+                    disputes,
                 })
             })
             .collect();
@@ -2968,14 +3076,17 @@ impl ServiceLedger {
             .is_some_and(|a| a.is_pipeline() && a.member_of(tier, escrow).is_some())
     }
 
-    /// Whether a failure report by the head `head` against the link `(tier, key)` can still
-    /// count on the armed pipeline audit of `request_hash`.
-    pub fn failure_report_admissible(&self, request_hash: &[u8; 32], head: &Hash, tier: u8, key: &Hash) -> bool {
+    /// Whether a pipeline dispute event can still count at `daa` on the armed audit of its request.
+    pub fn pipeline_event_admissible(&self, ev: &PipelineEvent, daa: u64) -> bool {
         let layout = self.layout();
-        self.pending
-            .get(request_hash)
-            .and_then(|r| r.audit.as_ref())
-            .is_some_and(|a| a.is_pipeline() && a.failure_admissible(layout, head, tier, key))
+        let Some(a) = self.pending.get(ev.request_hash()).and_then(|r| r.audit.as_ref()).filter(|a| a.is_pipeline() && daa <= a.window_end_daa) else {
+            return false;
+        };
+        match ev {
+            PipelineEvent::Demand { .. } => a.demand_admissible(layout, ev, daa),
+            PipelineEvent::Answer { .. } => a.answered_dispute(layout, ev, daa).is_some(),
+            PipelineEvent::Fail { head, tier, link, .. } => a.failure_admissible(head, *tier, link),
+        }
     }
 
     /// Whether a response to `request_hash` signed by `escrow_pubkey` can still count: the
@@ -3279,7 +3390,6 @@ impl ServiceLedger {
             early_traces: self.early_traces.clone(),
             trace_roots: self.trace_roots.clone(),
             held_draws: self.held_draws.clone(),
-            accusations: self.accusations.clone(),
         }
     }
 
@@ -3299,7 +3409,6 @@ impl ServiceLedger {
         self.early_traces = snap.early_traces.clone();
         self.trace_roots = snap.trace_roots.clone();
         self.held_draws = snap.held_draws.clone();
-        self.accusations = snap.accusations.clone();
     }
 
     /// Reverses one folded block's vault mutations — the exact inverse of the fold's op order
@@ -3387,7 +3496,6 @@ pub struct ServiceLedgerSnapshot {
     held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
     /// Non-empty range tables by epoch, ascending, at most [`RANGE_TABLES_KEPT`].
     pub range_tables: Vec<(u64, RangeTable)>,
-    accusations: std::collections::BTreeMap<Hash, (Hash, u64)>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
@@ -3395,7 +3503,6 @@ const SNAPSHOT_ENCODING_VERSION: u8 = 1;
 const TRAILER_EARLY_DECLARATIONS: u8 = 1;
 const TRAILER_PENDING_DECLARATIONS: u8 = 2;
 const TRAILER_RANGE_TABLES: u8 = 3;
-const TRAILER_ACCUSATIONS: u8 = 4;
 /// Encoding 1 plus a trailing private-recipient section (`[n: u32] n × [request_hash: 32]
 /// [cohort seed: 36] [k: u32] [k × escrow key: 32]`, pending order, ascending keys). Emitted only when a pending
 /// request carries recipients, so every snapshot without one keeps its historical bytes and
@@ -3654,6 +3761,15 @@ impl ServiceLedgerSnapshot {
                             out.push(*t);
                             out.extend_from_slice(&k.as_bytes());
                         }
+                        out.extend_from_slice(&(a.disputes.len() as u32).to_le_bytes());
+                        for d in a.disputes.iter() {
+                            out.extend_from_slice(&d.head.as_bytes());
+                            out.push(d.tier);
+                            out.extend_from_slice(&d.link.as_bytes());
+                            out.extend_from_slice(&d.pos.to_le_bytes());
+                            out.extend_from_slice(&d.opened_daa.to_le_bytes());
+                            out.push(d.answered as u8);
+                        }
                     }
                 }
                 None => out.push(0),
@@ -3881,15 +3997,6 @@ impl ServiceLedgerSnapshot {
                 }
             }
         }
-        if !self.accusations.is_empty() {
-            out.push(TRAILER_ACCUSATIONS);
-            out.extend_from_slice(&(self.accusations.len() as u32).to_le_bytes());
-            for (accused, (accuser, at)) in self.accusations.iter() {
-                out.extend_from_slice(&accused.as_bytes());
-                out.extend_from_slice(&accuser.as_bytes());
-                out.extend_from_slice(&at.to_le_bytes());
-            }
-        }
         out
     }
 
@@ -3960,6 +4067,7 @@ impl ServiceLedgerSnapshot {
                     let mut declared = Vec::new();
                     let mut pipelines = Vec::new();
                     let mut failures = Vec::new();
+                    let mut disputes = Vec::new();
                     let mut declare_end_daa = 0;
                     let mut rank_seed = None;
                     if flag == 2 {
@@ -4012,8 +4120,25 @@ impl ServiceLedgerSnapshot {
                             let t = r.u8()?;
                             failures.push((head, t, r.hash()?));
                         }
+                        let k = r.u32()? as usize;
+                        if k > declared.len() * declared.len() {
+                            return Err("malformed audit disputes".into());
+                        }
+                        for _ in 0..k {
+                            let head = r.hash()?;
+                            let tier = r.u8()?;
+                            let link = r.hash()?;
+                            let pos = r.u32()?;
+                            let opened_daa = r.u64()?;
+                            let answered = match r.u8()? {
+                                0 => false,
+                                1 => true,
+                                _ => return Err("malformed audit dispute".into()),
+                            };
+                            disputes.push(Dispute { head, tier, link, pos, opened_daa, answered });
+                        }
                     }
-                    Some(Audit { cohort, delegations, responded, window_end_daa, members, declared, pipelines, failures, declare_end_daa, rank_seed, v3: None })
+                    Some(Audit { cohort, delegations, responded, window_end_daa, members, declared, pipelines, failures, disputes, declare_end_daa, rank_seed, v3: None })
                 }
                 _ => return Err("malformed audit".into()),
             };
@@ -4407,16 +4532,6 @@ impl ServiceLedgerSnapshot {
                         snap.range_tables.push((epoch, RangeTable::from_entries(entries)?));
                     }
                 }
-                TRAILER_ACCUSATIONS => {
-                    for _ in 0..n {
-                        let accused = r.hash()?;
-                        let accuser = r.hash()?;
-                        let at = r.u64()?;
-                        if accused == accuser || snap.accusations.insert(accused, (accuser, at)).is_some() {
-                            return Err("malformed accusations".into());
-                        }
-                    }
-                }
                 _ => return Err("unknown trailer section".into()),
             }
         }
@@ -4687,7 +4802,6 @@ impl ServiceLedger {
             early_traces: self.early_traces.clone(),
             trace_roots: self.trace_roots.clone(),
             held_draws: self.held_draws.clone(),
-            accusations: self.accusations.clone(),
         }
     }
 
@@ -4697,7 +4811,6 @@ impl ServiceLedger {
         self.pending = snap.pending.clone();
         self.early_responses = snap.early_responses.clone();
         self.early_declarations = snap.early_declarations.clone();
-        self.accusations = snap.accusations.clone();
         self.strikes = snap.strikes.clone();
         self.base = std::sync::Arc::new(Default::default());
         self.first_seen = snap.first_seen.clone();
@@ -4900,8 +5013,8 @@ mod tests {
         NETWORK_MODEL_TIER,
     };
     use super::{
-        Audit, Formation, HeldDeclaration, PipelineAssignment, PipelineDeclaration, PipelineSlot, ServiceLedgerSnapshot, NETWORK_ZONES,
-        PIPELINE_DECLARATION_WINDOW_DAA,
+        Audit, Formation, HeldDeclaration, PipelineAssignment, PipelineDeclaration, PipelineEvent, PipelineSlot, ServiceLedgerSnapshot,
+        NETWORK_ZONES, PIPELINE_ANSWER_WINDOW_DAA, PIPELINE_DECLARATION_WINDOW_DAA,
     };
 
     // Identity == escrow key in most tests; the delegation mapping itself is covered by
@@ -6134,7 +6247,7 @@ mod tests {
     }
 
     #[test]
-    fn network_model_served_response_credits_every_signer_and_accuses_the_replaced_link() {
+    fn network_model_served_response_credits_every_signer_and_spares_the_replaced_link() {
         let rh = [7u8; 32];
         let sub_tier = NETWORK_MODEL_TIER + 3;
         let cohorts = three_on(sub_tier);
@@ -6145,7 +6258,6 @@ mod tests {
         let (p, other) = (&f.pipelines[0], &f.pipelines[1]);
         let head = head_of(p);
         let spare = f.surplus[0].1;
-        let replaced = p.iter().find(|(t, _)| *t == sub_tier).unwrap().1;
         ledger.strikes.insert(head, StrikeEntry { count: 1, last_daa: 50 });
         let links: Vec<super::ResponseLinks> = vec![(rh, head, with_link(p, sub_tier, spare))];
         let out = ledger.on_chain_block_with_rewards(RANKED, &[], &[], &[(rh, Some(head))], &[], &[], &links, &[], |_| true, cohorts);
@@ -6156,10 +6268,9 @@ mod tests {
         let responded = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().responded.clone();
         assert_eq!(responded.len(), NETWORK_MODEL_SHARDS.len(), "every signer is credited");
         assert!(out.resets.iter().any(|(id, _)| *id == head));
-        // window close: the other head neither served nor reported; one head alone accuses the replaced link
+        // window close: only the other head, which neither served nor forced a step; a replacement strikes nobody
         let out = ledger.on_chain_block(closing_daa(), &[], &[], &[], |_| true, cohorts);
         assert_eq!(struck(&out), vec![head_of(other)]);
-        assert_eq!(ledger.accusations.get(&replaced), Some(&(head, closing_daa())));
         assert_eq!(ledger.pending_len(), 0);
     }
 
@@ -6207,120 +6318,155 @@ mod tests {
         assert_eq!(struck(&out), sorted(vec![head, head_of(q)]));
     }
 
-    fn fold_failure(ledger: &mut ServiceLedger, daa: u64, rh: [u8; 32], head: Hash, tier: u8, key: Hash) -> FoldOutcome {
-        ledger.on_chain_block_with_pipeline(daa, &[], &[], &[], &[], &[], &[], &[], &[], &[(rh, head, tier, key)], None, |_| true, shard_cohorts(None))
+    fn fold_events(ledger: &mut ServiceLedger, daa: u64, evs: &[PipelineEvent]) -> FoldOutcome {
+        ledger.on_chain_block_with_pipeline(daa, &[], &[], &[], &[], &[], &[], &[], &[], evs, None, |_| true, shard_cohorts(None))
+    }
+
+    fn residual_len() -> usize {
+        2 * NETWORK_MODEL_MAINNET.residual_values
+    }
+
+    /// A forced step on `link` of `tier` at position 0, with a well-formed input.
+    fn demand(rh: [u8; 32], head: Hash, tier: u8, link: Hash) -> PipelineEvent {
+        let first = tier == NETWORK_MODEL_TIER + 1;
+        PipelineEvent::Demand { request_hash: rh, head, tier, link, pos: 0, receipt_end: None, input_len: if first { 4 } else { residual_len() }, input_ok: true }
+    }
+
+    fn answer(rh: [u8; 32], head: Hash, tier: u8, link: Hash) -> PipelineEvent {
+        PipelineEvent::Answer { request_hash: rh, head, tier, link, pos: 0, output_len: residual_len(), output_ok: true }
+    }
+
+    fn key_of(p: &[(u8, Hash)], tier: u8) -> Hash {
+        p.iter().find(|(t, _)| *t == tier).unwrap().1
+    }
+
+    fn disputes_of(ledger: &ServiceLedger, rh: &[u8; 32]) -> Vec<super::Dispute> {
+        ledger.pending.get(rh).unwrap().audit.as_ref().unwrap().disputes.clone()
     }
 
     #[test]
-    fn network_model_failure_report_spares_the_head_and_accuses_the_link() {
+    fn network_model_unanswered_forced_step_strikes_the_link_and_excuses_the_head() {
         let rh = [7u8; 32];
+        let t = NETWORK_MODEL_TIER + 3;
         let mut ledger = ranked_ledger(rh, 0, two_each);
         let f = formation_of(&ledger, &rh);
-        let (p, q) = (&f.pipelines[0], &f.pipelines[1]);
-        let t = NETWORK_MODEL_TIER + 3;
-        let named = p.iter().find(|(lt, _)| *lt == t).unwrap().1;
-        fold_failure(&mut ledger, RANKED, rh, head_of(p), t, named);
-        fold_response(&mut ledger, RANKED + 1, rh, head_of(q), &links_of(q));
+        let (p, q) = (f.pipelines[0].clone(), f.pipelines[1].clone());
+        fold_events(&mut ledger, RANKED, &[demand(rh, head_of(&p), t, key_of(&p, t))]);
+        assert_eq!(disputes_of(&ledger, &rh).len(), 1);
+        fold_response(&mut ledger, RANKED + 1, rh, head_of(&q), &links_of(&q));
         let out = ledger.on_chain_block(closing_daa(), &[], &[], &[], |_| true, two_each);
-        assert!(struck(&out).is_empty());
-        assert_eq!(ledger.accusations.get(&named), Some(&(head_of(p), closing_daa())));
+        assert_eq!(struck(&out), vec![key_of(&p, t)], "the silent link at its first failure, never the head");
     }
 
     #[test]
-    fn network_model_link_accused_by_two_heads_is_struck() {
+    fn network_model_answered_forced_step_spares_the_link() {
         let rh = [7u8; 32];
         let t = NETWORK_MODEL_TIER + 3;
-        let mut ledger = ranked_ledger(rh, 0, two_each);
-        let p = formation_of(&ledger, &rh).pipelines[0].clone();
-        let named = p.iter().find(|(lt, _)| *lt == t).unwrap().1;
-        let first = head_of(&p);
-        fold_failure(&mut ledger, RANKED, rh, first, t, named);
-        let end = closing_daa();
-        assert!(struck(&ledger.on_chain_block(end, &[], &[], &[], |_| true, two_each)).iter().all(|id| *id != named));
-        // the same head again does not strike
-        let again = |ledger: &mut ServiceLedger, rh2: [u8; 32], at: u64, head: Hash| -> FoldOutcome {
-            let solo = move |tier: u8| -> Vec<(Hash, Hash)> {
-                if tier <= NETWORK_MODEL_TIER {
-                    Vec::new()
-                } else if tier == NETWORK_MODEL_HEAD_TIER {
-                    vec![(head, head)]
-                } else if tier == t {
-                    vec![(named, named)]
-                } else {
-                    vec![(shard_id(tier, 0), shard_id(tier, 0))]
-                }
-            };
-            ledger.on_chain_block(at, &[(rh2, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, solo);
-            ledger.on_chain_block(at + 1, &[], &[], &[], |_| true, solo);
-            let decls: Vec<PipelineDeclaration> = network_model_shard_tiers().flat_map(|tier| solo(tier).into_iter().map(move |(_, e)| (rh2, tier, e, 0))).collect();
-            ledger.on_chain_block_with_rewards(at + 2, &[], &[], &[], &[], &[], &[], &decls, |_| true, solo);
-            let ranked = at + 1 + PIPELINE_DECLARATION_WINDOW_DAA + 2;
-            ledger.on_chain_block(ranked - 1, &[], &[], &[], |_| true, solo);
-            ledger.on_chain_block_with_pipeline(ranked, &[], &[], &[], &[], &[], &[], &[], &[], &[(rh2, head, t, named)], None, |_| true, solo);
-            let w = service_window_daa_at(NETWORK_MODEL_TIER, 256, true, crate::config::params::Lineup::H18);
-            ledger.on_chain_block(at + 1 + PIPELINE_DECLARATION_WINDOW_DAA + w + 1, &[], &[], &[], |_| true, solo)
+        let close = |ledger: &mut ServiceLedger| struck(&ledger.on_chain_block(closing_daa(), &[], &[], &[], |_| true, two_each));
+        let setup = || {
+            let mut ledger = ranked_ledger(rh, 0, two_each);
+            let f = formation_of(&ledger, &rh);
+            let (p, q) = (f.pipelines[0].clone(), f.pipelines[1].clone());
+            fold_response(&mut ledger, RANKED, rh, head_of(&q), &links_of(&q));
+            let link = key_of(&p, t);
+            fold_events(&mut ledger, RANKED, &[demand(rh, head_of(&p), t, link), answer(rh, head_of(&p), t, link)]);
+            (ledger, p, link)
         };
-        assert!(!struck(&again(&mut ledger, [8u8; 32], end + 10, first)).contains(&named));
-        // a head of another identity does
-        let other = shard_id(NETWORK_MODEL_HEAD_TIER, 7);
-        assert_eq!(struck(&again(&mut ledger, [9u8; 32], end + 20_000, other)), vec![named]);
-        assert!(!ledger.accusations.contains_key(&named));
+        // answered in the same block: the head that then neither serves nor reports is struck
+        let (mut ledger, p, link) = setup();
+        assert!(disputes_of(&ledger, &rh)[0].answered);
+        assert_eq!(close(&mut ledger), vec![head_of(&p)]);
+        // reported after the answer: nobody
+        let (mut ledger, p, link2) = setup();
+        assert_eq!(link, link2);
+        let fail = PipelineEvent::Fail { request_hash: rh, head: head_of(&p), tier: t, link };
+        assert!(ledger.pipeline_event_admissible(&fail, RANKED + 1));
+        fold_events(&mut ledger, RANKED + 1, &[fail.clone(), fail]);
+        assert_eq!(ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().failures.len(), 1);
+        assert!(close(&mut ledger).is_empty());
     }
 
     #[test]
-    fn accusations_need_two_distinct_accusers_within_the_strike_interval() {
-        let mut ledger = ServiceLedger::default();
-        let (a, h1, h2, h3) = (Hash::from_u64_word(1), Hash::from_u64_word(2), Hash::from_u64_word(3), Hash::from_u64_word(4));
-        // a head accusing itself is no accusation
-        assert!(ledger.accuse(&[(a, a)], 5).is_empty());
-        assert!(ledger.accusations.is_empty());
-        assert!(ledger.accuse(&[(a, h1)], 10).is_empty());
-        assert!(ledger.accuse(&[(a, h1)], 20).is_empty());
-        assert_eq!(ledger.accuse(&[(a, h2)], 30), vec![a]);
-        assert!(ledger.accuse(&[(a, h3)], 40).is_empty());
-        // an accusation expires with the strike interval
-        let b = Hash::from_u64_word(9);
-        ledger.accuse(&[(b, h1)], 100);
-        ledger.on_chain_block(100 + SERVICE_STRIKE_INTERVAL_DAA, &[], &[], &[], |_| true, cohort_of(&[]));
-        assert!(!ledger.accusations.contains_key(&b));
-        assert!(ledger.accuse(&[(b, h2)], 100 + SERVICE_STRIKE_INTERVAL_DAA).is_empty());
-    }
-
-    #[test]
-    fn network_model_failure_reports_are_bounded() {
+    fn network_model_late_or_unsound_answers_leave_the_step_open() {
         let rh = [7u8; 32];
         let t = NETWORK_MODEL_TIER + 3;
-        let t2 = NETWORK_MODEL_TIER + 2;
-        let audit_of = |l: &ServiceLedger| l.pending.get(&rh).unwrap().audit.as_ref().unwrap().failures.clone();
-        // before the ranks are drawn nothing can be reported
+        for case in 0..3 {
+            let mut ledger = ranked_ledger(rh, 0, two_each);
+            let f = formation_of(&ledger, &rh);
+            let (p, q) = (f.pipelines[0].clone(), f.pipelines[1].clone());
+            fold_response(&mut ledger, RANKED, rh, head_of(&q), &links_of(&q));
+            let link = key_of(&p, t);
+            fold_events(&mut ledger, RANKED, &[demand(rh, head_of(&p), t, link)]);
+            let (at, ans) = match case {
+                0 => (RANKED + PIPELINE_ANSWER_WINDOW_DAA + 1, answer(rh, head_of(&p), t, link)),
+                1 => (RANKED + 1, PipelineEvent::Answer { request_hash: rh, head: head_of(&p), tier: t, link, pos: 0, output_len: residual_len(), output_ok: false }),
+                _ => (RANKED + 1, PipelineEvent::Answer { request_hash: rh, head: head_of(&p), tier: t, link, pos: 0, output_len: residual_len() - 2, output_ok: true }),
+            };
+            assert!(!ledger.pipeline_event_admissible(&ans, at), "case {case}");
+            fold_events(&mut ledger, at, &[ans]);
+            assert!(!disputes_of(&ledger, &rh)[0].answered, "case {case}");
+            assert_eq!(struck(&ledger.on_chain_block(closing_daa(), &[], &[], &[], |_| true, two_each)), vec![link], "case {case}");
+        }
+    }
+
+    #[test]
+    fn network_model_forced_steps_are_bounded() {
+        let rh = [7u8; 32];
+        let t = NETWORK_MODEL_TIER + 3;
+        let t1 = NETWORK_MODEL_TIER + 1;
+        let ht = NETWORK_MODEL_HEAD_TIER;
+        // before the ranks are drawn nothing can be forced
         let mut early = split_ledger();
         early.on_chain_block(100, &[(rh, NETWORK_MODEL_TIER, 256)], &[], &[], |_| true, shard_cohorts(None));
         early.on_chain_block(ARMED, &[], &[], &[], |_| true, shard_cohorts(None));
         fold_declarations(&mut early, ARMED + 1, &declare_all(rh, 0));
-        assert!(!early.failure_report_admissible(&rh, &shard_id(NETWORK_MODEL_HEAD_TIER, 0), t, &shard_id(t, 0)));
-        let mut ledger = ranked_ledger(rh, 0, two_each);
+        assert!(!early.pipeline_event_admissible(&demand(rh, shard_id(ht, 0), t, shard_id(t, 0)), ARMED + 2));
+        let cohorts = three_on(t);
+        let mut ledger = ranked_ledger(rh, 0, cohorts);
         let f = formation_of(&ledger, &rh);
-        let (p, q) = (&f.pipelines[0], &f.pipelines[1]);
-        let key = |pl: &[(u8, Hash)], tier: u8| pl.iter().find(|(lt, _)| *lt == tier).unwrap().1;
-        // a link of another pipeline, the head tier itself, a key that is no head
-        fold_failure(&mut ledger, RANKED, rh, head_of(p), t, key(q, t));
-        fold_failure(&mut ledger, RANKED, rh, head_of(p), NETWORK_MODEL_HEAD_TIER, head_of(p));
-        fold_failure(&mut ledger, RANKED, rh, key(p, t), t2, key(p, t2));
-        assert!(audit_of(&ledger).is_empty());
-        assert!(!ledger.failure_report_admissible(&rh, &head_of(p), t, &key(q, t)));
-        assert!(ledger.failure_report_admissible(&rh, &head_of(p), t, &key(p, t)));
-        // one report per head: the second one is ignored
-        fold_failure(&mut ledger, RANKED + 1, rh, head_of(p), t, key(p, t));
-        fold_failure(&mut ledger, RANKED + 2, rh, head_of(p), t2, key(p, t2));
-        assert_eq!(audit_of(&ledger), vec![(head_of(p), t, key(p, t))]);
-        // a served pipeline cannot report
-        fold_response(&mut ledger, RANKED + 3, rh, head_of(q), &links_of(q));
-        fold_failure(&mut ledger, RANKED + 4, rh, head_of(q), t, key(q, t));
-        assert_eq!(audit_of(&ledger).len(), 1);
-        // nor a report past the window
-        let mut late = ranked_ledger(rh, 0, two_each);
-        fold_failure(&mut late, closing_daa(), rh, head_of(p), t, key(p, t));
-        assert!(late.pending.get(&rh).is_none_or(|r| r.audit.as_ref().is_none_or(|a| a.failures.is_empty())));
+        let (p, q) = (f.pipelines[0].clone(), f.pipelines[1].clone());
+        let spare = f.surplus[0].1;
+        let h = head_of(&p);
+        let ok = |l: &ServiceLedger, ev: PipelineEvent| l.pipeline_event_admissible(&ev, RANKED);
+        let with = |pos: u32, receipt_end: Option<u32>, input_len: usize, input_ok: bool, tier: u8, link: Hash| PipelineEvent::Demand {
+            request_hash: rh,
+            head: h,
+            tier,
+            link,
+            pos,
+            receipt_end,
+            input_len,
+            input_ok,
+        };
+        let r = residual_len();
+        assert!(ok(&ledger, with(0, None, r, true, t, key_of(&p, t))));
+        assert!(ok(&ledger, with(5, Some(5), r, true, t, key_of(&p, t))), "at the end of the link's receipt");
+        assert!(!ok(&ledger, with(4, Some(5), r, true, t, key_of(&p, t))));
+        assert!(!ok(&ledger, with(3, None, r, true, t, key_of(&p, t))));
+        assert!(!ok(&ledger, with(0, None, r - 2, true, t, key_of(&p, t))));
+        assert!(!ok(&ledger, with(0, None, r, false, t, key_of(&p, t))), "a non-finite input");
+        assert!(ok(&ledger, with(0, None, 4, true, t1, key_of(&p, t1))), "the first range takes a token");
+        assert!(!ok(&ledger, with(0, None, r, true, t1, key_of(&p, t1))));
+        assert!(ok(&ledger, with(0, None, r, true, t, spare)), "a surplus key the head may use");
+        assert!(!ok(&ledger, with(0, None, r, true, t, key_of(&q, t))), "another pipeline's link");
+        assert!(!ok(&ledger, with(0, None, r, true, ht, key_of(&q, ht))), "the head tier");
+        assert!(!ok(&ledger, PipelineEvent::Demand { request_hash: rh, head: key_of(&p, t), tier: t1, link: key_of(&p, t1), pos: 0, receipt_end: None, input_len: 4, input_ok: true }));
+        let end = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().window_end_daa;
+        assert!(!ledger.pipeline_event_admissible(&with(0, None, r, true, t, key_of(&p, t)), end - PIPELINE_ANSWER_WINDOW_DAA + 1));
+        // a failure report needs an answered forced step
+        let fail = PipelineEvent::Fail { request_hash: rh, head: h, tier: t, link: key_of(&p, t) };
+        assert!(!ok(&ledger, fail));
+        // one demand per (head, link)
+        fold_events(&mut ledger, RANKED, &[with(0, None, r, true, t, key_of(&p, t)), with(0, None, r, true, t, key_of(&p, t))]);
+        assert_eq!(disputes_of(&ledger, &rh).len(), 1);
+        assert!(!ok(&ledger, with(0, None, r, true, t, key_of(&p, t))));
+        // nor on a served pipeline
+        fold_response(&mut ledger, RANKED + 1, rh, head_of(&q), &links_of(&q));
+        assert!(!ledger.pipeline_event_admissible(&PipelineEvent::Demand { request_hash: rh, head: head_of(&q), tier: t, link: key_of(&q, t), pos: 0, receipt_end: None, input_len: r, input_ok: true }, RANKED + 2));
+        // the assignment carries the forced step
+        let a = ledger.pipeline_assignments();
+        assert_eq!(a[0].disputes, vec![(h.as_bytes(), t, key_of(&p, t).as_bytes(), 0, RANKED + PIPELINE_ANSWER_WINDOW_DAA, false)]);
+        assert_eq!(PipelineAssignment::decode(&a[0].encode()).unwrap(), a[0]);
     }
 
     #[test]
@@ -6451,6 +6597,7 @@ mod tests {
             declared,
             pipelines: Vec::new(),
             failures: Vec::new(),
+            disputes: Vec::new(),
             declare_end_daa: 400,
             rank_seed: Some(Hash::from_u64_word(42)),
         }
@@ -6538,17 +6685,20 @@ mod tests {
         // nobody answers: the silent member and both heads
         let v = audit.pipeline_verdict(layout);
         assert_eq!(v.struck, sorted(vec![silent, hp, hq]));
-        assert!(v.accusations.is_empty());
-        assert_eq!(v.unpaid, v.struck);
-        // p is served with the spare, q's head reports its t7 link
+        // p is served with the spare; q forced its t7 link, which stayed silent
         audit.pipelines.push((head_of(&p), with_link(&p, t5, f.surplus[0].1)));
-        let q7 = q.iter().find(|(t, _)| *t == t7).unwrap().1;
+        let q7 = id(&q, t7);
+        let open = super::Dispute { head: head_of(&q), tier: t7, link: q7, pos: 0, opened_daa: 500, answered: false };
+        audit.disputes.push(open);
+        assert_eq!(audit.pipeline_verdict(layout).struck, sorted(vec![silent, q7]));
+        // the link answered: q's head is struck again, unless it reports after the answer
+        audit.disputes[0].answered = true;
+        assert_eq!(audit.pipeline_verdict(layout).struck, sorted(vec![silent, hq]));
         audit.failures.push((head_of(&q), t7, q7));
-        let v = audit.pipeline_verdict(layout);
-        assert_eq!(v.struck, vec![silent]);
-        assert_eq!(sorted(v.accusations.iter().map(|(a, _)| *a).collect()), sorted(vec![id(&p, t5), id(&q, t7)]));
-        assert!(v.accusations.contains(&(id(&p, t5), hp)) && v.accusations.contains(&(id(&q, t7), hq)));
-        assert_eq!(v.unpaid, sorted(vec![silent, id(&p, t5), id(&q, t7), hq]));
+        assert_eq!(audit.pipeline_verdict(layout).struck, vec![silent]);
+        // a silent forced link of a served pipeline is struck too
+        audit.disputes.push(super::Dispute { head: head_of(&p), tier: t7, link: id(&p, t7), ..open });
+        assert_eq!(audit.pipeline_verdict(layout).struck, sorted(vec![silent, id(&p, t7)]));
     }
 
     #[test]
@@ -6633,21 +6783,18 @@ mod tests {
         let resp = vec![(rh, head_of(&p), links_of(&p))];
         let t7 = NETWORK_MODEL_TIER + 3;
         let q7 = q.iter().find(|(t, _)| *t == t7).unwrap().1;
-        ledger.on_chain_block_with_pipeline(RANKED, &[], &[], &[], &[(rh, Some(head_of(&p)))], &[], &[], &resp, &[], &[(rh, head_of(&q), t7, q7)], None, |_| true, mixed);
-        ledger.accusations.insert(q7, (head_of(&q), RANKED));
+        let forced = demand(rh, head_of(&q), t7, q7);
+        ledger.on_chain_block_with_pipeline(RANKED, &[], &[], &[], &[(rh, Some(head_of(&p)))], &[], &[], &resp, &[], &[forced, answer(rh, head_of(&q), t7, q7)], None, |_| true, mixed);
+        ledger.on_chain_block_with_pipeline(RANKED + 1, &[], &[], &[], &[], &[], &[], &[], &[], &[PipelineEvent::Fail { request_hash: rh, head: head_of(&q), tier: t7, link: q7 }], None, |_| true, mixed);
         let audit = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap();
-        assert!(audit.rank_seed.is_some() && audit.pipelines.len() == 1 && audit.failures.len() == 1);
+        assert!(audit.rank_seed.is_some() && audit.pipelines.len() == 1 && audit.failures.len() == 1 && audit.disputes.len() == 1);
         let bytes = ledger.snapshot().to_bytes();
         let decoded = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, ledger.snapshot());
         let mut restored = split_ledger();
         restored.restore_snapshot(&decoded);
         assert_eq!(restored.pending, ledger.pending);
-        assert_eq!(restored.accusations, ledger.accusations);
         assert_eq!(restored.pipeline_assignments(), ledger.pipeline_assignments());
-        let mut selfish = ledger.snapshot();
-        selfish.accusations.insert(q7, (q7, RANKED));
-        assert!(ServiceLedgerSnapshot::from_bytes(&selfish.to_bytes()).is_err());
         // a lineup-only ledger encodes exactly as before: flag 1, no pipeline section, no trailer
         let mut old = ServiceLedger::default();
         old.on_chain_block(100, &[(lineup, 0, 64)], &[], &[], |_| true, cohort_of(&[a]));

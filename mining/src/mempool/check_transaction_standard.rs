@@ -53,6 +53,9 @@ const MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS: u64 = keryx_verifiable_inference
 /// Maximum standard transient mass of an opening: the largest payload plus the transaction header.
 const MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS: u64 = MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS * TRANSIENT_BYTE_TO_MASS_FACTOR;
 
+/// Maximum standard transient mass of an AiAvail: the largest dispute plus the transaction header.
+const MAXIMUM_STANDARD_AI_AVAIL_TRANSIENT_MASS: u64 = (keryx_inference::MAX_AI_DISPUTE_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
+
 impl Mempool {
     pub(crate) fn check_transaction_standard_in_isolation(&self, transaction: &MutableTransaction) -> NonStandardResult<()> {
         let transaction_id = transaction.id();
@@ -94,6 +97,8 @@ impl Mempool {
             MAXIMUM_STANDARD_AI_RESPONSE_TRANSIENT_MASS
         } else if transaction.tx.is_ai_opening() {
             MAXIMUM_STANDARD_AI_OPENING_TRANSIENT_MASS
+        } else if transaction.tx.is_ai_avail() {
+            MAXIMUM_STANDARD_AI_AVAIL_TRANSIENT_MASS
         } else {
             MAXIMUM_STANDARD_TRANSACTION_MASS
         };

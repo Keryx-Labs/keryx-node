@@ -2,7 +2,7 @@ use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
 use keryx_inference::{
     AiChallengePayload, AiResponsePayload,
-    ai_avail_request_hash, AI_AVAIL_PAYLOAD_LEN, AI_FAIL_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    ai_avail_request_hash, AI_AVAIL_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
 };
 use std::collections::HashSet;
@@ -197,7 +197,7 @@ fn check_ai_payload_len(tx: &Transaction) -> TxResult<()> {
     } else if tx.is_ai_opening() {
         (keryx_verifiable_inference::opening::MIN_PAYLOAD_LEN, keryx_verifiable_inference::opening::MAX_PAYLOAD_LEN)
     } else if tx.is_ai_avail() {
-        (AI_AVAIL_PAYLOAD_LEN, AI_FAIL_PAYLOAD_LEN)
+        (AI_AVAIL_PAYLOAD_LEN, keryx_inference::MAX_AI_DISPUTE_PAYLOAD_LEN)
     } else {
         return Ok(());
     };
