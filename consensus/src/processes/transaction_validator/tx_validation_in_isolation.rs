@@ -2,7 +2,7 @@ use crate::constants::{MAX_SOMPI, TX_VERSION};
 use keryx_consensus_core::tx::Transaction;
 use keryx_inference::{
     AiChallengePayload, AiResponsePayload,
-    ai_avail_request_hash, AI_AVAIL_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN,
+    ai_avail_request_hash, AI_AVAIL_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN_H18,
     MIN_AI_CHALLENGE_PAYLOAD_LEN, MIN_AI_REQUEST_PAYLOAD_LEN, MIN_AI_RESPONSE_PAYLOAD_LEN,
 };
 use std::collections::HashSet;
@@ -191,7 +191,7 @@ fn check_ai_payload_len(tx: &Transaction) -> TxResult<()> {
     let (min, max) = if tx.is_ai_request() {
         (MIN_AI_REQUEST_PAYLOAD_LEN, MAX_AI_REQUEST_PRIVATE_PAYLOAD_LEN)
     } else if tx.is_ai_response() {
-        (MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN)
+        (MIN_AI_RESPONSE_PAYLOAD_LEN, MAX_AI_RESPONSE_PAYLOAD_LEN_H18)
     } else if tx.is_ai_challenge() {
         (MIN_AI_CHALLENGE_PAYLOAD_LEN, MAX_AI_CHALLENGE_PAYLOAD_LEN)
     } else if tx.is_ai_opening() {

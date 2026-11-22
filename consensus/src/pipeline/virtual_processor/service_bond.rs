@@ -11,7 +11,7 @@ use keryx_consensus_core::collateral::{
     PipelineEvent, ProductionIndexSnapshot, ResponseLinks, RewardEntry, ServiceLedger, ServiceLedgerSnapshot, ServiceMiss, ServicePenalty,
     ServiceProvider, ServiceProvidersSnapshot, ServiceReward, ServiceStrikesSnapshot, ShardAvailability, StrikeEntry,
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
-    TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
+    TraceInputs, TraceOpeningEvent, TraceResponseEvent, range_audit_id, verify_opening_signature,
 };
 use keryx_consensus_core::range_assignment::{home_range, judging_table_epoch, next_range_table, RANGE_TABLES_KEPT};
 use keryx_consensus_core::config::params::{Lineup, NETWORK_MODEL_TIER, POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
@@ -567,6 +567,7 @@ impl VirtualStateProcessor {
                     };
                     let mut response_txid = [0u8; 32];
                     response_txid.copy_from_slice(&tx.id().as_bytes());
+                    let answer_len = resp.private_body.as_deref().map_or(0, plaintext_answer_len);
                     responses.push(TraceResponseEvent {
                         response_txid,
                         request_hash: resp.request_hash,
@@ -575,10 +576,30 @@ impl VirtualStateProcessor {
                         trace_root: trace.trace_root,
                         n_prompt: trace.n_prompt,
                         n_pos: trace.n_pos,
-                        answer_len: resp.private_body.as_deref().map_or(0, plaintext_answer_len),
+                        answer_len,
                         stage: trace.stage,
                         tokens: trace.tokens_root.is_some(),
+                        range_tier: None,
                     });
+                    // Each link range is audited on its own, under an id of its own; the link
+                    // signatures over these roots were checked with the head's.
+                    if let Some(ranges) = resp.ranges.as_ref().filter(|_| verified_links(&resp).is_some()) {
+                        for ((t, root), l) in ranges.roots.iter().zip(&resp.links) {
+                            responses.push(TraceResponseEvent {
+                                response_txid: range_audit_id(&response_txid, *t),
+                                request_hash: resp.request_hash,
+                                responder: escrow_miner_key(&l.escrow_pubkey),
+                                escrow_pubkey: l.escrow_pubkey,
+                                trace_root: *root,
+                                n_prompt: trace.n_prompt,
+                                n_pos: trace.n_pos,
+                                answer_len,
+                                stage: 1,
+                                tokens: false,
+                                range_tier: Some(*t),
+                            });
+                        }
+                    }
                 } else if tx.is_ai_opening() {
                     let Some(signed) = SignedPayload::split(&tx.payload) else { continue };
                     if !verify_opening_signature(&signed.escrow_pubkey, &signed.signature, signed.body) {
@@ -989,8 +1010,14 @@ impl VirtualStateProcessor {
             let audit_at = |at: u64| self.trace_audit_activation.is_active(at);
             let chain_at = |at: u64| self.trace_chain_activation.is_active(at);
             let attn_at = |at: u64| self.attention_activation.is_active(at);
-            let tier =
-                |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at), self.lineup_at(at)) } else { None };
+            let tier = |t: u8, at: u64| {
+                if !h14 {
+                    return None;
+                }
+                trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at), self.lineup_at(at)).or_else(|| {
+                    self.model_split_activation.is_active(at).then(|| self.network_model.range_trace_rules(t, audit_at(at))).flatten()
+                })
+            };
             let traces = TraceInputs {
                 chain_hash: hash,
                 responses: &trace_responses,

@@ -1713,6 +1713,8 @@ pub struct NetworkModelLayout {
     pub range_pad_tiles: Option<u64>,
     /// Values a range passes on per position.
     pub residual_values: usize,
+    /// Trace manifest of each range, in shard order; a range without one is not audited.
+    pub range_manifests: &'static [Option<TraceManifest>],
 }
 
 impl NetworkModelLayout {
@@ -1733,6 +1735,23 @@ impl NetworkModelLayout {
     /// Tier of the pipeline head: the last shard.
     pub fn head_tier(&self) -> u8 {
         NETWORK_MODEL_TIER + self.n_shards() as u8
+    }
+
+    /// Audit rules of the range served at shard `tier`: its products against its own weight root.
+    pub fn range_trace_rules(&self, tier: u8, audit_all: bool) -> Option<TraceRules> {
+        if !self.shard_tiers().contains(&tier) {
+            return None;
+        }
+        let m = (*self.range_manifests.get((tier - NETWORK_MODEL_TIER - 1) as usize)?)?;
+        let t = self.tiers.get(tier as usize)?;
+        let ctx = keryx_verifiable_inference::verify::TierCtx {
+            r_t: t.root,
+            n_chunks: t.chunks,
+            m_t: m.m_t,
+            n_entries: m.n_entries,
+            n_products: m.n_products,
+        };
+        Some(TraceRules { ctx, prefix: None, chain: None, audit_all, attention: false })
     }
 
     /// Every shard tier, head included.
@@ -1762,6 +1781,7 @@ pub static NETWORK_MODEL_MAINNET: NetworkModelLayout = NetworkModelLayout {
     lineup: Lineup::H18,
     range_pad_tiles: None,
     residual_values: 16_384,
+    range_manifests: &[],
 };
 
 /// The bench network model floor is the 9B flat floor (0.5 KRX).
@@ -1773,6 +1793,7 @@ pub static NETWORK_MODEL_SPLIT9B: NetworkModelLayout = NetworkModelLayout {
     lineup: Lineup::H14Split,
     range_pad_tiles: None,
     residual_values: 4_096,
+    range_manifests: &[],
 };
 
 /// Devnet bench: the truncated V4-Flash in two ranges, H18 lineup.
@@ -1784,6 +1805,7 @@ pub static NETWORK_MODEL_V4T: NetworkModelLayout = NetworkModelLayout {
     lineup: Lineup::H18,
     range_pad_tiles: Some(DEVNET_RANGE_PAD_TILES),
     residual_values: 16_384,
+    range_manifests: &[],
 };
 
 /// Reward-share weight of a network-model tier; 0 for any other tier.

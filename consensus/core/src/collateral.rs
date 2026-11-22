@@ -257,6 +257,18 @@ pub struct TraceResponseEvent {
     pub answer_len: u32,
     pub stage: u8,
     pub tokens: bool,
+    /// Shard tier of a pipeline link's range trace, under [`range_audit_id`]; `None` for the
+    /// response's own trace.
+    pub range_tier: Option<u8>,
+}
+
+/// Audit id of the range trace of the link at shard `tier` of response `txid`.
+pub fn range_audit_id(txid: &[u8; 32], tier: u8) -> [u8; 32] {
+    let mut h = blake2b_simd::Params::new().hash_length(32).to_state();
+    h.update(b"KeryxRangeAuditV1");
+    h.update(txid);
+    h.update(&[tier]);
+    h.finalize().as_bytes().try_into().unwrap()
 }
 
 /// An opening the ledger awaits: who signs it, its seed, its deadline, the pieces still owed and
@@ -2074,6 +2086,7 @@ impl ServiceLedger {
                             answer_len: shape.answer_len,
                             stage: t.stage,
                             tokens: t.tokens,
+                            range_tier: None,
                         }),
                         _ => early.retain(|k| *k != key),
                     }
@@ -2716,14 +2729,25 @@ impl ServiceLedger {
 
     /// Fills the tier, token budget and sanctioned identities of a trace audit from its request,
     /// once that request's audit is armed.
-    fn resolve_trace_audit(&self, a: &mut TraceAudit, one_miss: bool) {
+    fn resolve_trace_audit(&self, a: &mut TraceAudit, one_miss: bool, range_tier: Option<u8>) {
         if !a.identities.is_empty() || (one_miss && a.tier != TRACE_TIER_UNKNOWN) {
             return;
         }
         let Some(req) = self.pending.get(&a.request_hash) else { return };
         let Some(audit) = req.audit.as_ref() else { return };
-        a.tier = req.tier;
         a.max_tokens = req.max_tokens;
+        if audit.is_pipeline() {
+            let layout = self.layout();
+            // The head's own trace covers the head range; each link range has its own audit.
+            let tier = range_tier.unwrap_or_else(|| layout.head_tier());
+            a.tier = tier;
+            a.identities = audit.holder(tier, &Hash::from_bytes(a.escrow_pubkey)).into_iter().collect();
+            return;
+        }
+        if range_tier.is_some() {
+            return;
+        }
+        a.tier = req.tier;
         a.identities = audit
             .delegations
             .iter()
@@ -2747,11 +2771,21 @@ impl ServiceLedger {
         let lg = self.lineup_gate();
         let mut audited: std::collections::HashSet<([u8; 32], Hash)> =
             if tr.sanction { self.trace_audits.values().map(|a| (a.request_hash, a.responder)).collect() } else { Default::default() };
+        // A link range follows its head's trace and is recorded only when the head's is.
+        let mut head_kept: Option<[u8; 32]> = None;
         for ev in tr.responses.iter().chain(parked) {
+            if let Some(t) = ev.range_tier
+                && head_kept.is_none_or(|h| range_audit_id(&h, t) != ev.response_txid)
+            {
+                continue;
+            }
+            if ev.range_tier.is_none() {
+                head_kept = None;
+            }
             if self.trace_audits.contains_key(&ev.response_txid)
                 || self.trace_roots.contains_key(&ev.response_txid)
                 || misshaped.contains(&(ev.request_hash, ev.responder))
-                || (tr.sanction && !self.trace_response_known(ev))
+                || (tr.sanction && ev.range_tier.is_none() && !self.trace_response_known(ev))
                 || (tr.sanction && !audited.insert((ev.request_hash, ev.responder)))
             {
                 continue;
@@ -2773,7 +2807,13 @@ impl ServiceLedger {
                 attn: None,
                 chain_start: 0,
             };
-            self.resolve_trace_audit(&mut a, tr.one_miss);
+            self.resolve_trace_audit(&mut a, tr.one_miss, ev.range_tier);
+            if ev.range_tier.is_some() && a.identities.is_empty() {
+                continue;
+            }
+            if ev.range_tier.is_none() {
+                head_kept = Some(ev.response_txid);
+            }
             self.trace_audits.insert(ev.response_txid, a);
         }
 
@@ -2792,7 +2832,7 @@ impl ServiceLedger {
         }
         for txid in ripe {
             let mut a = self.trace_audits.remove(&txid).unwrap();
-            self.resolve_trace_audit(&mut a, tr.one_miss);
+            self.resolve_trace_audit(&mut a, tr.one_miss, None);
             if tr.sanction && a.identities.is_empty() && self.pending.get(&a.request_hash).is_some_and(|r| r.audit.is_none()) {
                 self.trace_audits.insert(txid, a);
                 continue;
@@ -2801,8 +2841,9 @@ impl ServiceLedger {
             let rules = if a.tier != TRACE_TIER_UNKNOWN && !a.identities.is_empty() { (tr.tier)(a.tier, a.accepted_daa) } else { None };
             if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
                 let prompt = if rules.as_ref().is_some_and(|r| r.attention) { attn_first_prompt_daa(a.n_prompt) } else { 0 };
-                let own = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa), lg.at(a.accepted_daa)) + prompt;
-                let work = OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt), lg.at(a.accepted_daa));
+                let wt = a.tier.min(crate::config::params::NETWORK_MODEL_TIER);
+                let own = daa + service_window_daa_at(wt, a.max_tokens, self.v2_at(daa), lg.at(a.accepted_daa)) + prompt;
+                let work = OPEN_AUDIT_WORK_PASSES * service_work_daa(wt, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt), lg.at(a.accepted_daa));
                 let start = chain_end.get(&a.escrow_pubkey).map_or(own, |&end| own.max(end + work));
                 self.trace_roots.insert(txid, daa);
                 if tr.sanction {
@@ -3253,7 +3294,7 @@ impl ServiceLedger {
         let unresolved: Vec<[u8; 32]> = self.trace_audits.iter().filter(|(_, a)| a.identities.is_empty()).map(|(k, _)| *k).collect();
         for k in unresolved {
             let mut a = self.trace_audits.remove(&k).unwrap();
-            self.resolve_trace_audit(&mut a, one_miss);
+            self.resolve_trace_audit(&mut a, one_miss, None);
             self.trace_audits.insert(k, a);
         }
     }
@@ -3357,7 +3398,7 @@ impl ServiceLedger {
                     .trace_audits
                     .values()
                     .filter(|a| a.identities.contains(m))
-                    .map(|a| OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt), lg.at(a.accepted_daa)))
+                    .map(|a| OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier.min(crate::config::params::NETWORK_MODEL_TIER), a.n_prompt, a.n_pos.saturating_sub(a.n_prompt), lg.at(a.accepted_daa)))
                     .sum();
                 (ahead.iter().sum::<u64>() + audits, ahead.len() > SERVICE_QUEUE_CAP)
             })
@@ -6669,6 +6710,72 @@ mod tests {
     }
 
     #[test]
+    fn a_pipeline_response_opens_one_trace_audit_per_range() {
+        let rh = [7u8; 32];
+        let mut ledger = ranked_ledger(rh, 0, two_each);
+        let layout = ledger.layout();
+        let f = ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().formation(layout);
+        let p = f.pipelines[0].clone();
+        let txid = [0x51u8; 32];
+        use super::{range_audit_id, TraceInputs, TraceResponseEvent};
+        let ev = |txid: [u8; 32], key: Hash, range_tier: Option<u8>| TraceResponseEvent {
+            response_txid: txid,
+            request_hash: rh,
+            responder: key,
+            escrow_pubkey: key.as_bytes(),
+            trace_root: [1u8; 32],
+            n_prompt: 3,
+            n_pos: 9,
+            answer_len: 0,
+            stage: 1,
+            tokens: false,
+            range_tier,
+        };
+        let head = head_of(&p);
+        let links: Vec<(u8, Hash)> = p.iter().filter(|(t, _)| *t != NETWORK_MODEL_HEAD_TIER).copied().collect();
+        let mut responses = vec![ev(txid, head, None)];
+        responses.extend(links.iter().map(|(t, k)| ev(range_audit_id(&txid, *t), *k, Some(*t))));
+        // a range without its head, and a range held by an undeclared key, are not audited
+        let orphan = [0x52u8; 32];
+        responses.push(ev(range_audit_id(&orphan, links[0].0), links[0].1, Some(links[0].0)));
+        let stranger = ev(range_audit_id(&[0x53u8; 32], links[0].0), Hash::from_bytes([0xeeu8; 32]), Some(links[0].0));
+        let tier = |_: u8, _: u64| -> Option<crate::config::params::TraceRules> { None };
+        let tr = TraceInputs {
+            chain_hash: Hash::from_bytes([3u8; 32]),
+            responses: &responses,
+            openings: &[],
+            tier: &tier,
+            prompt_lens: &[],
+            shape: false,
+            sanction: false,
+            context: false,
+            draw: false,
+            window_v3: false,
+            dedup: false,
+            seed_bind: false,
+            untraced_silence: false,
+            own_shape: false,
+            one_miss: false,
+            uniform_strikes: false,
+            audit_queue: false,
+        };
+        ledger.on_chain_block_with_traces(RANKED, &[], &[], &[], &[], &[], &[], &tr, |_| true, two_each);
+        let a = ledger.trace_audits.get(&txid).unwrap();
+        assert_eq!((a.tier, a.identities.clone()), (NETWORK_MODEL_HEAD_TIER, vec![head]));
+        for (t, k) in links.iter() {
+            let a = ledger.trace_audits.get(&range_audit_id(&txid, *t)).unwrap();
+            assert_eq!((a.tier, a.identities.clone(), a.escrow_pubkey), (*t, vec![*k], k.as_bytes()));
+        }
+        assert!(!ledger.trace_audits.contains_key(&range_audit_id(&orphan, links[0].0)));
+        let mut ledger2 = ranked_ledger(rh, 0, two_each);
+        let alone = [ev([0x53u8; 32], head, None), stranger];
+        let tr2 = TraceInputs { responses: &alone, ..tr };
+        ledger2.on_chain_block_with_traces(RANKED, &[], &[], &[], &[], &[], &[], &tr2, |_| true, two_each);
+        assert!(!ledger2.trace_audits.contains_key(&range_audit_id(&[0x53u8; 32], links[0].0)));
+        assert_eq!(ledger.trace_audits.len(), 1 + links.len());
+    }
+
+    #[test]
     fn pipeline_verdict_judges_every_place() {
         let layout = &NETWORK_MODEL_MAINNET;
         let t5 = NETWORK_MODEL_TIER + 1;
@@ -7293,6 +7400,7 @@ mod tests {
                     answer_len: self.shape.map_or(0, |(_, a)| a),
                     stage: 1,
                     tokens: false,
+                    range_tier: None,
                 };
                 (r, ev)
             }
@@ -7810,6 +7918,7 @@ mod tests {
                     answer_len: 0,
                     stage: STAGE_CHAIN,
                     tokens: true,
+                    range_tier: None,
                 };
                 let mut run = Self { ledger: ServiceLedger::default(), tier, trace, seed: [0; 32] };
                 let h0 = Hash::from_bytes([0u8; 32]);
@@ -8651,6 +8760,7 @@ mod tests {
                                 answer_len: 0,
                                 stage: 1,
                                 tokens: false,
+                                range_tier: None,
                             }
                         })
                     })
@@ -9350,9 +9460,9 @@ mod tests {
             assert_ne!(t.tier, TRACE_TIER_UNKNOWN);
             t.identities.clear();
             let mut gated = t.clone();
-            net.ledger.resolve_trace_audit(&mut t, false);
+            net.ledger.resolve_trace_audit(&mut t, false, None);
             assert_eq!(t.identities, vec![a]);
-            net.ledger.resolve_trace_audit(&mut gated, true);
+            net.ledger.resolve_trace_audit(&mut gated, true, None);
             assert!(gated.identities.is_empty());
         }
 

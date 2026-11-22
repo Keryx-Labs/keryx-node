@@ -20,6 +20,9 @@ pub enum VerifiableEraViolation {
     BodyTooLongBeforeChain(usize),
     /// An AiResponse or opening with inputs, outputs, a lock time, gas or a non-zero version.
     Form,
+    /// An AiResponse with link range traces, or longer than the pre-split maximum, before
+    /// `model_split_activation`.
+    RangesBeforeSplit,
 }
 
 impl std::fmt::Display for VerifiableEraViolation {
@@ -31,8 +34,22 @@ impl std::fmt::Display for VerifiableEraViolation {
             Self::MalformedOpening => write!(f, "opening payload does not decode"),
             Self::BodyTooLongBeforeChain(len) => write!(f, "AiResponse body of {len} bytes exceeds {} before the stage-2 activation", keryx_inference::MAX_AI_RESPONSE_PRIVATE_BODY_LEN_H14),
             Self::Form => write!(f, "AI transaction carries inputs, outputs, a lock time, gas or a non-zero version"),
+            Self::RangesBeforeSplit => write!(f, "AiResponse carries link range traces before the model-split activation"),
         }
     }
+}
+
+/// Link range traces, and the response size they need, only exist from `model_split_activation`.
+pub fn check_range_traces_era(tx: &Transaction, daa_score: u64, model_split_activation: ForkActivation) -> Result<(), VerifiableEraViolation> {
+    if !tx.is_ai_response() || model_split_activation.is_active(daa_score) {
+        return Ok(());
+    }
+    if tx.payload.len() > keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN
+        || AiResponsePayload::deserialize(&tx.payload).is_some_and(|r| r.ranges.is_some())
+    {
+        return Err(VerifiableEraViolation::RangesBeforeSplit);
+    }
+    Ok(())
 }
 
 /// Checks one transaction against the verifiable-inference era at `daa_score`.
@@ -180,6 +197,24 @@ mod tests {
             .with_private_body(vec![3u8; 40]);
         let r = if trace { r.with_trace(TraceCommitment { trace_root: [4; 32], n_prompt: 3, n_pos: 9, stage: 1, tokens_root: None }) } else { r };
         r.serialize()
+    }
+
+    #[test]
+    fn range_traces_only_from_the_split() {
+        use keryx_inference::{AiResponseLink, RangeTraces};
+        let link = AiResponseLink { tier: 5, escrow_pubkey: [5; 32], signature: [6; 64] };
+        let r = AiResponsePayload::new_v3([7u8; 32], 1, [0u8; 34], 1, AiResponder { escrow_pubkey: [1; 32], signature: [2; 64] }, vec![link])
+            .with_private_body(vec![3u8; 40])
+            .with_trace(TraceCommitment { trace_root: [4; 32], n_prompt: 3, n_pos: 9, stage: 1, tokens_root: None });
+        let ranged = AiResponsePayload { ranges: Some(RangeTraces { roots: vec![(5, [8; 32])], boundaries: vec![[9; 32]] }), ..r.clone() };
+        let split = ForkActivation::new(GATE);
+        let t = tx(SUBNETWORK_ID_AI_RESPONSE, ranged.serialize());
+        assert_eq!(check_range_traces_era(&t, GATE - 1, split), Err(VerifiableEraViolation::RangesBeforeSplit));
+        assert!(check_range_traces_era(&t, GATE, split).is_ok());
+        assert!(check_range_traces_era(&tx(SUBNETWORK_ID_AI_RESPONSE, r.serialize()), GATE - 1, split).is_ok());
+        let long = tx(SUBNETWORK_ID_AI_RESPONSE, vec![0u8; keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN + 1]);
+        assert_eq!(check_range_traces_era(&long, GATE - 1, split), Err(VerifiableEraViolation::RangesBeforeSplit));
+        assert!(check_range_traces_era(&long, GATE, split).is_ok());
     }
 
     fn opening() -> Vec<u8> {

@@ -45,7 +45,7 @@ const MAXIMUM_STANDARD_AI_REQUEST_TRANSIENT_MASS: u64 =
 
 /// Maximum standard transient mass of an AiResponse: the largest payload plus the transaction header.
 const MAXIMUM_STANDARD_AI_RESPONSE_TRANSIENT_MASS: u64 =
-    (keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
+    (keryx_inference::MAX_AI_RESPONSE_PAYLOAD_LEN_H18 as u64 + 4_096) * TRANSIENT_BYTE_TO_MASS_FACTOR;
 
 /// Maximum standard compute mass of an opening: the largest payload plus the transaction header.
 const MAXIMUM_STANDARD_AI_OPENING_COMPUTE_MASS: u64 = keryx_verifiable_inference::opening::MAX_PAYLOAD_LEN as u64 + 4_096;

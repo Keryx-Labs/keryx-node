@@ -90,7 +90,7 @@ use once_cell::unsync::Lazy;
 
 use super::utxo_validation::check_ai_request_tx_payload_rules;
 use crate::processes::private_inference::{PrivateEraViolation, check_private_inference_era};
-use crate::processes::verifiable_inference::check_verifiable_inference_era;
+use crate::processes::verifiable_inference::{check_range_traces_era, check_verifiable_inference_era};
 use super::errors::{PruningImportError, PruningImportResult};
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use itertools::Itertools;
@@ -1699,6 +1699,8 @@ impl VirtualStateProcessor {
         })?;
         check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation, self.attention_activation)
             .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
+        check_range_traces_era(&mutable_tx.tx, virtual_daa_score, self.model_split_activation)
+            .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
     }
@@ -1807,6 +1809,8 @@ impl VirtualStateProcessor {
             self.attention_activation,
         )
         .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
+        check_range_traces_era(tx, virtual_state.daa_score, self.model_split_activation)
+            .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         let ValidatedTransaction { calculated_fee, .. } =
             self.validate_transaction_in_utxo_context(tx, utxo_view, virtual_state.daa_score, TxValidationFlags::Full)?;
         Ok(calculated_fee)

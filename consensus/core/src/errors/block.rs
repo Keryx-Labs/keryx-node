@@ -240,6 +240,9 @@ pub enum RuleError {
     #[error("AiResponse tx {0} carries a {1}-byte body above the pre-stage-2 maximum")]
     AiResponseBodyTooLong(TransactionId, usize),
 
+    #[error("AiResponse tx {0} carries link range traces or exceeds the pre-split size before the model-split activation")]
+    AiResponseRangesBeforeSplit(TransactionId),
+
     #[error("block carries {0} opening transactions, at most one is allowed")]
     TooManyAiOpenings(usize),
 

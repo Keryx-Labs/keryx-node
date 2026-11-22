@@ -7,7 +7,7 @@ use crate::model::stores::pom_proof::PomProofStoreReader;
 use crate::processes::{
     coinbase::coinbase_outputs_limit,
     private_inference::{PrivateEraViolation, check_private_inference_era},
-    verifiable_inference::{VerifiableEraViolation, check_verifiable_inference_era},
+    verifiable_inference::{VerifiableEraViolation, check_range_traces_era, check_verifiable_inference_era},
     transaction_validator::errors::TxRuleError,
 };
 use keryx_consensus_core::{
@@ -183,7 +183,11 @@ impl BlockBodyProcessor {
                     VerifiableEraViolation::MalformedOpening => RuleError::AiOpeningMalformed(tx.id()),
                     VerifiableEraViolation::Form => RuleError::AiTxForm(tx.id()),
                     VerifiableEraViolation::BodyTooLongBeforeChain(len) => RuleError::AiResponseBodyTooLong(tx.id(), len),
+                    VerifiableEraViolation::RangesBeforeSplit => RuleError::AiResponseRangesBeforeSplit(tx.id()),
                 });
+            }
+            if check_range_traces_era(tx, block.header.daa_score, self.model_split_activation).is_err() {
+                return Err(RuleError::AiResponseRangesBeforeSplit(tx.id()));
             }
             openings += tx.is_ai_opening() as usize;
         }
