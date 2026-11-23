@@ -7790,7 +7790,7 @@ mod tests {
             assert_eq!(required_pieces(trace_rules(0, true, true, true, true, crate::config::params::Lineup::H14).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
             assert_eq!(required_pieces(trace_rules(4, true, true, true, true, crate::config::params::Lineup::H14).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
             assert_eq!(required_pieces(trace_rules(1, true, true, true, true, crate::config::params::Lineup::H18).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
-            assert_eq!(required_pieces(trace_rules(0, true, true, true, true, crate::config::params::Lineup::H18).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RESID);
+            assert!(trace_rules(0, true, true, true, true, crate::config::params::Lineup::H18).is_none());
         }
 
         #[test]

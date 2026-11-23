@@ -1,7 +1,7 @@
 use crate::imports::*;
 use keryx_consensus_core::collateral::{PrivateCohortSeed, private_cohort_rank, private_cohort_seed, private_target_cohort};
 use keryx_consensus_core::config::params::{
-    BOLT_E4B_MODEL_ID, GEMMA_4_12B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, INFERENCE_REWARD_MINIMUMS_FLAT,
+    GEMMA_4_12B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, INFERENCE_REWARD_MINIMUMS_FLAT, KEV_4B_MODEL_ID,
     INFERENCE_REWARD_MINIMUMS_V2_H6, KIMI_LINEAR_48B_MODEL_ID, Params, QWEN3_5_9B_ABLITERATED_MODEL_ID, QWEN3_5_9B_Q8_MODEL_ID,
     QWEN3_6_27B_MODEL_ID, QWEN3_8_27B_MODEL_ID, service_tiers,
 };
@@ -24,7 +24,7 @@ use workflow_core::task::sleep;
 
 /// Display names of the tier models, H6, H14 and H18 lineups.
 const MODEL_NAMES: [([u8; 32], &str); 8] = [
-    (BOLT_E4B_MODEL_ID, "Nemotron-3.5-Bolt-E4B"),
+    (KEV_4B_MODEL_ID, "Kev-4B"),
     (QWEN3_5_9B_Q8_MODEL_ID, "Qwen3.5-9B-Q8_0"),
     (QWEN3_5_9B_ABLITERATED_MODEL_ID, "Qwen3.5-9B"),
     (GLM_4_9B_0414_MODEL_ID, "GLM-4-9B"),

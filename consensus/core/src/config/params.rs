@@ -345,13 +345,13 @@ pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
     (KIMI_LINEAR_48B_MODEL_ID,         250_000_000), // 2.5 KRX
 ];
 
-/// NVIDIA-Nemotron-3.5-Bolt-E4B heretic Q6_K (Losew GGUF, arch gemma4). H18 tier 0. `model_id` =
-/// CIDv0[2..34] of the pinned GGUF (IPFS Qmf6tsQ2DDMLSrQKwuL2NfmJUBkeV9GGwZUu8Co9JfJJ4G).
-pub const BOLT_E4B_MODEL_ID: [u8; 32] = [
-    0xf9, 0x10, 0x8e, 0xb1, 0xc6, 0x7b, 0x3e, 0xe0,
-    0xd4, 0x4c, 0x96, 0xf2, 0x59, 0xe3, 0xfd, 0x93,
-    0xee, 0x50, 0x75, 0x19, 0x4b, 0x54, 0x43, 0x61,
-    0x65, 0xcf, 0x19, 0x87, 0xab, 0xaf, 0x5a, 0xc9,
+/// Kev-4B Q8_0 (ggml-org GGUF, arch qwen35, decision model). H18 tier 0. `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS QmcYss4ww73a1FGPWPJUpXyyrvHucX84ebGPV955pVp1uJ).
+pub const KEV_4B_MODEL_ID: [u8; 32] = [
+    0xd3, 0x25, 0x75, 0xe6, 0x1a, 0xf4, 0x9d, 0x71,
+    0xfa, 0x6c, 0x31, 0x0f, 0x6d, 0x6b, 0xef, 0xe1,
+    0xfe, 0x4b, 0xa9, 0xe3, 0x84, 0xbc, 0x03, 0xa1,
+    0x61, 0x81, 0x94, 0x0e, 0x5c, 0xeb, 0x52, 0x51,
 ];
 
 /// Qwen3.5-9B-abliterated Q8_0 (huihui-ai abliteration, mradermacher GGUF). H18 tier 1. `model_id` =
@@ -367,7 +367,7 @@ pub const QWEN3_5_9B_Q8_MODEL_ID: [u8; 32] = [
 /// lineup, then the network model, shared by its four signers. Models that left the lineup keep
 /// an entry no request can meet.
 pub const INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT: &[([u8; 32], u64)] = &[
-    (BOLT_E4B_MODEL_ID,                 50_000_000),
+    (KEV_4B_MODEL_ID,                   50_000_000),
     (QWEN3_5_9B_Q8_MODEL_ID,           100_000_000),
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000),
     (QWEN3_8_27B_MODEL_ID,             200_000_000),
@@ -650,7 +650,7 @@ pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266
 /// Context pad tiles of each `POM_TIERS_MODEL_SPLIT` tier: the H18 lineup, the whole network model
 /// (not mined) and its four ranges, each range padded to the 32 GB class total of the H14 tier 4.
 pub const POM_V5_PAD_TILES_H18: [u64; 9] =
-    [780_288, 1_778_688, 4_599_808, 6_266_880, 0, 7_228_416, 6_608_896, 6_618_112, 8_496_128];
+    [2_423_808, 1_778_688, 4_599_808, 6_266_880, 0, 7_228_416, 6_608_896, 6_618_112, 8_496_128];
 
 const _: () = assert!(
     POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
@@ -1237,62 +1237,9 @@ const QWEN3_5_PREFIX: TracePrefix = match TRACE_PREFIXES {
     _ => panic!(),
 };
 
-/// The Gemma 4 tokenizer of H14 tier 2, on the Bolt-E4B manifests.
-const BOLT_E4B_PREFIX: TracePrefix = match TRACE_PREFIXES {
-    [_, _, Some(p), ..] => TracePrefix { embd_entry: 343, norm_entry: 344, embd_scale: 50.59644317626953, ..p },
-    _ => panic!(),
-};
-
-/// Trace data of tiers 0 and 1 of the H18 lineup; `None` = not traced. Later tiers follow the H14 tables.
+/// Trace data of tiers 0 and 1 of the H18 lineup; `None` = not traced (tier 0 awaits the Kev-4B manifests). Later tiers follow the H14 tables.
 pub const TRACE_TIERS_H18: [Option<TraceTierH18>; 2] = [
-    Some(TraceTierH18 {
-        prefix_manifest: TraceManifest {
-            m_t: [
-                0x6d, 0x12, 0xb7, 0xa4, 0x77, 0xdf, 0xc7, 0xc4, 0xe1, 0x25, 0xf5, 0x5c, 0xbe, 0x2d, 0x51, 0xc3,
-                0x32, 0xc1, 0xdd, 0x2a, 0x70, 0x6d, 0x7b, 0x21, 0xed, 0x9b, 0x1e, 0xb8, 0x23, 0x7d, 0xdf, 0x8f,
-            ],
-            n_entries: 345,
-            n_products: 343,
-        },
-        chain: TraceChain {
-            manifest: TraceManifest {
-                m_t: [
-                    0x20, 0xf5, 0x9f, 0xb5, 0x7e, 0x2a, 0x54, 0x62, 0xfa, 0x95, 0x20, 0x4e, 0xdc, 0xab, 0xd5, 0x8d,
-                    0x8c, 0x7b, 0x2f, 0x75, 0x2a, 0xc7, 0x65, 0xe1, 0xf4, 0xc8, 0x71, 0x62, 0x46, 0x4a, 0x09, 0x05,
-                ],
-                n_entries: 600,
-                n_products: 343,
-            },
-            ctx: keryx_verifiable_inference::chain::ChainCtx {
-                n_layers: 42,
-                layer_base: 558,
-                embd_entry: 343,
-                eps: 9.999999974752427e-07,
-                embd_scale: 50.59644317626953,
-                trim_last: false,
-                n_used: 0,
-                n_attn: 0,
-                n_recur: 0,
-                seq_heads: 0,
-                ple_entry: 557,
-                ple_width: 256,
-            },
-            prefix: BOLT_E4B_PREFIX,
-        },
-        attn: TraceNext {
-            manifest: TraceManifest {
-                m_t: [
-                    0x24, 0xa7, 0x87, 0xf6, 0x6b, 0x02, 0x1a, 0xb6, 0x45, 0xed, 0x82, 0x88, 0x54, 0xd5, 0x61, 0xff,
-                    0xcb, 0xf5, 0x62, 0xa5, 0xa0, 0xe8, 0x64, 0xaa, 0x97, 0x0d, 0x0f, 0xc1, 0x43, 0x99, 0xf4, 0x09,
-                ],
-                n_entries: 667,
-                n_products: 343,
-            },
-            n_attn: 42,
-            n_recur: 0,
-            seq_heads: 2,
-        },
-    }),
+    None,
     Some(TraceTierH18 {
         prefix_manifest: TraceManifest {
             m_t: [
@@ -1504,12 +1451,12 @@ pub const NETWORK_MODEL_SHARDS: &[([u8; 32], u32, u32)] = &[
 /// `model_split_activation`.
 pub const POM_TIERS_MODEL_SPLIT: &[crate::pom::PomTier] = &[
     crate::pom::PomTier {
-        model_id: BOLT_E4B_MODEL_ID,
+        model_id: KEV_4B_MODEL_ID,
         root: [
-            0xe6, 0x0c, 0x06, 0x62, 0xc6, 0xe1, 0xe4, 0x7f, 0xaf, 0x22, 0x76, 0xc9, 0x48, 0xb4, 0x26, 0x95,
-            0x66, 0xb9, 0xd0, 0x52, 0xa4, 0xf7, 0xfe, 0xc2, 0x48, 0xb1, 0x42, 0x1d, 0x45, 0xf5, 0x9b, 0xca,
+            0xb3, 0x14, 0x69, 0x21, 0xa4, 0x1a, 0xf0, 0xb9, 0x23, 0xe6, 0xc8, 0xa8, 0xd9, 0xec, 0x4d, 0xeb,
+            0x8b, 0xea, 0x8c, 0x62, 0xc7, 0x51, 0xd8, 0xfb, 0x69, 0xba, 0x2f, 0x43, 0xc7, 0xc1, 0x57, 0x2f,
         ],
-        chunks: 192_383_008,
+        chunks: 139_775_936,
     },
     crate::pom::PomTier {
         model_id: QWEN3_5_9B_Q8_MODEL_ID,
@@ -1693,7 +1640,7 @@ pub const TIER_REWARD_BPS_MODEL_SPLIT_V4T: [u64; 7] = [4_000, 5_500, 7_000, 8_50
 
 /// The H18 floors plus the bench network model at 0.5 KRX.
 pub const INFERENCE_REWARD_MINIMUMS_MODEL_SPLIT_V4T: &[([u8; 32], u64)] = &[
-    (BOLT_E4B_MODEL_ID,                 50_000_000),
+    (KEV_4B_MODEL_ID,                   50_000_000),
     (QWEN3_5_9B_Q8_MODEL_ID,           100_000_000),
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000),
     (QWEN3_8_27B_MODEL_ID,             200_000_000),
@@ -3679,8 +3626,8 @@ mod model_split_tables_tests {
                 assert_eq!(POM_TIERS_MODEL_SPLIT[i].chunks, t.chunks);
             }
         }
-        assert_eq!(POM_TIERS_MODEL_SPLIT[0].model_id, BOLT_E4B_MODEL_ID);
-        assert_eq!(POM_TIERS_MODEL_SPLIT[0].chunks, 192_383_008);
+        assert_eq!(POM_TIERS_MODEL_SPLIT[0].model_id, KEV_4B_MODEL_ID);
+        assert_eq!(POM_TIERS_MODEL_SPLIT[0].chunks, 139_775_936);
         assert_eq!(POM_TIERS_MODEL_SPLIT[1].model_id, QWEN3_5_9B_Q8_MODEL_ID);
         assert_eq!(POM_TIERS_MODEL_SPLIT[1].chunks, 297_391_680);
         let ids = |t: &[crate::pom::PomTier]| t.iter().map(|x| x.model_id).collect::<Vec<_>>();
@@ -3726,20 +3673,8 @@ mod model_split_tables_tests {
             let h18 = total(POM_TIERS_MODEL_SPLIT[t].chunks, POM_V5_PAD_TILES_H18[t]);
             assert!(h16.abs_diff(h18) <= 1 << 20, "tier {t}: {h16} vs {h18}");
         }
-        let t0 = &TRACE_TIERS_H18[0].as_ref().unwrap();
-        let bolt = trace_rules(0, true, true, true, true, Lineup::H18).unwrap();
-        assert_eq!(bolt.ctx.r_t, POM_TIERS_MODEL_SPLIT[0].root);
-        assert_eq!(bolt.ctx.n_chunks, POM_TIERS_MODEL_SPLIT[0].chunks);
-        assert_eq!(bolt.ctx.m_t, t0.attn.manifest.m_t);
-        assert!(bolt.attention);
-        let ch = bolt.chain.unwrap();
-        assert_eq!((ch.n_layers, ch.n_attn, ch.n_recur, ch.seq_heads, ch.ple_entry, ch.ple_width), (42, 42, 0, 2, 557, 256));
-        assert_eq!(trace_rules(0, true, true, true, false, Lineup::H18).unwrap().ctx.m_t, t0.chain.manifest.m_t);
-        assert_eq!(trace_rules(0, true, true, false, false, Lineup::H18).unwrap().ctx.m_t, t0.prefix_manifest.m_t);
-        // tier 0 of H18 is the Gemma 4 tokenizer of H14 tier 2, on its own manifest entries
-        let (p, gemma) = (bolt.prefix.unwrap(), TRACE_PREFIXES[2].clone().unwrap());
-        assert_eq!((p.table, p.offset, p.eps), (gemma.table, gemma.offset, gemma.eps));
-        assert_eq!((p.embd_entry, p.norm_entry), (343, 344));
+        // tier 0 (Kev-4B) is not traced until its manifests are built
+        assert!(trace_rules(0, true, true, true, true, Lineup::H18).is_none());
         assert!(trace_rules(1, false, true, false, false, Lineup::H18).is_none());
         let t1 = &TRACE_TIERS_H18[1].as_ref().unwrap();
         let attn = trace_rules(1, true, true, true, true, Lineup::H18).unwrap();
