@@ -15,6 +15,9 @@ pub const FORM_PAIR_GATE: u8 = 2;
 pub const FORM_PAIR_UP: u8 = 3;
 pub const GLU_SWIGLU: u8 = 1;
 pub const GLU_GEGLU: u8 = 2;
+/// SwiGLU with the gate clamped above and the up clamped on both sides at `SWIGLU_CLAMP_LIMIT`.
+pub const GLU_SWIGLU_CLAMP: u8 = 7;
+pub const SWIGLU_CLAMP_LIMIT: f64 = 10.0;
 pub const NONE: u32 = u32::MAX;
 pub const ROLE_LAYER: u8 = 5;
 /// F32 router weights: `m` rows (experts) of `k` values.
@@ -699,10 +702,10 @@ mod range_manifest_tests {
             (include_bytes!("../testdata/v4t-range-1.manifest"), "ea09c706be45bc596e079d6da94dfa7af2499334123d695f8c344af043e4920d", 15, 15),
         ];
         let mainnet: [(&[u8], &str, usize, u32); 4] = [
-            (include_bytes!("../testdata/mainnet-range-0.manifest"), "cb1793c52124b1e40571b6fe9f6dff5d47acb89b8a0735dadbd7c7490672e720", 181, 181),
-            (include_bytes!("../testdata/mainnet-range-1.manifest"), "2ae3a3564150ad9cd4a372a787f02a38e2fda340652d82529009694ea9ef6b5f", 185, 185),
-            (include_bytes!("../testdata/mainnet-range-2.manifest"), "055bfa4bc25df49ce25549b48b0ecd2dab3b8acd79afed0184c2397bf32b8066", 189, 189),
-            (include_bytes!("../testdata/mainnet-range-3.manifest"), "79f62b9df5971c116cba3945bdd1bd9950938b8bdcd4fa8d3480fc43203b00c9", 170, 170),
+            (include_bytes!("../testdata/mainnet-range-0.manifest"), "3258778c6a86fc438564de0daf374009e0e6f2f51f44cf4a1b73b93c2b7d9e41", 222, 212),
+            (include_bytes!("../testdata/mainnet-range-1.manifest"), "eaa41c3ba9d21bd9d3d32dcc43ccaf7289b52ff22a027d0f0ff2e3f3088cfb55", 195, 187),
+            (include_bytes!("../testdata/mainnet-range-2.manifest"), "d459443805e9b6d044a320c8278cb6e5407f5927b0adf172f4520eff390461b0", 196, 187),
+            (include_bytes!("../testdata/mainnet-range-3.manifest"), "aaecceb2b57adc283cf0f8530d259b58626afde80c0fe9665a763c9ec61f075f", 177, 170),
         ];
         let files = files.into_iter().chain(mainnet);
         for (data, root, n, n_products) in files {
