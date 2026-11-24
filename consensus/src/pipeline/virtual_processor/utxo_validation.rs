@@ -89,6 +89,7 @@ static H14_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H15_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H16_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H17_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
+static H18_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H7_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 static H8_BANNER_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -592,6 +593,24 @@ impl VirtualStateProcessor {
             info!("════════════════ KERYX HARDFORK H17 · DAA {} ════════════════", self.ratio_probation_activation.daa_score());
             info!("  ▶ HOLDER REWARD — the bracket of an address that resumes production follows its recent production");
             info!("  ▶ MANDATORY UPDATE — node v1.6.8 or newer");
+            info!("  (first block seen at/after the gate: daa {})", header.daa_score);
+            info!("═══════════════════════════════════════════════════════════════");
+        }
+
+        if banner_should_fire(self.h18_activation, header)
+            && H18_BANNER_LOGGED.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+        {
+            info!("════════════════ KERYX HARDFORK H18 · DAA {} ════════════════", self.h18_activation.daa_score());
+            info!("  ▶ NEW LINEUP — seven tiers");
+            info!("    Tier 0 (8 GB)    — Kev-4B");
+            info!("    Tier 1 (12 GB)   — Qwen3.5-9B Q8_0");
+            info!("    Tier 2 (16 GB)   — MiniCPM-V-4.7-35B-A3B");
+            info!("    Tier 3 (24 GB)   — Gemma-4-31B");
+            info!("    Tier 4 (32 GB)   — Qwen3.8-27B TURBO");
+            info!("    Tier 5 (96 GB)   — GLM-5.3-Flash");
+            info!("    Tier 6 (141 GB)  — DeepSeek-V4.1-Flash");
+            info!("  ▶ TIER RESERVE — the tier reward that lower tiers do not earn funds the bonus of tiers 5 and 6");
+            info!("  ▶ MANDATORY UPDATE — node v1.6.9 or newer");
             info!("  (first block seen at/after the gate: daa {})", header.daa_score);
             info!("═══════════════════════════════════════════════════════════════");
         }
