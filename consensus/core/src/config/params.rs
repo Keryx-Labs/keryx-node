@@ -1311,6 +1311,75 @@ pub const TRACE_ATTN_H_NEXT: [Option<TraceNext>; 5] = [
     }),
 ];
 
+/// Trace data of a tier whose model joined the lineup at H18.
+#[derive(Clone, Debug)]
+pub struct TraceTierH18 {
+    pub prefix_manifest: TraceManifest,
+    pub chain: TraceChain,
+    pub attn: TraceNext,
+}
+
+const QWEN3_5_PREFIX: TracePrefix = match TRACE_PREFIXES {
+    [Some(p), ..] => p,
+    _ => panic!(),
+};
+
+/// Trace data of each tier of the H18 lineup; `None` = not traced.
+pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
+    None,
+    Some(TraceTierH18 {
+        prefix_manifest: TraceManifest {
+            m_t: [
+                0x80, 0x47, 0xcc, 0x47, 0x5c, 0x02, 0x73, 0x25, 0x2a, 0x4c, 0x07, 0xb1, 0xfa, 0x43, 0x84, 0x87,
+                0xee, 0x20, 0xaa, 0xd3, 0xc1, 0x3a, 0x5e, 0x99, 0xf4, 0xb3, 0x85, 0xbe, 0xcb, 0x2c, 0xf5, 0x2d,
+            ],
+            n_entries: 251,
+            n_products: 249,
+        },
+        chain: TraceChain {
+            manifest: TraceManifest {
+                m_t: [
+                    0x07, 0xb6, 0x94, 0x48, 0x52, 0xd3, 0x10, 0xa6, 0x31, 0xd5, 0x74, 0xa3, 0xad, 0xb3, 0x9e, 0x91,
+                    0x5b, 0x47, 0xde, 0x8d, 0x01, 0x89, 0x66, 0x27, 0x69, 0x0b, 0xe6, 0x2a, 0x9a, 0xf9, 0x21, 0x37,
+                ],
+                n_entries: 347,
+                n_products: 249,
+            },
+            ctx: keryx_verifiable_inference::chain::ChainCtx {
+                n_layers: 32,
+                layer_base: 315,
+                embd_entry: 249,
+                eps: 9.999999974752427e-07,
+                embd_scale: 1.0,
+                trim_last: false,
+                n_used: 0,
+                n_attn: 0,
+                n_recur: 0,
+                seq_heads: 0,
+            },
+            prefix: QWEN3_5_PREFIX,
+        },
+        attn: TraceNext {
+            manifest: TraceManifest {
+                m_t: [
+                    0xfb, 0x02, 0xfb, 0xac, 0xa5, 0xd5, 0x28, 0xf6, 0xd3, 0x20, 0x43, 0x09, 0x37, 0xa9, 0x60, 0xec,
+                    0x75, 0x2c, 0x07, 0x23, 0xc4, 0x5e, 0x7c, 0x27, 0x3d, 0x98, 0x00, 0xf0, 0x87, 0x6c, 0x05, 0xe2,
+                ],
+                n_entries: 459,
+                n_products: 249,
+            },
+            n_attn: 8,
+            n_recur: 24,
+            seq_heads: 32,
+        },
+    }),
+    None,
+    None,
+    None,
+    None,
+    None,
+];
+
 /// Audit rules of a tier: the verifier context, the prefix context under the prefix rule, the
 /// chain context under stage 2, and whether every traced response is audited.
 #[derive(Clone, Debug)]
@@ -1326,19 +1395,23 @@ pub struct TraceRules {
 /// Audit rules of `tier` in `lineup`; `prefix` selects the prefix rule and its manifests,
 /// `chain` stage 2 and its manifests, `attention` the attention manifests of the tiers that have one.
 pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attention: bool, lineup: Lineup) -> Option<TraceRules> {
-    if lineup == Lineup::H18 {
-        return None;
-    }
+    let h18 = match lineup {
+        Lineup::H18 => Some(TRACE_TIERS_H18.get(tier as usize)?.clone()?),
+        Lineup::H14 => None,
+    };
+    let t = lineup.tiers().get(tier as usize)?;
     if chain {
-        let mut c = TRACE_CHAINS_H15.get(tier as usize)?.clone()?;
-        let attn = if attention { *TRACE_ATTN_H_NEXT.get(tier as usize)? } else { None };
+        let (mut c, next) = match &h18 {
+            Some(h) => (h.chain.clone(), Some(h.attn)),
+            None => (TRACE_CHAINS_H15.get(tier as usize)?.clone()?, *TRACE_ATTN_H_NEXT.get(tier as usize)?),
+        };
+        let attn = if attention { next } else { None };
         if let Some(n) = &attn {
             c.manifest = n.manifest;
             c.ctx.n_attn = n.n_attn;
             c.ctx.n_recur = n.n_recur;
             c.ctx.seq_heads = n.seq_heads;
         }
-        let t = POM_TIERS_H14.get(tier as usize)?;
         let ctx = keryx_verifiable_inference::verify::TierCtx {
             r_t: t.root,
             n_chunks: t.chunks,
@@ -1348,9 +1421,11 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
         };
         return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all, attention: attn.is_some() });
     }
-    let manifests = if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 };
-    let m = (*manifests.get(tier as usize)?)?;
-    let t = POM_TIERS_H14.get(tier as usize)?;
+    let m = match &h18 {
+        Some(h) if prefix => h.prefix_manifest,
+        Some(_) => return None,
+        None => (*(if prefix { &TRACE_MANIFESTS_PREFIX } else { &TRACE_MANIFESTS_H14 }).get(tier as usize)?)?,
+    };
     let ctx = keryx_verifiable_inference::verify::TierCtx {
         r_t: t.root,
         n_chunks: t.chunks,
@@ -1358,7 +1433,11 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
         n_entries: m.n_entries,
         n_products: m.n_products,
     };
-    let prefix = if prefix { Some(TRACE_PREFIXES.get(tier as usize)?.clone()?) } else { None };
+    let prefix = match (&h18, prefix) {
+        (_, false) => None,
+        (Some(h), true) => Some(h.chain.prefix.clone()),
+        (None, true) => Some(TRACE_PREFIXES.get(tier as usize)?.clone()?),
+    };
     Some(TraceRules { ctx, prefix, chain: None, audit_all, attention: false })
 }
 
@@ -3349,6 +3428,33 @@ mod pad_table_tests {
                 "H18 scheduled with {} of {H18_TIER_COUNT} tiers pinned",
                 POM_TIERS_H18.len()
             );
+        }
+    }
+
+    #[test]
+    fn h18_traces_only_tier_1() {
+        for t in (0..H18_TIER_COUNT as u8).filter(|t| *t != 1) {
+            assert!(trace_rules(t, true, true, true, true, Lineup::H18).is_none());
+            assert!(trace_rules(t, true, true, false, false, Lineup::H18).is_none());
+        }
+        assert!(trace_rules(1, false, true, false, false, Lineup::H18).is_none());
+        let t1 = TRACE_TIERS_H18[1].as_ref().unwrap();
+        let attn = trace_rules(1, true, true, true, true, Lineup::H18).unwrap();
+        assert_eq!((attn.ctx.r_t, attn.ctx.n_chunks), (POM_TIERS_H18[1].root, POM_TIERS_H18[1].chunks));
+        assert_eq!(attn.ctx.m_t, t1.attn.manifest.m_t);
+        assert!(attn.attention);
+        let ch = attn.chain.unwrap();
+        assert_eq!((ch.n_attn, ch.n_recur, ch.seq_heads), (8, 24, 32));
+        let base = trace_rules(1, true, true, true, false, Lineup::H18).unwrap();
+        assert_eq!(base.ctx.m_t, t1.chain.manifest.m_t);
+        assert!(!base.attention && base.chain.unwrap().n_attn == 0);
+        let pre = trace_rules(1, true, true, false, false, Lineup::H18).unwrap();
+        assert_eq!(pre.ctx.m_t, t1.prefix_manifest.m_t);
+        assert!(pre.chain.is_none());
+        // the Qwen3.5 tokenizer of H14 tier 0, not the GLM one of H14 tier 1
+        for r in [&attn, &base, &pre] {
+            assert_eq!(r.prefix.as_ref(), TRACE_PREFIXES[0].as_ref());
+            assert_ne!(r.ctx.m_t, trace_rules(1, true, true, true, true, Lineup::H14).unwrap().ctx.m_t);
         }
     }
 
