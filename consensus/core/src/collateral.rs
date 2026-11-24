@@ -2618,8 +2618,8 @@ pub struct ServiceLedgerSnapshot {
     early_traces: std::collections::BTreeMap<([u8; 32], Hash), EarlyTrace>,
     trace_roots: std::collections::BTreeMap<[u8; 32], u64>,
     held_draws: std::collections::BTreeMap<[u8; 32], HeldDraw>,
-    /// Tier reserve after the snapshot block, once the reserve rule applies.
-    pub tier_reserve: Option<u64>,
+    /// Tier reserve state after the snapshot block, once the reserve rule applies.
+    pub tier_reserve: Option<crate::coinbase::TierReserve>,
 }
 
 const SNAPSHOT_ENCODING_VERSION: u8 = 1;
@@ -3016,7 +3016,8 @@ impl ServiceLedgerSnapshot {
             }
         }
         if let Some(reserve) = self.tier_reserve {
-            out.extend_from_slice(&reserve.to_le_bytes());
+            out.extend_from_slice(&reserve.reserve.to_le_bytes());
+            out.extend_from_slice(&reserve.ask_average.to_le_bytes());
         }
         out
     }
@@ -3423,7 +3424,8 @@ impl ServiceLedgerSnapshot {
             }
         }
         if version >= SNAPSHOT_ENCODING_VERSION_RESERVE {
-            snap.tier_reserve = Some(r.u64()?);
+            let reserve = r.u64()?;
+            snap.tier_reserve = Some(crate::coinbase::TierReserve { reserve, ask_average: r.u64()? });
         }
         if r.pos != bytes.len() {
             return Err("trailing bytes".into());
@@ -3721,14 +3723,17 @@ mod tests {
         let empty = super::ServiceLedger::default().snapshot();
         let bytes = empty.to_bytes();
         assert_eq!(bytes[0], super::SNAPSHOT_ENCODING_VERSION, "no reserve keeps the historical encoding");
-        let reserved = super::ServiceLedgerSnapshot { tier_reserve: Some(9_000_000_000_000), ..empty.clone() };
+        let reserved = super::ServiceLedgerSnapshot {
+            tier_reserve: Some(crate::coinbase::TierReserve { reserve: 9_000_000_000_000, ask_average: 5 }),
+            ..empty.clone()
+        };
         let rbytes = reserved.to_bytes();
         assert_eq!(rbytes[0], super::SNAPSHOT_ENCODING_VERSION_RESERVE);
         assert_eq!(super::ServiceLedgerSnapshot::from_bytes(&rbytes).unwrap(), reserved);
         assert_ne!(super::ServiceLedgerSnapshot::hash_of_bytes(&rbytes), super::ServiceLedgerSnapshot::hash_of_bytes(&bytes));
         assert_eq!(super::ServiceLedgerSnapshot::from_bytes(&bytes).unwrap().tier_reserve, None);
         // A v13 snapshot with an empty chain section stays rejected.
-        let mut v13 = rbytes[..rbytes.len() - 8].to_vec();
+        let mut v13 = rbytes[..rbytes.len() - 16].to_vec();
         v13[0] = super::SNAPSHOT_ENCODING_VERSION_CHAIN;
         assert!(super::ServiceLedgerSnapshot::from_bytes(&v13).is_err());
     }
@@ -7008,10 +7013,13 @@ mod tests {
             assert_eq!(bytes[0], super::super::SNAPSHOT_ENCODING_VERSION_CHAIN);
             assert_eq!(super::super::ServiceLedgerSnapshot::from_bytes(&bytes).unwrap(), snap);
             // The tier reserve rides a v14 trailer on top of a chained snapshot.
-            let reserved = super::super::ServiceLedgerSnapshot { tier_reserve: Some(42), ..snap.clone() };
+            let reserved = super::super::ServiceLedgerSnapshot {
+                tier_reserve: Some(crate::coinbase::TierReserve { reserve: 42, ask_average: 7 }),
+                ..snap.clone()
+            };
             let rbytes = reserved.to_bytes();
             assert_eq!(rbytes[0], super::super::SNAPSHOT_ENCODING_VERSION_RESERVE);
-            assert_eq!(&rbytes[1..rbytes.len() - 8], &bytes[1..]);
+            assert_eq!(&rbytes[1..rbytes.len() - 16], &bytes[1..]);
             assert_eq!(super::super::ServiceLedgerSnapshot::from_bytes(&rbytes).unwrap(), reserved);
             assert_eq!(out.misses.len(), 1, "one strike per block");
             assert!(out.misses.iter().all(|m| m.miner == a && m.opening_missing));

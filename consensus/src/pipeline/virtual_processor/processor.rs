@@ -903,7 +903,7 @@ impl VirtualStateProcessor {
         multiset: MuHash,
         acceptance_data: AcceptanceData,
         pruning_sample_from_pov: Hash,
-        tier_reserve_after: Option<u64>,
+        tier_reserve_after: Option<keryx_consensus_core::coinbase::TierReserve>,
     ) {
         let mut batch = WriteBatch::default();
         if let Some(reserve) = tier_reserve_after {
@@ -2039,6 +2039,9 @@ impl VirtualStateProcessor {
     /// Refuses to start when the sink is past the H18 gate without a tier reserve: chain blocks
     /// validated by a binary without the reserve rule cannot be extended.
     fn check_tier_reserve_at_sink(&self) {
+        if self.pruning_meta_stores.read().is_in_transitional_ibd_state() {
+            return;
+        }
         let Some(state) = self.virtual_stores.read().state.get().optional().unwrap() else { return };
         let sink = state.ghostdag_data.selected_parent;
         if sink == self.genesis.hash || !self.h18_activation.is_active(self.headers_store.get_daa_score(sink).unwrap()) {

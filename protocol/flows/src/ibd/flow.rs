@@ -717,13 +717,13 @@ impl IbdFlow {
 
     /// The sealed service-state commitments carried by the last chain headers anchored at
     /// `pruning_point` (selected-parent chain below the headers-selected tip), with their counts;
-    /// the relay header alone when no chain header carries that pruning point yet.
+    /// the relay header alone when no chain header carries that pruning point yet (flagged false).
     async fn service_commitment_votes(
         &self,
         consensus: &ConsensusProxy,
         pruning_point: Hash,
         relay_header: &Header,
-    ) -> Result<HashMap<Hash, usize>, ProtocolError> {
+    ) -> Result<(HashMap<Hash, usize>, bool), ProtocolError> {
         const VOTE_DEPTH: usize = 512;
         let mut votes: HashMap<Hash, usize> = HashMap::new();
         let mut hash = consensus.async_get_headers_selected_tip().await;
@@ -735,13 +735,14 @@ impl IbdFlow {
             let Ok(ghostdag) = consensus.async_get_ghostdag_data(hash).await else { break };
             hash = ghostdag.selected_parent;
         }
+        let chain_voted = !votes.is_empty();
         if votes.is_empty() && relay_header.pruning_point == pruning_point {
             votes.insert(relay_header.service_state_hash, 1);
         }
         if votes.is_empty() {
             return Err(ProtocolError::Other("no validated header anchors the negotiated pruning point"));
         }
-        Ok(votes)
+        Ok((votes, chain_voted))
     }
 
     /// Downloads the sealed service-bond state (every finality-flushed row up to the new pruning
@@ -763,7 +764,7 @@ impl IbdFlow {
         if self.protocol_version < 10 {
             return Err(ProtocolError::Other("peer cannot serve the service-state handoff window — sync from an upgraded peer"));
         }
-        let votes = self.service_commitment_votes(consensus, pruning_point, relay_header).await?;
+        let (votes, chain_voted) = self.service_commitment_votes(consensus, pruning_point, relay_header).await?;
         let majority = votes.iter().max_by_key(|(commitment, count)| (**count, **commitment)).map(|(c, _)| *c).unwrap();
         let checkpoint = self.ctx.config.service_state_checkpoint.filter(|(daa, _)| *daa <= pp_daa);
         info!("downloading the sealed service state for pruning point {}", pruning_point);
@@ -894,12 +895,15 @@ impl IbdFlow {
             production_bytes.as_ref().and_then(|bytes| ProductionIndexSnapshot::from_bytes(bytes).ok()).map(|s| s.relative_hash());
         // A v3 or v4 vote (past `production_index_activation`) binds rows, ledger and production
         // together; a v2 vote binds rows and ledger only.
-        let production_voted = match (ledger_hash, production_hash, production_relative_hash) {
-            (Some(l), Some(p), Some(r)) => {
-                votes.contains_key(&service_commitment_v3(computed, l, p)) || votes.contains_key(&service_commitment_v4(computed, l, r))
-            }
-            _ => false,
-        };
+        let mut snapshot_commitments = Vec::new();
+        if let (Some(l), Some(p), Some(r)) = (ledger_hash, production_hash, production_relative_hash) {
+            snapshot_commitments.push(service_commitment_v3(computed, l, p));
+            snapshot_commitments.push(service_commitment_v4(computed, l, r));
+        }
+        let production_voted = snapshot_commitments.iter().any(|c| votes.contains_key(c));
+        if let Some(l) = ledger_hash {
+            snapshot_commitments.push(service_commitment_v2(computed, l));
+        }
         let snapshot_voted =
             production_voted || ledger_hash.is_some_and(|l| votes.contains_key(&service_commitment_v2(computed, l)));
         // With a checkpoint, the rows up to it must reproduce it and the whole set must match a
@@ -929,7 +933,9 @@ impl IbdFlow {
         if keryx_consensus_core::pom::h18_active(pp_daa) {
             let reserve =
                 snapshot_bytes.as_ref().and_then(|bytes| ServiceLedgerSnapshot::from_bytes(bytes).ok()).and_then(|s| s.tier_reserve);
-            if reserve.is_none() || !snapshot_voted {
+            let top = votes.values().copied().max().unwrap_or(0);
+            let majority_voted = chain_voted && snapshot_commitments.iter().any(|c| votes.get(c) == Some(&top));
+            if reserve.is_none() || !majority_voted {
                 return Err(ProtocolError::Other("peer served no committed tier reserve at the pruning point"));
             }
         }

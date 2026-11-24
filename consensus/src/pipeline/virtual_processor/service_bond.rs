@@ -1,6 +1,5 @@
 use super::VirtualStateProcessor;
 use crate::model::stores::tier_reserve::TierReserveStoreReader;
-use keryx_database::prelude::StoreResultExt;
 use crate::processes::service_commit;
 use crate::model::stores::{
     acceptance_data::AcceptanceDataStoreReader, block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader,
@@ -1007,7 +1006,7 @@ impl VirtualStateProcessor {
             if !warmup && self.is_pruning_sample_block(hash) && !self.service_ledger_hashes.read().contains_key(&hash) {
                 let mut snapshot = ledger.snapshot();
                 snapshot.recent_producers = self.recent_producers_below(sc, i, daa, pruning_point);
-                snapshot.tier_reserve = self.tier_reserve_store.get(hash).optional().unwrap();
+                snapshot.tier_reserve = self.tier_reserve_at_sample(hash);
                 let bytes = snapshot.to_bytes();
                 let snapshot_hash = ServiceLedgerSnapshot::hash_of_bytes(&bytes);
                 self.service_ledger_hashes.write().insert(hash, snapshot_hash);
@@ -1127,7 +1126,7 @@ impl VirtualStateProcessor {
             if self.is_pruning_sample_block(*h) {
                 let mut snapshot = sync.ledger.snapshot();
                 snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa, pruning_point);
-                snapshot.tier_reserve = self.tier_reserve_store.get(*h).optional().unwrap();
+                snapshot.tier_reserve = self.tier_reserve_at_sample(*h);
                 let bytes = snapshot.to_bytes();
                 self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
@@ -1683,6 +1682,14 @@ impl VirtualStateProcessor {
     /// finality]` — in `(daa, request hash)` order. Wins with no payout script stay burned.
     /// `parent(sp)` is `sp`'s own selected parent: the committed selected chain is not consulted,
     /// so the expectation is the same on every chain candidate and from every node's point of view.
+    /// Tier reserve state after pruning sample `hash`, required once the reserve rule applies there.
+    fn tier_reserve_at_sample(&self, hash: Hash) -> Option<keryx_consensus_core::coinbase::TierReserve> {
+        if !self.h18_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
+            return None;
+        }
+        Some(self.tier_reserve_store.get(hash).unwrap_or_else(|e| panic!("tier reserve of pruning sample {hash} is missing ({e})")))
+    }
+
     pub(super) fn service_reward_mints_for(&self, sp: Hash) -> Vec<(ScriptPublicKey, u64)> {
         let sp_daa = self.headers_store.get_daa_score(sp).unwrap();
         if !self.reward_routing_activation.is_active(sp_daa) {

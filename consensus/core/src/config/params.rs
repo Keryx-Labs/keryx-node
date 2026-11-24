@@ -1487,6 +1487,12 @@ pub const TIER_REWARD_BPS_H18: [u64; H18_TIER_COUNT] = [6_000, 7_000, 8_000, 9_0
 /// Ceiling of the tier reserve, in sompi (about one hour of inflow); inflow above it is burned.
 pub const TIER_RESERVE_CAP_SOMPI: u64 = 38_000 * crate::constants::SOMPI_PER_KASPA;
 
+/// Chain blocks over which the tier excess average of the reserve is taken.
+pub const TIER_RESERVE_AVERAGE_BLOCKS: u64 = 3_000;
+
+/// Chain blocks of average excess the reserve must hold for draws to be paid in full.
+pub const TIER_RESERVE_HORIZON_BLOCKS: u64 = 600;
+
 /// Tier-reward schedule for a block at `daa_score`: 7-tier H18 once `h18_activation` is live,
 /// 5-tier H6 once `pom_v3_activation` is live, 5-tier H2 once `very_light_activation`, legacy
 /// 4-tier before. Chosen per block from that block's own DAA (never frozen) — same gating

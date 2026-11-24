@@ -53,5 +53,15 @@ pub struct CoinbaseTransactionTemplate {
     /// Used by modify_block_template to rewrite the correct output when changing miner address.
     pub red_reward_output_index: Option<usize>,
     /// Tier reserve after this coinbase; `None` when the reserve rule does not apply.
-    pub tier_reserve_after: Option<u64>,
+    pub tier_reserve_after: Option<TierReserve>,
 }
+
+/// Tier reserve state after a chain block, in sompi: the reserve and the running average of the
+/// tier excess its chain blocks' mergesets carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierReserve {
+    pub reserve: u64,
+    pub ask_average: u64,
+}
+
+impl keryx_utils::mem_size::MemSizeEstimator for TierReserve {}

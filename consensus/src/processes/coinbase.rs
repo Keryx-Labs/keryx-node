@@ -1,9 +1,12 @@
 use keryx_addresses::{Address, Prefix, Version};
 use keryx_consensus_core::{
-    BlockHashMap, BlockHashSet, HashMapCustomHasher,
+    BlockHashMap, BlockHashSet,
     coinbase::*,
     collateral::{CHALLENGE_WINDOW_BLOCKS, SERVICE_BOND_CSV_WINDOW_BLOCKS},
-    config::params::{ForkActivation, RATIO_REWARD_BPS_DIVISOR, TIER_RESERVE_CAP_SOMPI, TIER_REWARD_BPS_DIVISOR},
+    config::params::{
+        ForkActivation, RATIO_REWARD_BPS_DIVISOR, TIER_RESERVE_AVERAGE_BLOCKS, TIER_RESERVE_CAP_SOMPI, TIER_RESERVE_HORIZON_BLOCKS,
+        TIER_REWARD_BPS_DIVISOR,
+    },
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
@@ -18,13 +21,21 @@ use std::convert::TryInto;
 
 use crate::{constants, model::stores::ghostdag::GhostdagData};
 
-/// Outcome of folding the tier reserve over one block: the reserve after it, the amount each drawing
+/// Outcome of folding the tier reserve over one block: the state after it, the amount each drawing
 /// blue receives from it, and the inflow burned above the ceiling.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TierReserveFold {
-    pub after: u64,
+    pub after: TierReserve,
     pub draws: BlockHashMap<u64>,
     pub overflow: u64,
+}
+
+/// Range the reserve after a block can take whatever the holder ratios of its drawing blues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierReserveBounds {
+    pub min: u64,
+    pub max: u64,
+    pub ask_average: u64,
 }
 
 /// Part of a miner cut a tier value earns before any reserve draw: the whole cut is the most.
@@ -32,35 +43,73 @@ fn tier_earned(miner_cut: u64, tier_bps: u64) -> u64 {
     miner_cut * tier_bps.min(TIER_REWARD_BPS_DIVISOR) / TIER_REWARD_BPS_DIVISOR
 }
 
-/// Reserve fold over `(blue, miner cut, tier bps, ratio bps)` entries (see
-/// `CoinbaseManager::tier_reserve_fold`). Each drawing blue asks for its tier excess scaled by its
-/// holder ratio; when the reserve cannot cover every ask, it is shared pro rata and the rounding
-/// remainder stays in the reserve.
-pub fn fold_tier_reserve(before: u64, rewarded: &[(Hash, u64, u64, u64)]) -> TierReserveFold {
-    let mut available = before;
-    for (_, cut, bps, _) in rewarded {
-        available = available.saturating_add(cut - tier_earned(*cut, *bps));
-    }
-    let asks: Vec<(Hash, u64)> = rewarded
+fn tier_excess(miner_cut: u64, tier_bps: u64) -> u128 {
+    miner_cut as u128 * tier_bps.saturating_sub(TIER_REWARD_BPS_DIVISOR) as u128 / TIER_REWARD_BPS_DIVISOR as u128
+}
+
+/// Fill applied to every ask of a block, fixed by the state before it: full while the reserve holds
+/// `TIER_RESERVE_HORIZON_BLOCKS` of average excess, proportional below.
+fn tier_fill(before: &TierReserve, ask: u128) -> u128 {
+    let budget = TIER_RESERVE_HORIZON_BLOCKS as u128 * before.ask_average as u128;
+    if budget <= before.reserve as u128 { ask } else { ask * before.reserve as u128 / budget }
+}
+
+fn tier_inflow(rewarded: &[(Hash, u64, u64)]) -> u64 {
+    rewarded.iter().map(|(_, cut, bps)| cut - tier_earned(*cut, *bps)).sum()
+}
+
+fn tier_ask_average(before: &TierReserve, rewarded: &[(Hash, u64, u64)]) -> u64 {
+    let excess: u128 = rewarded.iter().map(|(_, cut, bps)| tier_excess(*cut, *bps)).sum();
+    let n = TIER_RESERVE_AVERAGE_BLOCKS as u128;
+    ((before.ask_average as u128 * (n - 1) + excess) / n).min(u64::MAX as u128) as u64
+}
+
+/// Reserve fold over `(blue, miner cut, tier bps)` entries (see `CoinbaseManager::tier_reserve_entries`).
+/// Every blue below the divisor adds its tier shortfall. Every blue above it asks for its tier excess
+/// scaled by its holder ratio, and receives that ask times the fill fixed by the state before the
+/// block, the same wherever the blue is merged; if the block's draws exceed the reserve they are
+/// shared pro rata. What is not drawn stays; inflow above `TIER_RESERVE_CAP_SOMPI` is burned.
+pub fn fold_tier_reserve(
+    before: TierReserve,
+    rewarded: &[(Hash, u64, u64)],
+    ratio_bps_by_block: &BlockHashMap<u64>,
+) -> TierReserveFold {
+    let available = before.reserve.saturating_add(tier_inflow(rewarded));
+    let mut wanted: Vec<(Hash, u128)> = rewarded
         .iter()
-        .filter(|(_, _, bps, _)| *bps > TIER_REWARD_BPS_DIVISOR)
-        .map(|(blue, cut, bps, ratio)| {
-            let excess = *cut as u128 * (*bps - TIER_REWARD_BPS_DIVISOR) as u128 / TIER_REWARD_BPS_DIVISOR as u128;
-            (*blue, (excess * *ratio as u128 / RATIO_REWARD_BPS_DIVISOR as u128) as u64)
+        .filter(|(_, _, bps)| *bps > TIER_REWARD_BPS_DIVISOR)
+        .map(|(blue, cut, bps)| {
+            let ratio = ratio_bps_by_block.get(blue).copied().unwrap_or(RATIO_REWARD_BPS_DIVISOR);
+            (*blue, tier_fill(&before, tier_excess(*cut, *bps) * ratio as u128 / RATIO_REWARD_BPS_DIVISOR as u128))
         })
-        .filter(|(_, ask)| *ask > 0)
         .collect();
-    let total: u128 = asks.iter().map(|(_, ask)| *ask as u128).sum();
-    let mut draws = BlockHashMap::new();
-    for (blue, ask) in asks {
-        let draw = if total <= available as u128 { ask } else { (ask as u128 * available as u128 / total) as u64 };
-        if draw > 0 {
-            draws.insert(blue, draw);
+    let total: u128 = wanted.iter().map(|(_, w)| *w).sum();
+    if total > available as u128 {
+        for (_, w) in wanted.iter_mut() {
+            *w = *w * available as u128 / total;
         }
     }
-    available -= draws.values().sum::<u64>();
-    let overflow = available.saturating_sub(TIER_RESERVE_CAP_SOMPI);
-    TierReserveFold { after: available - overflow, draws, overflow }
+    let draws: BlockHashMap<u64> = wanted.into_iter().filter(|(_, w)| *w > 0).map(|(b, w)| (b, w as u64)).collect();
+    let left = available - draws.values().sum::<u64>();
+    let overflow = left.saturating_sub(TIER_RESERVE_CAP_SOMPI);
+    TierReserveFold {
+        after: TierReserve { reserve: left - overflow, ask_average: tier_ask_average(&before, rewarded) },
+        draws,
+        overflow,
+    }
+}
+
+/// Bounds of the reserve after a block over every holder ratio: no draw at most, full-ratio draws
+/// at least.
+pub fn tier_reserve_bounds(before: TierReserve, rewarded: &[(Hash, u64, u64)]) -> TierReserveBounds {
+    let available = before.reserve.saturating_add(tier_inflow(rewarded)) as u128;
+    let full: u128 = rewarded.iter().map(|(_, cut, bps)| tier_fill(&before, tier_excess(*cut, *bps))).sum();
+    let cap = TIER_RESERVE_CAP_SOMPI as u128;
+    TierReserveBounds {
+        min: (available - full.min(available)).min(cap) as u64,
+        max: available.min(cap) as u64,
+        ask_average: tier_ask_average(&before, rewarded),
+    }
 }
 
 // ── R&D allocation ────────────────────────────────────────────────────────────
@@ -339,7 +388,7 @@ impl CoinbaseManager {
         // Tier reserve before this block (the selected parent's), or `None` before the reserve rule.
         // Under the rule a tier value above the divisor draws its excess from the reserve, and the
         // shortfall of a value below it feeds the reserve instead of the burn.
-        tier_reserve: Option<u64>,
+        tier_reserve: Option<TierReserve>,
         // Service-bond suspension: blue block hashes whose producer is under a finality-deep
         // production suspension as of this block. Their entire miner cut is burned (they earn
         // nothing), the reorg-immune analogue of "this producer's blocks are invalid". Empty
@@ -359,15 +408,9 @@ impl CoinbaseManager {
         // only the miner's share is penalised.
         let mut reward_burn_total = 0u64;
         let reserve = tier_reserve.map(|before| {
-            self.tier_reserve_fold(
-                before,
-                ghostdag_data,
-                mergeset_rewards,
-                mergeset_non_daa,
-                tier_bps_by_block,
-                ratio_bps_by_block,
-                suspended_blues,
-            )
+            let rewarded =
+                self.tier_reserve_entries(ghostdag_data, mergeset_rewards, mergeset_non_daa, tier_bps_by_block, suspended_blues);
+            fold_tier_reserve(before, &rewarded, ratio_bps_by_block)
         });
 
         // Add outputs for each mergeset blue block (∩ DAA window).
@@ -505,36 +548,26 @@ impl CoinbaseManager {
         subsidy - subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR - subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR
     }
 
-    /// Folds the tier reserve over a block's rewarded blues: every blue below the divisor adds its tier
-    /// shortfall, then every blue above it draws its excess (or what is left), in mergeset order, then
-    /// inflow above `TIER_RESERVE_CAP_SOMPI` is burned. Suspended blues neither add nor draw.
-    pub fn tier_reserve_fold(
+    /// Reserve entries `(blue, miner cut, tier bps)` of a block's rewarded blues, in mergeset order:
+    /// non-DAA, suspended and zero-subsidy blues neither add nor draw.
+    pub fn tier_reserve_entries(
         &self,
-        before: u64,
         ghostdag_data: &GhostdagData,
         mergeset_rewards: &BlockHashMap<BlockRewardData>,
         mergeset_non_daa: &BlockHashSet,
         tier_bps_by_block: &BlockHashMap<u64>,
-        ratio_bps_by_block: &BlockHashMap<u64>,
         suspended_blues: &BlockHashSet,
-    ) -> TierReserveFold {
-        let rewarded: Vec<(Hash, u64, u64, u64)> = ghostdag_data
+    ) -> Vec<(Hash, u64, u64)> {
+        ghostdag_data
             .mergeset_blues
             .iter()
             .filter(|h| !mergeset_non_daa.contains(h) && !suspended_blues.contains(h))
             .filter_map(|h| {
                 let subsidy = mergeset_rewards.get(h).unwrap().subsidy;
-                (subsidy > 0).then(|| {
-                    (
-                        *h,
-                        Self::miner_cut(subsidy),
-                        tier_bps_by_block.get(h).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR),
-                        ratio_bps_by_block.get(h).copied().unwrap_or(RATIO_REWARD_BPS_DIVISOR),
-                    )
-                })
+                (subsidy > 0)
+                    .then(|| (*h, Self::miner_cut(subsidy), tier_bps_by_block.get(h).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR)))
             })
-            .collect();
-        fold_tier_reserve(before, &rewarded)
+            .collect()
     }
 
     /// Tier reserve after a chain block, read off its actual coinbase: the reserve before it, plus
@@ -846,7 +879,7 @@ mod tests {
                 &none,
                 &tier_bps,
                 ratio,
-                Some(reserve),
+                Some(TierReserve { reserve, ask_average: 0 }),
                 suspended,
                 &[],
             )
@@ -867,17 +900,17 @@ mod tests {
         assert_eq!(paid(&full, 0xb0), cut);
         assert_eq!(paid(&full, 0xc0), cut + wanted);
         assert_eq!(burned(&full), 0);
-        assert_eq!(full.tier_reserve_after, Some(10 * wanted + inflow - wanted));
+        assert_eq!(full.tier_reserve_after.map(|r| r.reserve), Some(10 * wanted + inflow - wanted));
 
         // An empty reserve pays only what this block's own small blues fed into it.
         let empty = coinbase(0, &BlockHashMap::new(), &none);
         assert_eq!(paid(&empty, 0xc0), cut + inflow);
-        assert_eq!(empty.tier_reserve_after, Some(0));
+        assert_eq!(empty.tier_reserve_after.map(|r| r.reserve), Some(0));
 
         // At the ceiling the bonus still draws, and the reserve ends below it.
         let capped = coinbase(TIER_RESERVE_CAP_SOMPI, &BlockHashMap::new(), &none);
         assert_eq!(paid(&capped, 0xc0), cut + wanted);
-        assert_eq!(capped.tier_reserve_after, Some(TIER_RESERVE_CAP_SOMPI + inflow - wanted));
+        assert_eq!(capped.tier_reserve_after.map(|r| r.reserve), Some(TIER_RESERVE_CAP_SOMPI + inflow - wanted));
         assert_eq!(burned(&capped), 0);
 
         // The holder ratio scales the draw too: the base part it withholds burns, the bonus part it
@@ -887,25 +920,36 @@ mod tests {
         let ratio = coinbase(10 * wanted, &half, &none);
         assert_eq!(paid(&ratio, 0xc0), cut / 2 + wanted / 2);
         assert_eq!(burned(&ratio), cut - cut / 2);
-        assert_eq!(ratio.tier_reserve_after, Some(10 * wanted + inflow - wanted / 2));
+        assert_eq!(ratio.tier_reserve_after.map(|r| r.reserve), Some(10 * wanted + inflow - wanted / 2));
 
         // A suspended producer neither feeds nor draws.
-        let mut suspended = BlockHashSet::new();
-        suspended.insert(small);
-        suspended.insert(big);
-        let sus = coinbase(10 * wanted, &BlockHashMap::new(), &suspended);
+        let mut sus_set = BlockHashSet::new();
+        sus_set.insert(small);
+        sus_set.insert(big);
+        let sus = coinbase(10 * wanted, &BlockHashMap::new(), &sus_set);
         assert_eq!(paid(&sus, 0xa0) + paid(&sus, 0xc0), 0);
-        assert_eq!(sus.tier_reserve_after, Some(10 * wanted));
+        assert_eq!(sus.tier_reserve_after.map(|r| r.reserve), Some(10 * wanted));
 
         // Supply: reserve change + every output = the mergeset subsidies.
         for (t, before) in
             [(&full, 10 * wanted), (&empty, 0), (&capped, TIER_RESERVE_CAP_SOMPI), (&ratio, 10 * wanted), (&sus, 10 * wanted)]
         {
             let out: u64 = t.tx.outputs.iter().map(|o| o.value).sum();
-            assert_eq!(out as i128 + t.tier_reserve_after.unwrap() as i128 - before as i128, 3 * subsidy as i128);
-            // Reading the reserve off the coinbase gives the rule's own value.
-            assert_eq!(cbm.tier_reserve_implied(before, &t.tx, &ghostdag, &mergeset_rewards, &none, &[]), t.tier_reserve_after);
+            let after = t.tier_reserve_after.unwrap().reserve;
+            assert_eq!(out as i128 + after as i128 - before as i128, 3 * subsidy as i128);
+            // Reading the reserve off the coinbase gives the rule's own value, inside the trusted bounds.
+            assert_eq!(cbm.tier_reserve_implied(before, &t.tx, &ghostdag, &mergeset_rewards, &none, &[]), Some(after));
+            let suspended = if std::ptr::eq(t, &sus) { sus_set.clone() } else { none.clone() };
+            let rewarded = cbm.tier_reserve_entries(&ghostdag, &mergeset_rewards, &none, &tier_bps, &suspended);
+            let bounds = tier_reserve_bounds(TierReserve { reserve: before, ask_average: 0 }, &rewarded);
+            assert!((bounds.min..=bounds.max).contains(&after));
         }
+        // Full holder ratio is the lowest the reserve can end.
+        let rewarded = cbm.tier_reserve_entries(&ghostdag, &mergeset_rewards, &none, &tier_bps, &none);
+        assert_eq!(
+            tier_reserve_bounds(TierReserve { reserve: 10 * wanted, ask_average: 0 }, &rewarded).min,
+            full.tier_reserve_after.unwrap().reserve
+        );
         // A coinbase paying out more than it had to distribute implies no reserve.
         let mut inflated = full.tx.clone();
         inflated.outputs[0].value += 10 * wanted + inflow;
@@ -913,30 +957,55 @@ mod tests {
     }
 
     #[test]
-    fn tier_reserve_shares_a_short_reserve_pro_rata() {
-        let (a, b): (Hash, Hash) = (1.into(), 2.into());
-        let (cut, full) = (1_000u64, RATIO_REWARD_BPS_DIVISOR);
+    fn tier_reserve_fill_is_fixed_by_the_parent() {
+        let (a, b, c): (Hash, Hash, Hash) = (1.into(), 2.into(), 3.into());
+        let cut = 1_000u64;
+        let at = |reserve: u64, ask_average: u64| TierReserve { reserve, ask_average };
+        let full = BlockHashMap::new();
+        let two = [(a, cut, 20_000), (b, cut, 20_000)];
         // Enough for everyone: each drawer gets its whole ask.
-        let rich = fold_tier_reserve(5_000, &[(a, cut, 20_000, full), (b, cut, 20_000, full)]);
-        assert_eq!((rich.draws.get(&a), rich.draws.get(&b), rich.after), (Some(&1_000), Some(&1_000), 3_000));
-        // Short: shared in proportion to the asks, whatever the mergeset order.
-        let short = fold_tier_reserve(1_500, &[(a, cut, 20_000, full), (b, cut, 20_000, full)]);
-        assert_eq!((short.draws.get(&a), short.draws.get(&b), short.after), (Some(&750), Some(&750), 0));
-        let swapped = fold_tier_reserve(1_500, &[(b, cut, 20_000, full), (a, cut, 20_000, full)]);
+        let rich = fold_tier_reserve(at(5_000, 0), &two, &full);
+        assert_eq!((rich.draws.get(&a), rich.draws.get(&b), rich.after.reserve), (Some(&1_000), Some(&1_000), 3_000));
+        // Below the horizon every ask gets the same fill, whatever it is merged with.
+        let avg = 10;
+        let budget = TIER_RESERVE_HORIZON_BLOCKS * avg;
+        let together = fold_tier_reserve(at(budget / 6, avg), &two, &full);
+        let alone = fold_tier_reserve(at(budget / 6, avg), &[(c, cut, 20_000)], &full);
+        assert_eq!(together.draws.get(&a), Some(&166));
+        assert_eq!(together.draws.get(&b), Some(&166));
+        assert_eq!(alone.draws.get(&c), Some(&166));
+        // Draws above what the block can pay are shared pro rata, the remainder stays.
+        let short = fold_tier_reserve(at(1_500, 0), &two, &full);
+        assert_eq!((short.draws.get(&a), short.draws.get(&b), short.after.reserve), (Some(&750), Some(&750), 0));
+        let swapped = fold_tier_reserve(at(1_500, 0), &[(b, cut, 20_000), (a, cut, 20_000)], &full);
         assert_eq!(swapped.draws, short.draws);
-        // The rounding remainder stays in the reserve.
-        let odd = fold_tier_reserve(1_001, &[(a, cut, 20_000, full), (b, cut, 20_000, full)]);
-        assert_eq!((odd.draws.get(&a), odd.draws.get(&b), odd.after), (Some(&500), Some(&500), 1));
-        // A low holder ratio asks less, and the share follows the asks.
-        let weighted = fold_tier_reserve(600, &[(a, cut, 20_000, full / 2), (b, cut, 20_000, full)]);
+        let odd = fold_tier_reserve(at(1_001, 0), &two, &full);
+        assert_eq!((odd.draws.get(&a), odd.draws.get(&b), odd.after.reserve), (Some(&500), Some(&500), 1));
+        // A low holder ratio asks less; what it leaves stays in the reserve.
+        let mut half = BlockHashMap::new();
+        half.insert(a, RATIO_REWARD_BPS_DIVISOR / 2);
+        let weighted = fold_tier_reserve(at(600, 0), &two, &half);
         assert_eq!((weighted.draws.get(&a), weighted.draws.get(&b)), (Some(&200), Some(&400)));
+        let rich_half = fold_tier_reserve(at(5_000, 0), &two, &half);
+        assert_eq!((rich_half.draws.get(&a), rich_half.after.reserve), (Some(&500), 3_500));
+        // Trusted bounds hold for any ratio, rounding included.
+        for (before, ratios) in [(at(1_001, 0), &full), (at(600, 0), &half), (at(budget / 6, avg), &half), (at(5_000, 0), &half)] {
+            let bounds = tier_reserve_bounds(before, &two);
+            let fold = fold_tier_reserve(before, &two, ratios);
+            assert!((bounds.min..=bounds.max).contains(&fold.after.reserve));
+            assert_eq!(bounds.ask_average, fold.after.ask_average);
+        }
         // A small blue of the same block feeds the drawers.
-        let fed = fold_tier_reserve(0, &[(a, cut, 6_000, full), (b, cut, 20_000, full)]);
-        assert_eq!((fed.draws.get(&b), fed.after), (Some(&400), 0));
+        let fed = fold_tier_reserve(at(0, 0), &[(a, cut, 6_000), (b, cut, 20_000)], &full);
+        assert_eq!((fed.draws.get(&b), fed.after.reserve), (Some(&400), 0));
         // Inflow above the ceiling is burned, not kept.
         let cap = keryx_consensus_core::config::params::TIER_RESERVE_CAP_SOMPI;
-        let over = fold_tier_reserve(cap, &[(a, cut, 6_000, full)]);
-        assert_eq!((over.after, over.overflow), (cap, 400));
+        let over = fold_tier_reserve(at(cap, 0), &[(a, cut, 6_000)], &full);
+        assert_eq!((over.after.reserve, over.overflow), (cap, 400));
+        // The average follows the excess of every chain block, drawn or not.
+        let n = TIER_RESERVE_AVERAGE_BLOCKS;
+        assert_eq!(fold_tier_reserve(at(0, 0), &[(a, n * 1_000, 20_000)], &full).after.ask_average, 1_000);
+        assert_eq!(fold_tier_reserve(at(0, n), &[(a, cut, 6_000)], &full).after.ask_average, n - 1);
     }
 
     #[test]

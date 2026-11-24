@@ -1,5 +1,7 @@
 use super::VirtualStateProcessor;
 use crate::model::stores::tier_reserve::TierReserveStoreReader;
+use crate::processes::coinbase::tier_reserve_bounds;
+use keryx_consensus_core::coinbase::TierReserve;
 use crate::{
     errors::{
         BlockProcessResult,
@@ -35,7 +37,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_H18, INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, ratio_on_probation, ratio_probation_production, RATIO_PROBATION_FLOOR_BLOCKS, RATIO_PROBATION_SLICES, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_H18, INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, TIER_REWARD_BPS_H18, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, ratio_on_probation, ratio_probation_production, RATIO_PROBATION_FLOOR_BLOCKS, RATIO_PROBATION_SLICES, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -165,7 +167,7 @@ pub(super) struct UtxoProcessingContext<'a> {
     pub mergeset_rewards: BlockHashMap<BlockRewardData>,
     pub pruning_sample_from_pov: Option<Hash>,
     /// Tier reserve after this chain block, under the reserve rule.
-    pub tier_reserve_after: Option<u64>,
+    pub tier_reserve_after: Option<TierReserve>,
 }
 
 impl<'a> UtxoProcessingContext<'a> {
@@ -328,12 +330,22 @@ impl VirtualStateProcessor {
         let mergeset_non_daa = self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap();
         // The reserve after every chain block, trusted or not, is read off its actual coinbase: a
         // verified coinbase equals the expected one, so this is the rule's own fold, and a trusted one
-        // carries the chain's value without re-deriving the holder ratios.
+        // carries the chain's value within the range the rule allows for any holder ratio.
+        let reward_mints = self.service_reward_mints_for(ctx.selected_parent());
         let tier_reserve = self.tier_reserve_before(ctx.selected_parent(), header.daa_score);
         if let Some(before) = tier_reserve {
-            let reward_mints = self.service_reward_mints_for(ctx.selected_parent());
+            let tier_bps_by_block = self.tier_bps_by_block(&ctx.ghostdag_data, &mergeset_non_daa, header.daa_score);
+            let suspended_blues = self.suspended_blues(&ctx.ghostdag_data, &mergeset_non_daa, header.daa_score);
+            let rewarded = self.coinbase_manager.tier_reserve_entries(
+                &ctx.ghostdag_data,
+                &ctx.mergeset_rewards,
+                &mergeset_non_daa,
+                &tier_bps_by_block,
+                &suspended_blues,
+            );
+            let bounds = tier_reserve_bounds(before, &rewarded);
             let implied = self.coinbase_manager.tier_reserve_implied(
-                before,
+                before.reserve,
                 &txs[0],
                 &ctx.ghostdag_data,
                 &ctx.mergeset_rewards,
@@ -341,8 +353,10 @@ impl VirtualStateProcessor {
                 &reward_mints,
             );
             match implied {
-                Some(after) => ctx.tier_reserve_after = Some(after),
-                None => return Err(BadCoinbaseTransaction),
+                Some(reserve) if (bounds.min..=bounds.max).contains(&reserve) => {
+                    ctx.tier_reserve_after = Some(TierReserve { reserve, ask_average: bounds.ask_average })
+                }
+                _ => return Err(BadCoinbaseTransaction),
             }
         }
         if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
@@ -354,6 +368,7 @@ impl VirtualStateProcessor {
                 &mergeset_non_daa,
                 &[sp_diff, &ctx.mergeset_diff],
                 tier_reserve,
+                &reward_mints,
                 enforce,
             )?;
         }
@@ -737,7 +752,8 @@ impl VirtualStateProcessor {
         // Diffs from the committed virtual to this block's own view, for ratio-reward balances.
         view_diffs: &[&UtxoDiff],
         // Tier reserve before this block, under the reserve rule.
-        tier_reserve: Option<u64>,
+        tier_reserve: Option<TierReserve>,
+        reward_mints: &[(ScriptPublicKey, u64)],
         // When false (observe-only): compute the expected coinbase and LOG any mismatch, but do NOT
         // reject the block. Lets the network run while we confirm the producer and validators compute
         // the identical coinbase (logs comparable across nodes) before enforcement is switched on.
@@ -748,7 +764,6 @@ impl VirtualStateProcessor {
         let tier_bps_by_block = self.tier_bps_by_block(ghostdag_data, mergeset_non_daa, daa_score);
         let ratio_bps_by_block = self.ratio_bps_by_block(ghostdag_data, mergeset_non_daa, mergeset_rewards, daa_score, view_diffs);
         let suspended_blues = self.suspended_blues(ghostdag_data, mergeset_non_daa, daa_score);
-        let reward_mints = self.service_reward_mints_for(ghostdag_data.selected_parent);
         let expected_coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -761,7 +776,7 @@ impl VirtualStateProcessor {
                 &ratio_bps_by_block,
                 tier_reserve,
                 &suspended_blues,
-                &reward_mints,
+                reward_mints,
             )
             .unwrap()
             .tx;
@@ -859,14 +874,14 @@ impl VirtualStateProcessor {
 
     /// Tier reserve a block at `daa_score` starts from: its selected parent's, `None` before the
     /// reserve rule. A selected parent below the gate starts the reserve at zero.
-    pub(super) fn tier_reserve_before(&self, selected_parent: Hash, daa_score: u64) -> Option<u64> {
+    pub(super) fn tier_reserve_before(&self, selected_parent: Hash, daa_score: u64) -> Option<TierReserve> {
         if !self.h18_activation.is_active(daa_score) {
             return None;
         }
         if selected_parent == self.genesis.hash
             || !self.h18_activation.is_active(self.headers_store.get_daa_score(selected_parent).unwrap())
         {
-            return Some(0);
+            return Some(TierReserve::default());
         }
         match self.tier_reserve_store.get(selected_parent) {
             Ok(reserve) => Some(reserve),
@@ -1127,14 +1142,25 @@ impl VirtualStateProcessor {
     ///   becomes the exact mirror of payment: every blue is merged by exactly one chain block, so
     ///   every paid block is counted exactly once, connectivity-bias-free.
     pub(super) fn block_productions(&self, hash: Hash) -> Vec<(ScriptPublicKey, u64)> {
-        if self.pom_level_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
+        let daa_score = self.headers_store.get_daa_score(hash).unwrap();
+        if self.pom_level_activation.is_active(daa_score) {
             let ghostdag_data = self.ghostdag_store.get_data(hash).unwrap();
             let non_daa = self.daa_excluded_store.get_mergeset_non_daa(hash).unwrap();
+            // Under the reserve rule a blue above the divisor counts its whole tier value.
+            let h18 = self.h18_activation.is_active(daa_score);
             ghostdag_data
                 .mergeset_blues
                 .iter()
                 .filter(|b| !non_daa.contains(b))
-                .filter_map(|b| self.block_production(*b))
+                .filter_map(|b| {
+                    let (spk, cut) = self.block_production(*b)?;
+                    if !h18 {
+                        return Some((spk, cut));
+                    }
+                    let tier = self.headers_store.get_header(*b).unwrap().pom_tier as usize;
+                    let bps = TIER_REWARD_BPS_H18.get(tier).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR).max(TIER_REWARD_BPS_DIVISOR);
+                    Some((spk, (cut as u128 * bps as u128 / TIER_REWARD_BPS_DIVISOR as u128) as u64))
+                })
                 .collect()
         } else {
             self.block_production(hash).into_iter().collect()
