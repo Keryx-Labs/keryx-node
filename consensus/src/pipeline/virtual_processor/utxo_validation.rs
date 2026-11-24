@@ -326,23 +326,24 @@ impl VirtualStateProcessor {
         // walk quadratic, so a trusted transition must not pay for a comparison it discards.
         let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase_at(header.daa_score);
         let mergeset_non_daa = self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap();
-        // The reserve is folded on every chain block, trusted or not: its children start from it.
+        // The reserve after every chain block, trusted or not, is read off its actual coinbase: a
+        // verified coinbase equals the expected one, so this is the rule's own fold, and a trusted one
+        // carries the chain's value without re-deriving the holder ratios.
         let tier_reserve = self.tier_reserve_before(ctx.selected_parent(), header.daa_score);
         if let Some(before) = tier_reserve {
-            let tier_bps_by_block = self.tier_bps_by_block(&ctx.ghostdag_data, &mergeset_non_daa, header.daa_score);
-            let suspended_blues = self.suspended_blues(&ctx.ghostdag_data, &mergeset_non_daa, header.daa_score);
-            ctx.tier_reserve_after = Some(
-                self.coinbase_manager
-                    .tier_reserve_fold(
-                        before,
-                        &ctx.ghostdag_data,
-                        &ctx.mergeset_rewards,
-                        &mergeset_non_daa,
-                        &tier_bps_by_block,
-                        &suspended_blues,
-                    )
-                    .after,
+            let reward_mints = self.service_reward_mints_for(ctx.selected_parent());
+            let implied = self.coinbase_manager.tier_reserve_implied(
+                before,
+                &txs[0],
+                &ctx.ghostdag_data,
+                &ctx.mergeset_rewards,
+                &mergeset_non_daa,
+                &reward_mints,
             );
+            match implied {
+                Some(after) => ctx.tier_reserve_after = Some(after),
+                None => return Err(BadCoinbaseTransaction),
+            }
         }
         if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
             self.verify_coinbase_transaction(

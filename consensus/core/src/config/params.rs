@@ -1484,8 +1484,8 @@ pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 /// its excess from the tier reserve, which collects the shortfall of the values below it.
 pub const TIER_REWARD_BPS_H18: [u64; H18_TIER_COUNT] = [6_000, 7_000, 8_000, 9_000, 10_000, 20_000, 58_000];
 
-/// Ceiling of the tier reserve, in sompi; inflow above it is burned.
-pub const TIER_RESERVE_CAP_SOMPI: u64 = 900_000 * crate::constants::SOMPI_PER_KASPA;
+/// Ceiling of the tier reserve, in sompi (about one hour of inflow); inflow above it is burned.
+pub const TIER_RESERVE_CAP_SOMPI: u64 = 38_000 * crate::constants::SOMPI_PER_KASPA;
 
 /// Tier-reward schedule for a block at `daa_score`: 7-tier H18 once `h18_activation` is live,
 /// 5-tier H6 once `pom_v3_activation` is live, 5-tier H2 once `very_light_activation`, legacy
