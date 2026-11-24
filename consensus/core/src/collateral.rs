@@ -687,7 +687,7 @@ pub const SERVICE_WINDOW_BASE_DAA_V3: u64 = 150;
 pub const SERVICE_WINDOW_RATE_V3: [u64; 5] = [90, 180, 85, 70, 35];
 
 /// The same allowance for each `POM_TIERS_H18` tier.
-pub const SERVICE_WINDOW_RATE_H18: &[u64] = &[90, 208];
+pub const SERVICE_WINDOW_RATE_H18: &[u64] = &[90, 208, 85, 70];
 
 const _: () = assert!(SERVICE_WINDOW_RATE_H18.len() == crate::config::params::POM_TIERS_H18.len());
 

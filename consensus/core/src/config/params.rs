@@ -360,11 +360,31 @@ pub const QWEN3_5_9B_Q8_MODEL_ID: [u8; 32] = [
     0x04, 0xc3, 0xbf, 0xbc, 0xf6, 0x71, 0x64, 0x57,
 ];
 
+/// MiniCPM-V-4.7-35B-A3B abliterated IQ3_XXS (mradermacher GGUF, language model qwen3_5_moe). H18
+/// tier 2. `model_id` = CIDv0[2..34] of the pinned GGUF (IPFS QmdXoCVVLhTxwo8DoG7uXJKsHA5rghaavLYh5tW3Rgob8S).
+pub const MINICPM_V_4_7_MODEL_ID: [u8; 32] = [
+    0xe1, 0xba, 0x4a, 0xb2, 0xf8, 0xcf, 0xc6, 0xde,
+    0x46, 0x57, 0x33, 0x45, 0x7f, 0xc1, 0x4c, 0x7e,
+    0x3b, 0x9e, 0x58, 0x97, 0x06, 0xc8, 0x8b, 0x58,
+    0x25, 0x1a, 0x8c, 0x2f, 0xbc, 0x90, 0x38, 0x17,
+];
+
+/// Gemma-4-31B ARA heretic Q4_K_M (mradermacher GGUF, arch gemma4). H18 tier 3. `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS QmXjFHkSXBqcpUQpdgfv9aFRnQ679jaABs3czwDgVTunsF).
+pub const GEMMA_4_31B_MODEL_ID: [u8; 32] = [
+    0x8b, 0x83, 0x0f, 0x57, 0x7d, 0x1e, 0xae, 0x28,
+    0x6b, 0xf8, 0x5f, 0x37, 0x5b, 0x8a, 0x69, 0x17,
+    0x23, 0x22, 0x57, 0xf8, 0x7c, 0x64, 0x54, 0xb2,
+    0x8c, 0xfb, 0xf4, 0x4c, 0xdd, 0xd1, 0x69, 0xb6,
+];
+
 /// Per-model `inference_reward` floors once `h18_activation` is live. Models that left the lineup
 /// keep an entry no request can meet.
 pub const INFERENCE_REWARD_MINIMUMS_H18: &[([u8; 32], u64)] = &[
     (KEV_4B_MODEL_ID,                   50_000_000), // 0.5 KRX
     (QWEN3_5_9B_Q8_MODEL_ID,           100_000_000), // 1.0 KRX
+    (MINICPM_V_4_7_MODEL_ID,           150_000_000), // 1.5 KRX
+    (GEMMA_4_31B_MODEL_ID,             200_000_000), // 2.0 KRX
     (QWEN3_5_9B_ABLITERATED_MODEL_ID,  u64::MAX),
     (GLM_4_9B_0414_MODEL_ID,           u64::MAX),
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, u64::MAX),
@@ -662,10 +682,26 @@ pub const POM_TIERS_H18: &[crate::pom::PomTier] = &[
         ],
         chunks: 297_391_680,
     },
+    crate::pom::PomTier {
+        model_id: MINICPM_V_4_7_MODEL_ID,
+        root: [
+            0x95, 0x06, 0xd8, 0xd4, 0xdf, 0x80, 0xb1, 0x62, 0x87, 0x86, 0x05, 0x29, 0xa8, 0x9a, 0x92, 0x7c,
+            0xed, 0xe4, 0x09, 0x2e, 0x34, 0xcf, 0x29, 0xe5, 0x3f, 0x41, 0x14, 0x35, 0x00, 0xaa, 0xfa, 0xcb,
+        ],
+        chunks: 425_386_472,
+    },
+    crate::pom::PomTier {
+        model_id: GEMMA_4_31B_MODEL_ID,
+        root: [
+            0x12, 0x0e, 0x22, 0x46, 0x32, 0x76, 0xe4, 0xf6, 0xe8, 0xd6, 0x63, 0x1e, 0x4e, 0x04, 0x2e, 0x56,
+            0xf6, 0x07, 0x59, 0x6b, 0xd0, 0x28, 0x1c, 0xf5, 0xba, 0x4b, 0x86, 0x32, 0xdd, 0x8b, 0x08, 0x29,
+        ],
+        chunks: 583_475_904,
+    },
 ];
 
 /// Context pad tiles of each `POM_TIERS_H18` tier.
-pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688];
+pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688, 846_848, 4_439_040];
 
 const _: () = assert!(
     POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
@@ -1276,7 +1312,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
 pub const CONTEXT_FLOORS_H14: [u32; 5] = [8_192, 32_768, 32_768, 32_768, 32_768];
 
 /// Context floor of each `POM_TIERS_H18` tier, in tokens.
-pub const CONTEXT_FLOORS_H18: &[u32] = &[32_768, 32_768];
+pub const CONTEXT_FLOORS_H18: &[u32] = &[32_768, 32_768, 32_768, 32_768];
 
 const _: () = assert!(CONTEXT_FLOORS_H18.len() == POM_TIERS_H18.len());
 
