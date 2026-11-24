@@ -25,6 +25,7 @@ impl CoinbaseManagerMock {
             tx: Transaction::new(TX_VERSION, vec![], vec![output], 0, SUBNETWORK_ID_COINBASE, 0, payload),
             has_red_reward: false,
             red_reward_output_index: None,
+            tier_reserve_after: None,
         }
     }
 

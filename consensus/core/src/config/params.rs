@@ -1480,8 +1480,12 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 ///   4  Kimi-48B        0%
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
-/// H18 (7-tier) tier-reward schedule, gated by `h18_activation`.
-pub const TIER_REWARD_BPS_H18: [u64; H18_TIER_COUNT] = [4_500, 5_000, 5_500, 6_000, 7_000, 8_500, 10_000];
+/// H18 (7-tier) tier-reward schedule, gated by `h18_activation`. A value above the divisor pays
+/// its excess from the tier reserve, which collects the shortfall of the values below it.
+pub const TIER_REWARD_BPS_H18: [u64; H18_TIER_COUNT] = [6_000, 7_000, 8_000, 9_000, 10_000, 20_000, 58_000];
+
+/// Ceiling of the tier reserve, in sompi; inflow above it is burned.
+pub const TIER_RESERVE_CAP_SOMPI: u64 = 900_000 * crate::constants::SOMPI_PER_KASPA;
 
 /// Tier-reward schedule for a block at `daa_score`: 7-tier H18 once `h18_activation` is live,
 /// 5-tier H6 once `pom_v3_activation` is live, 5-tier H2 once `very_light_activation`, legacy
@@ -3352,7 +3356,8 @@ mod pad_table_tests {
         assert_eq!(tier_reward_bps(true, true, true), &TIER_REWARD_BPS_H18);
         assert_eq!(tier_reward_bps(true, true, false), &TIER_REWARD_BPS_H6);
         assert!(TIER_REWARD_BPS_H18.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(TIER_REWARD_BPS_H18[H18_TIER_COUNT - 1], TIER_REWARD_BPS_DIVISOR);
+        assert_eq!(TIER_REWARD_BPS_H18[4], TIER_REWARD_BPS_DIVISOR);
+        assert!(TIER_REWARD_BPS_H18[5..].iter().all(|b| *b > TIER_REWARD_BPS_DIVISOR));
         assert_eq!(anchors(pom_tiers(true, true, true, true, true, true)), anchors(POM_TIERS_H18));
         assert_eq!(anchors(service_tiers(true, true)), anchors(POM_TIERS_H18));
         for (t, tier) in POM_TIERS_H18.iter().enumerate() {

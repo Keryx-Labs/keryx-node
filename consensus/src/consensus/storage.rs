@@ -25,6 +25,7 @@ use crate::{
         relations::DbRelationsStore,
         selected_chain::DbSelectedChainStore,
         statuses::DbStatusesStore,
+        tier_reserve::DbTierReserveStore,
         tips::DbTipsStore,
         utxo_diffs::DbUtxoDiffsStore,
         utxo_multisets::DbUtxoMultisetsStore,
@@ -70,6 +71,7 @@ pub struct ConsensusStorage {
     pub daa_excluded_store: Arc<DbDaaStore>,
     pub depth_store: Arc<DbDepthStore>,
     pub pom_tier_store: Arc<DbPomTierStore>,
+    pub tier_reserve_store: Arc<DbTierReserveStore>,
     pub pom_proof_store: Arc<DbPomProofStore>,
     pub pruning_samples_store: Arc<DbPruningSamplesStore>,
 
@@ -253,6 +255,7 @@ impl ConsensusStorage {
         ));
         let daa_excluded_store = Arc::new(DbDaaStore::new(db.clone(), daa_excluded_builder.build()));
         let pom_tier_store = Arc::new(DbPomTierStore::new(db.clone(), header_data_builder.build()));
+        let tier_reserve_store = Arc::new(DbTierReserveStore::new(db.clone(), block_data_builder.build()));
         let pom_proof_store = Arc::new(if config.pom_proof_ring_file {
             DbPomProofStore::open_file(db.path(), ring_capacity_from_env(DEFAULT_FILE_RING_BYTES))
                 .expect("open the PoM proof ring next to the consensus database")
@@ -355,6 +358,7 @@ impl ConsensusStorage {
             daa_excluded_store,
             depth_store,
             pom_tier_store,
+            tier_reserve_store,
             pom_proof_store,
             pruning_samples_store,
             utxo_diffs_store,

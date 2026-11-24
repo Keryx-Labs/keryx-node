@@ -1,4 +1,5 @@
 use super::VirtualStateProcessor;
+use crate::model::stores::tier_reserve::TierReserveStoreReader;
 use crate::{
     errors::{
         BlockProcessResult,
@@ -163,6 +164,8 @@ pub(super) struct UtxoProcessingContext<'a> {
     pub mergeset_acceptance_data: Vec<MergesetBlockAcceptanceData>,
     pub mergeset_rewards: BlockHashMap<BlockRewardData>,
     pub pruning_sample_from_pov: Option<Hash>,
+    /// Tier reserve after this chain block, under the reserve rule.
+    pub tier_reserve_after: Option<u64>,
 }
 
 impl<'a> UtxoProcessingContext<'a> {
@@ -176,6 +179,7 @@ impl<'a> UtxoProcessingContext<'a> {
             mergeset_rewards: BlockHashMap::with_capacity(mergeset_size),
             mergeset_acceptance_data: Vec::with_capacity(mergeset_size),
             pruning_sample_from_pov: Default::default(),
+            tier_reserve_after: None,
         }
     }
 
@@ -321,14 +325,34 @@ impl VirtualStateProcessor {
         // distance from the committed virtual — computing it per block turns a long re-validation
         // walk quadratic, so a trusted transition must not pay for a comparison it discards.
         let enforce = self.ratio_verification_activation.is_active(header.daa_score) && !self.trust_coinbase_at(header.daa_score);
+        let mergeset_non_daa = self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap();
+        // The reserve is folded on every chain block, trusted or not: its children start from it.
+        let tier_reserve = self.tier_reserve_before(ctx.selected_parent(), header.daa_score);
+        if let Some(before) = tier_reserve {
+            let tier_bps_by_block = self.tier_bps_by_block(&ctx.ghostdag_data, &mergeset_non_daa, header.daa_score);
+            let suspended_blues = self.suspended_blues(&ctx.ghostdag_data, &mergeset_non_daa, header.daa_score);
+            ctx.tier_reserve_after = Some(
+                self.coinbase_manager
+                    .tier_reserve_fold(
+                        before,
+                        &ctx.ghostdag_data,
+                        &ctx.mergeset_rewards,
+                        &mergeset_non_daa,
+                        &tier_bps_by_block,
+                        &suspended_blues,
+                    )
+                    .after,
+            );
+        }
         if enforce || std::env::var("KERYX_RATIO_DEBUG").is_ok() {
             self.verify_coinbase_transaction(
                 &txs[0],
                 header.daa_score,
                 &ctx.ghostdag_data,
                 &ctx.mergeset_rewards,
-                &self.daa_excluded_store.get_mergeset_non_daa(header.hash).unwrap(),
+                &mergeset_non_daa,
                 &[sp_diff, &ctx.mergeset_diff],
+                tier_reserve,
                 enforce,
             )?;
         }
@@ -711,6 +735,8 @@ impl VirtualStateProcessor {
         mergeset_non_daa: &BlockHashSet,
         // Diffs from the committed virtual to this block's own view, for ratio-reward balances.
         view_diffs: &[&UtxoDiff],
+        // Tier reserve before this block, under the reserve rule.
+        tier_reserve: Option<u64>,
         // When false (observe-only): compute the expected coinbase and LOG any mismatch, but do NOT
         // reject the block. Lets the network run while we confirm the producer and validators compute
         // the identical coinbase (logs comparable across nodes) before enforcement is switched on.
@@ -732,6 +758,7 @@ impl VirtualStateProcessor {
                 mergeset_non_daa,
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
+                tier_reserve,
                 &suspended_blues,
                 &reward_mints,
             )
@@ -827,6 +854,18 @@ impl VirtualStateProcessor {
             None if pp_daa < self.production_index_floor_daa() => Ok(None),
             None => Err(MissingProductionIndexSnapshot(header.pruning_point)),
         }
+    }
+
+    /// Tier reserve a block at `daa_score` starts from: its selected parent's, `None` before the
+    /// reserve rule. A selected parent below the gate starts the reserve at zero.
+    pub(super) fn tier_reserve_before(&self, selected_parent: Hash, daa_score: u64) -> Option<u64> {
+        if !self.h18_activation.is_active(daa_score) {
+            return None;
+        }
+        if !self.h18_activation.is_active(self.headers_store.get_daa_score(selected_parent).unwrap()) {
+            return Some(0);
+        }
+        Some(self.tier_reserve_store.get(selected_parent).unwrap())
     }
 
     pub(super) fn tier_bps_by_block(

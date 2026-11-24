@@ -155,6 +155,8 @@ pub enum DatabaseStorePrefixes {
     ProductionWindowDaa = 203,
     /// Bounds (bottom, sample chain indices) of that imported window.
     ProductionImportedWindow = 204,
+    /// Tier reserve after each UTXO-valid chain block: block hash → sompi.
+    TierReserve = 205,
 
     // ---- Separator ----
     /// Reserved as a separator

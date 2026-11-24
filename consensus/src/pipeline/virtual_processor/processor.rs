@@ -36,6 +36,7 @@ use crate::{
             relations::{DbRelationsStore, RelationsStoreReader},
             selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
+            tier_reserve::DbTierReserveStore,
             tips::{DbTipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
             utxo_multisets::{DbUtxoMultisetsStore, UtxoMultisetsStoreReader},
@@ -141,6 +142,7 @@ pub struct VirtualStateProcessor {
     pub(super) block_transactions_store: Arc<DbBlockTransactionsStore>,
     /// Proven PoM tier per block, read to scale the tier-reward coinbase split.
     pub(super) pom_tier_store: Arc<DbPomTierStore>,
+    pub(super) tier_reserve_store: Arc<DbTierReserveStore>,
     /// RAM-only service-bond ledger (H6), folded along the committed selected chain.
     pub(super) service_ledger: parking_lot::Mutex<super::service_bond::ServiceLedgerSync>,
     /// Burned escrow outpoints (finality-deep misses), persisted counterpart in `service_burn_store`.
@@ -436,6 +438,7 @@ impl VirtualStateProcessor {
             daa_excluded_store: storage.daa_excluded_store.clone(),
             block_transactions_store: storage.block_transactions_store.clone(),
             pom_tier_store: storage.pom_tier_store.clone(),
+            tier_reserve_store: storage.tier_reserve_store.clone(),
             service_ledger: Default::default(),
             service_burned: Default::default(),
             service_burn_store: storage.service_burn_store.clone(),
@@ -875,6 +878,7 @@ impl VirtualStateProcessor {
                             ctx.multiset_hash,
                             ctx.mergeset_acceptance_data,
                             ctx.pruning_sample_from_pov.expect("verified"),
+                            ctx.tier_reserve_after,
                         );
                         // Count the number of UTXO-processed chain blocks
                         chain_block_counter += 1;
@@ -899,8 +903,12 @@ impl VirtualStateProcessor {
         multiset: MuHash,
         acceptance_data: AcceptanceData,
         pruning_sample_from_pov: Hash,
+        tier_reserve_after: Option<u64>,
     ) {
         let mut batch = WriteBatch::default();
+        if let Some(reserve) = tier_reserve_after {
+            self.tier_reserve_store.insert_batch(&mut batch, current, reserve).unwrap();
+        }
         self.utxo_diffs_store.insert_batch(&mut batch, current, Arc::new(mergeset_diff)).unwrap();
         self.utxo_multisets_store.insert_batch(&mut batch, current, multiset).unwrap();
         self.acceptance_data_store.insert_batch(&mut batch, current, Arc::new(acceptance_data)).unwrap();
@@ -1908,6 +1916,7 @@ impl VirtualStateProcessor {
         let suspended_blues =
             self.suspended_blues(&virtual_state.ghostdag_data, &virtual_state.mergeset_non_daa, virtual_state.daa_score);
         let reward_mints = self.service_reward_mints_for(virtual_state.ghostdag_data.selected_parent);
+        let tier_reserve = self.tier_reserve_before(virtual_state.ghostdag_data.selected_parent, virtual_state.daa_score);
         let coinbase = self
             .coinbase_manager
             .expected_coinbase_transaction(
@@ -1918,6 +1927,7 @@ impl VirtualStateProcessor {
                 &virtual_state.mergeset_non_daa,
                 &tier_bps_by_block,
                 &ratio_bps_by_block,
+                tier_reserve,
                 &suspended_blues,
                 &reward_mints,
             )
@@ -2029,7 +2039,7 @@ impl VirtualStateProcessor {
     /// Note that pruning point-related stores are initialized by `init`
     pub fn process_genesis(self: &Arc<Self>) {
         // Write the UTXO state of genesis
-        self.commit_utxo_state(self.genesis.hash, UtxoDiff::default(), MuHash::new(), AcceptanceData::default(), ZERO_HASH);
+        self.commit_utxo_state(self.genesis.hash, UtxoDiff::default(), MuHash::new(), AcceptanceData::default(), ZERO_HASH, None);
 
         // Init the virtual selected chain store
         let mut batch = WriteBatch::default();

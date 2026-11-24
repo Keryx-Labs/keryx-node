@@ -22,6 +22,7 @@ pub mod headers_selected_tip;
 pub mod past_pruning_points;
 pub mod pom_proof;
 pub mod pom_tier;
+pub mod tier_reserve;
 pub mod production_seed;
 pub mod pruning;
 pub mod pruning_meta;

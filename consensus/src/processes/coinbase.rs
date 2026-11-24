@@ -1,14 +1,14 @@
 use keryx_addresses::{Address, Prefix, Version};
 use keryx_consensus_core::{
-    BlockHashMap, BlockHashSet,
+    BlockHashMap, BlockHashSet, HashMapCustomHasher,
     coinbase::*,
     collateral::{CHALLENGE_WINDOW_BLOCKS, SERVICE_BOND_CSV_WINDOW_BLOCKS},
-    config::params::{ForkActivation, RATIO_REWARD_BPS_DIVISOR, TIER_REWARD_BPS_DIVISOR},
+    config::params::{ForkActivation, RATIO_REWARD_BPS_DIVISOR, TIER_RESERVE_CAP_SOMPI, TIER_REWARD_BPS_DIVISOR},
     errors::coinbase::{CoinbaseError, CoinbaseResult},
     subnets,
     tx::{ScriptPublicKey, ScriptVec, Transaction, TransactionOutput},
 };
-use keryx_hashes::{Hasher, TransactionHash};
+use keryx_hashes::{Hash, Hasher, TransactionHash};
 use keryx_txscript::{
     opcodes::codes::{OpCheckSequenceVerify, OpCheckSig},
     script_builder::ScriptBuilder,
@@ -17,6 +17,40 @@ use keryx_txscript::{
 use std::convert::TryInto;
 
 use crate::{constants, model::stores::ghostdag::GhostdagData};
+
+/// Outcome of folding the tier reserve over one block: the reserve after it, the amount each drawing
+/// blue receives from it, and the inflow burned above the ceiling.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TierReserveFold {
+    pub after: u64,
+    pub draws: BlockHashMap<u64>,
+    pub overflow: u64,
+}
+
+/// Part of a miner cut a tier value earns before any reserve draw: the whole cut is the most.
+fn tier_earned(miner_cut: u64, tier_bps: u64) -> u64 {
+    miner_cut * tier_bps.min(TIER_REWARD_BPS_DIVISOR) / TIER_REWARD_BPS_DIVISOR
+}
+
+/// Reserve fold over `(blue, miner cut, tier bps)` entries in mergeset order (see
+/// `CoinbaseManager::tier_reserve_fold`).
+pub fn fold_tier_reserve(before: u64, rewarded: &[(Hash, u64, u64)]) -> TierReserveFold {
+    let mut available = before;
+    for (_, cut, bps) in rewarded {
+        available = available.saturating_add(cut - tier_earned(*cut, *bps));
+    }
+    let mut draws = BlockHashMap::new();
+    for (blue, cut, bps) in rewarded.iter().filter(|(_, _, bps)| *bps > TIER_REWARD_BPS_DIVISOR) {
+        let wanted = (*cut as u128 * (*bps - TIER_REWARD_BPS_DIVISOR) as u128 / TIER_REWARD_BPS_DIVISOR as u128) as u64;
+        let draw = wanted.min(available);
+        available -= draw;
+        if draw > 0 {
+            draws.insert(*blue, draw);
+        }
+    }
+    let overflow = available.saturating_sub(TIER_RESERVE_CAP_SOMPI);
+    TierReserveFold { after: available - overflow, draws, overflow }
+}
 
 // ── R&D allocation ────────────────────────────────────────────────────────────
 
@@ -291,6 +325,10 @@ impl CoinbaseManager {
         // (no penalty), so this is a no-op before `ratio_reward_activation`. Compounds
         // multiplicatively with `tier_bps_by_block` (see `ratio_bps_by_block`).
         ratio_bps_by_block: &BlockHashMap<u64>,
+        // Tier reserve before this block (the selected parent's), or `None` before the reserve rule.
+        // Under the rule a tier value above the divisor draws its excess from the reserve, and the
+        // shortfall of a value below it feeds the reserve instead of the burn.
+        tier_reserve: Option<u64>,
         // Service-bond suspension: blue block hashes whose producer is under a finality-deep
         // production suspension as of this block. Their entire miner cut is burned (they earn
         // nothing), the reorg-immune analogue of "this producer's blocks are invalid". Empty
@@ -309,6 +347,9 @@ impl CoinbaseManager {
         // in a single output below. Keeps the total block reward equal to the schedule subsidy —
         // only the miner's share is penalised.
         let mut reward_burn_total = 0u64;
+        let reserve = tier_reserve.map(|before| {
+            self.tier_reserve_fold(before, ghostdag_data, mergeset_rewards, mergeset_non_daa, tier_bps_by_block, suspended_blues)
+        });
 
         // Add outputs for each mergeset blue block (∩ DAA window).
         // Transaction fees: 100% burned — no miner benefit, maximum supply destruction.
@@ -338,11 +379,20 @@ impl CoinbaseManager {
                 // A suspended producer earns nothing: his whole miner cut is burned. The escrow and
                 // R&D cuts keep their full-subsidy base, so the total block reward is unchanged.
                 let miner_paid = if suspended_blues.contains(blue) {
+                    reward_burn_total += miner_subsidy;
                     0
+                } else if let Some(fold) = &reserve {
+                    // Under the reserve rule the tier shortfall went to the reserve (`tier_reserve_fold`);
+                    // only the holder-ratio part of the earned amount is burned here.
+                    let earned = tier_earned(miner_subsidy, tier_bps) + fold.draws.get(blue).copied().unwrap_or(0);
+                    let paid = earned * ratio_bps / RATIO_REWARD_BPS_DIVISOR;
+                    reward_burn_total += earned - paid;
+                    paid
                 } else {
-                    miner_subsidy * tier_bps / TIER_REWARD_BPS_DIVISOR * ratio_bps / RATIO_REWARD_BPS_DIVISOR
+                    let paid = tier_earned(miner_subsidy, tier_bps) * ratio_bps / RATIO_REWARD_BPS_DIVISOR;
+                    reward_burn_total += miner_subsidy - paid;
+                    paid
                 };
-                reward_burn_total += miner_subsidy - miner_paid;
                 // Zero-value outputs are rejected in isolation, so a fully-burned miner cut emits
                 // none: the amount is already in `reward_burn_total`.
                 if miner_paid > 0 {
@@ -403,6 +453,11 @@ impl CoinbaseManager {
             outputs.push(TransactionOutput::new(rd_total, self.rd_allocation_script_public_key.clone()));
         }
 
+        // Reserve inflow above the ceiling is burned with the miner-cut reductions.
+        if let Some(fold) = &reserve {
+            reward_burn_total += fold.overflow;
+        }
+
         // Burn the accumulated miner-cut reductions (tier + ratio) in one output. Appended last so
         // it never shifts `red_reward_output_index`. Zero before both rewards activate.
         if reward_burn_total > 0 {
@@ -422,7 +477,38 @@ impl CoinbaseManager {
             tx: Transaction::new(constants::TX_VERSION, vec![], outputs, 0, subnets::SUBNETWORK_ID_COINBASE, 0, payload),
             has_red_reward: red_subsidy > 0 || red_fees > 0,
             red_reward_output_index,
+            tier_reserve_after: reserve.map(|fold| fold.after),
         })
+    }
+
+    /// Miner cut of a blue block's subsidy: the subsidy minus its R&D and escrow cuts.
+    fn miner_cut(subsidy: u64) -> u64 {
+        subsidy - subsidy * RD_ALLOCATION_BPS / RD_ALLOCATION_BPS_DIVISOR - subsidy * ESCROW_RATE_BPS / ESCROW_RATE_BPS_DIVISOR
+    }
+
+    /// Folds the tier reserve over a block's rewarded blues: every blue below the divisor adds its tier
+    /// shortfall, then every blue above it draws its excess (or what is left), in mergeset order, then
+    /// inflow above `TIER_RESERVE_CAP_SOMPI` is burned. Suspended blues neither add nor draw.
+    pub fn tier_reserve_fold(
+        &self,
+        before: u64,
+        ghostdag_data: &GhostdagData,
+        mergeset_rewards: &BlockHashMap<BlockRewardData>,
+        mergeset_non_daa: &BlockHashSet,
+        tier_bps_by_block: &BlockHashMap<u64>,
+        suspended_blues: &BlockHashSet,
+    ) -> TierReserveFold {
+        let rewarded: Vec<(Hash, u64, u64)> = ghostdag_data
+            .mergeset_blues
+            .iter()
+            .filter(|h| !mergeset_non_daa.contains(h) && !suspended_blues.contains(h))
+            .filter_map(|h| {
+                let subsidy = mergeset_rewards.get(h).unwrap().subsidy;
+                (subsidy > 0)
+                    .then(|| (*h, Self::miner_cut(subsidy), tier_bps_by_block.get(h).copied().unwrap_or(TIER_REWARD_BPS_DIVISOR)))
+            })
+            .collect();
+        fold_tier_reserve(before, &rewarded)
     }
 
     pub fn serialize_coinbase_payload<T: AsRef<[u8]>>(&self, data: &CoinbaseData<T>) -> CoinbaseResult<Vec<u8>> {
@@ -682,6 +768,110 @@ mod tests {
     /// and the top tier (3, 0 %). Only the *miner cut* is scaled, the shortfall is burned, and
     /// the total block reward, the escrow cuts and the R&D cut are untouched.
     #[test]
+    fn tier_reserve_feeds_and_pays_the_datacenter_tiers() {
+        use keryx_consensus_core::config::params::{TIER_RESERVE_CAP_SOMPI, TIER_REWARD_BPS_H18};
+        let cbm = create_manager(&MAINNET_PARAMS);
+        let subsidy = 1_000_000_000u64;
+        let cut = CoinbaseManager::miner_cut(subsidy);
+        let (small, mid, big): (Hash, Hash, Hash) = (1.into(), 2.into(), 3.into());
+        let spk = |b: u8| ScriptPublicKey::from_vec(0, vec![b]);
+        let mut mergeset_rewards = BlockHashMap::new();
+        for (h, b) in [(small, 0xa0), (mid, 0xb0), (big, 0xc0)] {
+            mergeset_rewards.insert(h, BlockRewardData::new_with_escrow(subsidy, 0, spk(b), Some(spk(b + 1))));
+        }
+        let ghostdag = ghostdag_with_blues(vec![small, mid, big]);
+        let none = BlockHashSet::new();
+        let mut tier_bps = BlockHashMap::new();
+        tier_bps.insert(small, TIER_REWARD_BPS_H18[0]);
+        tier_bps.insert(mid, TIER_REWARD_BPS_H18[4]);
+        tier_bps.insert(big, TIER_REWARD_BPS_H18[6]);
+        let coinbase = |reserve: u64, ratio: &BlockHashMap<u64>, suspended: &BlockHashSet| {
+            cbm.expected_coinbase_transaction(
+                0,
+                MinerData::new(spk(0xee), vec![]),
+                &ghostdag,
+                &mergeset_rewards,
+                &none,
+                &tier_bps,
+                ratio,
+                Some(reserve),
+                suspended,
+                &[],
+            )
+            .unwrap()
+        };
+        let paid = |t: &CoinbaseTransactionTemplate, b: u8| {
+            t.tx.outputs.iter().filter(|o| o.script_public_key == spk(b)).map(|o| o.value).sum::<u64>()
+        };
+        let burned = |t: &CoinbaseTransactionTemplate| {
+            t.tx.outputs.iter().filter(|o| o.script_public_key == cbm.burn_script_public_key).map(|o| o.value).sum::<u64>()
+        };
+        let wanted = cut * (TIER_REWARD_BPS_H18[6] - TIER_REWARD_BPS_DIVISOR) / TIER_REWARD_BPS_DIVISOR;
+        let inflow = cut - cut * TIER_REWARD_BPS_H18[0] / TIER_REWARD_BPS_DIVISOR;
+
+        // A full reserve pays the whole bonus; the small blue's shortfall is kept, nothing burned.
+        let full = coinbase(10 * wanted, &BlockHashMap::new(), &none);
+        assert_eq!(paid(&full, 0xa0), cut - inflow);
+        assert_eq!(paid(&full, 0xb0), cut);
+        assert_eq!(paid(&full, 0xc0), cut + wanted);
+        assert_eq!(burned(&full), 0);
+        assert_eq!(full.tier_reserve_after, Some(10 * wanted + inflow - wanted));
+
+        // An empty reserve pays only what this block's own small blues fed into it.
+        let empty = coinbase(0, &BlockHashMap::new(), &none);
+        assert_eq!(paid(&empty, 0xc0), cut + inflow);
+        assert_eq!(empty.tier_reserve_after, Some(0));
+
+        // At the ceiling the bonus still draws, and the reserve ends below it.
+        let capped = coinbase(TIER_RESERVE_CAP_SOMPI, &BlockHashMap::new(), &none);
+        assert_eq!(paid(&capped, 0xc0), cut + wanted);
+        assert_eq!(capped.tier_reserve_after, Some(TIER_RESERVE_CAP_SOMPI + inflow - wanted));
+        assert_eq!(burned(&capped), 0);
+
+        // The holder ratio scales base and bonus together; what it withholds is burned, not reserved.
+        let mut half = BlockHashMap::new();
+        half.insert(big, RATIO_REWARD_BPS_DIVISOR / 2);
+        let ratio = coinbase(10 * wanted, &half, &none);
+        assert_eq!(paid(&ratio, 0xc0), (cut + wanted) / 2);
+        assert_eq!(burned(&ratio), (cut + wanted) - (cut + wanted) / 2);
+        assert_eq!(ratio.tier_reserve_after, full.tier_reserve_after);
+
+        // A suspended producer neither feeds nor draws.
+        let mut suspended = BlockHashSet::new();
+        suspended.insert(small);
+        suspended.insert(big);
+        let sus = coinbase(10 * wanted, &BlockHashMap::new(), &suspended);
+        assert_eq!(paid(&sus, 0xa0) + paid(&sus, 0xc0), 0);
+        assert_eq!(sus.tier_reserve_after, Some(10 * wanted));
+
+        // Supply: reserve change + every output = the mergeset subsidies.
+        for (t, before) in
+            [(&full, 10 * wanted), (&empty, 0), (&capped, TIER_RESERVE_CAP_SOMPI), (&ratio, 10 * wanted), (&sus, 10 * wanted)]
+        {
+            let out: u64 = t.tx.outputs.iter().map(|o| o.value).sum();
+            assert_eq!(out as i128 + t.tier_reserve_after.unwrap() as i128 - before as i128, 3 * subsidy as i128);
+        }
+    }
+
+    #[test]
+    fn tier_reserve_draws_in_mergeset_order_until_empty() {
+        let (a, b): (Hash, Hash) = (1.into(), 2.into());
+        let cut = 1_000u64;
+        let fold = fold_tier_reserve(1_500, &[(a, cut, 20_000), (b, cut, 20_000)]);
+        assert_eq!(fold.draws.get(&a), Some(&1_000));
+        assert_eq!(fold.draws.get(&b), Some(&500));
+        assert_eq!(fold.after, 0);
+        assert_eq!(fold.overflow, 0);
+        let fed = fold_tier_reserve(0, &[(a, cut, 6_000), (b, cut, 20_000)]);
+        assert_eq!(fed.draws.get(&b), Some(&400));
+        assert_eq!(fed.after, 0);
+        // Inflow above the ceiling is burned, not kept.
+        let cap = keryx_consensus_core::config::params::TIER_RESERVE_CAP_SOMPI;
+        let over = fold_tier_reserve(cap, &[(a, cut, 6_000)]);
+        assert_eq!((over.after, over.overflow), (cap, 400));
+    }
+
+    #[test]
     fn tier_reward_scales_only_miner_cut() {
         let cbm = create_manager(&MAINNET_PARAMS);
         let subsidy = 1_000_000_000u64;
@@ -708,7 +898,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new(), &[])
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, None, &BlockHashSet::new(), &[])
             .unwrap()
             .tx;
 
@@ -767,6 +957,7 @@ mod tests {
                 &BlockHashSet::new(),
                 &BlockHashMap::new(),
                 &BlockHashMap::new(),
+                None,
                 &suspended,
                 &[],
             )
@@ -815,7 +1006,7 @@ mod tests {
         let ratio_bps = BlockHashMap::new();
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new(), &[])
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, None, &BlockHashSet::new(), &[])
             .unwrap()
             .tx;
 
@@ -856,7 +1047,7 @@ mod tests {
         ratio_bps.insert(h_a, RATIO_REWARD_BPS[0]); // floor bracket 40 %
 
         let tx = cbm
-            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, &BlockHashSet::new(), &[])
+            .expected_coinbase_transaction(0, miner_data, &ghostdag, &mergeset_rewards, &non_daa, &tier_bps, &ratio_bps, None, &BlockHashSet::new(), &[])
             .unwrap()
             .tx;
 
@@ -1080,6 +1271,7 @@ mod tests {
                 &BlockHashSet::new(),
                 &BlockHashMap::new(),
                 &BlockHashMap::new(),
+                None,
                 &BlockHashSet::new(),
                 &[],
             )

@@ -52,4 +52,6 @@ pub struct CoinbaseTransactionTemplate {
     /// Index of the red-blocks reward output within the coinbase outputs, if present.
     /// Used by modify_block_template to rewrite the correct output when changing miner address.
     pub red_reward_output_index: Option<usize>,
+    /// Tier reserve after this coinbase; `None` when the reserve rule does not apply.
+    pub tier_reserve_after: Option<u64>,
 }
