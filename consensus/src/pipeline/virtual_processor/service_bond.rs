@@ -1,4 +1,6 @@
 use super::VirtualStateProcessor;
+use crate::model::stores::tier_reserve::TierReserveStoreReader;
+use keryx_database::prelude::StoreResultExt;
 use crate::processes::service_commit;
 use crate::model::stores::{
     acceptance_data::AcceptanceDataStoreReader, block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader,
@@ -1363,6 +1365,7 @@ impl VirtualStateProcessor {
             floors: Vec::with_capacity(groups.len()),
             entries: Vec::with_capacity(groups.len()),
             window_daa: (bottom..=sample_idx).map(|i| self.chain_index_daa(sc, i)).collect(),
+            tier_reserve: self.tier_reserve_store.get(sample).optional().unwrap(),
         };
         for (spk, base, points) in groups {
             snap.floors.push((spk.clone(), base));
@@ -1470,6 +1473,9 @@ impl VirtualStateProcessor {
             return Err(ConsensusError::General("production snapshot numbering does not match the local chain"));
         }
         drop(sc);
+        if let Some(reserve) = snapshot.tier_reserve {
+            self.tier_reserve_store.set(sample, reserve).unwrap();
+        }
         self.production_index_hashes.write().insert(sample, (ProductionIndexSnapshot::hash_of_bytes(&bytes), snapshot.relative_hash()));
         self.production_index_snapshot_store.set(sample, bytes).unwrap();
         info!(

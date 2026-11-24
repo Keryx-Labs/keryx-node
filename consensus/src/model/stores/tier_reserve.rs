@@ -4,7 +4,7 @@ use keryx_consensus_core::BlockHasher;
 use keryx_database::prelude::CachePolicy;
 use keryx_database::prelude::DB;
 use keryx_database::prelude::StoreError;
-use keryx_database::prelude::{BatchDbWriter, CachedDbAccess};
+use keryx_database::prelude::{BatchDbWriter, CachedDbAccess, DirectDbWriter};
 use keryx_database::registry::DatabaseStorePrefixes;
 use keryx_hashes::Hash;
 use rocksdb::WriteBatch;
@@ -34,6 +34,11 @@ impl DbTierReserveStore {
 
     pub fn insert_batch(&self, batch: &mut WriteBatch, hash: Hash, reserve: u64) -> Result<(), StoreError> {
         self.access.write(BatchDbWriter::new(batch), hash, reserve)
+    }
+
+    /// Sets the reserve of `hash` outside a batch (snapshot import at a new pruning point).
+    pub fn set(&self, hash: Hash, reserve: u64) -> Result<(), StoreError> {
+        self.access.write(DirectDbWriter::new(&self.db), hash, reserve)
     }
 
     pub fn delete_batch(&self, batch: &mut WriteBatch, hash: Hash) -> Result<(), StoreError> {

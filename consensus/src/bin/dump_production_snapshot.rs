@@ -165,6 +165,7 @@ fn main() {
                 .map(|(spk, e)| (spk.clone(), e.iter().map(|(i, c)| (i - snap.bottom_index, *c)).collect()))
                 .collect(),
             window_daa: snap.window_daa.clone(),
+            tier_reserve: snap.tier_reserve,
         };
         let n_entries: usize = snap.entries.iter().map(|(_, e)| e.len()).sum();
         println!(

@@ -3464,6 +3464,7 @@ pub fn service_commitment_v4(rows: Hash, ledger: Hash, production: Hash) -> Hash
 
 const PRODUCTION_SNAPSHOT_ENCODING_V1: u8 = 1;
 const PRODUCTION_SNAPSHOT_ENCODING_V2: u8 = 2;
+const PRODUCTION_SNAPSHOT_ENCODING_V3: u8 = 3;
 
 /// Canonical snapshot of the ratio-reward production index at a pruning sample: per-SPK cumulative
 /// production at the window bottom (`floors`), the sparse prefix entries inside the window, both
@@ -3482,6 +3483,8 @@ pub struct ProductionIndexSnapshot {
     /// daa score of chain indices `bottom_index..=sample_index`, strictly increasing; empty on a
     /// v1 snapshot.
     pub window_daa: Vec<u64>,
+    /// Tier reserve after the sample block, once the reserve rule applies (v3 only).
+    pub tier_reserve: Option<u64>,
 }
 
 impl ProductionIndexSnapshot {
@@ -3508,6 +3511,7 @@ impl ProductionIndexSnapshot {
                 })
                 .collect(),
             window_daa: self.window_daa.clone(),
+            tier_reserve: self.tier_reserve,
         }
     }
 
@@ -3518,7 +3522,13 @@ impl ProductionIndexSnapshot {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(if self.window_daa.is_empty() { PRODUCTION_SNAPSHOT_ENCODING_V1 } else { PRODUCTION_SNAPSHOT_ENCODING_V2 });
+        out.push(if self.tier_reserve.is_some() {
+            PRODUCTION_SNAPSHOT_ENCODING_V3
+        } else if self.window_daa.is_empty() {
+            PRODUCTION_SNAPSHOT_ENCODING_V1
+        } else {
+            PRODUCTION_SNAPSHOT_ENCODING_V2
+        });
         out.extend_from_slice(&self.bottom_index.to_le_bytes());
         out.extend_from_slice(&self.sample_index.to_le_bytes());
         out.extend_from_slice(&(self.floors.len() as u32).to_le_bytes());
@@ -3544,13 +3554,16 @@ impl ProductionIndexSnapshot {
                 prev = *daa;
             }
         }
+        if let Some(reserve) = self.tier_reserve {
+            out.extend_from_slice(&reserve.to_le_bytes());
+        }
         out
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut r = Reader { bytes, pos: 0 };
         let version = r.u8()?;
-        if version != PRODUCTION_SNAPSHOT_ENCODING_V1 && version != PRODUCTION_SNAPSHOT_ENCODING_V2 {
+        if !matches!(version, PRODUCTION_SNAPSHOT_ENCODING_V1 | PRODUCTION_SNAPSHOT_ENCODING_V2 | PRODUCTION_SNAPSHOT_ENCODING_V3) {
             return Err("unknown production snapshot version".into());
         }
         let mut snap = Self { bottom_index: r.u64()?, sample_index: r.u64()?, ..Default::default() };
@@ -3586,7 +3599,7 @@ impl ProductionIndexSnapshot {
             }
             snap.entries.push((spk, points));
         }
-        if version == PRODUCTION_SNAPSHOT_ENCODING_V2 {
+        if version != PRODUCTION_SNAPSHOT_ENCODING_V1 {
             let n = r.u32()? as u64;
             if n == 0 || n != snap.sample_index - snap.bottom_index + 1 {
                 return Err("malformed production window table".into());
@@ -3602,6 +3615,9 @@ impl ProductionIndexSnapshot {
                 daa = daa.checked_add(delta).ok_or("production window table overflow")?;
                 snap.window_daa.push(daa);
             }
+        }
+        if version == PRODUCTION_SNAPSHOT_ENCODING_V3 {
+            snap.tier_reserve = Some(r.u64()?);
         }
         if r.pos != bytes.len() {
             return Err("trailing bytes".into());
@@ -3787,6 +3803,8 @@ mod tests {
             floors: vec![(spk.clone(), 7)],
             entries: vec![(spk.clone(), vec![(101, 9), (240, 12)])],
             window_daa: window_daa.clone(),
+
+            tier_reserve: None,
         };
         let b = ProductionIndexSnapshot {
             bottom_index: 5_100,
@@ -3794,6 +3812,7 @@ mod tests {
             floors: vec![(spk.clone(), 1_007)],
             entries: vec![(spk.clone(), vec![(5_101, 1_009), (5_240, 1_012)])],
             window_daa,
+            tier_reserve: None,
         };
         assert_ne!(ProductionIndexSnapshot::hash_of_bytes(&a.to_bytes()), ProductionIndexSnapshot::hash_of_bytes(&b.to_bytes()));
         assert_eq!(a.relative_hash(), b.relative_hash(), "same window production, same relative hash");
@@ -3815,6 +3834,8 @@ mod tests {
             floors: vec![(spk_a.clone(), 7), (spk_b.clone(), 0)],
             entries: vec![(spk_a.clone(), vec![(101, 9), (240, 12)]), (spk_b.clone(), vec![(250, 3)])],
             window_daa: vec![],
+
+            tier_reserve: None,
         };
         let bytes = snap.to_bytes();
         assert_eq!(bytes[0], 1, "a snapshot without the table keeps the legacy encoding and hash");
@@ -3832,6 +3853,18 @@ mod tests {
         assert_eq!(tabled.window_daa_at(250), Some(1_750));
         assert_eq!(tabled.window_daa_at(99), None);
         assert_eq!(tabled.window_daa_at(251), None);
+        // With the tier reserve: v3 encoding, its own hash, exact round trip, relative form keeps it.
+        let reserved = ProductionIndexSnapshot { tier_reserve: Some(123_456_789), ..tabled.clone() };
+        let rbytes = reserved.to_bytes();
+        assert_eq!(rbytes[0], 3);
+        assert_eq!(&rbytes[1..rbytes.len() - 8], &tbytes[1..]);
+        assert_ne!(ProductionIndexSnapshot::hash_of_bytes(&rbytes), ProductionIndexSnapshot::hash_of_bytes(&tbytes));
+        assert_eq!(ProductionIndexSnapshot::from_bytes(&rbytes).unwrap(), reserved);
+        assert_eq!(reserved.relative().tier_reserve, Some(123_456_789));
+        assert_ne!(reserved.relative_hash(), tabled.relative_hash());
+        // A v3 snapshot needs the window table.
+        let bare = ProductionIndexSnapshot { tier_reserve: Some(1), ..snap.clone() };
+        assert!(ProductionIndexSnapshot::from_bytes(&bare.to_bytes()).is_err());
         // Large deltas exercise multi-byte varints.
         let wide = ProductionIndexSnapshot { window_daa: (0..=150u64).map(|i| (1 << 40) | (i * 300)).collect(), ..snap.clone() };
         assert_eq!(ProductionIndexSnapshot::from_bytes(&wide.to_bytes()).unwrap(), wide);
@@ -3855,6 +3888,8 @@ mod tests {
             floors: vec![(spk_b.clone(), 0), (spk_a.clone(), 7)],
             entries: vec![],
             window_daa: vec![],
+
+            tier_reserve: None,
         };
         assert!(ProductionIndexSnapshot::from_bytes(&unsorted.to_bytes()).is_err());
 
@@ -3865,6 +3900,8 @@ mod tests {
             floors: vec![],
             entries: vec![(spk_a, vec![(100, 5)])],
             window_daa: vec![],
+
+            tier_reserve: None,
         };
         assert!(ProductionIndexSnapshot::from_bytes(&out_of_window.to_bytes()).is_err());
 
