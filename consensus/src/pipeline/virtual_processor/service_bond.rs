@@ -1677,11 +1677,6 @@ impl VirtualStateProcessor {
         Some(frontier.map_or(span_cap, |f| f.min(span_cap)))
     }
 
-    /// Coinbase mint expectation for a block whose selected parent is `sp`: the reward wins
-    /// finalized exactly by `sp`'s fold — event daa in `(parent(sp).daa − finality, sp.daa −
-    /// finality]` — in `(daa, request hash)` order. Wins with no payout script stay burned.
-    /// `parent(sp)` is `sp`'s own selected parent: the committed selected chain is not consulted,
-    /// so the expectation is the same on every chain candidate and from every node's point of view.
     /// Tier reserve state after pruning sample `hash`, required once the reserve rule applies there.
     fn tier_reserve_at_sample(&self, hash: Hash) -> Option<keryx_consensus_core::coinbase::TierReserve> {
         if !self.h18_activation.is_active(self.headers_store.get_daa_score(hash).unwrap()) {
@@ -1690,6 +1685,11 @@ impl VirtualStateProcessor {
         Some(self.tier_reserve_store.get(hash).unwrap_or_else(|e| panic!("tier reserve of pruning sample {hash} is missing ({e})")))
     }
 
+    /// Coinbase mint expectation for a block whose selected parent is `sp`: the reward wins
+    /// finalized exactly by `sp`'s fold — event daa in `(parent(sp).daa − finality, sp.daa −
+    /// finality]` — in `(daa, request hash)` order. Wins with no payout script stay burned.
+    /// `parent(sp)` is `sp`'s own selected parent: the committed selected chain is not consulted,
+    /// so the expectation is the same on every chain candidate and from every node's point of view.
     pub(super) fn service_reward_mints_for(&self, sp: Hash) -> Vec<(ScriptPublicKey, u64)> {
         let sp_daa = self.headers_store.get_daa_score(sp).unwrap();
         if !self.reward_routing_activation.is_active(sp_daa) {
