@@ -101,6 +101,7 @@ pub struct BlockBodyProcessor {
     pub(super) attention_activation: ForkActivation,
     pub(super) h10_activation: ForkActivation,
     pub(super) private_inference_activation: ForkActivation,
+    pub(super) h18_activation: ForkActivation,
     pub(super) verifiable_inference_activation: ForkActivation,
 
     // Stores
@@ -258,6 +259,7 @@ impl BlockBodyProcessor {
             attention_activation: params.attention_activation,
             h10_activation: params.h10_activation,
             private_inference_activation: params.private_inference_activation,
+            h18_activation: params.h18_activation,
             verifiable_inference_activation: params.verifiable_inference_activation,
 
             statuses_store: storage.statuses_store.clone(),

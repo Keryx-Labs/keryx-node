@@ -1,7 +1,7 @@
 use crate::imports::*;
 use keryx_consensus_core::collateral::{PrivateCohortSeed, private_cohort_rank, private_cohort_seed, private_target_cohort};
 use keryx_consensus_core::config::params::{
-    GEMMA_4_12B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, INFERENCE_REWARD_MINIMUMS_FLAT, INFERENCE_REWARD_MINIMUMS_V2_H6,
+    GEMMA_4_12B_ABLITERATED_MODEL_ID, GLM_4_9B_0414_MODEL_ID, INFERENCE_REWARD_MINIMUMS_FLAT, INFERENCE_REWARD_MINIMUMS_H18, INFERENCE_REWARD_MINIMUMS_V2_H6,
     KIMI_LINEAR_48B_MODEL_ID, Params, QWEN3_5_9B_ABLITERATED_MODEL_ID, QWEN3_6_27B_MODEL_ID, QWEN3_8_27B_MODEL_ID, service_tiers,
 };
 use keryx_consensus_core::constants::{SOMPI_PER_KASPA, TX_VERSION};
@@ -68,7 +68,7 @@ impl Inference {
             &[
                 ("inference providers [tier]", "List the responders eligible right now per tier, with the escrow key to seal requests to"),
                 (
-                    "inference send --tier <0-4> [--max-tokens N] [--reward KRX] [--fee KRX] [--wait SECS] <prompt | @file>",
+                    "inference send --tier <n> [--max-tokens N] [--reward KRX] [--fee KRX] [--wait SECS] <prompt | @file>",
                     "Seal a prompt to the whole cohort of the tier and submit the AiRequest",
                 ),
                 (
@@ -165,12 +165,10 @@ impl Inference {
             (None, Some(t)) => {
                 let params = Params::from(ctx.wallet().network_id()?);
                 let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
-                service_tiers(params.private_inference_activation.is_active(daa))
-                    .get(t)
-                    .map(|m| m.model_id)
-                    .ok_or_else(|| Error::custom("--tier must be 0-4"))?
+                let tiers = service_tiers(params.private_inference_activation.is_active(daa), params.h18_activation.is_active(daa));
+                tiers.get(t).map(|m| m.model_id).ok_or_else(|| Error::custom(format!("--tier must be 0-{}", tiers.len() - 1)))?
             }
-            (None, None) => return Err(Error::custom("choose the model with --tier <0-4> or --model <hex>")),
+            (None, None) => return Err(Error::custom("choose the model with --tier <n> or --model <hex>")),
         };
         let prompt = read_text_argument(&prompt_words)?;
         if prompt.is_empty() {
@@ -182,7 +180,13 @@ impl Inference {
                 let params = Params::from(ctx.wallet().network_id()?);
                 let daa = ctx.wallet().rpc_api().get_service_providers(None).await?.virtual_daa_score;
                 let flat = params.private_inference_activation.is_active(daa);
-                let table = if flat { INFERENCE_REWARD_MINIMUMS_FLAT } else { INFERENCE_REWARD_MINIMUMS_V2_H6 };
+                let table = if params.h18_activation.is_active(daa) {
+                    INFERENCE_REWARD_MINIMUMS_H18
+                } else if flat {
+                    INFERENCE_REWARD_MINIMUMS_FLAT
+                } else {
+                    INFERENCE_REWARD_MINIMUMS_V2_H6
+                };
                 let base = table
                     .iter()
                     .find(|(id, _)| *id == model_id)
@@ -460,8 +464,8 @@ impl Inference {
 /// its tier, completed by rank with the tier's providers of the last `SEAL_WINDOW_DAA` up to the
 /// recipient cap.
 async fn cohort_recipients(ctx: &Arc<KaspaCli>, model_id: &[u8; 32], seed: &PrivateCohortSeed) -> Result<Vec<[u8; 32]>> {
-    let tier = service_tiers(true).iter().position(|t| t.model_id == *model_id).ok_or_else(|| Error::custom("unknown model: no tier serves it"))?
-        as u32;
+    let position = |h18: bool| service_tiers(true, h18).iter().position(|t| t.model_id == *model_id);
+    let tier = position(true).or_else(|| position(false)).ok_or_else(|| Error::custom("unknown model: no tier serves it"))? as u32;
     let rpc = ctx.wallet().rpc_api();
     let keys_of = |resp: &keryx_rpc_core::GetServiceProvidersResponse| -> Vec<[u8; 32]> {
         let mut keys: Vec<[u8; 32]> = resp.providers.iter().filter(|p| p.tier == tier).map(|p| p.escrow_pubkey.as_bytes()).collect();

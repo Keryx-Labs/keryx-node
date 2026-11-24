@@ -189,6 +189,8 @@ pub struct VirtualStateProcessor {
     pub(super) reward_routing_activation: ForkActivation,
     /// Private-inference activation (see `params.private_inference_activation`).
     pub(super) private_inference_activation: ForkActivation,
+    /// H18 lineup activation (see `params.h18_activation`).
+    pub(super) h18_activation: ForkActivation,
     /// Verifiable-inference activation (see `params.verifiable_inference_activation`).
     pub(super) verifiable_inference_activation: ForkActivation,
     /// Trace shape rule activation (see `params.trace_shape_activation`).
@@ -463,6 +465,7 @@ impl VirtualStateProcessor {
             service_reward_recent: Default::default(),
             reward_routing_activation: params.reward_routing_activation,
             private_inference_activation: params.private_inference_activation,
+            h18_activation: params.h18_activation,
             verifiable_inference_activation: params.verifiable_inference_activation,
             trace_shape_activation: params.trace_shape_activation,
             trace_prefix_activation: params.trace_prefix_activation,

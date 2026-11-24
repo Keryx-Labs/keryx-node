@@ -13,7 +13,7 @@ use keryx_consensus_core::collateral::{
     MAX_SERVICE_PROVIDERS_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA, SERVICE_ELIGIBILITY_WINDOW_DAA_V2, SERVICE_SUSPENSION_DAA,
     TraceInputs, TraceOpeningEvent, TraceResponseEvent, verify_opening_signature,
 };
-use keryx_consensus_core::config::params::{POM_TIERS_H6, POM_TIERS_H14, service_tiers, trace_rules};
+use keryx_consensus_core::config::params::{Lineup, POM_TIERS_H6, POM_TIERS_H14, lineup_tier_replaced, service_tiers, trace_rules};
 use keryx_consensus_core::tx::{ScriptPublicKey, TransactionOutpoint};
 use keryx_consensus_core::ChainPath;
 use keryx_consensus_core::blockhash::BlockHashExtensions;
@@ -262,6 +262,9 @@ impl VirtualStateProcessor {
         {
             daa_bound = daa_bound.max(self.private_inference_activation.daa_score().saturating_sub(1));
         }
+        if self.h18_activation.is_active(seed_header.daa_score) && lineup_tier_replaced(target_tier, Lineup::H14, Lineup::H18) {
+            daa_bound = daa_bound.max(self.h18_activation.daa_score().saturating_sub(1));
+        }
         // A window crossing below retained history only happens while re-validating blocks near
         // the local pruning point (fresh IBD / restart catch-up). Past the ledger gate the part
         // below the pruning point is read from the imported snapshot; before it the audit arms
@@ -319,12 +322,7 @@ impl VirtualStateProcessor {
     /// responder signature yields `None` (a volunteer — never serves the assignment). With
     /// `private` set, a request sealed to named responders also yields its recipient set.
     #[allow(clippy::type_complexity)]
-    fn service_events_of_chain_block(
-        &self,
-        hash: Hash,
-        txid_identity: bool,
-        private: bool,
-    ) -> ServiceEvents {
+    fn service_events_of_chain_block(&self, hash: Hash, txid_identity: bool, private: bool, h18: bool) -> ServiceEvents {
         let mut requests = Vec::new();
         let mut request_rewards = Vec::new();
         let mut request_recipients = Vec::new();
@@ -337,7 +335,7 @@ impl VirtualStateProcessor {
                 let tx = &txs[entry.index_within_block as usize];
                 if tx.is_ai_request() {
                     if let Some(req) = AiRequestPayload::deserialize(&tx.payload)
-                        && let Some(tier) = service_tiers(private).iter().position(|t| t.model_id == req.model_id)
+                        && let Some(tier) = service_tiers(private, h18).iter().position(|t| t.model_id == req.model_id)
                     {
                         // Past the gate a request is identified by its transaction id.
                         let mut request_hash = [0u8; 32];
@@ -536,6 +534,7 @@ impl VirtualStateProcessor {
             self.trace_audit_activation.is_active(at),
             self.trace_chain_activation.is_active(at),
             self.attention_activation.is_active(at),
+            Lineup::at(self.h18_activation, at),
         );
         keryx_consensus_core::collateral::required_pieces(rules.as_ref())
     }
@@ -614,7 +613,13 @@ impl VirtualStateProcessor {
         let Ok((_, sink)) = sc.get_tip() else {
             return ServiceProvidersSnapshot { virtual_daa_score, providers };
         };
-        for (tier, model) in service_tiers(self.private_inference_activation.is_active(virtual_daa_score)).iter().enumerate() {
+        for (tier, model) in service_tiers(
+            self.private_inference_activation.is_active(virtual_daa_score),
+            self.h18_activation.is_active(virtual_daa_score),
+        )
+        .iter()
+        .enumerate()
+        {
             for (identity, escrow) in self.service_eligible_miners_in(&*sc, sink, tier as u8, window, own_pp) {
                 providers.push(ServiceProvider { tier: tier as u8, model_id: model.model_id, identity, escrow_pubkey: escrow.as_bytes() });
             }
@@ -635,7 +640,8 @@ impl VirtualStateProcessor {
         if !self.private_inference_activation.is_active(virtual_daa_score) {
             return None;
         }
-        let tier = service_tiers(true).iter().position(|t| t.model_id == *model_id)? as u8;
+        let tier =
+            service_tiers(true, self.h18_activation.is_active(virtual_daa_score)).iter().position(|t| t.model_id == *model_id)? as u8;
         let (own_pp, sc) = self.retained_pruning_point_and_chain();
         let sink = sc.get_tip().ok()?.1;
         let cohort: Vec<Hash> = self
@@ -711,12 +717,14 @@ impl VirtualStateProcessor {
         }
         ledger.set_window_v2_activation(self.service_bond_v2_activation.daa_score());
         ledger.set_reward_routing_activation(self.reward_routing_activation.daa_score());
+        ledger.set_h18_activation(self.h18_activation.daa_score());
         ledger.set_burnable_window(self.service_burnable_window_daa);
         let ServiceEvents { requests, request_rewards, request_recipients, request_prompt_lens, responses } = self
             .service_events_of_chain_block(
                 hash,
                 self.reward_routing_activation.is_active(daa),
                 self.private_inference_activation.is_active(daa),
+                self.h18_activation.is_active(daa),
             );
         let producers =
             if self.reward_routing_activation.is_active(daa) { self.service_producer_spks_of_chain_block(hash) } else { Vec::new() };
@@ -758,8 +766,13 @@ impl VirtualStateProcessor {
             let audit_at = |at: u64| self.trace_audit_activation.is_active(at);
             let chain_at = |at: u64| self.trace_chain_activation.is_active(at);
             let attn_at = |at: u64| self.attention_activation.is_active(at);
-            let tier =
-                |t: u8, at: u64| if h14 { trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at)) } else { None };
+            let tier = |t: u8, at: u64| {
+                if h14 {
+                    trace_rules(t, prefix_at(at), audit_at(at), chain_at(at), attn_at(at), Lineup::at(self.h18_activation, at))
+                } else {
+                    None
+                }
+            };
             let traces = TraceInputs {
                 chain_hash: hash,
                 responses: &trace_responses,

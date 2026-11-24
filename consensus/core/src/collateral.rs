@@ -2,6 +2,7 @@ use keryx_hashes::{Hash, Hasher, TransactionHash};
 use keryx_utils::mem_size::MemSizeEstimator;
 use serde::{Deserialize, Serialize};
 
+use crate::config::params::Lineup;
 use crate::tx::ScriptPublicKey;
 
 /// Fraction of each accepted block subsidy held in escrow as miner collateral (basis points).
@@ -685,25 +686,39 @@ pub const SERVICE_WINDOW_BASE_DAA_V3: u64 = 150;
 /// Per-tier generation allowance of the v3 window, in hundredths of a DAA per generated token.
 pub const SERVICE_WINDOW_RATE_V3: [u64; 5] = [90, 180, 85, 70, 35];
 
+/// The same allowance for each `POM_TIERS_H18` tier.
+pub const SERVICE_WINDOW_RATE_H18: &[u64] = &[90, 208];
+
+const _: () = assert!(SERVICE_WINDOW_RATE_H18.len() == crate::config::params::POM_TIERS_H18.len());
+
 /// Requests queued ahead of a request at one responder beyond which no lateness is imputed to
 /// it on that request. Must equal the miner's request queue size.
 pub const SERVICE_QUEUE_CAP: usize = 64;
 
 /// Serving work of one request under the v3 window, in DAA: `n_prompt` prompt tokens (or
 /// sealed bytes, which bound them) and `generated` generated tokens.
-pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32) -> u64 {
-    let rate = SERVICE_WINDOW_RATE_V3[(tier as usize).min(SERVICE_WINDOW_RATE_V3.len() - 1)];
+pub fn service_work_daa(tier: u8, n_prompt: u32, generated: u32, lineup: Lineup) -> u64 {
+    let rates: &[u64] = match lineup {
+        Lineup::H14 => &SERVICE_WINDOW_RATE_V3,
+        Lineup::H18 => SERVICE_WINDOW_RATE_H18,
+    };
+    let rate = rates[(tier as usize).min(rates.len() - 1)];
     2 * (n_prompt as u64).div_ceil(100) + (rate * generated.min(AI_REQUEST_MAX_TOKENS_CAP) as u64).div_ceil(100)
 }
 
 /// Service window of one request under `service_window_v3_activation`, queue excluded.
-pub fn service_window_daa_v3(tier: u8, n_prompt: u32, generated: u32) -> u64 {
-    SERVICE_WINDOW_BASE_DAA_V3 + service_work_daa(tier, n_prompt, generated)
+pub fn service_window_daa_v3(tier: u8, n_prompt: u32, generated: u32, lineup: Lineup) -> u64 {
+    SERVICE_WINDOW_BASE_DAA_V3 + service_work_daa(tier, n_prompt, generated, lineup)
 }
 
 /// Length of the reward draw of a request: half its v3 window at full budget.
-pub fn reward_draw_window_daa(tier: u8, prompt_len: u32, max_tokens: u32) -> u64 {
-    service_window_daa_v3(tier, prompt_len, max_tokens).div_ceil(2)
+pub fn reward_draw_window_daa(tier: u8, prompt_len: u32, max_tokens: u32, lineup: Lineup) -> u64 {
+    service_window_daa_v3(tier, prompt_len, max_tokens, lineup).div_ceil(2)
+}
+
+/// Lineup of a request accepted at `accepted_daa` under an H18 gate at `h18`.
+fn lineup_from(h18: Option<u64>, accepted_daa: u64) -> Lineup {
+    if h18.is_some_and(|a| accepted_daa >= a) { Lineup::H18 } else { Lineup::H14 }
 }
 
 /// Domain separator of the reward draw seed.
@@ -926,9 +941,9 @@ impl PendingRequest {
         (p, g)
     }
 
-    fn reference_work(&self) -> u64 {
+    fn reference_work(&self, lineup: Lineup) -> u64 {
         let (p, g) = self.reference_shape();
-        service_work_daa(self.tier, p, g)
+        service_work_daa(self.tier, p, g, lineup)
     }
 }
 
@@ -1127,6 +1142,8 @@ pub struct ServiceLedger {
     /// Activation daa of the v2 service windows; `None` = not armed. Configuration, not folded
     /// state — installed on every fold entry, untouched by snapshots.
     window_v2_activation_daa: Option<u64>,
+    /// Activation daa of the H18 lineup; `None` = not armed. Configuration, not folded state.
+    h18_activation_daa: Option<u64>,
     /// Burnable window override (test networks); `None` = `SERVICE_BURNABLE_WINDOW_DAA`.
     burnable_window_daa: Option<u64>,
     /// Activation daa of vault reward routing (requests accepted at or after it mint their
@@ -1502,6 +1519,7 @@ impl ServiceLedger {
         // identity that delegated to it as having served this audit and resets their streak.
         // Anyone else's response is ignored by the ledger. A response landing before the audit
         // arms is parked on the request and credited when it does.
+        let h18 = self.h18_activation_daa;
         for (rh, responder) in responses {
             let Some(r) = responder else { continue };
             if misshaped.contains(&(*rh, *r)) {
@@ -1558,7 +1576,14 @@ impl ServiceLedger {
                     && traces.is_some_and(|tr| {
                         tr.context
                             && tr.responses.iter().any(|ev| {
-                                ev.request_hash == *rh && ev.responder == *r && crate::config::params::prompt_fits_floor(req_tier, ev.n_prompt, req_max_tokens)
+                                ev.request_hash == *rh
+                                    && ev.responder == *r
+                                    && crate::config::params::prompt_fits_floor(
+                                        req_tier,
+                                        ev.n_prompt,
+                                        req_max_tokens,
+                                        lineup_from(h18, req_accepted),
+                                    )
                             })
                     })
                 {
@@ -1632,13 +1657,23 @@ impl ServiceLedger {
         let mut armed_v3: Vec<[u8; 32]> = Vec::new();
         for rh in hashes {
             let req = self.pending.get(&rh).unwrap();
+            // A request whose tier serves another model past the gate cannot be served there: it
+            // is dropped, armed or not, and nobody is struck.
+            if daa > req.accepted_daa
+                && crate::config::params::lineup_tier_replaced(req.tier, self.lineup_at(req.accepted_daa), self.lineup_at(daa))
+            {
+                self.pending.remove(&rh);
+                self.early_shapes.retain(|(h, _), _| *h != rh);
+                continue;
+            }
             match &req.audit {
                 Some(a) if daa > a.window_end_daa => {
                     let audit = a.clone();
                     let late: Vec<Hash> = match &audit.v3 {
                         Some(w) => {
                             let (p, g) = req.reference_shape();
-                            let reference = service_window_daa_v3(req.tier, p, g);
+                            let lineup = lineup_from(self.h18_activation_daa, req.accepted_daa);
+                            let reference = service_window_daa_v3(req.tier, p, g, lineup);
                             let own_shape = traces.is_some_and(|tr| tr.own_shape);
                             w.answers
                                 .iter()
@@ -1646,7 +1681,7 @@ impl ServiceLedger {
                                     let window = match shape.filter(|_| own_shape) {
                                         Some((sp, sg)) => {
                                             let sp = if req.prompt_len > 0 { sp.min(req.prompt_len) } else { sp };
-                                            reference.max(service_window_daa_v3(req.tier, sp, sg.min(req.max_tokens)))
+                                            reference.max(service_window_daa_v3(req.tier, sp, sg.min(req.max_tokens), lineup))
                                         }
                                         None => reference,
                                     };
@@ -1665,7 +1700,12 @@ impl ServiceLedger {
                     };
                     let excused = traces.is_some_and(|tr| tr.context)
                         && !req.fit_proven
-                        && crate::config::params::safe_prompt_len(req.tier, req.max_tokens).is_some_and(|safe| req.prompt_len > safe);
+                        && crate::config::params::safe_prompt_len(
+                            req.tier,
+                            req.max_tokens,
+                            lineup_from(self.h18_activation_daa, req.accepted_daa),
+                        )
+                        .is_some_and(|safe| req.prompt_len > safe);
                     self.drop_draw_candidates(&rh, &late);
                     if let Some(tr) = traces {
                         self.close_or_hold_draw(&rh, &tr.chain_hash, &awaiting, warmup, &mut outcome);
@@ -1751,6 +1791,7 @@ impl ServiceLedger {
                         // as the live path, so an early answer and a late one are worth the same.
                         let req_tier = req.tier;
                         let req_max_tokens = req.max_tokens;
+                        let req_lineup = lineup_from(self.h18_activation_daa, req.accepted_daa);
                         let audit_rule = traces.is_some_and(|tr| (tr.tier)(req_tier, req.accepted_daa).is_some_and(|rules| rules.audit_all));
                         let early = std::mem::take(&mut self.pending.get_mut(&rh).unwrap().early_responders);
                         let mut drawable: Vec<Hash> = Vec::new();
@@ -1779,7 +1820,11 @@ impl ServiceLedger {
                                     }
                                 }
                             }
-                            if member && self.early_shapes.get(&(rh, *key)).is_some_and(|s| crate::config::params::prompt_fits_floor(req_tier, s.n_prompt, req_max_tokens)) {
+                            if member
+                                && self.early_shapes.get(&(rh, *key)).is_some_and(|s| {
+                                    crate::config::params::prompt_fits_floor(req_tier, s.n_prompt, req_max_tokens, req_lineup)
+                                })
+                            {
                                 fit = true;
                             }
                         }
@@ -1926,7 +1971,8 @@ impl ServiceLedger {
             if rules.as_ref().is_some_and(|r| r.audit_all || keryx_verifiable_inference::draw::audited(&seed)) {
                 let prompt = if rules.as_ref().is_some_and(|r| r.attention) { attn_first_prompt_daa(a.n_prompt) } else { 0 };
                 let own = daa + service_window_daa_at(a.tier, a.max_tokens, self.v2_at(daa)) + prompt;
-                let work = OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt));
+                let work = OPEN_AUDIT_WORK_PASSES
+                    * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt), self.lineup_at(a.accepted_daa));
                 let start = chain_end.get(&a.escrow_pubkey).map_or(own, |&end| own.max(end + work));
                 self.trace_roots.insert(txid, daa);
                 if tr.sanction {
@@ -2272,6 +2318,16 @@ impl ServiceLedger {
         self.reward_routing_daa = Some(daa);
     }
 
+    /// Installs the H18 lineup activation daa.
+    pub fn set_h18_activation(&mut self, daa: u64) {
+        self.h18_activation_daa = Some(daa);
+    }
+
+    /// Lineup of a request accepted at `accepted_daa`.
+    fn lineup_at(&self, accepted_daa: u64) -> Lineup {
+        lineup_from(self.h18_activation_daa, accepted_daa)
+    }
+
     /// Awards `rh` to `identity` if the request is routed, unawarded, and carries a reward.
     /// A warmup fold sets the winner without emitting — the reward row is already persisted.
     fn maybe_award(&mut self, rh: &[u8; 32], identity: Hash, warmup: bool, outcome: &mut FoldOutcome) {
@@ -2293,6 +2349,7 @@ impl ServiceLedger {
     /// Credits `served` on the reward of `rh`. An open draw takes them as candidates until it
     /// closes; otherwise the first credit opens a draw under the draw rule, or wins outright.
     fn credit_reward(&mut self, rh: &[u8; 32], served: &[Hash], daa: u64, draw_rule: bool, warmup: bool, outcome: &mut FoldOutcome) {
+        let h18 = self.h18_activation_daa;
         let Some(&first) = served.first() else { return };
         let Some(routed_from) = self.reward_routing_daa else { return };
         let Some(req) = self.pending.get_mut(rh) else { return };
@@ -2310,7 +2367,7 @@ impl ServiceLedger {
             return;
         }
         if draw_rule {
-            let close_daa = daa + reward_draw_window_daa(req.tier, req.prompt_len, req.max_tokens);
+            let close_daa = daa + reward_draw_window_daa(req.tier, req.prompt_len, req.max_tokens, lineup_from(h18, req.accepted_daa));
             req.draw = Some(RewardDraw { open_daa: daa, close_daa, candidates: served.iter().map(|id| (*id, daa)).collect() });
             return;
         }
@@ -2396,7 +2453,7 @@ impl ServiceLedger {
     /// up to [`AUDIT_SPAN_DAA`] after each one's acceptance.
     fn push_open_audits(&mut self, armed: &TraceAudit, daa: u64) {
         let generated = armed.n_pos.saturating_sub(armed.n_prompt).min(armed.max_tokens);
-        let push = AUDIT_QUEUE_PASSES * service_work_daa(armed.tier, armed.n_prompt, generated);
+        let push = AUDIT_QUEUE_PASSES * service_work_daa(armed.tier, armed.n_prompt, generated, self.lineup_at(armed.accepted_daa));
         for o in self.trace_audits.values_mut() {
             if o.escrow_pubkey == armed.escrow_pubkey && o.seed.is_some() && o.deadline_daa >= daa {
                 o.deadline_daa = o.deadline_daa.saturating_add(push).min(o.accepted_daa + AUDIT_SPAN_DAA).max(o.deadline_daa);
@@ -2419,18 +2476,21 @@ impl ServiceLedger {
                     .filter(|(h, j)| {
                         *h != rh && j.audit.as_ref().is_some_and(|ja| ja.cohort.binary_search(m).is_ok() && !ja.responded.contains(m))
                     })
-                    .map(|(_, j)| j.reference_work())
+                    .map(|(_, j)| j.reference_work(self.lineup_at(j.accepted_daa)))
                     .collect();
                 let audits: u64 = self
                     .trace_audits
                     .values()
                     .filter(|a| a.identities.contains(m))
-                    .map(|a| OPEN_AUDIT_WORK_PASSES * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt)))
+                    .map(|a| {
+                        OPEN_AUDIT_WORK_PASSES
+                            * service_work_daa(a.tier, a.n_prompt, a.n_pos.saturating_sub(a.n_prompt), self.lineup_at(a.accepted_daa))
+                    })
                     .sum();
                 (ahead.iter().sum::<u64>() + audits, ahead.len() > SERVICE_QUEUE_CAP)
             })
             .collect();
-        let own = service_window_daa_v3(req.tier, req.prompt_len, req.max_tokens);
+        let own = service_window_daa_v3(req.tier, req.prompt_len, req.max_tokens, self.lineup_at(req.accepted_daa));
         let horizon_end = req.accepted_daa + SERVICE_LEDGER_HORIZON_DAA - 2;
         let end = (daa + own + queue.iter().map(|(q, _)| *q).max().unwrap_or(0)).min(horizon_end);
         let audit = self.pending.get_mut(rh).unwrap().audit.as_mut().unwrap();
@@ -3823,6 +3883,27 @@ mod tests {
 
     // Identity == escrow key in most tests; the delegation mapping itself is covered by
     // `response_credits_the_delegating_identity`.
+    #[test]
+    fn requests_of_a_replaced_tier_are_dropped_at_the_gate_without_strikes() {
+        let mut ledger = ServiceLedger::default();
+        ledger.set_h18_activation(200);
+        let a = Hash::from_bytes([1u8; 32]);
+        let (r0, r2) = ([0x10u8; 32], [0x12u8; 32]);
+        ledger.on_chain_block(100, &[(r0, 0, 64), (r2, 2, 64)], &[], &[], |_| true, cohort_of(&[a]));
+        ledger.on_chain_block(101, &[], &[], &[], |_| true, cohort_of(&[a]));
+        assert_eq!(ledger.pending_len(), 2);
+        assert!(ledger.pending.values().all(|r| r.audit.is_some()));
+        let out = ledger.on_chain_block(201, &[], &[], &[], |_| true, cohort_of(&[a]));
+        assert!(out.misses.is_empty());
+        assert_eq!(ledger.pending_len(), 0);
+
+        let mut ledger = ServiceLedger::default();
+        ledger.set_h18_activation(200);
+        ledger.on_chain_block(201, &[(r0, 0, 64)], &[], &[], |_| true, cohort_of(&[a]));
+        ledger.on_chain_block(202, &[], &[], &[], |_| true, cohort_of(&[a]));
+        assert_eq!(ledger.pending_len(), 1);
+    }
+
     fn cohort_of(set: &[Hash]) -> impl FnMut(u8) -> Vec<(Hash, Hash)> + '_ {
         move |_tier| set.iter().map(|m| (*m, *m)).collect()
     }
@@ -4883,8 +4964,9 @@ mod tests {
 
     mod traces {
         use super::super::{ServiceLedger, ServiceLedgerSnapshot, TraceInputs, TraceOpeningEvent, TraceResponseEvent, trace_seed};
-        use keryx_hashes::Hash;
+        use crate::config::params::Lineup;
         use crate::config::params::TraceRules;
+        use keryx_hashes::Hash;
         use keryx_verifiable_inference::{
             draw,
             testkit::{Model, Response},
@@ -5478,11 +5560,20 @@ mod tests {
             use crate::collateral::{PIECE_ATTN, PIECE_RECUR, PIECE_RESID, PIECE_TRACE, required_pieces};
             use crate::config::params::trace_rules;
             assert_eq!(required_pieces(None), PIECE_TRACE);
-            assert_eq!(required_pieces(trace_rules(1, true, true, false, false).as_ref()), PIECE_TRACE);
-            assert_eq!(required_pieces(trace_rules(1, true, true, true, false).as_ref()), PIECE_TRACE | PIECE_RESID);
-            assert_eq!(required_pieces(trace_rules(1, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RESID);
-            assert_eq!(required_pieces(trace_rules(0, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
-            assert_eq!(required_pieces(trace_rules(4, true, true, true, true).as_ref()), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID);
+            assert_eq!(required_pieces(trace_rules(1, true, true, false, false, Lineup::H14).as_ref()), PIECE_TRACE);
+            assert_eq!(required_pieces(trace_rules(1, true, true, true, false, Lineup::H14).as_ref()), PIECE_TRACE | PIECE_RESID);
+            assert_eq!(
+                required_pieces(trace_rules(1, true, true, true, true, Lineup::H14).as_ref()),
+                PIECE_TRACE | PIECE_ATTN | PIECE_RESID
+            );
+            assert_eq!(
+                required_pieces(trace_rules(0, true, true, true, true, Lineup::H14).as_ref()),
+                PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID
+            );
+            assert_eq!(
+                required_pieces(trace_rules(4, true, true, true, true, Lineup::H14).as_ref()),
+                PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID
+            );
         }
 
         #[test]
@@ -5532,7 +5623,10 @@ mod tests {
                 }
                 .encode()
             };
-            let (with, without) = (trace_rules(1, true, true, true, true).unwrap(), trace_rules(1, true, true, true, false).unwrap());
+            let (with, without) = (
+                trace_rules(1, true, true, true, true, Lineup::H14).unwrap(),
+                trace_rules(1, true, true, true, false, Lineup::H14).unwrap(),
+            );
             let check = |r, roots| trace_opening_valid(r, &audit, &[9; 32], &TXID, &body(roots, None));
             assert_eq!(check(&with, None), Err("sequence root missing"));
             assert_eq!(check(&with, Some(([0x12; 32], seq_root))), Err("trace root split"));
@@ -5910,7 +6004,8 @@ mod tests {
             assert_eq!(run.ledger.trace_audits.len(), 2);
             let first = run.ledger.trace_audits.values().map(|a| a.deadline_daa).min().unwrap();
             let second = run.ledger.trace_audits.values().max_by_key(|a| a.deadline_daa).unwrap();
-            let work = super::super::OPEN_AUDIT_WORK_PASSES * super::super::service_work_daa(0, second.n_prompt, second.n_pos - second.n_prompt);
+            let work = super::super::OPEN_AUDIT_WORK_PASSES
+                * super::super::service_work_daa(0, second.n_prompt, second.n_pos - second.n_prompt, Lineup::H14);
             let last = second.deadline_daa;
             assert_eq!(last, first + work + super::super::OPENING_BACKLOG_DAA, "the second draw of one key chains behind the first");
             (run, first, last)
@@ -5969,7 +6064,7 @@ mod tests {
             let (_, before, after, second_q) = queued_second_draw(true, ESCROW_PK, |_| {});
             assert_eq!(second_q, second, "the armed audit itself is unchanged by the rule");
             let generated = (second.n_pos - second.n_prompt).min(second.max_tokens);
-            let push = super::super::AUDIT_QUEUE_PASSES * super::super::service_work_daa(0, second.n_prompt, generated);
+            let push = super::super::AUDIT_QUEUE_PASSES * super::super::service_work_daa(0, second.n_prompt, generated, Lineup::H14);
             assert!(push > 0);
             assert_eq!(after, before + push);
         }
@@ -6582,12 +6677,12 @@ mod tests {
 
         #[test]
         fn v3_work_matches_the_measured_coefficients() {
-            assert_eq!(service_work_daa(2, 5_000, 2_048), 100 + 1_741);
-            assert_eq!(service_window_daa_v3(2, 5_000, 2_048), 1_991);
-            assert_eq!(reward_draw_window_daa(2, 5_000, 2_048), 996);
-            assert_eq!(service_window_daa_v3(4, 5_000, 2_048), 150 + 100 + 717);
-            assert_eq!(reward_draw_window_daa(4, 5_000, 2_048), 484);
-            assert_eq!(service_work_daa(1, 0, 4_096), service_work_daa(1, 0, 10_000));
+            assert_eq!(service_work_daa(2, 5_000, 2_048, Lineup::H14), 100 + 1_741);
+            assert_eq!(service_window_daa_v3(2, 5_000, 2_048, Lineup::H14), 1_991);
+            assert_eq!(reward_draw_window_daa(2, 5_000, 2_048, Lineup::H14), 996);
+            assert_eq!(service_window_daa_v3(4, 5_000, 2_048, Lineup::H14), 150 + 100 + 717);
+            assert_eq!(reward_draw_window_daa(4, 5_000, 2_048, Lineup::H14), 484);
+            assert_eq!(service_work_daa(1, 0, 4_096, Lineup::H14), service_work_daa(1, 0, 10_000, Lineup::H14));
         }
 
         #[test]
@@ -6607,7 +6702,7 @@ mod tests {
             net.fold(100, chain(0), &[(RH, 256)], &[]);
             net.fold(101, chain(0), &[], &[]);
             assert!(net.fold(102, chain(0), &[], &[(RH, b, None)]).rewards.is_empty());
-            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            let close = 102 + reward_draw_window_daa(0, 0, 256, Lineup::H14);
             assert_eq!(close, 102 + 191);
             assert!(net.fold(close - 1, chain(0), &[], &[(RH, a, None)]).rewards.is_empty());
             let closing = chain(9);
@@ -6627,7 +6722,7 @@ mod tests {
             net.fold(100, chain(0), &[(RH, 256)], &[]);
             net.fold(101, chain(0), &[], &[]);
             net.fold(102, chain(0), &[], &[(RH, a, None)]);
-            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            let close = 102 + reward_draw_window_daa(0, 0, 256, Lineup::H14);
             let out = net.fold(close, chain(9), &[], &[]);
             assert_eq!(out.rewards[0].winner, a);
             assert!(net.fold(close + 1, chain(9), &[], &[(RH, b, None)]).rewards.is_empty());
@@ -6765,7 +6860,7 @@ mod tests {
             net.fold(101, chain(0), &[], &[]);
             net.fold(102, chain(0), &[], &[(RH, a, None)]);
             net.ledger.drop_draw_candidates(&RH, &[a]);
-            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            let close = 102 + reward_draw_window_daa(0, 0, 256, Lineup::H14);
             assert!(net.fold(close, chain(9), &[], &[]).rewards.is_empty());
             let req = net.ledger.pending.get(&RH).unwrap();
             assert_eq!((req.winner, req.reward), (None, 0));
@@ -6846,7 +6941,7 @@ mod tests {
             net.fold(102, chain(0), &[], &answers);
             assert_eq!(net.ledger.trace_audits.len(), 6);
             net.fold(102 + TRACE_SEED_DELAY_DAA, chain(0), &[], &[]);
-            let work = super::super::OPEN_AUDIT_WORK_PASSES * service_work_daa(0, 0, 4_096);
+            let work = super::super::OPEN_AUDIT_WORK_PASSES * service_work_daa(0, 0, 4_096, Lineup::H14);
             let opened = (super::super::OPENING_BACKLOG_CAP_DAA / work + 1) as usize;
             assert!(opened < 6);
             assert_eq!(net.ledger.trace_audits.len(), opened);
@@ -6862,7 +6957,7 @@ mod tests {
             let mut net = Net::new(false, true, vec![a]);
             net.audit_all = true;
             net.sanction = true;
-            let work = super::super::OPEN_AUDIT_WORK_PASSES * service_work_daa(0, 0, 4_096);
+            let work = super::super::OPEN_AUDIT_WORK_PASSES * service_work_daa(0, 0, 4_096, Lineup::H14);
             let fit = (super::super::AUDIT_SPAN_DAA / work) as usize;
             let requests: Vec<([u8; 32], u32)> = (0..fit as u8 + 3).map(|i| ([i + 10; 32], 4_096)).collect();
             net.fold(100, chain(0), &requests, &[]);
@@ -6939,8 +7034,8 @@ mod tests {
             net.fold(100, chain(0), &[(RH, 4_096)], &[]);
             net.fold(101, chain(0), &[], &[]);
             net.fold(102, chain(0), &[], &[(RH, a, None), (RH, c, None)]);
-            let close = 102 + reward_draw_window_daa(0, 0, 4_096);
-            let allowed = 101 + service_window_daa_v3(0, 0, 1);
+            let close = 102 + reward_draw_window_daa(0, 0, 4_096, Lineup::H14);
+            let allowed = 101 + service_window_daa_v3(0, 0, 1, Lineup::H14);
             assert!(allowed + 1 < close);
             net.fold(allowed - 1, chain(0), &[], &[(RH, a, Some((0, 1))), (RH, c, Some((0, 1)))]);
             net.fold(allowed + 1, chain(0), &[], &[(RH, b, Some((0, 1)))]);
@@ -6965,7 +7060,7 @@ mod tests {
             assert!(ServiceLedgerSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
             let mut restored = Net::new(true, false, vec![a, b]);
             restored.ledger.restore_snapshot(&parsed);
-            let close = 102 + reward_draw_window_daa(0, 0, 256);
+            let close = 102 + reward_draw_window_daa(0, 0, 256, Lineup::H14);
             assert_eq!(restored.fold(close, chain(9), &[], &[]).rewards, net.fold(close, chain(9), &[], &[]).rewards);
         }
 
@@ -6978,7 +7073,7 @@ mod tests {
             // full budget, no prompt bytes: 150 + 231
             assert_eq!(net.window_end(&RH), 101 + 381);
             // 200 generated tokens on 100 prompt tokens: allowed until 101 + 150 + 2 + 180
-            let allowed = 101 + service_window_daa_v3(0, 100, 200);
+            let allowed = 101 + service_window_daa_v3(0, 100, 200, Lineup::H14);
             assert_eq!(allowed, 433);
             net.fold(150, chain(0), &[], &[(RH, a, Some((100, 300)))]);
             net.fold(allowed, chain(0), &[], &[(RH, b, Some((100, 300)))]);
@@ -7045,8 +7140,8 @@ mod tests {
             net.fold(101, chain(0), &[], &[]);
             let arm = 101;
             net.fold(102, chain(0), &[], &[(RH, a, Some((10, 60))), (RH, b, Some((10, 60))), (RH, c, Some((10, 60)))]);
-            let short_window = service_window_daa_v3(0, 10, 50);
-            let own_window = service_window_daa_v3(0, 10, 2000);
+            let short_window = service_window_daa_v3(0, 10, 50, Lineup::H14);
+            let own_window = service_window_daa_v3(0, 10, 2000, Lineup::H14);
             let at = arm + short_window + 30;
             assert!(at < arm + own_window, "the long answer must land inside its own window");
             assert!(at < net.window_end(&RH), "the long answer must land before the audit closes");
@@ -7073,7 +7168,7 @@ mod tests {
             net.one_miss = one_miss;
             net.fold(100, chain(0), &[(RH, 2048)], &[]);
             net.fold(101, chain(0), &[], &[]);
-            let late_at = 101 + service_window_daa_v3(0, 10, 50) + 50;
+            let late_at = 101 + service_window_daa_v3(0, 10, 50, Lineup::H14) + 50;
             assert!(late_at < net.window_end(&RH), "the answer must land before the audit closes");
             for daa in 102..late_at {
                 net.fold(daa, chain((daa % 7) as u8), &[], &[]);
@@ -7103,7 +7198,7 @@ mod tests {
             net.one_miss = one_miss;
             net.fold(100, chain(0), &[(RH, 2048)], &[]);
             net.fold(101, chain(0), &[], &[]);
-            let late_at = 101 + service_window_daa_v3(0, 10, 50) + 50;
+            let late_at = 101 + service_window_daa_v3(0, 10, 50, Lineup::H14) + 50;
             for daa in 102..late_at {
                 net.fold(daa, chain((daa % 7) as u8), &[], &[]);
             }
@@ -7153,7 +7248,7 @@ mod tests {
             net.fold(101, chain(0), &[], &[]);
             net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, Some((0, 256)))]);
             net.fold(103, chain(0), &[], &[]);
-            let replays = 3 * service_work_daa(0, 0, 256);
+            let replays = 3 * service_work_daa(0, 0, 256, Lineup::H14);
             let w = net.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
             assert_eq!(w.queue[1], (replays, false), "b's open audit is work ahead of the next request");
             assert!(net.window_end(&RH2) >= 103 + replays);
@@ -7169,7 +7264,7 @@ mod tests {
             // b already served the first request: only a has it queued
             net.fold(102, chain(0), &[(RH2, 256)], &[(RH, b, None)]);
             net.fold(103, chain(0), &[], &[]);
-            let queued = service_work_daa(0, 0, 256);
+            let queued = service_work_daa(0, 0, 256, Lineup::H14);
             assert_eq!(net.window_end(&RH2), 103 + 381 + queued);
             assert_eq!(net.window_end(&RH), first_end);
             let w = net.ledger.pending.get(&RH2).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
@@ -7193,7 +7288,7 @@ mod tests {
             net.fold(101, chain(0), &[], &[]);
             let rh = requests[0].0;
             let w = net.ledger.pending.get(&rh).unwrap().audit.as_ref().unwrap().v3.clone().unwrap();
-            assert_eq!(w.queue, vec![(service_work_daa(0, 0, 256) * (SERVICE_QUEUE_CAP as u64 + 1), true)]);
+            assert_eq!(w.queue, vec![(service_work_daa(0, 0, 256, Lineup::H14) * (SERVICE_QUEUE_CAP as u64 + 1), true)]);
             let end = net.window_end(&rh);
             let answers: Vec<Answer> = requests.iter().map(|(h, _)| (*h, a, Some((0, 1)))).collect();
             net.fold(end, chain(0), &[], &answers);

@@ -61,12 +61,15 @@ pub enum PomWireError {
 /// Both are what [`encode_v4_deduped`]/[`decode_v4_deduped`] need, and both are derivable by any
 /// peer holding the header — which is why the compact form can omit them.
 ///
-/// The tier table is `POM_TIERS_H14` from the private-inference activation, else `POM_TIERS_H6`:
-/// `pom_v4_activation` is strictly later than `pom_v3_activation`, so every v4 block selects one of
-/// them in `pom_tiers`. A tier outside it is rejected here rather than guessed, and the caller falls
+/// The tier table is `POM_TIERS_H18` from H18, `POM_TIERS_H14` from the private-inference
+/// activation, else `POM_TIERS_H6`: `pom_v4_activation` is strictly later than
+/// `pom_v3_activation`, so every v4 block selects one of them in `pom_tiers`. A tier outside it is rejected here rather than guessed, and the caller falls
 /// back to the legacy encoding.
 pub fn v4_wire_context(header: &Header, tier: u8) -> Result<(u64, u64), PomWireError> {
-    let tiers = crate::config::params::service_tiers(crate::pom::private_inference_active(header.daa_score));
+    let tiers = crate::config::params::service_tiers(
+        crate::pom::private_inference_active(header.daa_score),
+        crate::pom::h18_active(header.daa_score),
+    );
     let t = tiers.get(tier as usize).ok_or(PomWireError::UnknownTier(tier))?;
     let pre_pow_hash = hash_override_nonce_time(header, 0, 0).as_bytes();
     Ok((pom_block_seed_rewalk_era(&pre_pow_hash, header.timestamp, header.nonce, header.daa_score), t.chunks))

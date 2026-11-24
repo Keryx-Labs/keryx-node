@@ -95,7 +95,14 @@ impl BlockBodyProcessor {
             return Err(RuleError::BadBlockTask(Fail::Shape));
         }
         let opening = Opening::decode(bytes).ok_or(RuleError::BadBlockTask(Fail::Shape))?;
-        let rules = keryx_consensus_core::config::params::trace_rules(proof.tier, true, false, true, false)
+        let rules = keryx_consensus_core::config::params::trace_rules(
+            proof.tier,
+            true,
+            false,
+            true,
+            false,
+            keryx_consensus_core::config::params::Lineup::at(self.h18_activation, block.header.daa_score),
+        )
             .ok_or(RuleError::BadBlockTask(Fail::Manifest))?;
         let (Some(chain), Some(prefix)) = (rules.chain.as_ref(), rules.prefix.as_ref()) else {
             return Err(RuleError::BadBlockTask(Fail::Manifest));
@@ -349,6 +356,7 @@ impl BlockBodyProcessor {
         let pom_v3 = self.pom_v3_activation.is_active(header.daa_score);
         let pom_v4 = self.pom_v4_activation.is_active(header.daa_score);
         let tiers = pom_tiers(
+            self.h18_activation.is_active(header.daa_score),
             self.private_inference_activation.is_active(header.daa_score),
             pom_v3,
             self.h5_activation.is_active(header.daa_score),
@@ -395,7 +403,11 @@ impl BlockBodyProcessor {
         let final_hash = |s: u64| if h3 { pom_pow_value_h3(s, &pre_pow_hash) } else { pom_pow_value(s, &pre_pow_hash) };
 
         if self.pom_v5_activation.is_active(header.daa_score) {
-            let n_pad = keryx_consensus_core::config::params::pom_v5_pad_tiles(proof.tier, self.pad_margin_activation.is_active(header.daa_score));
+            let n_pad = keryx_consensus_core::config::params::pom_v5_pad_tiles(
+                proof.tier,
+                self.pad_margin_activation.is_active(header.daa_score),
+                keryx_consensus_core::config::params::Lineup::at(self.h18_activation, header.daa_score),
+            );
             let pad_seed = v5_pad_seed(proof.tier, &tier.model_id, &tier.root);
             return verify_pom_proof_v5_container(seed, proof, tier.chunks, &tier.root, &pad_seed, n_pad, &target, final_hash)
                 .map_err(RuleError::BadPomProofV4);

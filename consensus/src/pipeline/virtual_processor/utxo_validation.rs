@@ -34,7 +34,7 @@ use crate::model::stores::pruning::PruningStoreReader;
 use crate::model::stores::selected_chain::{DbSelectedChainStore, SelectedChainStoreReader};
 use crate::model::stores::windowed_production_prefix::WindowedProductionPrefixStoreReader;
 use keryx_consensus_core::coin_age::eff_balance_from_buckets;
-use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, ratio_on_probation, ratio_probation_production, RATIO_PROBATION_FLOOR_BLOCKS, RATIO_PROBATION_SLICES, tier_reward_bps};
+use keryx_consensus_core::config::params::{INFERENCE_REWARD_MINIMUMS_H18, INFERENCE_REWARD_MINIMUMS_V2_H4, INFERENCE_REWARD_MINIMUMS_V2_H6, INFERENCE_REWARD_MINIMUMS_FLAT, TIER_REWARD_BPS_DIVISOR, ratio_reward_bps, ratio_reward_bps_v2, ratio_reward_bps_v3, ratio_on_probation, ratio_probation_production, RATIO_PROBATION_FLOOR_BLOCKS, RATIO_PROBATION_SLICES, tier_reward_bps};
 use keryx_database::prelude::StoreResultExt;
 use keryx_consensus_core::{
     BlockHashMap, BlockHashSet, ChainPath, HashMapCustomHasher,
@@ -668,7 +668,9 @@ impl VirtualStateProcessor {
     /// OPoI v2 introduced the uncensored lineup. Resolved in one place so the pre-UTXO fast path,
     /// the full block check and mempool admission cannot read different tables for the same score.
     pub(super) fn ai_reward_minimums(&self, daa_score: u64) -> &[([u8; 32], u64)] {
-        if self.private_inference_activation.is_active(daa_score) {
+        if self.h18_activation.is_active(daa_score) {
+            INFERENCE_REWARD_MINIMUMS_H18
+        } else if self.private_inference_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_FLAT
         } else if self.pom_v3_activation.is_active(daa_score) {
             INFERENCE_REWARD_MINIMUMS_V2_H6
@@ -842,6 +844,7 @@ impl VirtualStateProcessor {
         let schedule = tier_reward_bps(
             self.very_light_activation.is_active(pov_daa_score),
             self.pom_v3_activation.is_active(pov_daa_score),
+            self.h18_activation.is_active(pov_daa_score),
         );
         // H6: the tier bonus is gated on standing — an identity in probation earns the floor
         // rate whatever tier it proves, so rotating identities forfeits the bonus for the whole

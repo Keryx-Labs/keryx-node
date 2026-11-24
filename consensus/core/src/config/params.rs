@@ -206,6 +206,9 @@ pub const H17_ACTIVATION_DAA: u64 = 153_085_000;
 /// Testnet H17 gate.
 pub const TESTNET_H17_ACTIVATION_DAA: u64 = 565_000;
 
+/// Number of tiers of the H18 lineup.
+pub const H18_TIER_COUNT: usize = 8;
+
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
 /// chain, together with its daa score. Once the local DAG contains this block, IBD chain
@@ -337,6 +340,36 @@ pub const INFERENCE_REWARD_MINIMUMS_FLAT: &[([u8; 32], u64)] = &[
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, 150_000_000), // 1.5 KRX
     (QWEN3_8_27B_MODEL_ID,             200_000_000), // 2.0 KRX
     (KIMI_LINEAR_48B_MODEL_ID,         250_000_000), // 2.5 KRX
+];
+
+/// Kev-4B Q8_0 (ggml-org GGUF, arch qwen35, decision model). H18 tier 0. `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS QmcYss4ww73a1FGPWPJUpXyyrvHucX84ebGPV955pVp1uJ).
+pub const KEV_4B_MODEL_ID: [u8; 32] = [
+    0xd3, 0x25, 0x75, 0xe6, 0x1a, 0xf4, 0x9d, 0x71,
+    0xfa, 0x6c, 0x31, 0x0f, 0x6d, 0x6b, 0xef, 0xe1,
+    0xfe, 0x4b, 0xa9, 0xe3, 0x84, 0xbc, 0x03, 0xa1,
+    0x61, 0x81, 0x94, 0x0e, 0x5c, 0xeb, 0x52, 0x51,
+];
+
+/// Qwen3.5-9B-abliterated Q8_0 (huihui-ai abliteration, mradermacher GGUF). H18 tier 1. `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS QmQtTFMQYvnoZ1ZxNsuth8zzLWoBVKnCDVoW2ViCn8H6na).
+pub const QWEN3_5_9B_Q8_MODEL_ID: [u8; 32] = [
+    0x25, 0xdd, 0x00, 0x1c, 0xa8, 0x01, 0x70, 0x8f,
+    0xa8, 0x2a, 0x9d, 0x2a, 0x77, 0xe7, 0xba, 0xec,
+    0x4f, 0x27, 0x43, 0xae, 0xbe, 0xe9, 0x9d, 0xc6,
+    0x04, 0xc3, 0xbf, 0xbc, 0xf6, 0x71, 0x64, 0x57,
+];
+
+/// Per-model `inference_reward` floors once `h18_activation` is live. Models that left the lineup
+/// keep an entry no request can meet.
+pub const INFERENCE_REWARD_MINIMUMS_H18: &[([u8; 32], u64)] = &[
+    (KEV_4B_MODEL_ID,                   50_000_000), // 0.5 KRX
+    (QWEN3_5_9B_Q8_MODEL_ID,           100_000_000), // 1.0 KRX
+    (QWEN3_5_9B_ABLITERATED_MODEL_ID,  u64::MAX),
+    (GLM_4_9B_0414_MODEL_ID,           u64::MAX),
+    (GEMMA_4_12B_ABLITERATED_MODEL_ID, u64::MAX),
+    (QWEN3_8_27B_MODEL_ID,             u64::MAX),
+    (KIMI_LINEAR_48B_MODEL_ID,         u64::MAX),
 ];
 
 // --- Proof-of-Model possession (post-PoW). See POM_CONSENSUS_SPEC.md. ---
@@ -610,11 +643,74 @@ pub const POM_V5_PAD_TILES_H14: [u64; 5] = [638_976, 3_213_312, 4_804_608, 6_471
 /// Context pad tiles of each `POM_TIERS_H14` tier from `pad_margin_activation`.
 pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
 
-const _: () = assert!(POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len() && POM_V5_PAD_TILES_H16.len() == POM_TIERS_H14.len());
+/// H18 possession anchors, by tier. Gated by `h18_activation`; tiers are appended as they are
+/// pinned, and the gate stays unscheduled until all `H18_TIER_COUNT` are.
+pub const POM_TIERS_H18: &[crate::pom::PomTier] = &[
+    crate::pom::PomTier {
+        model_id: KEV_4B_MODEL_ID,
+        root: [
+            0xb3, 0x14, 0x69, 0x21, 0xa4, 0x1a, 0xf0, 0xb9, 0x23, 0xe6, 0xc8, 0xa8, 0xd9, 0xec, 0x4d, 0xeb,
+            0x8b, 0xea, 0x8c, 0x62, 0xc7, 0x51, 0xd8, 0xfb, 0x69, 0xba, 0x2f, 0x43, 0xc7, 0xc1, 0x57, 0x2f,
+        ],
+        chunks: 139_775_936,
+    },
+    crate::pom::PomTier {
+        model_id: QWEN3_5_9B_Q8_MODEL_ID,
+        root: [
+            0x8d, 0x78, 0x1a, 0xd6, 0x29, 0x21, 0x77, 0xe4, 0x37, 0xae, 0x23, 0xc8, 0x42, 0x4e, 0xc3, 0x05,
+            0x73, 0x03, 0x69, 0x78, 0x26, 0x9f, 0xbb, 0x3b, 0x57, 0x55, 0x2c, 0xa1, 0xe4, 0x3d, 0x67, 0x65,
+        ],
+        chunks: 297_391_680,
+    },
+];
+
+/// Context pad tiles of each `POM_TIERS_H18` tier.
+pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688];
+
+const _: () = assert!(
+    POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
+        && POM_V5_PAD_TILES_H16.len() == POM_TIERS_H14.len()
+        && POM_V5_PAD_TILES_H18.len() == POM_TIERS_H18.len()
+        && POM_TIERS_H18.len() <= H18_TIER_COUNT
+);
+
+/// Lineup the per-tier rules follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lineup {
+    /// `POM_TIERS_H14`, before `h18_activation`.
+    H14,
+    /// `POM_TIERS_H18`, from `h18_activation`.
+    H18,
+}
+
+impl Lineup {
+    /// Lineup of a block or request at `daa_score`.
+    pub fn at(h18: ForkActivation, daa_score: u64) -> Lineup {
+        if h18.is_active(daa_score) { Lineup::H18 } else { Lineup::H14 }
+    }
+
+    /// Possession anchors of the lineup.
+    pub fn tiers(self) -> &'static [crate::pom::PomTier] {
+        match self {
+            Lineup::H14 => POM_TIERS_H14,
+            Lineup::H18 => POM_TIERS_H18,
+        }
+    }
+}
+
+/// Whether `tier` serves another model under `to` than under `from`.
+pub fn lineup_tier_replaced(tier: u8, from: Lineup, to: Lineup) -> bool {
+    let model = |l: Lineup| l.tiers().get(tier as usize).map(|t| t.model_id);
+    model(from) != model(to)
+}
 
 /// Context pad tiles of `tier`; 0 = no pad.
-pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool) -> u64 {
-    let table = if pad_margin { &POM_V5_PAD_TILES_H16 } else { &POM_V5_PAD_TILES_H14 };
+pub fn pom_v5_pad_tiles(tier: u8, pad_margin: bool, lineup: Lineup) -> u64 {
+    let table: &[u64] = match lineup {
+        Lineup::H18 => POM_V5_PAD_TILES_H18,
+        Lineup::H14 if pad_margin => &POM_V5_PAD_TILES_H16,
+        Lineup::H14 => &POM_V5_PAD_TILES_H14,
+    };
     table.get(tier as usize).copied().unwrap_or(0)
 }
 
@@ -1136,9 +1232,12 @@ pub struct TraceRules {
     pub attention: bool,
 }
 
-/// Audit rules of `tier` in the H14 lineup; `prefix` selects the prefix rule and its manifests,
+/// Audit rules of `tier` in `lineup`; `prefix` selects the prefix rule and its manifests,
 /// `chain` stage 2 and its manifests, `attention` the attention manifests of the tiers that have one.
-pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attention: bool) -> Option<TraceRules> {
+pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attention: bool, lineup: Lineup) -> Option<TraceRules> {
+    if lineup == Lineup::H18 {
+        return None;
+    }
     if chain {
         let mut c = TRACE_CHAINS_H15.get(tier as usize)?.clone()?;
         let attn = if attention { *TRACE_ATTN_H_NEXT.get(tier as usize)? } else { None };
@@ -1176,46 +1275,64 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
 /// Must equal the miner's `ctx_floor` per model.
 pub const CONTEXT_FLOORS_H14: [u32; 5] = [8_192, 32_768, 32_768, 32_768, 32_768];
 
+/// Context floor of each `POM_TIERS_H18` tier, in tokens.
+pub const CONTEXT_FLOORS_H18: &[u32] = &[32_768, 32_768];
+
+const _: () = assert!(CONTEXT_FLOORS_H18.len() == POM_TIERS_H18.len());
+
 /// Positions the chat template and the request prefix add to a prompt, at most.
 pub const CONTEXT_OVERHEAD_TOKENS: u32 = 512;
 
 /// Context floor of `tier`, in tokens.
-pub fn context_floor(tier: u8) -> Option<u32> {
-    CONTEXT_FLOORS_H14.get(tier as usize).copied()
+pub fn context_floor(tier: u8, lineup: Lineup) -> Option<u32> {
+    let floors: &[u32] = match lineup {
+        Lineup::H14 => &CONTEXT_FLOORS_H14,
+        Lineup::H18 => CONTEXT_FLOORS_H18,
+    };
+    floors.get(tier as usize).copied()
 }
 
 /// Longest prompt, in bytes, sure to fit the context floor of `tier` under `max_tokens`: a
 /// token spans at least one byte.
-pub fn safe_prompt_len(tier: u8, max_tokens: u32) -> Option<u32> {
-    Some(context_floor(tier)?.saturating_sub(max_tokens.saturating_add(CONTEXT_OVERHEAD_TOKENS)))
+pub fn safe_prompt_len(tier: u8, max_tokens: u32, lineup: Lineup) -> Option<u32> {
+    Some(context_floor(tier, lineup)?.saturating_sub(max_tokens.saturating_add(CONTEXT_OVERHEAD_TOKENS)))
 }
 
 /// Whether a traced prompt of `n_prompt` positions fits the context floor of `tier` with its
 /// `max_tokens` budget.
-pub fn prompt_fits_floor(tier: u8, n_prompt: u32, max_tokens: u32) -> bool {
-    context_floor(tier).is_some_and(|floor| n_prompt.saturating_add(max_tokens) <= floor)
+pub fn prompt_fits_floor(tier: u8, n_prompt: u32, max_tokens: u32, lineup: Lineup) -> bool {
+    context_floor(tier, lineup).is_some_and(|floor| n_prompt.saturating_add(max_tokens) <= floor)
 }
 
-/// Tier lineup of the service ledger and the provider queries: the H14 set once
-/// `private_inference_activation` is live, else the H6 set.
-pub fn service_tiers(private_inference_active: bool) -> &'static [crate::pom::PomTier] {
-    if private_inference_active { POM_TIERS_H14 } else { POM_TIERS_H6 }
+/// Tier lineup of the service ledger and the provider queries: the H18 set once `h18_activation`
+/// is live, else the H14 set once `private_inference_activation` is live, else the H6 set.
+pub fn service_tiers(private_inference_active: bool, h18_active: bool) -> &'static [crate::pom::PomTier] {
+    if h18_active {
+        POM_TIERS_H18
+    } else if private_inference_active {
+        POM_TIERS_H14
+    } else {
+        POM_TIERS_H6
+    }
 }
 
-/// Possession anchors for a block at `daa_score`: the H14 set once `private_inference_activation`
-/// is live, else the H6 set, else the H5 set once `h5_activation` is live (tier-0 model swap),
+/// Possession anchors for a block at `daa_score`: the H18 set once `h18_activation` is live, the
+/// H14 set once `private_inference_activation` is live, else the H6 set, else the H5 set once `h5_activation` is live (tier-0 model swap),
 /// else the H4 candle-free set, else the 5-tier H2 set once `very_light_activation`, else the
 /// legacy 4-tier set. The choice MUST be made per block from that block's own DAA (never
 /// frozen) — an archival/IBD node recomputing an older block under a newer scheme would validate
 /// against the wrong anchors and reject the chain.
 pub fn pom_tiers(
+    h18_active: bool,
     private_inference_active: bool,
     pom_v3_active: bool,
     h5_active: bool,
     coin_age_active: bool,
     very_light_active: bool,
 ) -> &'static [crate::pom::PomTier] {
-    if private_inference_active {
+    if h18_active {
+        POM_TIERS_H18
+    } else if private_inference_active {
         POM_TIERS_H14
     } else if pom_v3_active {
         POM_TIERS_H6
@@ -1272,12 +1389,17 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 ///   4  Kimi-48B        0%
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
-/// Tier-reward schedule for a block at `daa_score`: 5-tier H6 once `pom_v3_activation` is live,
-/// 5-tier H2 once `very_light_activation`, legacy 4-tier before. Chosen per block from that block's
-/// own DAA (never frozen) — same gating discipline as `pom_tiers`, so archival/IBD recomputation of
-/// older blocks stays canonical.
-pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool) -> &'static [u64] {
-    if pom_v3_active {
+/// H18 (8-tier) tier-reward schedule, gated by `h18_activation`.
+pub const TIER_REWARD_BPS_H18: [u64; H18_TIER_COUNT] = [4_500, 5_000, 5_500, 6_000, 7_000, 8_000, 9_000, 10_000];
+
+/// Tier-reward schedule for a block at `daa_score`: 8-tier H18 once `h18_activation` is live,
+/// 5-tier H6 once `pom_v3_activation` is live, 5-tier H2 once `very_light_activation`, legacy
+/// 4-tier before. Chosen per block from that block's own DAA (never frozen) — same gating
+/// discipline as `pom_tiers`, so archival/IBD recomputation of older blocks stays canonical.
+pub fn tier_reward_bps(very_light_active: bool, pom_v3_active: bool, h18_active: bool) -> &'static [u64] {
+    if h18_active {
+        &TIER_REWARD_BPS_H18
+    } else if pom_v3_active {
         &TIER_REWARD_BPS_H6
     } else if very_light_active {
         &TIER_REWARD_BPS_H2
@@ -2034,6 +2156,8 @@ pub struct Params {
     pub pad_margin_activation: ForkActivation,
     /// H17: ratio-reward production of an address on probation, see `ratio_probation_production`.
     pub ratio_probation_activation: ForkActivation,
+    /// H18: the 8-tier lineup (`POM_TIERS_H18`) and its per-tier rules.
+    pub h18_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
     pub service_burnable_window_daa: u64,
@@ -2323,6 +2447,7 @@ impl Params {
             audit_queue_activation: self.audit_queue_activation,
             pad_margin_activation: self.pad_margin_activation,
             ratio_probation_activation: self.ratio_probation_activation,
+            h18_activation: self.h18_activation,
             service_burnable_window_daa: self.service_burnable_window_daa,
 
             chain_anchor: self.chain_anchor,
@@ -2558,6 +2683,7 @@ pub const MAINNET_PARAMS: Params = Params {
     audit_queue_activation: ForkActivation::new(H16_ACTIVATION_DAA),
     pad_margin_activation: ForkActivation::new(H16_ACTIVATION_DAA),
     ratio_probation_activation: ForkActivation::new(H17_ACTIVATION_DAA),
+    h18_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: Some((CHAIN_ANCHOR_HASH, CHAIN_ANCHOR_DAA)),
     service_state_checkpoint: Some((SERVICE_STATE_CHECKPOINT_DAA, SERVICE_STATE_CHECKPOINT)),
@@ -2712,6 +2838,7 @@ pub const TESTNET_PARAMS: Params = Params {
     audit_queue_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     pad_margin_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     ratio_probation_activation: ForkActivation::new(TESTNET_H17_ACTIVATION_DAA),
+    h18_activation: ForkActivation::never(),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2829,6 +2956,7 @@ pub const SIMNET_PARAMS: Params = Params {
     audit_queue_activation: ForkActivation::never(),
     pad_margin_activation: ForkActivation::never(),
     ratio_probation_activation: ForkActivation::never(),
+    h18_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -2940,6 +3068,7 @@ pub const DEVNET_PARAMS: Params = Params {
     audit_queue_activation: ForkActivation::never(),
     pad_margin_activation: ForkActivation::never(),
     ratio_probation_activation: ForkActivation::never(),
+    h18_activation: ForkActivation::never(),
     service_burnable_window_daa: crate::collateral::SERVICE_BURNABLE_WINDOW_DAA,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -3059,11 +3188,11 @@ mod pad_table_tests {
         for t in 0..POM_TIERS_H14.len() {
             assert_eq!(POM_V5_PAD_TILES_H16[t], POM_V5_PAD_TILES_H14[t] - 204_800);
             assert!(POM_V5_PAD_TILES_H16[t] > 0);
-            assert_eq!(pom_v5_pad_tiles(t as u8, false), POM_V5_PAD_TILES_H14[t]);
-            assert_eq!(pom_v5_pad_tiles(t as u8, true), POM_V5_PAD_TILES_H16[t]);
+            assert_eq!(pom_v5_pad_tiles(t as u8, false, Lineup::H14), POM_V5_PAD_TILES_H14[t]);
+            assert_eq!(pom_v5_pad_tiles(t as u8, true, Lineup::H14), POM_V5_PAD_TILES_H16[t]);
         }
-        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, false), 0);
-        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, true), 0);
+        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, false, Lineup::H14), 0);
+        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H14.len() as u8, true, Lineup::H14), 0);
     }
 
     #[test]
@@ -3112,6 +3241,45 @@ mod pad_table_tests {
     }
 
     #[test]
+    fn h18_gate_waits_for_the_full_lineup() {
+        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS, &SIMNET_PARAMS, &DEVNET_PARAMS] {
+            assert!(
+                p.h18_activation == ForkActivation::never() || POM_TIERS_H18.len() == H18_TIER_COUNT,
+                "H18 scheduled with {} of {H18_TIER_COUNT} tiers pinned",
+                POM_TIERS_H18.len()
+            );
+        }
+    }
+
+    #[test]
+    fn h18_lineup_rules() {
+        let anchors = |tiers: &[crate::pom::PomTier]| tiers.iter().map(|t| (t.model_id, t.root, t.chunks)).collect::<Vec<_>>();
+        let h18 = ForkActivation::new(1_000);
+        assert_eq!(Lineup::at(h18, 999), Lineup::H14);
+        assert_eq!(Lineup::at(h18, 1_000), Lineup::H18);
+        assert_eq!(Lineup::at(ForkActivation::never(), u64::MAX - 1), Lineup::H14);
+        assert_eq!(tier_reward_bps(true, true, true), &TIER_REWARD_BPS_H18);
+        assert_eq!(tier_reward_bps(true, true, false), &TIER_REWARD_BPS_H6);
+        assert!(TIER_REWARD_BPS_H18.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(TIER_REWARD_BPS_H18[H18_TIER_COUNT - 1], TIER_REWARD_BPS_DIVISOR);
+        assert_eq!(anchors(pom_tiers(true, true, true, true, true, true)), anchors(POM_TIERS_H18));
+        assert_eq!(anchors(service_tiers(true, true)), anchors(POM_TIERS_H18));
+        for (t, tier) in POM_TIERS_H18.iter().enumerate() {
+            assert!(lineup_tier_replaced(t as u8, Lineup::H14, Lineup::H18));
+            assert!(POM_TIERS_H14.iter().all(|old| old.model_id != tier.model_id));
+            assert_eq!(pom_v5_pad_tiles(t as u8, true, Lineup::H18), POM_V5_PAD_TILES_H18[t]);
+            assert_eq!(context_floor(t as u8, Lineup::H18), Some(CONTEXT_FLOORS_H18[t]));
+            let floor = INFERENCE_REWARD_MINIMUMS_H18.iter().find(|(id, _)| *id == tier.model_id).map(|(_, f)| *f);
+            assert!(floor.is_some_and(|f| f < u64::MAX));
+        }
+        for old in POM_TIERS_H14 {
+            assert!(INFERENCE_REWARD_MINIMUMS_H18.iter().any(|(id, f)| *id == old.model_id && *f == u64::MAX));
+        }
+        assert_eq!(pom_v5_pad_tiles(POM_TIERS_H18.len() as u8, true, Lineup::H18), 0);
+        assert!(!lineup_tier_replaced(0, Lineup::H14, Lineup::H14));
+    }
+
+    #[test]
     fn ratio_probation_gate_is_h17() {
         assert_eq!(MAINNET_PARAMS.ratio_probation_activation.daa_score(), H17_ACTIVATION_DAA);
         assert_eq!(TESTNET_PARAMS.ratio_probation_activation.daa_score(), TESTNET_H17_ACTIVATION_DAA);
@@ -3138,10 +3306,10 @@ mod h14_lineup_tests {
     #[test]
     fn h14_swaps_only_tier_3() {
         let anchors = |tiers: &[crate::pom::PomTier]| tiers.iter().map(|t| (t.model_id, t.root, t.chunks)).collect::<Vec<_>>();
-        assert_eq!(anchors(pom_tiers(true, true, true, true, true)), anchors(POM_TIERS_H14));
-        assert_eq!(anchors(pom_tiers(false, true, true, true, true)), anchors(POM_TIERS_H6));
-        assert_eq!(anchors(service_tiers(true)), anchors(POM_TIERS_H14));
-        assert_eq!(anchors(service_tiers(false)), anchors(POM_TIERS_H6));
+        assert_eq!(anchors(pom_tiers(false, true, true, true, true, true)), anchors(POM_TIERS_H14));
+        assert_eq!(anchors(pom_tiers(false, false, true, true, true, true)), anchors(POM_TIERS_H6));
+        assert_eq!(anchors(service_tiers(true, false)), anchors(POM_TIERS_H14));
+        assert_eq!(anchors(service_tiers(false, false)), anchors(POM_TIERS_H6));
         assert_eq!(POM_TIERS_H14.len(), POM_TIERS_H6.len());
         for (i, (h6, h14)) in POM_TIERS_H6.iter().zip(POM_TIERS_H14).enumerate() {
             if i == 3 {
@@ -3174,8 +3342,8 @@ mod trace_chain_tests {
     #[test]
     fn attention_switches_only_the_tiers_that_have_a_manifest() {
         for tier in 0..5u8 {
-            let base = trace_rules(tier, true, true, true, false).unwrap();
-            let attn = trace_rules(tier, true, true, true, true).unwrap();
+            let base = trace_rules(tier, true, true, true, false, Lineup::H14).unwrap();
+            let attn = trace_rules(tier, true, true, true, true, Lineup::H14).unwrap();
             assert!(!base.attention && base.chain.unwrap().n_attn == 0);
             match &TRACE_ATTN_H_NEXT[tier as usize] {
                 Some(n) => {
@@ -3187,6 +3355,6 @@ mod trace_chain_tests {
                 None => assert!(!attn.attention && attn.ctx.m_t == base.ctx.m_t),
             }
         }
-        assert!(trace_rules(1, true, true, false, true).is_some_and(|r| !r.attention));
+        assert!(trace_rules(1, true, true, false, true, Lineup::H14).is_some_and(|r| !r.attention));
     }
 }
