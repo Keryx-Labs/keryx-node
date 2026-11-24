@@ -378,6 +378,15 @@ pub const GEMMA_4_31B_MODEL_ID: [u8; 32] = [
     0x8c, 0xfb, 0xf4, 0x4c, 0xdd, 0xd1, 0x69, 0xb6,
 ];
 
+/// Qwen3.8-27B TURBO Q6_K (DavidAU GGUF, arch qwen35, no MTP layer). H18 tier 4. `model_id` =
+/// CIDv0[2..34] of the pinned GGUF (IPFS QmWbaMThue94PHhRpmmPbCr3Yq18QW46boZRcfcLBkm4At).
+pub const QWEN3_8_27B_TURBO_MODEL_ID: [u8; 32] = [
+    0x7a, 0xb0, 0x48, 0x41, 0xbb, 0x0b, 0x92, 0xe2,
+    0xbb, 0xec, 0xdd, 0x53, 0xf8, 0xcd, 0xb0, 0x86,
+    0x51, 0xbd, 0x06, 0xe7, 0x06, 0x11, 0x08, 0xa9,
+    0x8d, 0x05, 0x49, 0x62, 0x86, 0xdb, 0x4c, 0xb9,
+];
+
 /// Per-model `inference_reward` floors once `h18_activation` is live. Models that left the lineup
 /// keep an entry no request can meet.
 pub const INFERENCE_REWARD_MINIMUMS_H18: &[([u8; 32], u64)] = &[
@@ -385,6 +394,7 @@ pub const INFERENCE_REWARD_MINIMUMS_H18: &[([u8; 32], u64)] = &[
     (QWEN3_5_9B_Q8_MODEL_ID,           100_000_000), // 1.0 KRX
     (MINICPM_V_4_7_MODEL_ID,           150_000_000), // 1.5 KRX
     (GEMMA_4_31B_MODEL_ID,             200_000_000), // 2.0 KRX
+    (QWEN3_8_27B_TURBO_MODEL_ID,       250_000_000), // 2.5 KRX
     (QWEN3_5_9B_ABLITERATED_MODEL_ID,  u64::MAX),
     (GLM_4_9B_0414_MODEL_ID,           u64::MAX),
     (GEMMA_4_12B_ABLITERATED_MODEL_ID, u64::MAX),
@@ -698,10 +708,18 @@ pub const POM_TIERS_H18: &[crate::pom::PomTier] = &[
         ],
         chunks: 583_475_904,
     },
+    crate::pom::PomTier {
+        model_id: QWEN3_8_27B_TURBO_MODEL_ID,
+        root: [
+            0x02, 0x27, 0x50, 0x04, 0x8e, 0x95, 0xbe, 0xd2, 0x9f, 0x76, 0x98, 0x88, 0x4d, 0xae, 0x42, 0xf9,
+            0xdf, 0x26, 0x86, 0xa7, 0x3a, 0x48, 0x23, 0x1d, 0x63, 0x2d, 0x0e, 0xdd, 0x55, 0xd9, 0xa3, 0x93,
+        ],
+        chunks: 736_605_888,
+    },
 ];
 
 /// Context pad tiles of each `POM_TIERS_H18` tier.
-pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688, 846_848, 4_439_040];
+pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688, 846_848, 4_439_040, 8_225_792];
 
 const _: () = assert!(
     POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
@@ -1312,7 +1330,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
 pub const CONTEXT_FLOORS_H14: [u32; 5] = [8_192, 32_768, 32_768, 32_768, 32_768];
 
 /// Context floor of each `POM_TIERS_H18` tier, in tokens.
-pub const CONTEXT_FLOORS_H18: &[u32] = &[32_768, 32_768, 32_768, 32_768];
+pub const CONTEXT_FLOORS_H18: &[u32] = &[32_768, 32_768, 32_768, 32_768, 32_768];
 
 const _: () = assert!(CONTEXT_FLOORS_H18.len() == POM_TIERS_H18.len());
 
