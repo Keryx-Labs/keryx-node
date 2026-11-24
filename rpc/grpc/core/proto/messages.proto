@@ -72,6 +72,7 @@ message KaspadRequest {
     GetServiceStrikesRequestMessage getServiceStrikesRequest = 1120;
     GetServiceProvidersRequestMessage getServiceProvidersRequest = 1124;
     GetAwaitedOpeningsRequestMessage getAwaitedOpeningsRequest = 1126;
+    GetTierReserveRequestMessage getTierReserveRequest = 1128;
   }
 }
 
@@ -144,6 +145,7 @@ message KaspadResponse {
     GetServiceStrikesResponseMessage getServiceStrikesResponse = 1121;
     GetServiceProvidersResponseMessage getServiceProvidersResponse = 1125;
     GetAwaitedOpeningsResponseMessage getAwaitedOpeningsResponse = 1127;
+    GetTierReserveResponseMessage getTierReserveResponse = 1129;
   }
 }
 

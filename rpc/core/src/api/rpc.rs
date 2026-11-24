@@ -483,6 +483,16 @@ pub trait RpcApi: Sync + Send + AnySync {
         request: GetAwaitedOpeningsRequest,
     ) -> RpcResult<GetAwaitedOpeningsResponse>;
 
+    /// The tier reserve after chain block `block_hash` (the sink when `None`).
+    async fn get_tier_reserve(&self, block_hash: Option<RpcHash>) -> RpcResult<GetTierReserveResponse> {
+        self.get_tier_reserve_call(None, GetTierReserveRequest { block_hash }).await
+    }
+    async fn get_tier_reserve_call(
+        &self,
+        connection: Option<&DynRpcConnection>,
+        request: GetTierReserveRequest,
+    ) -> RpcResult<GetTierReserveResponse>;
+
     async fn get_daa_score_timestamp_estimate(&self, daa_scores: Vec<u64>) -> RpcResult<Vec<u64>> {
         Ok(self.get_daa_score_timestamp_estimate_call(None, GetDaaScoreTimestampEstimateRequest { daa_scores }).await?.timestamps)
     }

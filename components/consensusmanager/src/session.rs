@@ -230,6 +230,13 @@ impl ConsensusSessionOwned {
         self.consensus.awaited_requests(escrow_pubkey, request_hashes)
     }
 
+    pub fn get_tier_reserve(
+        &self,
+        hash: Option<Hash>,
+    ) -> ConsensusResult<(Hash, u64, Option<keryx_consensus_core::coinbase::TierReserve>)> {
+        self.consensus.tier_reserve(hash)
+    }
+
     pub fn get_virtual_bits(&self) -> u32 {
         // Accessing cached virtual fields is lock-free and does not require spawn_blocking
         self.consensus.get_virtual_bits()

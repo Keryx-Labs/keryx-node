@@ -150,6 +150,8 @@ pub enum RpcApiOps {
     GetServiceProviders = 156,
     /// Openings the node awaits for a set of response transaction ids
     GetAwaitedOpenings = 157,
+    /// Tier reserve after a chain block
+    GetTierReserve = 158,
 }
 
 impl RpcApiOps {

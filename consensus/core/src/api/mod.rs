@@ -239,6 +239,13 @@ pub trait ConsensusApi: Send + Sync {
         Vec::new()
     }
 
+    /// The tier reserve state after chain block `hash` (the sink when `None`): the block, its DAA
+    /// score and its reserve, `None` before the reserve rule.
+    fn tier_reserve(&self, hash: Option<Hash>) -> ConsensusResult<(Hash, u64, Option<crate::coinbase::TierReserve>)> {
+        let _ = hash;
+        Err(crate::errors::consensus::ConsensusError::General("tier reserve is not available"))
+    }
+
     /// The pieces a drawn response still owes.
     fn awaited_opening_pieces(&self, response_txid: &[u8; 32]) -> Option<u8> {
         let _ = response_txid;

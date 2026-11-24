@@ -780,6 +780,15 @@ impl ConsensusApi for Consensus {
         self.virtual_processor.awaited_openings(response_txids)
     }
 
+    fn tier_reserve(&self, hash: Option<Hash>) -> ConsensusResult<(Hash, u64, Option<keryx_consensus_core::coinbase::TierReserve>)> {
+        use crate::model::stores::tier_reserve::TierReserveStoreReader;
+        let hash = hash.unwrap_or_else(|| self.get_sink());
+        let Some(daa) = self.headers_store.get_daa_score(hash).optional().unwrap() else {
+            return Err(ConsensusError::HeaderNotFound(hash));
+        };
+        Ok((hash, daa, self.storage.tier_reserve_store.get(hash).optional().unwrap()))
+    }
+
     fn get_service_state_rows(&self, pruning_point: Hash, handoff_daa: u64) -> ConsensusResult<Vec<Vec<u8>>> {
         let Some(pp_daa) = self.headers_store.get_daa_score(pruning_point).optional().unwrap() else {
             return Err(ConsensusError::HeaderNotFound(pruning_point));

@@ -945,6 +945,8 @@ build_wrpc_wasm_bindgen_interface!(
         /// Retrieves the openings the node awaits among a set of response
         /// transaction ids: signing key, seed, deadline and pieces still owed.
         GetAwaitedOpenings,
+        /// Retrieves the tier reserve after a chain block (the sink by default).
+        GetTierReserve,
         /// Retrieves information about the peers connected to the Kaspa node.
         /// Returned information: Peer ID, IP address and port, connection
         /// status, protocol version.

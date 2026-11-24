@@ -2191,6 +2191,66 @@ impl Deserializer for GetAwaitedOpeningsResponse {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTierReserveRequest {
+    /// Chain block to read; the sink when `None`.
+    pub block_hash: Option<RpcHash>,
+}
+
+impl Serializer for GetTierReserveRequest {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(Option<RpcHash>, &self.block_hash, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTierReserveRequest {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let block_hash = load!(Option<RpcHash>, reader)?;
+        Ok(Self { block_hash })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTierReserveResponse {
+    pub block_hash: RpcHash,
+    pub daa_score: u64,
+    /// Whether the reserve rule applies at this block.
+    pub active: bool,
+    /// Reserve after the block, in sompi.
+    pub reserve: u64,
+    /// Running average of the tier excess per chain block, in sompi.
+    pub ask_average: u64,
+}
+
+impl Serializer for GetTierReserveResponse {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(RpcHash, &self.block_hash, writer)?;
+        store!(u64, &self.daa_score, writer)?;
+        store!(bool, &self.active, writer)?;
+        store!(u64, &self.reserve, writer)?;
+        store!(u64, &self.ask_average, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for GetTierReserveResponse {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let block_hash = load!(RpcHash, reader)?;
+        let daa_score = load!(u64, reader)?;
+        let active = load!(bool, reader)?;
+        let reserve = load!(u64, reader)?;
+        let ask_average = load!(u64, reader)?;
+        Ok(Self { block_hash, daa_score, active, reserve, ask_average })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PingRequest {}

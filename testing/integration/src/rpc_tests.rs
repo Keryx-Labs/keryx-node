@@ -537,6 +537,14 @@ async fn sanity_test() {
                 })
             }
 
+            KaspadPayloadOps::GetTierReserve => {
+                let rpc_client = client.clone();
+                tst!(op, {
+                    let response = rpc_client.get_tier_reserve_call(None, GetTierReserveRequest::default()).await.unwrap();
+                    assert!(!response.active);
+                })
+            }
+
             KaspadPayloadOps::GetServiceProviders => {
                 let rpc_client = client.clone();
                 tst!(op, {

@@ -498,6 +498,20 @@ from!(item: RpcResult<&keryx_rpc_core::GetAwaitedOpeningsResponse>, protowire::G
     }
 });
 
+from!(item: &keryx_rpc_core::GetTierReserveRequest, protowire::GetTierReserveRequestMessage, {
+    Self { block_hash: item.block_hash.map(|h| h.to_string()).unwrap_or_default() }
+});
+from!(item: RpcResult<&keryx_rpc_core::GetTierReserveResponse>, protowire::GetTierReserveResponseMessage, {
+    Self {
+        block_hash: item.block_hash.to_string(),
+        daa_score: item.daa_score,
+        active: item.active,
+        reserve: item.reserve,
+        ask_average: item.ask_average,
+        error: None,
+    }
+});
+
 from!(item: &keryx_rpc_core::GetDaaScoreTimestampEstimateRequest, protowire::GetDaaScoreTimestampEstimateRequestMessage, {
     Self {
         daa_scores: item.daa_scores.clone()
@@ -1135,6 +1149,19 @@ try_from!(item: &protowire::GetAwaitedOpeningsResponseMessage, RpcResult<keryx_r
             .collect::<RpcResult<Vec<_>>>()?,
         closed_requests: item.closed_requests.iter().map(|h| RpcHash::from_str(h)).collect::<Result<Vec<_>, _>>()?,
         requests_checked: item.requests_checked,
+    }
+});
+
+try_from!(item: &protowire::GetTierReserveRequestMessage, keryx_rpc_core::GetTierReserveRequest, {
+    Self { block_hash: if item.block_hash.is_empty() { None } else { Some(RpcHash::from_str(&item.block_hash)?) } }
+});
+try_from!(item: &protowire::GetTierReserveResponseMessage, RpcResult<keryx_rpc_core::GetTierReserveResponse>, {
+    Self {
+        block_hash: RpcHash::from_str(&item.block_hash)?,
+        daa_score: item.daa_score,
+        active: item.active,
+        reserve: item.reserve,
+        ask_average: item.ask_average,
     }
 });
 

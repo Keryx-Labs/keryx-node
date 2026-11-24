@@ -387,6 +387,14 @@ impl RpcApi for RpcCoreMock {
         Err(RpcError::NotImplemented)
     }
 
+    async fn get_tier_reserve_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTierReserveRequest,
+    ) -> RpcResult<GetTierReserveResponse> {
+        Err(RpcError::NotImplemented)
+    }
+
     async fn get_daa_score_timestamp_estimate_call(
         &self,
         _connection: Option<&DynRpcConnection>,

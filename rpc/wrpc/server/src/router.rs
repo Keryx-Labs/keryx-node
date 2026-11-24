@@ -44,6 +44,7 @@ impl Router {
                 GetServiceStrikes,
                 GetServiceProviders,
                 GetAwaitedOpenings,
+                GetTierReserve,
                 GetBlock,
                 GetBlockCount,
                 GetBlockDagInfo,

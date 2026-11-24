@@ -1212,6 +1212,22 @@ mod mockery {
 
     test!(GetAwaitedOpeningsResponse);
 
+    impl Mock for GetTierReserveRequest {
+        fn mock() -> Self {
+            GetTierReserveRequest { block_hash: Some(mock()) }
+        }
+    }
+
+    test!(GetTierReserveRequest);
+
+    impl Mock for GetTierReserveResponse {
+        fn mock() -> Self {
+            GetTierReserveResponse { block_hash: mock(), daa_score: mock(), active: true, reserve: mock(), ask_average: mock() }
+        }
+    }
+
+    test!(GetTierReserveResponse);
+
     impl Mock for GetCoinSupplyResponse {
         fn mock() -> Self {
             GetCoinSupplyResponse { max_sompi: mock(), circulating_sompi: mock() }

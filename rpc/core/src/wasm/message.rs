@@ -340,6 +340,42 @@ try_from! ( args: GetAwaitedOpeningsResponse, IGetAwaitedOpeningsResponse, {
 });
 
 declare! {
+    IGetTierReserveRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTierReserveRequest {
+        blockHash?: HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTierReserveRequest, GetTierReserveRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTierReserveResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTierReserveResponse {
+        blockHash: HexString;
+        daaScore: bigint;
+        active: boolean;
+        reserve: bigint;
+        askAverage: bigint;
+    }
+    "#,
+}
+
+try_from! ( args: GetTierReserveResponse, IGetTierReserveResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
     IGetCoinSupplyRequest,
     r#"
     /**

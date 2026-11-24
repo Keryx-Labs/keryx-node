@@ -74,6 +74,7 @@ pub enum KaspadPayloadOps {
     GetServiceStrikes,
     GetServiceProviders,
     GetAwaitedOpenings,
+    GetTierReserve,
     GetBalanceByAddress,
     GetBalancesByAddresses,
     GetSinkBlueScore,

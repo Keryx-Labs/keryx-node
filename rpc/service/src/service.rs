@@ -1056,6 +1056,23 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         Ok(GetAwaitedOpeningsResponse { virtual_daa_score, openings, awaited_requests, closed_requests, requests_checked })
     }
 
+    async fn get_tier_reserve_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTierReserveRequest,
+    ) -> RpcResult<GetTierReserveResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let (block_hash, daa_score, reserve) = session.get_tier_reserve(request.block_hash)?;
+        let reserve = reserve.unwrap_or_default();
+        Ok(GetTierReserveResponse {
+            block_hash,
+            daa_score,
+            active: self.config.h18_activation.is_active(daa_score),
+            reserve: reserve.reserve,
+            ask_average: reserve.ask_average,
+        })
+    }
+
     async fn get_coin_supply_call(
         &self,
         _connection: Option<&DynRpcConnection>,
