@@ -862,10 +862,15 @@ impl VirtualStateProcessor {
         if !self.h18_activation.is_active(daa_score) {
             return None;
         }
-        if !self.h18_activation.is_active(self.headers_store.get_daa_score(selected_parent).unwrap()) {
+        if selected_parent == self.genesis.hash
+            || !self.h18_activation.is_active(self.headers_store.get_daa_score(selected_parent).unwrap())
+        {
             return Some(0);
         }
-        Some(self.tier_reserve_store.get(selected_parent).unwrap())
+        match self.tier_reserve_store.get(selected_parent) {
+            Ok(reserve) => Some(reserve),
+            Err(e) => panic!("tier reserve of chain block {selected_parent} is missing ({e}): resync this node from scratch"),
+        }
     }
 
     pub(super) fn tier_bps_by_block(

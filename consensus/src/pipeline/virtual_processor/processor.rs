@@ -36,7 +36,7 @@ use crate::{
             relations::{DbRelationsStore, RelationsStoreReader},
             selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             statuses::{DbStatusesStore, StatusesStore, StatusesStoreBatchExtensions, StatusesStoreReader},
-            tier_reserve::DbTierReserveStore,
+            tier_reserve::{DbTierReserveStore, TierReserveStoreReader},
             tips::{DbTipsStore, TipsStoreReader},
             utxo_diffs::{DbUtxoDiffsStore, UtxoDiffsStoreReader},
             utxo_multisets::{DbUtxoMultisetsStore, UtxoMultisetsStoreReader},
@@ -2014,6 +2014,7 @@ impl VirtualStateProcessor {
 
     /// Make sure pruning point-related stores are initialized
     pub fn init(self: &Arc<Self>) {
+        self.check_tier_reserve_at_sink();
         self.load_service_burned();
         // Restores the pending event queue before the first resolution.
         if let Some(pruning_point) = self.pruning_point_store.read().pruning_point().optional().unwrap() {
@@ -2032,6 +2033,22 @@ impl VirtualStateProcessor {
             self.db.write(batch).unwrap();
             drop(pruning_point_write);
             drop(pruning_meta_write);
+        }
+    }
+
+    /// Refuses to start when the sink is past the H18 gate without a tier reserve: chain blocks
+    /// validated by a binary without the reserve rule cannot be extended.
+    fn check_tier_reserve_at_sink(&self) {
+        let Some(state) = self.virtual_stores.read().state.get().optional().unwrap() else { return };
+        let sink = state.ghostdag_data.selected_parent;
+        if sink == self.genesis.hash || !self.h18_activation.is_active(self.headers_store.get_daa_score(sink).unwrap()) {
+            return;
+        }
+        if self.tier_reserve_store.get(sink).optional().unwrap().is_none() {
+            error!(
+                "tier reserve missing at the sink {sink} past the H18 gate: this database was built by an older binary, resync from scratch"
+            );
+            panic!("tier reserve missing at the sink past the H18 gate");
         }
     }
 

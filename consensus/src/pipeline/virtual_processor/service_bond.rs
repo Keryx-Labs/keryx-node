@@ -1007,6 +1007,7 @@ impl VirtualStateProcessor {
             if !warmup && self.is_pruning_sample_block(hash) && !self.service_ledger_hashes.read().contains_key(&hash) {
                 let mut snapshot = ledger.snapshot();
                 snapshot.recent_producers = self.recent_producers_below(sc, i, daa, pruning_point);
+                snapshot.tier_reserve = self.tier_reserve_store.get(hash).optional().unwrap();
                 let bytes = snapshot.to_bytes();
                 let snapshot_hash = ServiceLedgerSnapshot::hash_of_bytes(&bytes);
                 self.service_ledger_hashes.write().insert(hash, snapshot_hash);
@@ -1126,6 +1127,7 @@ impl VirtualStateProcessor {
             if self.is_pruning_sample_block(*h) {
                 let mut snapshot = sync.ledger.snapshot();
                 snapshot.recent_producers = self.recent_producers_below(&*sc, idx, daa, pruning_point);
+                snapshot.tier_reserve = self.tier_reserve_store.get(*h).optional().unwrap();
                 let bytes = snapshot.to_bytes();
                 self.service_ledger_hashes.write().insert(*h, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
                 self.service_ledger_snapshot_store.set(*h, bytes).unwrap();
@@ -1365,7 +1367,6 @@ impl VirtualStateProcessor {
             floors: Vec::with_capacity(groups.len()),
             entries: Vec::with_capacity(groups.len()),
             window_daa: (bottom..=sample_idx).map(|i| self.chain_index_daa(sc, i)).collect(),
-            tier_reserve: self.tier_reserve_store.get(sample).optional().unwrap(),
         };
         for (spk, base, points) in groups {
             snap.floors.push((spk.clone(), base));
@@ -1473,9 +1474,6 @@ impl VirtualStateProcessor {
             return Err(ConsensusError::General("production snapshot numbering does not match the local chain"));
         }
         drop(sc);
-        if let Some(reserve) = snapshot.tier_reserve {
-            self.tier_reserve_store.set(sample, reserve).unwrap();
-        }
         self.production_index_hashes.write().insert(sample, (ProductionIndexSnapshot::hash_of_bytes(&bytes), snapshot.relative_hash()));
         self.production_index_snapshot_store.set(sample, bytes).unwrap();
         info!(
@@ -1512,6 +1510,14 @@ impl VirtualStateProcessor {
             .get_by_hash(sample)
             .map_err(|_| keryx_consensus_core::errors::consensus::ConsensusError::General("snapshot sample is not a chain block"))?;
         let sample_daa = self.headers_store.get_daa_score(sample).unwrap();
+        if self.h18_activation.is_active(sample_daa) != snapshot.tier_reserve.is_some() {
+            return Err(keryx_consensus_core::errors::consensus::ConsensusError::General(
+                "ledger snapshot tier reserve does not match the gate at its sample",
+            ));
+        }
+        if let Some(reserve) = snapshot.tier_reserve {
+            self.tier_reserve_store.set(sample, reserve).unwrap();
+        }
         self.service_ledger_hashes.write().insert(sample, ServiceLedgerSnapshot::hash_of_bytes(&bytes));
         self.service_ledger_snapshot_store.set(sample, bytes).unwrap();
         *self.service_imported_producers.write() = snapshot.recent_producers.clone();

@@ -924,6 +924,15 @@ impl IbdFlow {
                 computed, majority
             )));
         }
+        // Past the H18 gate the chain cannot be validated without the tier reserve at the pruning
+        // point, so it must come in a ledger snapshot the chain commits to.
+        if keryx_consensus_core::pom::h18_active(pp_daa) {
+            let reserve =
+                snapshot_bytes.as_ref().and_then(|bytes| ServiceLedgerSnapshot::from_bytes(bytes).ok()).and_then(|s| s.tier_reserve);
+            if reserve.is_none() || !snapshot_voted {
+                return Err(ProtocolError::Other("peer served no committed tier reserve at the pruning point"));
+            }
+        }
         let handoff_rows = rows.len() - prefix_rows;
         consensus.clone().spawn_blocking(move |c| c.import_service_state(rows)).await?;
         info!("imported {} sealed service-state rows ({} verified, {} handoff)", prefix_rows + handoff_rows, prefix_rows, handoff_rows);
