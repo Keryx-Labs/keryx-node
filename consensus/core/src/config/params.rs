@@ -207,7 +207,7 @@ pub const H17_ACTIVATION_DAA: u64 = 153_085_000;
 pub const TESTNET_H17_ACTIVATION_DAA: u64 = 565_000;
 
 /// Number of tiers of the H18 lineup.
-pub const H18_TIER_COUNT: usize = 8;
+pub const H18_TIER_COUNT: usize = 7;
 
 /// Chain-anchor checkpoint (LOCAL PEERING POLICY, not a consensus rule — patched and unpatched
 /// nodes accept exactly the same blocks): a selected-chain block of the relaunched (bubble)
@@ -1389,10 +1389,10 @@ pub const TIER_REWARD_BPS_H2: [u64; 5] = [6_800, 7_600, 8_400, 9_200, 10_000];
 ///   4  Kimi-48B        0%
 pub const TIER_REWARD_BPS_H6: [u64; 5] = [6_000, 7_000, 8_000, 9_000, 10_000];
 
-/// H18 (8-tier) tier-reward schedule, gated by `h18_activation`.
-pub const TIER_REWARD_BPS_H18: [u64; H18_TIER_COUNT] = [4_500, 5_000, 5_500, 6_000, 7_000, 8_000, 9_000, 10_000];
+/// H18 (7-tier) tier-reward schedule, gated by `h18_activation`.
+pub const TIER_REWARD_BPS_H18: [u64; H18_TIER_COUNT] = [4_500, 5_000, 5_500, 6_000, 7_000, 8_500, 10_000];
 
-/// Tier-reward schedule for a block at `daa_score`: 8-tier H18 once `h18_activation` is live,
+/// Tier-reward schedule for a block at `daa_score`: 7-tier H18 once `h18_activation` is live,
 /// 5-tier H6 once `pom_v3_activation` is live, 5-tier H2 once `very_light_activation`, legacy
 /// 4-tier before. Chosen per block from that block's own DAA (never frozen) — same gating
 /// discipline as `pom_tiers`, so archival/IBD recomputation of older blocks stays canonical.
@@ -2156,7 +2156,7 @@ pub struct Params {
     pub pad_margin_activation: ForkActivation,
     /// H17: ratio-reward production of an address on probation, see `ratio_probation_production`.
     pub ratio_probation_activation: ForkActivation,
-    /// H18: the 8-tier lineup (`POM_TIERS_H18`) and its per-tier rules.
+    /// H18: the 7-tier lineup (`POM_TIERS_H18`) and its per-tier rules.
     pub h18_activation: ForkActivation,
     /// DAA window during which an escrow claim stays burnable (`collateral::SERVICE_BURNABLE_WINDOW_DAA`
     /// on mainnet; shrunk on test networks together with the depths).
