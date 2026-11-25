@@ -1331,6 +1331,15 @@ pub fn is_decision_model(model_id: &[u8; 32]) -> bool {
 
 const KEV_PREFIX: TracePrefix = TracePrefix { offset: 1, embd_entry: 250, norm_entry: 251, ..QWEN3_5_PREFIX };
 
+const MINICPM_V_4_7_PREFIX: TracePrefix = TracePrefix { embd_entry: 431, norm_entry: 432, ..QWEN3_5_PREFIX };
+
+const QWEN3_8_TURBO_PREFIX: TracePrefix = TracePrefix { embd_entry: 496, norm_entry: 497, ..QWEN3_5_PREFIX };
+
+const GEMMA4_31B_PREFIX: TracePrefix = match TRACE_PREFIXES {
+    [_, _, Some(p), ..] => TracePrefix { embd_entry: 411, norm_entry: 412, embd_scale: 73.32121276855469, ..p },
+    _ => panic!(),
+};
+
 const QWEN3_5_PREFIX: TracePrefix = match TRACE_PREFIXES {
     [Some(p), ..] => p,
     _ => panic!(),
@@ -1432,9 +1441,147 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
         },
         decision: None,
     }),
-    None,
-    None,
-    None,
+    Some(TraceTierH18 {
+        prefix_manifest: TraceManifest {
+            m_t: [
+                0x2c, 0x85, 0x88, 0x31, 0x60, 0xfc, 0x25, 0xd2, 0xad, 0x4e, 0x4e, 0x39, 0x50, 0x62, 0xd3, 0x5b,
+                0x59, 0xda, 0x50, 0x95, 0x0a, 0x3f, 0xa1, 0x39, 0xc6, 0x53, 0x0d, 0xa2, 0x1f, 0xe8, 0x6d, 0x69,
+            ],
+            n_entries: 433,
+            n_products: 431,
+        },
+        chain: TraceChain {
+            manifest: TraceManifest {
+                m_t: [
+                    0xb3, 0xf5, 0xb9, 0x84, 0xa1, 0x31, 0x53, 0xd6, 0x71, 0xc7, 0x4b, 0x01, 0x84, 0x34, 0xba, 0xfb,
+                    0x99, 0xdd, 0x15, 0xae, 0xab, 0x59, 0xed, 0x96, 0x24, 0x6b, 0xa0, 0x01, 0x7a, 0xe6, 0x51, 0xc9,
+                ],
+                n_entries: 633,
+                n_products: 431,
+            },
+            ctx: keryx_verifiable_inference::chain::ChainCtx {
+                n_layers: 40,
+                layer_base: 593,
+                embd_entry: 431,
+                eps: 9.999999974752427e-07,
+                embd_scale: 1.0,
+                trim_last: true,
+                n_used: 8,
+                n_attn: 0,
+                n_recur: 0,
+                seq_heads: 0,
+            },
+            prefix: MINICPM_V_4_7_PREFIX,
+        },
+        attn: TraceNext {
+            manifest: TraceManifest {
+                m_t: [
+                    0x62, 0x6f, 0x96, 0xbd, 0xe1, 0xb8, 0x49, 0x01, 0xbf, 0xff, 0xac, 0xd5, 0x9a, 0x84, 0xb0, 0x9a,
+                    0x95, 0xa6, 0x5b, 0x31, 0x01, 0xdf, 0xf6, 0x56, 0xaf, 0xe3, 0x11, 0x64, 0xb9, 0xa2, 0x0a, 0xd9,
+                ],
+                n_entries: 773,
+                n_products: 431,
+            },
+            n_attn: 10,
+            n_recur: 30,
+            seq_heads: 32,
+        },
+        decision: None,
+    }),
+    Some(TraceTierH18 {
+        prefix_manifest: TraceManifest {
+            m_t: [
+                0x63, 0x18, 0x37, 0x08, 0x27, 0x68, 0x5d, 0x26, 0xd2, 0x6a, 0x38, 0xac, 0xd7, 0xb9, 0x9b, 0xa8,
+                0xdf, 0x7a, 0xf0, 0x95, 0x69, 0xc1, 0x45, 0xe3, 0x56, 0x48, 0x4a, 0xa8, 0x0b, 0xb9, 0x6b, 0x98,
+            ],
+            n_entries: 413,
+            n_products: 411,
+        },
+        chain: TraceChain {
+            manifest: TraceManifest {
+                m_t: [
+                    0xd7, 0x3e, 0x86, 0xcd, 0xac, 0x75, 0x51, 0x7c, 0x4f, 0x25, 0x17, 0x8f, 0xa1, 0xcf, 0x23, 0xa2,
+                    0xa2, 0x3e, 0x8a, 0xeb, 0xc9, 0x43, 0x1d, 0xb7, 0xdd, 0x29, 0xf8, 0xd3, 0xf5, 0xef, 0x4c, 0x14,
+                ],
+                n_entries: 713,
+                n_products: 411,
+            },
+            ctx: keryx_verifiable_inference::chain::ChainCtx {
+                n_layers: 60,
+                layer_base: 653,
+                embd_entry: 411,
+                eps: 9.999999974752427e-07,
+                embd_scale: 73.32121276855469,
+                trim_last: true,
+                n_used: 0,
+                n_attn: 0,
+                n_recur: 0,
+                seq_heads: 0,
+            },
+            prefix: GEMMA4_31B_PREFIX,
+        },
+        attn: TraceNext {
+            manifest: TraceManifest {
+                m_t: [
+                    0x42, 0xa7, 0x6d, 0x7c, 0xe4, 0x97, 0x24, 0xa6, 0x51, 0x42, 0xdb, 0xd7, 0x14, 0x86, 0xb2, 0xe4,
+                    0x0d, 0xc5, 0xe8, 0xac, 0x89, 0x4f, 0x56, 0x08, 0x91, 0x81, 0x3b, 0x73, 0xb3, 0xf6, 0x96, 0x22,
+                ],
+                n_entries: 834,
+                n_products: 411,
+            },
+            n_attn: 60,
+            n_recur: 0,
+            seq_heads: 16,
+        },
+        decision: None,
+    }),
+    Some(TraceTierH18 {
+        prefix_manifest: TraceManifest {
+            m_t: [
+                0x34, 0x77, 0x12, 0xe7, 0x97, 0xa5, 0x98, 0x33, 0x49, 0xdc, 0x44, 0xbd, 0xe2, 0xc8, 0x1c, 0x2d,
+                0xa8, 0xfd, 0x4e, 0x7f, 0x64, 0xf4, 0x8c, 0xd0, 0xa6, 0xae, 0x19, 0xe0, 0x5c, 0x80, 0x06, 0x46,
+            ],
+            n_entries: 498,
+            n_products: 496,
+        },
+        chain: TraceChain {
+            manifest: TraceManifest {
+                m_t: [
+                    0xfe, 0x59, 0xf5, 0x80, 0xd0, 0x0f, 0xdd, 0x9a, 0x19, 0x2b, 0xb9, 0x4e, 0x17, 0x75, 0x8f, 0xfa,
+                    0x2b, 0x88, 0x57, 0x54, 0xf8, 0x5c, 0xc5, 0xdc, 0x19, 0x5a, 0xca, 0x9c, 0x29, 0xc2, 0xef, 0xd7,
+                ],
+                n_entries: 690,
+                n_products: 496,
+            },
+            ctx: keryx_verifiable_inference::chain::ChainCtx {
+                n_layers: 64,
+                layer_base: 626,
+                embd_entry: 496,
+                eps: 9.999999974752427e-07,
+                embd_scale: 1.0,
+                trim_last: true,
+                n_used: 0,
+                n_attn: 0,
+                n_recur: 0,
+                seq_heads: 0,
+            },
+            prefix: QWEN3_8_TURBO_PREFIX,
+        },
+        attn: TraceNext {
+            manifest: TraceManifest {
+                m_t: [
+                    0xaa, 0xb3, 0xae, 0xf4, 0xe7, 0xc3, 0x77, 0x40, 0x0f, 0x26, 0x35, 0x34, 0x6b, 0x32, 0xae, 0xeb,
+                    0x7b, 0x86, 0x19, 0x17, 0x2d, 0x03, 0x73, 0x97, 0x02, 0xd4, 0x4b, 0x08, 0x37, 0x74, 0x1e, 0xc4,
+                ],
+                n_entries: 914,
+                n_products: 496,
+            },
+            n_attn: 16,
+            n_recur: 48,
+            seq_heads: 48,
+        },
+        decision: None,
+    }),
     None,
     None,
 ];
@@ -3495,7 +3642,7 @@ mod pad_table_tests {
 
     #[test]
     fn h18_traces_tiers_0_and_1() {
-        for t in (0..H18_TIER_COUNT as u8).filter(|t| *t > 1) {
+        for t in (0..H18_TIER_COUNT as u8).filter(|t| *t > 4) {
             assert!(trace_rules(t, true, true, true, true, Lineup::H18).is_none());
             assert!(trace_rules(t, true, true, false, false, Lineup::H18).is_none());
         }
@@ -3519,6 +3666,44 @@ mod pad_table_tests {
             assert_ne!(r.ctx.m_t, trace_rules(1, true, true, true, true, Lineup::H14).unwrap().ctx.m_t);
             assert!(r.decision.is_none());
         }
+    }
+
+    #[test]
+    fn h18_tier_4_traces_qwen3_8_turbo() {
+        let t4 = TRACE_TIERS_H18[4].as_ref().unwrap();
+        let attn = trace_rules(4, true, true, true, true, Lineup::H18).unwrap();
+        assert_eq!((attn.ctx.r_t, attn.ctx.n_chunks), (POM_TIERS_H18[4].root, POM_TIERS_H18[4].chunks));
+        assert_eq!(attn.ctx.m_t, t4.attn.manifest.m_t);
+        let ch = attn.chain.unwrap();
+        assert_eq!((ch.n_layers, ch.n_attn, ch.n_recur, ch.seq_heads, ch.trim_last), (64, 16, 48, 48, true));
+        let p = attn.prefix.unwrap();
+        assert_eq!((p.offset, p.embd_entry, p.norm_entry), (6, 496, 497));
+    }
+
+    #[test]
+    fn h18_tier_2_traces_minicpm_v_4_7() {
+        let t2 = TRACE_TIERS_H18[2].as_ref().unwrap();
+        let attn = trace_rules(2, true, true, true, true, Lineup::H18).unwrap();
+        assert_eq!((attn.ctx.r_t, attn.ctx.n_chunks), (POM_TIERS_H18[2].root, POM_TIERS_H18[2].chunks));
+        assert_eq!(attn.ctx.m_t, t2.attn.manifest.m_t);
+        let ch = attn.chain.unwrap();
+        assert_eq!((ch.n_layers, ch.n_used, ch.n_attn, ch.n_recur, ch.seq_heads, ch.trim_last), (40, 8, 10, 30, 32, true));
+        let p = attn.prefix.unwrap();
+        assert_eq!((p.offset, p.embd_entry, p.norm_entry, p.table), (6, 431, 432, TRACE_PREFIXES[0].as_ref().unwrap().table));
+        assert!(attn.decision.is_none());
+    }
+
+    #[test]
+    fn h18_tier_3_traces_gemma_4_31b() {
+        let t3 = TRACE_TIERS_H18[3].as_ref().unwrap();
+        let attn = trace_rules(3, true, true, true, true, Lineup::H18).unwrap();
+        assert_eq!((attn.ctx.r_t, attn.ctx.n_chunks), (POM_TIERS_H18[3].root, POM_TIERS_H18[3].chunks));
+        assert_eq!(attn.ctx.m_t, t3.attn.manifest.m_t);
+        let ch = attn.chain.unwrap();
+        assert_eq!((ch.n_layers, ch.n_attn, ch.n_recur, ch.seq_heads, ch.trim_last), (60, 60, 0, 16, true));
+        let p = attn.prefix.unwrap();
+        assert_eq!((p.offset, p.embd_entry, p.norm_entry, p.table), (7, 411, 412, TRACE_PREFIXES[2].as_ref().unwrap().table));
+        assert!(attn.decision.is_none());
     }
 
     #[test]
