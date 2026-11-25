@@ -447,9 +447,9 @@ fn trace_opening_valid(
 /// The piece an opening body, seeded or not, proves.
 /// Piece an opening body proves.
 pub fn opening_body_piece(body: &[u8]) -> u8 {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, inner_body};
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, VERSION_ATTN_COMP, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
-        Some(VERSION_ATTN) => PIECE_ATTN,
+        Some(VERSION_ATTN | VERSION_ATTN_COMP) => PIECE_ATTN,
         Some(VERSION_RECUR) => PIECE_RECUR,
         Some(VERSION_RESID) => PIECE_RESID,
         Some(VERSION_DECISION) => PIECE_DECISION,
@@ -581,15 +581,24 @@ fn attn_opening_valid(
     txid: &[u8; 32],
     body: &[u8],
 ) -> Result<keryx_verifiable_inference::chain::AttnStep, &'static str> {
-    use keryx_verifiable_inference::{chain, opening::{AttnOpening, inner_body}, verify};
-    let op = inner_body(body).as_deref().and_then(AttnOpening::decode).ok_or("malformed attention body")?;
-    if &op.response_txid != txid {
-        return Err("response id mismatch");
-    }
+    use keryx_verifiable_inference::{chain, dsv41, opening::{AttnOpening, CompAttnOpening, inner_body}, verify};
+    let inner = inner_body(body).ok_or("malformed attention body")?;
     let (path, root) = match &audit.attn {
         Some(p) => (&p.path[..], Some(&p.root)),
         None => (&[][..], None),
     };
+    if let Some(op) = CompAttnOpening::decode(&inner) {
+        if &op.response_txid != txid {
+            return Err("response id mismatch");
+        }
+        let cc = rules.chain.as_ref().ok_or("attention without stage-2 rules")?;
+        let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+        return dsv41::verify_comp_attn_phase(&rules.ctx, cc, &resp, seed, path, root, &op).map_err(|_| "attention point");
+    }
+    let op = AttnOpening::decode(&inner).ok_or("malformed attention body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
     #[cfg(test)]
     if let Some(r) = ATTN_ORACLE.with(|o| o.borrow().as_ref().map(|f| f(path, root, &op))) {
         return r;
