@@ -88,6 +88,22 @@ pub fn row_matches(bytes: &[u8], row_type: u32, want: &[f64], pos: u64) -> bool 
     })
 }
 
+/// The partial of a head's sink: a logit `s` (on the scale of the scaled scores) with no value.
+pub fn sink_partial(d: usize, s: f64) -> crate::attn::Partial {
+    crate::attn::Partial { o: vec![0.0; d], m: s, l: 1.0 }
+}
+
+/// `p` with the sink `s` of its head in the softmax denominator.
+pub fn with_sink(p: &crate::attn::Partial, s: f64) -> Option<crate::attn::Partial> {
+    crate::attn_blocks::combine(&[p.clone(), sink_partial(p.o.len(), s)])
+}
+
+/// A head output with the rotary part of its last `n_rot` values undone at the query position.
+pub fn derope(o: &mut [f64], pos: u64, n_rot: usize, base: f64, yarn: &Yarn) {
+    let off = o.len() - n_rot;
+    rope_norm_yarn(o, off, pos, n_rot, base, yarn, true);
+}
+
 fn leaf_root(n_leaves: u64, index: u64, leaf: &LeafBytes) -> Result<Hash, Fail> {
     b3_fold(n_leaves, index, blake3::hash(&leaf.bytes).as_bytes(), &leaf.leaf_path).ok_or(Fail::Trace)
 }
@@ -469,6 +485,27 @@ mod tests {
             assert_eq!(verify_comp_point(&kit.tier, &kit.ctx, &kit.resp(), &s, &op), Err(Fail::Shape));
             let short = ResponseCtx { n_pos: 1, n_prompt: 1, ..kit.resp() };
             assert_eq!(verify_comp_point(&kit.tier, &kit.ctx, &short, &s, &kit.open(&s)), Ok(()));
+        }
+    }
+
+    /// ggml heads over 9 keys that are also the values, with a sink logit each (one dominating),
+    /// output de-rotated at position 3000.
+    #[test]
+    fn sink_heads_match_ggml() {
+        let f = f32s(include_bytes!("../testdata/dsv41-head.bin"));
+        let (d, h, nk) = (512usize, 4usize, 9usize);
+        let (q, k, sk, want) = (&f[..d * h], &f[d * h..d * h + d * nk], &f[d * h + d * nk..d * h + d * nk + h], &f[d * h + d * nk + h..]);
+        let keys: Vec<Vec<f32>> = k.chunks_exact(d).map(|c| c.to_vec()).collect();
+        let yarn = Yarn { freq_scale: 1.0 / 16.0, ext_factor: 1.0, attn_factor: (1.0f32 / (1.0 + 0.1 * 16f32.ln())) as f64, beta_fast: 32.0, beta_slow: 1.0, n_ctx_orig: 65_536 };
+        for hd in 0..h {
+            let qh: Vec<f64> = q[hd * d..(hd + 1) * d].iter().map(|&x| x as f64).collect();
+            let p = crate::attn::partial(crate::attn::Arith::Exact, &qh, 1.0 / (d as f64).sqrt(), &keys, &keys).unwrap();
+            let mut o = with_sink(&p, sk[hd] as f64).unwrap().o;
+            derope(&mut o, 3000, 64, 160_000.0, &yarn);
+            let dev = o.iter().zip(&want[hd * d..(hd + 1) * d]).fold(0f64, |m, (a, &b)| m.max((a - b as f64).abs()));
+            assert!(dev < 1e-6 + 4e-8 * 3000.0, "head {hd}: {dev}");
+            let without = p.o.iter().zip(&want[hd * d..(hd + 1) * d]).fold(0f64, |m, (a, &b)| m.max((a - b as f64).abs()));
+            assert!(without > 1e-3, "head {hd}: the sink and the de-rotation must matter");
         }
     }
 
