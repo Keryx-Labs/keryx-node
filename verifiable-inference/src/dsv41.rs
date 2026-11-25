@@ -752,7 +752,7 @@ mod tests {
                 sinks: NONE, sel: NONE, n_top: 0, row_len: 640, iq: NONE, iw: NONE, topk_src: NONE, cand: NONE, cand_n: 0, cand_bs: 0, pick: 0,
             };
             let none_link = Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NONE, norm: NONE, src: NONE });
-            let layer = LayerLinks { layer: 0, proj: 0, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: Some(comp) };
+            let layer = LayerLinks { layer: 0, proj: 0, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: Some(comp), engram: None };
             let entries = vec![
                 entry("blk.0.attn_compressor_kv.weight", manifest::ROLE_PRODUCT, crate::quant::Q8_0, 64, 512, 0, 0, none_link),
                 entry("blk.0.attn_compressor_gate.weight", manifest::ROLE_PRODUCT, crate::quant::Q8_0, 64, 512, 0, 0, none_link),
@@ -997,7 +997,7 @@ mod tests {
                 beta_fast: 32f32.to_bits(), beta_slow: 1f32.to_bits(), n_ctx_orig: 65_536, eps: 1e-20f32.to_bits(), sinks: 5, sel: 0, n_top: NTOP as u32, row_len: 640, iq: NONE, iw: NONE, topk_src: 0, cand: NONE, cand_n: 0, cand_bs: 0, pick: 0,
             };
             let none_link = Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NONE, norm: NONE, src: NONE });
-            let layer = LayerLinks { layer: 0, proj: 2, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: Some(comp) };
+            let layer = LayerLinks { layer: 0, proj: 2, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(attn), recur: None, hc: None, dsa: None, comp: Some(comp), engram: None };
             let entries = vec![
                 entry("blk.0.attn_q_b.weight", manifest::ROLE_PRODUCT, 64, NH * HD, 1, 0, 0, none_link),
                 entry("blk.0.attn_kv.weight", manifest::ROLE_PRODUCT, 64, HD, 1, 0, 0, none_link),
@@ -1339,7 +1339,7 @@ mod tests {
             };
             let none_link = Chain::Product(ProductLink { layer: 0, link: manifest::LINK_NONE, norm: NONE, src: NONE });
             let layer = |l: u32, c: CompLinks| {
-                Chain::Layer(LayerLinks { layer: l, proj: 0, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(a_links(l)), recur: None, hc: None, dsa: None, comp: Some(c) })
+                Chain::Layer(LayerLinks { layer: l, proj: 0, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: Some(a_links(l)), recur: None, hc: None, dsa: None, comp: Some(c), engram: None })
             };
             let entries = vec![
                 entry("blk.0.indexer.attn_q_b.weight", manifest::ROLE_PRODUCT, 64, NIH * DK, none_link),
