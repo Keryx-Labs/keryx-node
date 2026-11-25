@@ -661,7 +661,7 @@ mod tests {
                     LinkOpening::Token { .. } => 1,
                     LinkOpening::Norm { .. } => 2,
                     LinkOpening::Source { .. } => 3,
-                    LinkOpening::HcIn { .. } | LinkOpening::HcPre { .. } => 4,
+                    LinkOpening::HcIn { .. } | LinkOpening::HcPre { .. } | LinkOpening::Engram { .. } => 4,
                 };
                 links[kind] += 1;
                 verify_chain_point(&tc, &cc, &rc, &seed, i, &p, tok, &link, None).unwrap_or_else(|e| panic!("seed {s} point {i}: {e:?}"));

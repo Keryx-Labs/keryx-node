@@ -512,6 +512,40 @@ pub fn verify_chain_point(
             let w = f32_weights(tier, norm, pl.norm, k, b0 * 32, (n * 32).min(k - b0 * 32))?;
             fragment_link(xs, o.layout, k as usize, &rms_scaled(&h, ctx.eps, 1.0), &w, b0, n)?;
         }
+        (manifest::LINK_ENGRAM, LinkOpening::Engram { layer: le, prev, map, row }) if o.input.n_exp == 1 => {
+            let e = match open_entry(tier, le, ctx.layer_base as u64 + layer)?.chain {
+                Chain::Layer(ll) if ll.layer as u64 == layer => ll.engram.ok_or(Fail::Manifest)?,
+                _ => return Err(Fail::Manifest),
+            };
+            let (n_gram, d) = (e.n_gram as u64, e.head_dim as u64);
+            if report.rank != e.kv as u64 || k != e.n_cols() as u64 * d || !d.is_multiple_of(32) {
+                return Err(Fail::Manifest);
+            }
+            let t = report.t;
+            let shifts = t.min(n_gram - 1);
+            if prev.len() as u64 != shifts || map.len() as u64 != 1 + shifts {
+                return Err(Fail::Shape);
+            }
+            // the tokens back from t, each bound to its position by the meta leaf
+            let mut toks = vec![tok];
+            for (s, pt) in prev.iter().enumerate() {
+                let q = t - 1 - s as u64;
+                let meta = shape_any(tier, ctx);
+                let h = PosShape { tok: Some(pt.tok), ..meta }.meta_hash(q, crate::verify::expected_ubatch(q, resp.n_prompt));
+                let root = b3_fold(meta.n_leaves, meta.meta_index, &h, &pt.meta_path).ok_or(Fail::Trace)?;
+                if !b3_verify(&resp.trace_root, resp.n_pos as u64, q, &root, &pt.pos_path) {
+                    return Err(Fail::Trace);
+                }
+                toks.push(pt.tok);
+            }
+            let mut ids = toks.iter().zip(map).map(|(&tk, m)| crate::engram::mapped_id(&e, tk, m).ok_or(Fail::Trace)).collect::<Result<Vec<_>, _>>()?;
+            ids.resize(n_gram as usize, None);
+            let rows = crate::engram::engram_rows(&e, &ids).ok_or(Fail::Manifest)?;
+            let block = link_block(seed, i, &p.x, o.layout, k).ok_or(Fail::Shape)?;
+            let col = (block * 32 / d) as usize;
+            let vals = crate::engram::table_row(&e, rows[col], row).ok_or(Fail::Weights)?;
+            glu_link(&p.x, o.layout, k as usize, col * (d as usize / 32), &vals)?;
+        }
         (manifest::LINK_HC_HEAD, LinkOpening::Norm { src, norm }) if n_layers > 0 && o.input.n_exp == 1 => {
             let n_hc = pl.src as u64;
             if !(2..=16).contains(&n_hc) {

@@ -134,6 +134,17 @@ pub enum LinkOpening {
     HcIn { layer: EntryOpening, src: HcSource },
     /// The streams, the mix output and the mix weights the first product of a half reads.
     HcPre { layer: EntryOpening, src: HcSource, mixes: LeafBytes, base: (EntryOpening, ChunkRange), norm: (EntryOpening, ChunkRange) },
+    /// The layer of an n-gram lookup, the tokens before the position (their meta leaves), the
+    /// token map entries of the n-gram (the position's own first), and the table row read.
+    Engram { layer: EntryOpening, prev: Vec<PrevToken>, map: Vec<ChunkRange>, row: ChunkRange },
+}
+
+/// A committed token of an earlier position: its meta leaf's path and the position's path.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrevToken {
+    pub tok: u32,
+    pub meta_path: Vec<Hash>,
+    pub pos_path: Vec<Hash>,
 }
 
 /// Residual streams of a hyper-connection link: committed, or the token embedding repeated.
@@ -436,6 +447,21 @@ impl W {
                 self.weights(base);
                 self.weights(norm);
             }
+            LinkOpening::Engram { layer, prev, map, row } => {
+                self.u8(6);
+                self.entry(layer);
+                self.u8(prev.len() as u8);
+                for p in prev {
+                    self.u32(p.tok);
+                    self.hashes(&p.meta_path);
+                    self.hashes(&p.pos_path);
+                }
+                self.u8(map.len() as u8);
+                for m in map {
+                    self.range(m);
+                }
+                self.range(row);
+            }
         }
     }
     fn hc_source(&mut self, s: &HcSource) {
@@ -605,6 +631,14 @@ impl R<'_> {
             },
             4 => LinkOpening::HcIn { layer: self.entry()?, src: self.hc_source()? },
             5 => LinkOpening::HcPre { layer: self.entry()?, src: self.hc_source()?, mixes: self.leaf_bytes()?, base: self.weights()?, norm: self.weights()? },
+            6 => {
+                let layer = self.entry()?;
+                let np = self.u8()? as usize;
+                let prev = (0..np).map(|_| Some(PrevToken { tok: self.u32()?, meta_path: self.hashes()?, pos_path: self.hashes()? })).collect::<Option<Vec<_>>>()?;
+                let nm = self.u8()? as usize;
+                let map = (0..nm).map(|_| self.range()).collect::<Option<Vec<_>>>()?;
+                LinkOpening::Engram { layer, prev, map, row: self.range()? }
+            }
             _ => return None,
         })
     }

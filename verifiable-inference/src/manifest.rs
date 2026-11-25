@@ -47,6 +47,8 @@ pub const LINK_HC_FFN_PRE: u8 = 19;
 pub const LINK_NORMED: u8 = 20;
 /// Head input `rms_norm(mean_s R_s) * norm` over the streams of the last layer; `src` = stream count.
 pub const LINK_HC_HEAD: u8 = 21;
+/// Input of the n-gram lookup product: the table rows the position's n-gram hashes to.
+pub const LINK_ENGRAM: u8 = 22;
 
 const TAG_NONE: u8 = 0;
 const TAG_PRODUCT: u8 = 1;
