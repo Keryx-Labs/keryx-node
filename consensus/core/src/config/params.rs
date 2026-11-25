@@ -1014,7 +1014,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             n_entries: 347,
             n_products: 249,
         },
-        ctx: keryx_verifiable_inference::chain::ChainCtx {
+        ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
             n_layers: 32,
             layer_base: 315,
             embd_entry: 249,
@@ -1059,7 +1059,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             n_entries: 563,
             n_products: 241,
         },
-        ctx: keryx_verifiable_inference::chain::ChainCtx {
+        ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
             n_layers: 40,
             layer_base: 523,
             embd_entry: 361,
@@ -1104,7 +1104,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             n_entries: 571,
             n_products: 329,
         },
-        ctx: keryx_verifiable_inference::chain::ChainCtx {
+        ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
             n_layers: 48,
             layer_base: 523,
             embd_entry: 329,
@@ -1149,7 +1149,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             n_entries: 691,
             n_products: 497,
         },
-        ctx: keryx_verifiable_inference::chain::ChainCtx {
+        ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
             n_layers: 64,
             layer_base: 627,
             embd_entry: 497,
@@ -1194,7 +1194,7 @@ pub const TRACE_CHAINS_H15: [Option<TraceChain>; 5] = [
             n_entries: 530,
             n_products: 375,
         },
-        ctx: keryx_verifiable_inference::chain::ChainCtx {
+        ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
             n_layers: 27,
             layer_base: 503,
             embd_entry: 395,
@@ -1365,7 +1365,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
                 n_entries: 348,
                 n_products: 249,
             },
-            ctx: keryx_verifiable_inference::chain::ChainCtx {
+            ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
                 n_layers: 32,
                 layer_base: 316,
                 embd_entry: 250,
@@ -1412,7 +1412,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
                 n_entries: 347,
                 n_products: 249,
             },
-            ctx: keryx_verifiable_inference::chain::ChainCtx {
+            ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
                 n_layers: 32,
                 layer_base: 315,
                 embd_entry: 249,
@@ -1459,7 +1459,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
                 n_entries: 633,
                 n_products: 431,
             },
-            ctx: keryx_verifiable_inference::chain::ChainCtx {
+            ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
                 n_layers: 40,
                 layer_base: 593,
                 embd_entry: 431,
@@ -1506,7 +1506,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
                 n_entries: 713,
                 n_products: 411,
             },
-            ctx: keryx_verifiable_inference::chain::ChainCtx {
+            ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
                 n_layers: 60,
                 layer_base: 653,
                 embd_entry: 411,
@@ -1553,7 +1553,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
                 n_entries: 690,
                 n_products: 496,
             },
-            ctx: keryx_verifiable_inference::chain::ChainCtx {
+            ctx: keryx_verifiable_inference::chain::ChainCtx { n_sel: 0,
                 n_layers: 64,
                 layer_base: 626,
                 embd_entry: 496,
