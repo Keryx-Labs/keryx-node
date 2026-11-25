@@ -447,13 +447,13 @@ fn trace_opening_valid(
 /// The piece an opening body, seeded or not, proves.
 /// Piece an opening body proves.
 pub fn opening_body_piece(body: &[u8]) -> u8 {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, VERSION_ATTN_COMP, inner_body};
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, VERSION_ATTN_COMP, VERSION_COMP_SEL, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
         Some(VERSION_ATTN | VERSION_ATTN_COMP) => PIECE_ATTN,
         Some(VERSION_RECUR) => PIECE_RECUR,
         Some(VERSION_RESID) => PIECE_RESID,
         Some(VERSION_DECISION) => PIECE_DECISION,
-        Some(VERSION_SEL) => PIECE_SEL,
+        Some(VERSION_SEL | VERSION_COMP_SEL) => PIECE_SEL,
         Some(VERSION_COMP) => PIECE_COMP,
         _ => PIECE_TRACE,
     }
@@ -544,13 +544,20 @@ fn sel_opening_valid(
     txid: &[u8; 32],
     body: &[u8],
 ) -> Result<(), &'static str> {
-    use keryx_verifiable_inference::{dsa, opening::{SelOpeningPoint, inner_body}, verify};
-    let op = inner_body(body).as_deref().and_then(SelOpeningPoint::decode).ok_or("malformed selection body")?;
+    use keryx_verifiable_inference::{dsa, dsv41, opening::{CompSelOpening, SelOpeningPoint, inner_body}, verify};
+    let inner = inner_body(body).ok_or("malformed selection body")?;
+    let cc = rules.chain.as_ref().ok_or("selection without its rules")?;
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    if let Some(op) = CompSelOpening::decode(&inner) {
+        if &op.response_txid != txid {
+            return Err("response id mismatch");
+        }
+        return dsv41::verify_comp_sel_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "selection point");
+    }
+    let op = SelOpeningPoint::decode(&inner).ok_or("malformed selection body")?;
     if &op.response_txid != txid {
         return Err("response id mismatch");
     }
-    let cc = rules.chain.as_ref().ok_or("selection without its rules")?;
-    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     dsa::verify_sel_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "selection point")
 }
 
