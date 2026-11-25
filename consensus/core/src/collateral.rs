@@ -363,7 +363,9 @@ const PIECE_RESID: u8 = 8;
 const PIECE_DECISION: u8 = 16;
 /// The selection opening of a sparse attention tier is proven.
 const PIECE_SEL: u8 = 32;
-const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | PIECE_DECISION | PIECE_SEL;
+/// The compressed row opening of a compressed attention tier is proven.
+const PIECE_COMP: u8 = 64;
+const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | PIECE_DECISION | PIECE_SEL | PIECE_COMP;
 
 /// Pieces an audit under `rules` needs.
 pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
@@ -372,7 +374,8 @@ pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 
     let decision = if r.chain.is_some() && r.decision.is_some() { PIECE_DECISION } else { 0 };
     if r.attention {
         let sel = if r.chain.as_ref().is_some_and(|c| c.n_sel > 0) { PIECE_SEL } else { 0 };
-        PIECE_TRACE | PIECE_ATTN | resid | decision | sel | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
+        let comp = if r.chain.as_ref().is_some_and(|c| c.n_comp > 0) { PIECE_COMP } else { 0 };
+        PIECE_TRACE | PIECE_ATTN | resid | decision | sel | comp | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
     } else {
         PIECE_TRACE | resid | decision
     }
@@ -444,13 +447,14 @@ fn trace_opening_valid(
 /// The piece an opening body, seeded or not, proves.
 /// Piece an opening body proves.
 pub fn opening_body_piece(body: &[u8]) -> u8 {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, inner_body};
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
         Some(VERSION_ATTN) => PIECE_ATTN,
         Some(VERSION_RECUR) => PIECE_RECUR,
         Some(VERSION_RESID) => PIECE_RESID,
         Some(VERSION_DECISION) => PIECE_DECISION,
         Some(VERSION_SEL) => PIECE_SEL,
+        Some(VERSION_COMP) => PIECE_COMP,
         _ => PIECE_TRACE,
     }
 }
@@ -548,6 +552,24 @@ fn sel_opening_valid(
     let cc = rules.chain.as_ref().ok_or("selection without its rules")?;
     let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     dsa::verify_sel_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "selection point")
+}
+
+/// Checks that a compressed row opening body proves the compressed row point of `audit` under `seed`.
+fn comp_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{dsv41, opening::{CompOpeningPoint, inner_body}, verify};
+    let op = inner_body(body).as_deref().and_then(CompOpeningPoint::decode).ok_or("malformed compressed row body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let cc = rules.chain.as_ref().ok_or("compressed row without its rules")?;
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    dsv41::verify_comp_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "compressed row point")
 }
 
 /// Checks that an attention opening body proves the phase `audit` awaits of its attention point
@@ -2112,6 +2134,7 @@ impl ServiceLedger {
                 Some(r) if piece == PIECE_RESID => resid_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) if piece == PIECE_DECISION => decision_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) if piece == PIECE_SEL => sel_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(r) if piece == PIECE_COMP => comp_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 None => Err("no rules"),
             };
@@ -5735,6 +5758,10 @@ mod tests {
             let mut sparse = trace_rules(1, true, true, true, true, Lineup::H18).unwrap();
             sparse.chain.as_mut().unwrap().n_sel = 1;
             assert_eq!(required_pieces(Some(&sparse)), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | crate::collateral::PIECE_SEL);
+            sparse.chain.as_mut().unwrap().n_comp = 4;
+            assert_eq!(required_pieces(Some(&sparse)) & crate::collateral::PIECE_COMP, crate::collateral::PIECE_COMP);
+            let comp = keryx_verifiable_inference::opening::CompOpeningPoint::default().encode();
+            assert_eq!(crate::collateral::opening_body_piece(&comp), crate::collateral::PIECE_COMP);
             let body = keryx_verifiable_inference::opening::SelOpeningPoint::default().encode();
             assert_eq!(crate::collateral::opening_body_piece(&body), crate::collateral::PIECE_SEL);
         }
