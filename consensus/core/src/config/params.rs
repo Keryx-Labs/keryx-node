@@ -387,13 +387,14 @@ pub const QWEN3_8_27B_TURBO_MODEL_ID: [u8; 32] = [
     0x8d, 0x05, 0x49, 0x62, 0x86, 0xdb, 0x4c, 0xb9,
 ];
 
-/// GLM-5.3-Flash Uncensored IQ2_XXS (orcarouter abliteration, BoldingBuilds GGUF, arch glm5-next).
-/// H18 tier 5. `model_id` = CIDv0[2..34] of the pinned GGUF (IPFS QmbKYoo78q8PgZV2zSUHpNsgDHDHysT7TL9cMdjD41tsV6).
+/// GLM-5.3-Flash Uncensored IQ2_XXS (orcarouter abliteration, BoldingBuilds GGUF, arch glm5-next), its BF16
+/// tensors and `indexer.proj` requantized to Q8_0. H18 tier 5. `model_id` = CIDv0[2..34] of the
+/// pinned GGUF (IPFS QmRzv32qPfEb7G3Be3ZCPr5rDJoRb5fQE1bouYdv7R2SYv).
 pub const GLM_5_3_FLASH_MODEL_ID: [u8; 32] = [
-    0xc0, 0xdf, 0xad, 0x09, 0x1d, 0x2d, 0xa5, 0x02,
-    0xbf, 0xc1, 0x66, 0xa5, 0xbe, 0x26, 0x5a, 0x44,
-    0x3c, 0xc8, 0x53, 0xf0, 0xca, 0xfa, 0x95, 0xb3,
-    0xe4, 0xf0, 0xd4, 0xc7, 0x07, 0x97, 0x9a, 0x3d,
+    0x36, 0x60, 0x76, 0x06, 0x59, 0xdf, 0x7f, 0x17,
+    0x26, 0xc0, 0x47, 0xde, 0x0b, 0x30, 0x54, 0x62,
+    0xdc, 0xd4, 0xb2, 0x29, 0x11, 0x62, 0x2c, 0x03,
+    0xbe, 0xee, 0x10, 0xcd, 0x29, 0x46, 0x99, 0x67,
 ];
 
 /// DeepSeek-V4.1-Flash-1017 Uncensored IQ2_XXS (ISTA-DASLab GSQ-RCO, Abiray abliteration), body only:
@@ -740,10 +741,10 @@ pub const POM_TIERS_H18: &[crate::pom::PomTier] = &[
     crate::pom::PomTier {
         model_id: GLM_5_3_FLASH_MODEL_ID,
         root: [
-            0x9c, 0x9b, 0xb9, 0x2a, 0x08, 0x7a, 0xd0, 0x06, 0x1d, 0xf9, 0x7e, 0x0e, 0x40, 0x77, 0x9b, 0x19,
-            0x6d, 0xf3, 0xd3, 0xc6, 0xdb, 0x0f, 0x13, 0x54, 0xc3, 0x12, 0x1b, 0x5a, 0x12, 0xab, 0x02, 0x9a,
+            0x01, 0xe1, 0x5d, 0xd4, 0xd9, 0x3d, 0xbc, 0x76, 0x87, 0xcc, 0xa2, 0xc1, 0xa5, 0xb8, 0x2e, 0xbf,
+            0xff, 0xd4, 0x5e, 0xda, 0x80, 0xfe, 0xea, 0x61, 0x5f, 0x0d, 0x2c, 0x4b, 0xfa, 0xb7, 0x77, 0xe2,
         ],
-        chunks: 3_034_206_922,
+        chunks: 3_027_050_698,
     },
     crate::pom::PomTier {
         model_id: DEEPSEEK_V4_1_FLASH_MODEL_ID,
@@ -1240,6 +1241,8 @@ pub struct TraceNext {
     pub n_attn: u32,
     pub n_recur: u32,
     pub seq_heads: u32,
+    /// Selection leaves per position of the sparse attention layers.
+    pub n_sel: u32,
 }
 
 /// Next-gate manifests of the H14 lineup, by tier.
@@ -1256,6 +1259,7 @@ pub const TRACE_ATTN_H_NEXT: [Option<TraceNext>; 5] = [
         n_attn: 8,
         n_recur: 24,
         seq_heads: 32,
+        n_sel: 0,
     }),
     Some(TraceNext {
         manifest: TraceManifest {
@@ -1269,6 +1273,7 @@ pub const TRACE_ATTN_H_NEXT: [Option<TraceNext>; 5] = [
         n_attn: 40,
         n_recur: 0,
         seq_heads: 2,
+        n_sel: 0,
     }),
     Some(TraceNext {
         manifest: TraceManifest {
@@ -1282,6 +1287,7 @@ pub const TRACE_ATTN_H_NEXT: [Option<TraceNext>; 5] = [
         n_attn: 48,
         n_recur: 0,
         seq_heads: 8,
+        n_sel: 0,
     }),
     Some(TraceNext {
         manifest: TraceManifest {
@@ -1295,6 +1301,7 @@ pub const TRACE_ATTN_H_NEXT: [Option<TraceNext>; 5] = [
         n_attn: 16,
         n_recur: 48,
         seq_heads: 48,
+        n_sel: 0,
     }),
     Some(TraceNext {
         manifest: TraceManifest {
@@ -1308,6 +1315,7 @@ pub const TRACE_ATTN_H_NEXT: [Option<TraceNext>; 5] = [
         n_attn: 7,
         n_recur: 20,
         seq_heads: 32,
+        n_sel: 0,
     }),
 ];
 
@@ -1334,6 +1342,16 @@ const KEV_PREFIX: TracePrefix = TracePrefix { offset: 1, embd_entry: 250, norm_e
 const MINICPM_V_4_7_PREFIX: TracePrefix = TracePrefix { embd_entry: 431, norm_entry: 432, ..QWEN3_5_PREFIX };
 
 const QWEN3_8_TURBO_PREFIX: TracePrefix = TracePrefix { embd_entry: 496, norm_entry: 497, ..QWEN3_5_PREFIX };
+
+/// No norm weight: the first product of the layer-0 half reads the repeated embedding normed without weight.
+const GLM5_3_FLASH_PREFIX: TracePrefix = TracePrefix {
+    offset: 13,
+    embd_entry: 802,
+    norm_entry: keryx_verifiable_inference::manifest::NONE,
+    eps: 9.999999747378752e-06,
+    embd_scale: 1.0,
+    ..QWEN3_5_PREFIX
+};
 
 const GEMMA4_31B_PREFIX: TracePrefix = match TRACE_PREFIXES {
     [_, _, Some(p), ..] => TracePrefix { embd_entry: 411, norm_entry: 412, embd_scale: 73.32121276855469, ..p },
@@ -1391,6 +1409,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
             n_attn: 8,
             n_recur: 24,
             seq_heads: 32,
+            n_sel: 0,
         },
         decision: Some(keryx_verifiable_inference::decision::DecisionCtx { head_rank: 248, marker_tok: 248_050, pointer_tok: 248_062 }),
     }),
@@ -1438,6 +1457,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
             n_attn: 8,
             n_recur: 24,
             seq_heads: 32,
+            n_sel: 0,
         },
         decision: None,
     }),
@@ -1485,6 +1505,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
             n_attn: 10,
             n_recur: 30,
             seq_heads: 32,
+            n_sel: 0,
         },
         decision: None,
     }),
@@ -1532,6 +1553,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
             n_attn: 60,
             n_recur: 0,
             seq_heads: 16,
+            n_sel: 0,
         },
         decision: None,
     }),
@@ -1579,10 +1601,59 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
             n_attn: 16,
             n_recur: 48,
             seq_heads: 48,
+            n_sel: 0,
         },
         decision: None,
     }),
-    None,
+    Some(TraceTierH18 {
+        prefix_manifest: TraceManifest {
+            m_t: [
+                0xc8, 0x5f, 0x9f, 0x00, 0xc1, 0xad, 0x0b, 0xb3, 0xce, 0x65, 0x20, 0xa5, 0x05, 0xed, 0xef, 0x75,
+                0xbb, 0x24, 0x94, 0xf3, 0xcf, 0x3f, 0x3c, 0xed, 0x43, 0xa3, 0x82, 0x7b, 0xdb, 0xa1, 0x77, 0xc2,
+            ],
+            n_entries: 804,
+            n_products: 768,
+        },
+        chain: TraceChain {
+            manifest: TraceManifest {
+                m_t: [
+                    0xe2, 0x86, 0x98, 0x36, 0x1c, 0xe8, 0x8e, 0x4c, 0x42, 0x73, 0x4d, 0xf8, 0xab, 0xa4, 0x42, 0xbd,
+                    0x1c, 0x26, 0xca, 0x1d, 0xfe, 0x26, 0x09, 0x17, 0x01, 0xcf, 0x16, 0x69, 0x7c, 0x74, 0x17, 0xf7,
+                ],
+                n_entries: 1124,
+                n_products: 768,
+            },
+            ctx: keryx_verifiable_inference::chain::ChainCtx {
+                n_layers: 45,
+                layer_base: 1079,
+                embd_entry: 802,
+                eps: 9.999999747378752e-06,
+                embd_scale: 1.0,
+                trim_last: false,
+                n_used: 8,
+                n_attn: 0,
+                n_recur: 0,
+                seq_heads: 0,
+                n_sel: 0,
+            },
+            prefix: GLM5_3_FLASH_PREFIX,
+        },
+        attn: TraceNext {
+            manifest: TraceManifest {
+                m_t: [
+                    0x01, 0x49, 0x9c, 0x42, 0x0b, 0x14, 0xd3, 0xea, 0x97, 0x60, 0x30, 0x25, 0x8c, 0x42, 0xd0, 0xe3,
+                    0x35, 0x4a, 0x89, 0x37, 0xb4, 0x7c, 0x27, 0x85, 0x3a, 0x8f, 0x55, 0x5d, 0x7e, 0xab, 0x48, 0x0d,
+                ],
+                n_entries: 1372,
+                n_products: 768,
+            },
+            n_attn: 11,
+            n_recur: 34,
+            seq_heads: 64,
+            n_sel: 11,
+        },
+        decision: None,
+    }),
     None,
 ];
 
@@ -1619,6 +1690,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
             c.ctx.n_attn = n.n_attn;
             c.ctx.n_recur = n.n_recur;
             c.ctx.seq_heads = n.seq_heads;
+            c.ctx.n_sel = n.n_sel;
         }
         let ctx = keryx_verifiable_inference::verify::TierCtx {
             r_t: t.root,
@@ -3642,7 +3714,7 @@ mod pad_table_tests {
 
     #[test]
     fn h18_traces_tiers_0_and_1() {
-        for t in (0..H18_TIER_COUNT as u8).filter(|t| *t > 4) {
+        for t in (0..H18_TIER_COUNT as u8).filter(|t| *t > 5) {
             assert!(trace_rules(t, true, true, true, true, Lineup::H18).is_none());
             assert!(trace_rules(t, true, true, false, false, Lineup::H18).is_none());
         }
@@ -3678,6 +3750,21 @@ mod pad_table_tests {
         assert_eq!((ch.n_layers, ch.n_attn, ch.n_recur, ch.seq_heads, ch.trim_last), (64, 16, 48, 48, true));
         let p = attn.prefix.unwrap();
         assert_eq!((p.offset, p.embd_entry, p.norm_entry), (6, 496, 497));
+    }
+
+    #[test]
+    fn h18_tier_5_traces_glm_5_3_flash() {
+        let t5 = TRACE_TIERS_H18[5].as_ref().unwrap();
+        let attn = trace_rules(5, true, true, true, true, Lineup::H18).unwrap();
+        assert_eq!((attn.ctx.r_t, attn.ctx.n_chunks), (POM_TIERS_H18[5].root, POM_TIERS_H18[5].chunks));
+        assert_eq!(attn.ctx.m_t, t5.attn.manifest.m_t);
+        let ch = attn.chain.unwrap();
+        assert_eq!((ch.n_layers, ch.n_attn, ch.n_recur, ch.seq_heads, ch.n_sel, ch.trim_last), (45, 11, 34, 64, 11, false));
+        let base = trace_rules(5, true, true, true, false, Lineup::H18).unwrap();
+        assert_eq!((base.ctx.m_t, base.chain.unwrap().n_sel), (t5.chain.manifest.m_t, 0));
+        let p = attn.prefix.unwrap();
+        assert_eq!((p.offset, p.embd_entry, p.norm_entry), (13, 802, keryx_verifiable_inference::manifest::NONE));
+        assert_eq!(p.table, QWEN3_5_PREFIX.table);
     }
 
     #[test]
