@@ -763,7 +763,7 @@ mod tests {
             ];
             let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
             let tier = TierCtx { r_t: rt_range_proof(&chunk_leaves, 0, 1).0, n_chunks: chunk_leaves.len() as u64, m_t: rt_range_proof(&entry_leaves, 0, 1).0, n_entries: entries.len() as u64, n_products: 2 };
-            let ctx = ChainCtx { n_sel: 0, n_comp: 1, n_layers: 1, layer_base: 2, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 0, n_comp: 1, n_engram: 0, n_layers: 1, layer_base: 2, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let kvs: Vec<Vec<f32>> = (0..N).map(|t| vals(100 + t as u64, 512, 2.0)).collect();
             let gates: Vec<Vec<f32>> = (0..N).map(|t| vals(200 + t as u64, 512, 3.0)).collect();
             let f = |v: &[f32]| v.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>();
@@ -1008,7 +1008,7 @@ mod tests {
             ];
             let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
             let tier = TierCtx { r_t: rt_range_proof(&chunk_leaves, 0, 1).0, n_chunks: chunk_leaves.len() as u64, m_t: rt_range_proof(&entry_leaves, 0, 1).0, n_entries: entries.len() as u64, n_products: 3 };
-            let ctx = ChainCtx { n_sel: 1, n_comp: 1, n_layers: 1, layer_base: 3, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 1, n_comp: 1, n_engram: 0, n_layers: 1, layer_base: 3, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 1, n_recur: 0, seq_heads: 1 };
             let kv_y: Vec<Vec<f32>> = (0..N).map(|t| vals(300 + t as u64, HD, 2.0)).collect();
             let q: Vec<Vec<f32>> = (0..N).map(|t| vals(400 + t as u64, NH * HD, 1.0)).collect();
             let win_rows: Vec<Vec<u8>> = (0..N)
@@ -1351,7 +1351,7 @@ mod tests {
             ];
             let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
             let tier = TierCtx { r_t: [0; 32], n_chunks: 1, m_t: rt_range_proof(&entry_leaves, 0, 1).0, n_entries: entries.len() as u64, n_products: 4 };
-            let ctx = ChainCtx { n_sel: 3, n_comp: 1, n_layers: 2, layer_base: 4, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 2, n_recur: 0, seq_heads: 1 };
+            let ctx = ChainCtx { n_sel: 3, n_comp: 1, n_engram: 0, n_layers: 2, layer_base: 4, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 2, n_recur: 0, seq_heads: 1 };
             let y = block().yarn;
             let rows: Vec<Vec<u8>> = (0..N).map(|j| q8_0(&vals(700 + j as u64, LAT + DK, 1.0).iter().map(|&x| x as f64).collect::<Vec<_>>())).collect();
             let keys: Vec<Vec<f32>> = rows.iter().map(|r| crate::quant::dequant_row(crate::quant::Q8_0, r, LAT + DK).unwrap()[LAT..].to_vec()).collect();

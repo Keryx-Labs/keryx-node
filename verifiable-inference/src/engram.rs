@@ -72,6 +72,101 @@ pub fn table_row(e: &EngramLinks, row: u32, r: &ChunkRange) -> Option<Vec<f32>> 
     crate::quant::dequant_row(e.table_type, &r.chunks[o..o + rb as usize], d)
 }
 
+/// Draw index of the n-gram lookup point.
+pub const ENGRAM_POINT: u32 = crate::dsv41::COMP_POINT + 1;
+
+/// Gate of a stream: the sigmoid of the signed square root of `dot` (at least 1e-6 in magnitude,
+/// the sign of zero positive).
+pub fn stream_gate(dot: f64) -> f64 {
+    let m = dot.abs().max(1e-6).sqrt();
+    let x = if dot < 0.0 { -m } else { m };
+    1.0 / (1.0 + libm::exp(-x))
+}
+
+/// Verify the n-gram lookup point of a response under `seed`: the drawn chunk of one stream after
+/// the lookup of the drawn module is the stream before it plus the value gated by the normed dot
+/// of the stream with its key.
+pub fn verify_engram_point(tier: &crate::verify::TierCtx, ctx: &crate::chain::ChainCtx, resp: &crate::verify::ResponseCtx, seed: &Hash, op: &crate::opening::EngramOpening) -> Result<(), crate::verify::Fail> {
+    use crate::chain::{f32_weights, leaf_chunk, chunk_leaf, finite_f32s};
+    use crate::manifest::{self, Chain};
+    use crate::merkle::{B3_CHUNK, b3_fold, b3_verify};
+    use crate::verify::{Fail, open_entry};
+    let (nl, n_pos) = (ctx.n_layers as u64, resp.n_pos as u64);
+    if ctx.n_engram == 0 || nl == 0 || n_pos == 0 {
+        return Err(Fail::Unsupported);
+    }
+    if crate::seq::trace_root(&op.pos_root, &op.seq_root) != resp.trace_root {
+        return Err(Fail::Trace);
+    }
+    let d = crate::draw::point(seed, ENGRAM_POINT);
+    let module = d[1] % ctx.n_engram as u64;
+    let layer = (op.layer.index as u64).checked_sub(ctx.layer_base as u64).filter(|&l| l < nl).ok_or(Fail::Manifest)?;
+    let ll = match open_entry(tier, &op.layer, ctx.layer_base as u64 + layer)?.chain {
+        Chain::Layer(ll) if ll.layer as u64 == layer => ll,
+        _ => return Err(Fail::Manifest),
+    };
+    let (e, hc) = (ll.engram.ok_or(Fail::Manifest)?, ll.hc.ok_or(Fail::Manifest)?);
+    if e.module as u64 != module {
+        return Err(Fail::Manifest);
+    }
+    let out_leaf = crate::chain::engram_leaf(tier.n_products, nl, crate::chain::n_router(ctx), ctx.n_sel as u64, module);
+    if e.out_leaf as u64 != out_leaf {
+        return Err(Fail::Manifest);
+    }
+    let src = match layer {
+        0 => return Err(Fail::Unsupported),
+        l => crate::chain::resid_leaf(tier.n_products, l - 1, crate::chain::Resid::Out),
+    };
+    let kv = open_entry(tier, &op.kv, e.kv as u64)?;
+    let n = hc.n_hc as u64;
+    let dim = kv.m.checked_div(n + 1).filter(|&x| x > 0 && x * (n + 1) == kv.m).ok_or(Fail::Manifest)?;
+    let per = (4 * dim).checked_div(B3_CHUNK as u64).filter(|&p| p > 0 && p * B3_CHUNK as u64 == 4 * dim).ok_or(Fail::Manifest)?;
+    if kv.role != manifest::ROLE_PRODUCT || op.x.len() as u64 != per || op.key.len() as u64 != per {
+        return Err(Fail::Shape);
+    }
+    let t = d[0] % n_pos;
+    let (s, jc) = (d[2] % n, (d[2] / n) % per);
+    let shape = crate::chain::shape_any(tier, ctx);
+    let total = 4 * n * dim;
+    let h = chunk_leaf(&op.dst, total, s * per + jc)?;
+    let root = b3_fold(shape.n_leaves, out_leaf, &h, &op.dst.leaf_path).ok_or(Fail::Trace)?;
+    if !b3_verify(&op.pos_root, n_pos, t, &root, &op.pos_path) {
+        return Err(Fail::Trace);
+    }
+    let dst = finite_f32s(&op.dst.chunk)?;
+    let mut x = Vec::with_capacity(dim as usize);
+    let mut key = Vec::with_capacity(dim as usize);
+    for c in 0..per {
+        x.extend(leaf_chunk(&root, &shape, src, &op.x[c as usize], total, s * per + c)?);
+        key.extend(leaf_chunk(&root, &shape, 2 * e.kv as u64 + 1, &op.key[c as usize], 4 * kv.m, s * per + c)?);
+    }
+    let value = leaf_chunk(&root, &shape, 2 * e.kv as u64 + 1, &op.value, 4 * kv.m, n * per + jc)?;
+    let g = f32_weights(tier, &op.gate, e.gate, n * dim, s * dim, dim)?;
+    let rn = |v: &[f32]| {
+        let mut w: Vec<f64> = v.iter().map(|&a| a as f64).collect();
+        crate::attn::rms_norm(&mut w, None, ctx.eps);
+        w
+    };
+    let (rx, rk) = (rn(&x), rn(&key));
+    let scale = 1.0 / (dim as f64).sqrt();
+    let dot: f64 = rx.iter().zip(&rk).zip(&g).map(|((a, b), &c)| a * b * c as f64).sum::<f64>() * scale;
+    let mag: f64 = rx.iter().zip(&rk).zip(&g).map(|((a, b), &c)| (a * b * c as f64).abs()).sum::<f64>() * scale;
+    let gate = stream_gate(dot);
+    let dg = 0.25 * (1e-5 * mag).sqrt() + 1e-6;
+    let off = (jc * B3_CHUNK as u64 / 4) as usize;
+    if dst.len() != value.len() {
+        return Err(Fail::Shape);
+    }
+    for (j, (&got, &v)) in dst.iter().zip(&value).enumerate() {
+        let (xs, v) = (x[off + j] as f64, v as f64);
+        let want = xs + v * gate;
+        if (got as f64 - want).abs() > 2e-6 * (xs.abs() + (v * gate).abs()) + v.abs() * dg + 1e-30 {
+            return Err(Fail::Mismatch);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,7 +333,7 @@ mod tests {
                 r_t: crate::merkle::rt_range_proof(&chunk_leaves, 0, 1).0, n_chunks: chunk_leaves.len() as u64,
                 m_t: crate::merkle::rt_range_proof(&entry_leaves, 0, 1).0, n_entries: 2, n_products: 1,
             };
-            let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_layers: 1, layer_base: 1, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+            let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 0, n_layers: 1, layer_base: 1, embd_entry: 0, eps: 1e-6, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
             let tokens: Vec<u32> = (0..N as u32).map(|i| (i * 7 + 2) % 16).collect();
             let n_leaves = crate::chain::n_pos_leaves(1, 1, 0) as usize;
             let pos: Vec<(Vec<Vec<u8>>, Vec<Hash>)> = (0..N)
@@ -373,6 +468,193 @@ mod tests {
                     assert_eq!(r, Err(Fail::Trace), "t {t}");
                 }
             }
+        }
+    }
+
+    mod resid {
+        use super::*;
+        use crate::chain::ChainCtx;
+        use crate::manifest::{self, Chain, Entry, HcLinks, LayerLinks};
+        use crate::merkle::{B3_CHUNK, b3_chunk_cv, b3_path, b3_root};
+        use crate::opening::{EngramOpening, EntryOpening, LeafChunk};
+        use crate::verify::{Fail, ResponseCtx, TierCtx};
+
+        const N: usize = 5;
+        const NHC: usize = 2;
+        const D: usize = 256;
+        const NONE: u32 = manifest::NONE;
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Fault {
+            None,
+            /// The gate without the square root.
+            PlainGate,
+            /// The value added without its gate.
+            Ungated,
+            /// Each stream gated by the other stream's dot.
+            SwappedGates,
+        }
+
+        fn vals(seed: u64, n: usize, a: f32) -> Vec<f32> {
+            (0..n).map(|i| a * (blake3::hash(&[seed.to_le_bytes(), (i as u64).to_le_bytes()].concat()).as_bytes()[0] as f32 / 127.5 - 1.0)).collect()
+        }
+
+        struct Kit {
+            weights: Vec<u8>,
+            chunk_leaves: Vec<Hash>,
+            entries: Vec<Vec<u8>>,
+            entry_leaves: Vec<Hash>,
+            tier: TierCtx,
+            ctx: ChainCtx,
+            pos: Vec<(Vec<Vec<u8>>, Vec<Hash>)>,
+            pos_roots: Vec<Hash>,
+        }
+
+        fn entry(name: &str, role: u8, wtype: u32, k: usize, m: usize, n: usize, chain: Chain) -> Vec<u8> {
+            let e = Entry {
+                name: name.into(), wtype, k: k as u64, m: m as u64, n_exp: 1, chunk_base: 0, n_bytes: n as u64, row_bytes: n as u32, role, glu_op: 0,
+                glu_form: manifest::FORM_NONE, partner: NONE, bias: NONE, chain,
+            };
+            let mut b = crate::testkit::serialize(&e);
+            b.extend_from_slice(&manifest::chain_bytes(&e.chain));
+            b
+        }
+
+        fn build(fault: Fault) -> Kit {
+            let gates: Vec<f32> = vals(5, NHC * D, 1.5);
+            let weights: Vec<u8> = gates.iter().flat_map(|a| a.to_le_bytes()).collect();
+            let chunk_leaves: Vec<Hash> = weights.chunks_exact(32).map(|c| *blake3::hash(c).as_bytes()).collect();
+            let hc = HcLinks { attn_fn: 0, ffn_fn: 0, attn_scale: [0; 3], ffn_scale: [0; 3], attn_base: NONE, ffn_base: NONE, n_hc: NHC as u32, sinkhorn_iters: 20, eps: 0 };
+            let mut e = links(&[0], &[0; 32]);
+            e.module = 0;
+            e.kv = 0;
+            e.gate = 3;
+            e.out_leaf = crate::chain::engram_leaf(1, 2, 0, 0, 0) as u32;
+            let layer = |l: u32, eg: Option<EngramLinks>| {
+                Chain::Layer(LayerLinks { layer: l, proj: 0, down: 0, post_attn: NONE, post_ffn: NONE, scale: NONE, moe: None, attn: None, recur: None, hc: Some(hc), dsa: None, comp: None, engram: eg })
+            };
+            let entries = vec![
+                entry("blk.1.engram_kv.weight", manifest::ROLE_PRODUCT, crate::quant::Q8_0, 512, (NHC + 1) * D, 0, Chain::None),
+                entry("blk.0", manifest::ROLE_LAYER, 0, 0, 0, 0, layer(0, None)),
+                entry("blk.1", manifest::ROLE_LAYER, 0, 0, 0, 0, layer(1, Some(e))),
+                entry("blk.1.engram_gate.weight", manifest::ROLE_NORM, 0, NHC * D, 1, weights.len(), Chain::None),
+            ];
+            let entry_leaves: Vec<Hash> = entries.iter().map(|b| Entry::leaf(b)).collect();
+            let tier = TierCtx { r_t: crate::merkle::rt_range_proof(&chunk_leaves, 0, 1).0, n_chunks: chunk_leaves.len() as u64, m_t: crate::merkle::rt_range_proof(&entry_leaves, 0, 1).0, n_entries: 4, n_products: 1 };
+            let ctx = ChainCtx { n_sel: 0, n_comp: 0, n_engram: 1, n_layers: 2, layer_base: 1, embd_entry: 0, eps: 1e-20, embd_scale: 1.0, trim_last: false, n_used: 0, n_attn: 0, n_recur: 0, seq_heads: 0 };
+            let n_leaves = crate::chain::n_pos_leaves(1, 2, 0) as usize + 1;
+            let f = |v: &[f32]| v.iter().flat_map(|a| a.to_le_bytes()).collect::<Vec<u8>>();
+            let rn = |v: &[f32]| {
+                let mut w: Vec<f64> = v.iter().map(|&a| a as f64).collect();
+                crate::attn::rms_norm(&mut w, None, 1e-20);
+                w
+            };
+            let pos: Vec<(Vec<Vec<u8>>, Vec<Hash>)> = (0..N)
+                .map(|t| {
+                    let x = vals(100 + t as u64, NHC * D, 2.0);
+                    let kv = vals(200 + t as u64, (NHC + 1) * D, 1.0);
+                    let value = &kv[NHC * D..];
+                    let dots: Vec<f64> = (0..NHC)
+                        .map(|s| {
+                            let (rx, rk) = (rn(&x[s * D..(s + 1) * D]), rn(&kv[s * D..(s + 1) * D]));
+                            rx.iter().zip(&rk).zip(&gates[s * D..(s + 1) * D]).map(|((a, b), &c)| a * b * c as f64).sum::<f64>() / (D as f64).sqrt()
+                        })
+                        .collect();
+                    let out: Vec<f32> = (0..NHC)
+                        .flat_map(|s| {
+                            let dot = if fault == Fault::SwappedGates { dots[NHC - 1 - s] } else { dots[s] };
+                            let g = match fault {
+                                Fault::PlainGate => 1.0 / (1.0 + libm::exp(-dot)),
+                                Fault::Ungated => 1.0,
+                                _ => stream_gate(dot),
+                            };
+                            let x = &x;
+                            (0..D).map(move |j| (x[s * D + j] as f64 + value[j] as f64 * g) as f32).collect::<Vec<_>>()
+                        })
+                        .collect();
+                    let mut leaves = vec![Vec::new(); n_leaves];
+                    leaves[1] = f(&kv);
+                    leaves[crate::chain::resid_leaf(1, 0, crate::chain::Resid::Out) as usize] = f(&x);
+                    leaves[e.out_leaf as usize] = f(&out);
+                    leaves[n_leaves - 1] = crate::chain::meta(t as u32, 1, 7).to_vec();
+                    let hashes: Vec<Hash> = leaves.iter().map(|b| *blake3::hash(b).as_bytes()).collect();
+                    (leaves, hashes)
+                })
+                .collect();
+            let pos_roots: Vec<Hash> = pos.iter().map(|(_, h)| b3_root(h)).collect();
+            Kit { weights, chunk_leaves, entries, entry_leaves, tier, ctx, pos, pos_roots }
+        }
+
+        impl Kit {
+            fn eo(&self, i: usize) -> EntryOpening {
+                EntryOpening { index: i as u32, bytes: self.entries[i].clone(), path: crate::merkle::rt_range_proof(&self.entry_leaves, i as u64, 1).1 }
+            }
+
+            fn chunk(&self, t: usize, i: usize, c: usize) -> LeafChunk {
+                let b = &self.pos[t].0[i];
+                let n = b.len().div_ceil(B3_CHUNK);
+                let cvs: Vec<Hash> = (0..n).map(|k| b3_chunk_cv(&b[k * B3_CHUNK..((k + 1) * B3_CHUNK).min(b.len())], k as u64)).collect();
+                LeafChunk { total_len: b.len() as u32, index: c as u32, chunk: b[c * B3_CHUNK..((c + 1) * B3_CHUNK).min(b.len())].to_vec(), chunk_path: b3_path(&cvs, c), leaf_path: b3_path(&self.pos[t].1, i) }
+            }
+
+            fn resp(&self) -> ResponseCtx {
+                ResponseCtx { trace_root: crate::seq::trace_root(&b3_root(&self.pos_roots), &[5; 32]), n_prompt: N as u32, n_pos: N as u32 }
+            }
+
+            fn open(&self, seed: &Hash) -> EngramOpening {
+                let d = crate::draw::point(seed, ENGRAM_POINT);
+                let t = (d[0] % N as u64) as usize;
+                let (s, jc) = ((d[2] % NHC as u64) as usize, 0usize);
+                let out = crate::chain::engram_leaf(1, 2, 0, 0, 0) as usize;
+                let src = crate::chain::resid_leaf(1, 0, crate::chain::Resid::Out) as usize;
+                EngramOpening {
+                    response_txid: [1; 32],
+                    pos_root: b3_root(&self.pos_roots),
+                    seq_root: [5; 32],
+                    layer: self.eo(2),
+                    kv: self.eo(0),
+                    gate: (self.eo(3), ChunkRange { first_chunk: (s * D * 4 / 32) as u64, chunks: self.weights[s * D * 4..(s + 1) * D * 4].to_vec(), proof: crate::merkle::rt_range_proof(&self.chunk_leaves, (s * D * 4 / 32) as u64, (D * 4 / 32) as u64).1 }),
+                    pos_path: b3_path(&self.pos_roots, t),
+                    dst: self.chunk(t, out, s + jc),
+                    x: vec![self.chunk(t, src, s)],
+                    key: vec![self.chunk(t, 1, s)],
+                    value: self.chunk(t, 1, NHC + jc),
+                }
+            }
+        }
+
+        fn seeds() -> impl Iterator<Item = Hash> {
+            (0..32u32).map(|s| *blake3::hash(&s.to_le_bytes()).as_bytes())
+        }
+
+        #[test]
+        fn an_honest_lookup_residual_passes_and_round_trips() {
+            let kit = build(Fault::None);
+            for s in seeds() {
+                let op = kit.open(&s);
+                assert_eq!(EngramOpening::decode(&op.encode()), Some(op.clone()));
+                verify_engram_point(&kit.tier, &kit.ctx, &kit.resp(), &s, &op).unwrap_or_else(|e| panic!("{e:?}"));
+            }
+        }
+
+        #[test]
+        fn a_misgated_residual_is_refused() {
+            for fault in [Fault::PlainGate, Fault::Ungated, Fault::SwappedGates] {
+                let kit = build(fault);
+                for s in seeds() {
+                    assert_eq!(verify_engram_point(&kit.tier, &kit.ctx, &kit.resp(), &s, &kit.open(&s)), Err(Fail::Mismatch));
+                }
+            }
+        }
+
+        #[test]
+        fn a_stream_of_another_position_is_refused() {
+            let kit = build(Fault::None);
+            let s = seeds().next().unwrap();
+            let mut op = kit.open(&s);
+            let t = (crate::draw::point(&s, ENGRAM_POINT)[0] % N as u64) as usize;
+            op.x = vec![kit.chunk((t + 1) % N, crate::chain::resid_leaf(1, 0, crate::chain::Resid::Out) as usize, 0)];
+            assert_eq!(verify_engram_point(&kit.tier, &kit.ctx, &kit.resp(), &s, &op), Err(Fail::Trace));
         }
     }
 

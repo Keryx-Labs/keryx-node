@@ -365,7 +365,9 @@ const PIECE_DECISION: u8 = 16;
 const PIECE_SEL: u8 = 32;
 /// The compressed row opening of a compressed attention tier is proven.
 const PIECE_COMP: u8 = 64;
-const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | PIECE_DECISION | PIECE_SEL | PIECE_COMP;
+/// The n-gram lookup opening of a tier with n-gram lookups is proven.
+const PIECE_ENGRAM: u8 = 128;
+const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | PIECE_DECISION | PIECE_SEL | PIECE_COMP | PIECE_ENGRAM;
 
 /// Pieces an audit under `rules` needs.
 pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
@@ -375,7 +377,8 @@ pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 
     if r.attention {
         let sel = if r.chain.as_ref().is_some_and(|c| c.n_sel > 0) { PIECE_SEL } else { 0 };
         let comp = if r.chain.as_ref().is_some_and(|c| c.n_comp > 0) { PIECE_COMP } else { 0 };
-        PIECE_TRACE | PIECE_ATTN | resid | decision | sel | comp | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
+        let engram = if r.chain.as_ref().is_some_and(|c| c.n_engram > 0) { PIECE_ENGRAM } else { 0 };
+        PIECE_TRACE | PIECE_ATTN | resid | decision | sel | comp | engram | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
     } else {
         PIECE_TRACE | resid | decision
     }
@@ -447,7 +450,7 @@ fn trace_opening_valid(
 /// The piece an opening body, seeded or not, proves.
 /// Piece an opening body proves.
 pub fn opening_body_piece(body: &[u8]) -> u8 {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, VERSION_ATTN_COMP, VERSION_COMP_SEL, inner_body};
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, VERSION_ATTN_COMP, VERSION_COMP_SEL, VERSION_ENGRAM, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
         Some(VERSION_ATTN | VERSION_ATTN_COMP) => PIECE_ATTN,
         Some(VERSION_RECUR) => PIECE_RECUR,
@@ -455,6 +458,7 @@ pub fn opening_body_piece(body: &[u8]) -> u8 {
         Some(VERSION_DECISION) => PIECE_DECISION,
         Some(VERSION_SEL | VERSION_COMP_SEL) => PIECE_SEL,
         Some(VERSION_COMP) => PIECE_COMP,
+        Some(VERSION_ENGRAM) => PIECE_ENGRAM,
         _ => PIECE_TRACE,
     }
 }
@@ -577,6 +581,24 @@ fn comp_opening_valid(
     let cc = rules.chain.as_ref().ok_or("compressed row without its rules")?;
     let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     dsv41::verify_comp_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "compressed row point")
+}
+
+/// Checks that an n-gram lookup opening body proves the lookup point of `audit` under `seed`.
+fn engram_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{engram, opening::{EngramOpening, inner_body}, verify};
+    let op = inner_body(body).as_deref().and_then(EngramOpening::decode).ok_or("malformed n-gram lookup body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let cc = rules.chain.as_ref().ok_or("n-gram lookup without its rules")?;
+    let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    engram::verify_engram_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "n-gram lookup point")
 }
 
 /// Checks that an attention opening body proves the phase `audit` awaits of its attention point
@@ -2151,6 +2173,7 @@ impl ServiceLedger {
                 Some(r) if piece == PIECE_DECISION => decision_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) if piece == PIECE_SEL => sel_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) if piece == PIECE_COMP => comp_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(r) if piece == PIECE_ENGRAM => engram_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 None => Err("no rules"),
             };
@@ -5776,6 +5799,10 @@ mod tests {
             assert_eq!(required_pieces(Some(&sparse)), PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | crate::collateral::PIECE_SEL);
             sparse.chain.as_mut().unwrap().n_comp = 4;
             assert_eq!(required_pieces(Some(&sparse)) & crate::collateral::PIECE_COMP, crate::collateral::PIECE_COMP);
+            sparse.chain.as_mut().unwrap().n_engram = 2;
+            assert_eq!(required_pieces(Some(&sparse)) & crate::collateral::PIECE_ENGRAM, crate::collateral::PIECE_ENGRAM);
+            let eng = keryx_verifiable_inference::opening::EngramOpening::default().encode();
+            assert_eq!(crate::collateral::opening_body_piece(&eng), crate::collateral::PIECE_ENGRAM);
             let comp = keryx_verifiable_inference::opening::CompOpeningPoint::default().encode();
             assert_eq!(crate::collateral::opening_body_piece(&comp), crate::collateral::PIECE_COMP);
             let body = keryx_verifiable_inference::opening::SelOpeningPoint::default().encode();
