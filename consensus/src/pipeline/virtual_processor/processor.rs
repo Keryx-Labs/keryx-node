@@ -1647,6 +1647,13 @@ impl VirtualStateProcessor {
                 return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} exceeds the cap {}", req.max_tokens, cap)));
             }
         }
+        if mutable_tx.tx.is_ai_request()
+            && let Some(req) = keryx_inference::AiRequestPayload::deserialize(&mutable_tx.tx.payload)
+            && req.max_tokens != 0
+            && keryx_consensus_core::config::params::is_decision_model(&req.model_id)
+        {
+            return Err(TxRuleError::AiRequestPayloadRule(format!("max_tokens {} on a decision model", req.max_tokens)));
+        }
         // Private inference: the block rule, evaluated at the virtual score.
         check_private_inference_era(&mutable_tx.tx, virtual_daa_score, self.private_inference_activation).map_err(|v| match v {
             PrivateEraViolation::RequestTooLongBeforeActivation(len) => {

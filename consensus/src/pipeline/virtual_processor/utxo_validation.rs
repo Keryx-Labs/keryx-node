@@ -9,7 +9,7 @@ use crate::{
             AiRequestEscrowBelowInferenceReward, AiRequestFeeBelowInferenceReward,
             AiRequestInferenceRewardBelowMinimum, AiRequestInvalidEscrowScript,
             AiRequestMissingEscrowOutput, AiRequestPriorityFeeBelowMinimum,
-            AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
+            AiRequestDecisionMaxTokens, AiRequestMaxTokensExceeded, AiResponseModelCapMissing, AiResponseV2BeforeActivation, BadAcceptedIDMerkleRoot,
             BadCoinbaseTransaction, BadServiceStateCommitment, BadUTXOCommitment, InvalidTransactionsInUtxoContext, MissingProductionIndexSnapshot, MissingServiceLedgerSnapshot,
             UnknownHeaderPruningPoint, WrongHeaderPruningPoint,
         },
@@ -678,6 +678,17 @@ impl VirtualStateProcessor {
                     && req.max_tokens > AI_REQUEST_MAX_TOKENS_CAP
                 {
                     return Err(AiRequestMaxTokensExceeded(tx.id(), req.max_tokens, AI_REQUEST_MAX_TOKENS_CAP));
+                }
+            }
+        }
+        if self.h18_activation.is_active(header.daa_score) {
+            for tx in txs.iter().skip(1) {
+                if tx.is_ai_request()
+                    && let Some(req) = AiRequestPayload::deserialize(&tx.payload)
+                    && req.max_tokens != 0
+                    && keryx_consensus_core::config::params::is_decision_model(&req.model_id)
+                {
+                    return Err(AiRequestDecisionMaxTokens(tx.id(), req.max_tokens));
                 }
             }
         }

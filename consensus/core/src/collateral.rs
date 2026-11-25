@@ -191,6 +191,8 @@ pub struct TraceResponseEvent {
     pub answer_len: u32,
     pub stage: u8,
     pub tokens: bool,
+    /// Root of the generated tokens, or of the answer of a decision response.
+    pub tokens_root: Option<[u8; 32]>,
 }
 
 /// An opening the ledger awaits: who signs it, its seed, its deadline, the pieces still owed and
@@ -275,11 +277,17 @@ struct EarlyTrace {
     trace_root: [u8; 32],
     stage: u8,
     tokens: bool,
+    /// `tokens_root` of the response, kept from the H18 lineup.
+    answer_root: Option<[u8; 32]>,
 }
 
-fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, prefix_offset: Option<u32>) -> bool {
-    keryx_verifiable_inference::shape::shape_ok(req.prompt_len, shape.answer_len, req.max_tokens, shape.n_prompt, shape.n_pos)
-        && prefix_offset.is_none_or(|o| keryx_verifiable_inference::prefix::fits(shape.n_prompt, o))
+fn trace_shape_ok(req: &PendingRequest, shape: &TraceShape, rules: Option<&crate::config::params::TraceRules>) -> bool {
+    let fits = match rules.and_then(|r| r.decision) {
+        Some(_) => keryx_verifiable_inference::decision::shape_ok,
+        None => keryx_verifiable_inference::shape::shape_ok,
+    };
+    fits(req.prompt_len, shape.answer_len, req.max_tokens, shape.n_prompt, shape.n_pos)
+        && rules.and_then(|r| r.prefix.as_ref()).is_none_or(|p| keryx_verifiable_inference::prefix::fits(shape.n_prompt, p.offset))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,6 +311,8 @@ struct TraceAudit {
     attn: Option<AttnProgress>,
     /// Deadline on its escrow key's chain before the network backlog; 0 when unset.
     chain_start: u64,
+    /// `tokens_root` of the response, kept from the H18 lineup.
+    answer_root: Option<[u8; 32]>,
 }
 
 /// Accepted phases of an attention opening still short of its last.
@@ -349,16 +359,19 @@ const PIECE_ATTN: u8 = 2;
 const PIECE_RECUR: u8 = 4;
 /// The residual opening of a stage-2 audit is proven.
 const PIECE_RESID: u8 = 8;
-const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID;
+/// The decision opening of a decision response is proven.
+const PIECE_DECISION: u8 = 16;
+const PIECE_ALL: u8 = PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | PIECE_DECISION;
 
 /// Pieces an audit under `rules` needs.
 pub fn required_pieces(rules: Option<&crate::config::params::TraceRules>) -> u8 {
     let Some(r) = rules else { return PIECE_TRACE };
     let resid = if r.chain.is_some() { PIECE_RESID } else { 0 };
+    let decision = if r.chain.is_some() && r.decision.is_some() { PIECE_DECISION } else { 0 };
     if r.attention {
-        PIECE_TRACE | PIECE_ATTN | resid | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
+        PIECE_TRACE | PIECE_ATTN | resid | decision | if r.chain.as_ref().is_some_and(|c| c.n_recur > 0) { PIECE_RECUR } else { 0 }
     } else {
-        PIECE_TRACE | resid
+        PIECE_TRACE | resid | decision
     }
 }
 
@@ -428,11 +441,12 @@ fn trace_opening_valid(
 /// The piece an opening body, seeded or not, proves.
 /// Piece an opening body proves.
 pub fn opening_body_piece(body: &[u8]) -> u8 {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_RECUR, VERSION_RESID, inner_body};
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
         Some(VERSION_ATTN) => PIECE_ATTN,
         Some(VERSION_RECUR) => PIECE_RECUR,
         Some(VERSION_RESID) => PIECE_RESID,
+        Some(VERSION_DECISION) => PIECE_DECISION,
         _ => PIECE_TRACE,
     }
 }
@@ -492,6 +506,26 @@ fn recur_opening_valid(
     let cc = rules.chain.as_ref().ok_or("recurrence without stage-2 rules")?;
     let resp = verify::ResponseCtx { trace_root: audit.trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     recur::verify_recur_point(&rules.ctx, cc, &resp, seed, &op).map_err(|_| "recurrent point")
+}
+
+/// Checks that a decision opening body proves the answer `audit` committed and its drawn score.
+fn decision_opening_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{decision, opening::{DecisionOpening, inner_body}, verify};
+    let op = inner_body(body).as_deref().and_then(DecisionOpening::decode).ok_or("malformed decision body")?;
+    if &op.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let (Some(cc), Some(dc)) = (rules.chain.as_ref(), rules.decision.as_ref()) else { return Err("decision without its rules") };
+    let answer_root = audit.answer_root.ok_or("no committed answer")?;
+    let trace_root = split_trace_root(rules, audit, &op.roots)?;
+    let resp = verify::ResponseCtx { trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    decision::verify_decision_opening(&rules.ctx, cc, dc, &resp, seed, &answer_root, &op).map_err(|_| "decision point")
 }
 
 /// Checks that an attention opening body proves the phase `audit` awaits of its attention point
@@ -1413,13 +1447,13 @@ impl ServiceLedger {
                 draw: None,
             });
             if let Some(tr) = traces.filter(|tr| tr.shape) {
-                let prefix_offset = (tr.tier)(entry.tier, daa).and_then(|r| r.prefix.map(|p| p.offset));
+                let rules = (tr.tier)(entry.tier, daa);
                 let shapes: Vec<(Hash, TraceShape)> = self
                     .early_shapes
                     .range((*rh, Hash::from_bytes([0u8; 32]))..=(*rh, Hash::from_bytes([0xffu8; 32])))
                     .map(|((_, key), shape)| (*key, *shape))
                     .collect();
-                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, prefix_offset)));
+                early.retain(|key| shapes.iter().find(|(k, _)| k == key).is_none_or(|(_, shape)| trace_shape_ok(entry, shape, rules.as_ref())));
                 // Under the context rule and the v3 window the well-formed early shapes wait for
                 // the arming, where cohort membership is known.
                 let keep = tr.context || tr.window_v3;
@@ -1444,6 +1478,7 @@ impl ServiceLedger {
                             answer_len: shape.answer_len,
                             stage: t.stage,
                             tokens: t.tokens,
+                            tokens_root: t.answer_root,
                         }),
                         _ => early.retain(|k| *k != key),
                     }
@@ -1467,6 +1502,7 @@ impl ServiceLedger {
         let trace_responses: Vec<&TraceResponseEvent> = traces
             .map(|tr| tr.responses.iter().filter(|ev| !tr.dedup || seen_txids.insert(ev.response_txid)).collect())
             .unwrap_or_default();
+        let h18_now = self.lineup_at(daa) == Lineup::H18;
         if let Some(tr) = traces.filter(|tr| tr.shape) {
             for ev in trace_responses.iter() {
                 let answer_len = if ev.tokens {
@@ -1478,9 +1514,8 @@ impl ServiceLedger {
                 match self.pending.get(&ev.request_hash) {
                     Some(req) => {
                         let rules = (tr.tier)(req.tier, daa);
-                        let prefix_offset = rules.as_ref().and_then(|r| r.prefix.as_ref().map(|p| p.offset));
                         let stage_ok = rules.as_ref().is_none_or(|r| r.chain.is_none() || (ev.stage == keryx_verifiable_inference::chain::STAGE_CHAIN && ev.tokens));
-                        if !stage_ok || !trace_shape_ok(req, &shape, prefix_offset) {
+                        if !stage_ok || !trace_shape_ok(req, &shape, rules.as_ref()) {
                             misshaped.push((ev.request_hash, ev.responder));
                         } else if (tr.context || tr.window_v3) && req.audit.is_none() {
                             self.early_shapes.insert((ev.request_hash, ev.responder), shape);
@@ -1504,6 +1539,7 @@ impl ServiceLedger {
                                     trace_root: ev.trace_root,
                                     stage: ev.stage,
                                     tokens: ev.tokens,
+                                    answer_root: ev.tokens_root.filter(|_| h18_now),
                                 };
                                 self.early_traces.insert((ev.request_hash, ev.responder), t);
                             }
@@ -1916,6 +1952,7 @@ impl ServiceLedger {
     ) {
         let mut audited: std::collections::HashSet<([u8; 32], Hash)> =
             if tr.sanction { self.trace_audits.values().map(|a| (a.request_hash, a.responder)).collect() } else { Default::default() };
+        let h18_now = self.lineup_at(daa) == Lineup::H18;
         for ev in tr.responses.iter().chain(parked) {
             if self.trace_audits.contains_key(&ev.response_txid)
                 || self.trace_roots.contains_key(&ev.response_txid)
@@ -1941,6 +1978,7 @@ impl ServiceLedger {
                 pieces: 0,
                 attn: None,
                 chain_start: 0,
+                answer_root: ev.tokens_root.filter(|_| h18_now),
             };
             self.resolve_trace_audit(&mut a, tr.one_miss);
             self.trace_audits.insert(ev.response_txid, a);
@@ -2050,6 +2088,7 @@ impl ServiceLedger {
                 }),
                 Some(r) if piece == PIECE_RECUR => recur_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) if piece == PIECE_RESID => resid_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(r) if piece == PIECE_DECISION => decision_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 None => Err("no rules"),
             };
@@ -2669,6 +2708,10 @@ const SNAPSHOT_ENCODING_VERSION_CHAIN: u8 = 13;
 /// Sections of version 13 (possibly empty) followed by the tier reserve after the snapshot block
 /// (`[reserve: u64]`).
 const SNAPSHOT_ENCODING_VERSION_RESERVE: u8 = 14;
+/// Sections of version 14 followed by the kept `tokens_root` of the trace audits
+/// (`[n: u32] n × [response_txid: 32] [root: 32]`, key order) and of the early traces
+/// (`[m: u32] m × [request_hash: 32] [responder: 32] [root: 32]`, key order), not both empty.
+const SNAPSHOT_ENCODING_VERSION_ANSWER: u8 = 15;
 /// Children an attention phase may commit.
 const MAX_ATTN_CHILDREN: u64 = 1 << 16;
 
@@ -2756,7 +2799,12 @@ impl ServiceLedgerSnapshot {
         let halves: Vec<(&[u8; 32], u8)> = self.trace_audits.iter().filter(|(_, a)| a.pieces != 0).map(|(k, a)| (k, a.pieces)).collect();
         let phased: Vec<(&[u8; 32], &AttnProgress)> = self.trace_audits.iter().filter_map(|(k, a)| a.attn.as_ref().map(|p| (k, p))).collect();
         let chained: Vec<(&[u8; 32], u64)> = self.trace_audits.iter().filter(|(_, a)| a.chain_start != 0).map(|(k, a)| (k, a.chain_start)).collect();
-        let version = if self.tier_reserve.is_some() {
+        let answered: Vec<(&[u8; 32], &[u8; 32])> = self.trace_audits.iter().filter_map(|(k, a)| a.answer_root.as_ref().map(|r| (k, r))).collect();
+        let early_answered: Vec<(&([u8; 32], Hash), &[u8; 32])> =
+            self.early_traces.iter().filter_map(|(k, t)| t.answer_root.as_ref().map(|r| (k, r))).collect();
+        let version = if !answered.is_empty() || !early_answered.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_ANSWER
+        } else if self.tier_reserve.is_some() {
             SNAPSHOT_ENCODING_VERSION_RESERVE
         } else if !chained.is_empty() {
             SNAPSHOT_ENCODING_VERSION_CHAIN
@@ -3015,9 +3063,23 @@ impl ServiceLedgerSnapshot {
                 out.extend_from_slice(&start.to_le_bytes());
             }
         }
-        if let Some(reserve) = self.tier_reserve {
+        if version >= SNAPSHOT_ENCODING_VERSION_RESERVE {
+            let reserve = self.tier_reserve.unwrap_or_default();
             out.extend_from_slice(&reserve.reserve.to_le_bytes());
             out.extend_from_slice(&reserve.ask_average.to_le_bytes());
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ANSWER {
+            out.extend_from_slice(&(answered.len() as u32).to_le_bytes());
+            for (txid, root) in answered {
+                out.extend_from_slice(txid);
+                out.extend_from_slice(root);
+            }
+            out.extend_from_slice(&(early_answered.len() as u32).to_le_bytes());
+            for ((rh, key), root) in early_answered {
+                out.extend_from_slice(rh);
+                out.extend_from_slice(&key.as_bytes());
+                out.extend_from_slice(root);
+            }
         }
         out
     }
@@ -3041,6 +3103,7 @@ impl ServiceLedgerSnapshot {
                 | SNAPSHOT_ENCODING_VERSION_EARLY
                 | SNAPSHOT_ENCODING_VERSION_CHAIN
                 | SNAPSHOT_ENCODING_VERSION_RESERVE
+                | SNAPSHOT_ENCODING_VERSION_ANSWER
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -3205,6 +3268,7 @@ impl ServiceLedgerSnapshot {
                     pieces: 0,
                     attn: None,
                     chain_start: 0,
+                    answer_root: None,
                 };
                 match r.u8()? {
                     0 => {}
@@ -3403,6 +3467,7 @@ impl ServiceLedgerSnapshot {
                         1 => true,
                         _ => return Err("malformed early trace".into()),
                     },
+                    answer_root: None,
                 };
                 if snap.early_traces.insert((rh, key), t).is_some() {
                     return Err("malformed early trace section".into());
@@ -3426,6 +3491,30 @@ impl ServiceLedgerSnapshot {
         if version >= SNAPSHOT_ENCODING_VERSION_RESERVE {
             let reserve = r.u64()?;
             snap.tier_reserve = Some(crate::coinbase::TierReserve { reserve, ask_average: r.u64()? });
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_ANSWER {
+            let n = r.u32()?;
+            for _ in 0..n {
+                let txid = r.key()?;
+                let root = r.key()?;
+                match snap.trace_audits.get_mut(&txid) {
+                    Some(a) if a.answer_root.is_none() => a.answer_root = Some(root),
+                    _ => return Err("malformed answer section".into()),
+                }
+            }
+            let m = r.u32()?;
+            if n == 0 && m == 0 {
+                return Err("empty answer section".into());
+            }
+            for _ in 0..m {
+                let rh = r.key()?;
+                let key = r.hash()?;
+                let root = r.key()?;
+                match snap.early_traces.get_mut(&(rh, key)) {
+                    Some(t) if t.answer_root.is_none() => t.answer_root = Some(root),
+                    _ => return Err("malformed answer section".into()),
+                }
+            }
         }
         if r.pos != bytes.len() {
             return Err("trailing bytes".into());
@@ -5131,6 +5220,7 @@ mod tests {
                         chain: None,
                         audit_all: self.audit_all,
                         attention: self.attention,
+                        decision: None,
                     })
                 };
                 let lens = [(RH, self.shape.map_or(0, |(p, _)| p))];
@@ -5195,6 +5285,7 @@ mod tests {
                     answer_len: self.shape.map_or(0, |(_, a)| a),
                     stage: 1,
                     tokens: false,
+                    tokens_root: None,
                 };
                 (r, ev)
             }
@@ -5610,6 +5701,13 @@ mod tests {
             assert_eq!(
                 required_pieces(trace_rules(4, true, true, true, true, Lineup::H14).as_ref()),
                 PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID
+            );            assert_eq!(
+                required_pieces(trace_rules(0, true, true, true, true, Lineup::H18).as_ref()),
+                PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID | crate::collateral::PIECE_DECISION
+            );
+            assert_eq!(
+                required_pieces(trace_rules(1, true, true, true, true, Lineup::H18).as_ref()),
+                PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID
             );
         }
 
@@ -5636,6 +5734,7 @@ mod tests {
                 pieces: 0,
                 attn: None,
                 chain_start: 0,
+                answer_root: None,
             };
             let resid = ResidPoint {
                 n_ubatch: 1,
@@ -5722,6 +5821,7 @@ mod tests {
                     answer_len: 0,
                     stage: STAGE_CHAIN,
                     tokens: true,
+                    tokens_root: None,
                 };
                 let mut run = Self { ledger: ServiceLedger::default(), tier, trace, seed: [0; 32] };
                 let h0 = Hash::from_bytes([0u8; 32]);
@@ -5740,6 +5840,7 @@ mod tests {
                     chain: Some(self.tier.chain_ctx()),
                     audit_all: true,
                     attention: false,
+                    decision: None,
                 };
                 let tier = |t: u8, _at: u64| (t == 0).then(|| rules.clone());
                 let lens = [(RH, 0)];
@@ -6545,6 +6646,7 @@ mod tests {
                         chain: None,
                         audit_all: true,
                         attention: false,
+                        decision: None,
                     })
                 };
                 let events: Vec<TraceResponseEvent> = answers
@@ -6564,6 +6666,7 @@ mod tests {
                                 answer_len: 0,
                                 stage: 1,
                                 tokens: false,
+                                tokens_root: None,
                             }
                         })
                     })
@@ -6793,6 +6896,7 @@ mod tests {
                 pieces: 0,
                 attn: None,
                 chain_start: 0,
+                answer_root: None,
             };
             net.ledger.trace_audits.insert([key; 32], audit);
         }

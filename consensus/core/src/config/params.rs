@@ -1317,7 +1317,19 @@ pub struct TraceTierH18 {
     pub prefix_manifest: TraceManifest,
     pub chain: TraceChain,
     pub attn: TraceNext,
+    /// Pointer head of a decision model.
+    pub decision: Option<keryx_verifiable_inference::decision::DecisionCtx>,
 }
+
+/// Models whose requests are decisions (`max_tokens` = 0, answered by a pointer head).
+pub const DECISION_MODELS_H18: &[[u8; 32]] = &[KEV_4B_MODEL_ID];
+
+/// Whether `model_id` is a decision model.
+pub fn is_decision_model(model_id: &[u8; 32]) -> bool {
+    DECISION_MODELS_H18.contains(model_id)
+}
+
+const KEV_PREFIX: TracePrefix = TracePrefix { offset: 1, embd_entry: 250, norm_entry: 251, ..QWEN3_5_PREFIX };
 
 const QWEN3_5_PREFIX: TracePrefix = match TRACE_PREFIXES {
     [Some(p), ..] => p,
@@ -1326,7 +1338,53 @@ const QWEN3_5_PREFIX: TracePrefix = match TRACE_PREFIXES {
 
 /// Trace data of each tier of the H18 lineup; `None` = not traced.
 pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
-    None,
+    Some(TraceTierH18 {
+        prefix_manifest: TraceManifest {
+            m_t: [
+                0x03, 0x0a, 0xf3, 0x2e, 0x77, 0xff, 0x5f, 0x9e, 0x8d, 0x1e, 0x37, 0x33, 0x7c, 0x27, 0xef, 0x89,
+                0x26, 0x5a, 0x50, 0xb8, 0x15, 0xde, 0x47, 0x3b, 0xe7, 0xb2, 0x9e, 0xc1, 0x2d, 0x26, 0xa3, 0xb5,
+            ],
+            n_entries: 252,
+            n_products: 249,
+        },
+        chain: TraceChain {
+            manifest: TraceManifest {
+                m_t: [
+                    0xb4, 0xb7, 0x36, 0xb1, 0x09, 0xd9, 0x1e, 0xae, 0x13, 0x00, 0x5d, 0xd9, 0xff, 0xae, 0xe7, 0x1d,
+                    0x1c, 0xfb, 0xb6, 0x5c, 0x2d, 0x36, 0xb9, 0x13, 0xb4, 0x2f, 0x45, 0x65, 0xcd, 0xbb, 0x0b, 0x32,
+                ],
+                n_entries: 348,
+                n_products: 249,
+            },
+            ctx: keryx_verifiable_inference::chain::ChainCtx {
+                n_layers: 32,
+                layer_base: 316,
+                embd_entry: 250,
+                eps: 9.999999974752427e-07,
+                embd_scale: 1.0,
+                trim_last: false,
+                n_used: 0,
+                n_attn: 0,
+                n_recur: 0,
+                seq_heads: 0,
+            },
+            prefix: KEV_PREFIX,
+        },
+        attn: TraceNext {
+            manifest: TraceManifest {
+                m_t: [
+                    0xf4, 0x40, 0xb6, 0x9d, 0xc8, 0xa0, 0x9f, 0xdc, 0x32, 0x45, 0xdb, 0x51, 0x57, 0x8f, 0x1d, 0xa6,
+                    0xb1, 0x9a, 0x45, 0x3d, 0xe1, 0x85, 0xbf, 0x22, 0x70, 0x0c, 0x2a, 0xa1, 0x5c, 0x09, 0x93, 0x3a,
+                ],
+                n_entries: 460,
+                n_products: 249,
+            },
+            n_attn: 8,
+            n_recur: 24,
+            seq_heads: 32,
+        },
+        decision: Some(keryx_verifiable_inference::decision::DecisionCtx { head_rank: 248, marker_tok: 248_050, pointer_tok: 248_062 }),
+    }),
     Some(TraceTierH18 {
         prefix_manifest: TraceManifest {
             m_t: [
@@ -1372,6 +1430,7 @@ pub const TRACE_TIERS_H18: [Option<TraceTierH18>; H18_TIER_COUNT] = [
             n_recur: 24,
             seq_heads: 32,
         },
+        decision: None,
     }),
     None,
     None,
@@ -1390,6 +1449,8 @@ pub struct TraceRules {
     pub audit_all: bool,
     /// An audit also needs the attention opening of the response.
     pub attention: bool,
+    /// An audit also needs the decision opening of the response.
+    pub decision: Option<keryx_verifiable_inference::decision::DecisionCtx>,
 }
 
 /// Audit rules of `tier` in `lineup`; `prefix` selects the prefix rule and its manifests,
@@ -1419,7 +1480,8 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
             n_entries: c.manifest.n_entries,
             n_products: c.manifest.n_products,
         };
-        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all, attention: attn.is_some() });
+        let decision = h18.as_ref().and_then(|h| h.decision);
+        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all, attention: attn.is_some(), decision });
     }
     let m = match &h18 {
         Some(h) if prefix => h.prefix_manifest,
@@ -1438,7 +1500,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
         (Some(h), true) => Some(h.chain.prefix.clone()),
         (None, true) => Some(TRACE_PREFIXES.get(tier as usize)?.clone()?),
     };
-    Some(TraceRules { ctx, prefix, chain: None, audit_all, attention: false })
+    Some(TraceRules { ctx, prefix, chain: None, audit_all, attention: false, decision: None })
 }
 
 /// Context floor of each tier of the H14 lineup, in tokens: the context a responder is held to.
@@ -3432,8 +3494,8 @@ mod pad_table_tests {
     }
 
     #[test]
-    fn h18_traces_only_tier_1() {
-        for t in (0..H18_TIER_COUNT as u8).filter(|t| *t != 1) {
+    fn h18_traces_tiers_0_and_1() {
+        for t in (0..H18_TIER_COUNT as u8).filter(|t| *t > 1) {
             assert!(trace_rules(t, true, true, true, true, Lineup::H18).is_none());
             assert!(trace_rules(t, true, true, false, false, Lineup::H18).is_none());
         }
@@ -3455,7 +3517,26 @@ mod pad_table_tests {
         for r in [&attn, &base, &pre] {
             assert_eq!(r.prefix.as_ref(), TRACE_PREFIXES[0].as_ref());
             assert_ne!(r.ctx.m_t, trace_rules(1, true, true, true, true, Lineup::H14).unwrap().ctx.m_t);
+            assert!(r.decision.is_none());
         }
+    }
+
+    #[test]
+    fn h18_tier_0_is_the_traced_decision_model() {
+        assert!(is_decision_model(&KEV_4B_MODEL_ID) && !is_decision_model(&QWEN3_5_9B_Q8_MODEL_ID));
+        assert_eq!(POM_TIERS_H18[0].model_id, KEV_4B_MODEL_ID);
+        let t0 = TRACE_TIERS_H18[0].as_ref().unwrap();
+        let attn = trace_rules(0, true, true, true, true, Lineup::H18).unwrap();
+        assert_eq!((attn.ctx.r_t, attn.ctx.n_chunks), (POM_TIERS_H18[0].root, POM_TIERS_H18[0].chunks));
+        assert_eq!(attn.ctx.m_t, t0.attn.manifest.m_t);
+        let d = attn.decision.unwrap();
+        assert_eq!((d.head_rank, d.marker_tok, d.pointer_tok), (248, 248_050, 248_062));
+        assert!(d.head_rank < attn.ctx.n_products as u32);
+        let ch = attn.chain.unwrap();
+        assert_eq!((ch.n_attn, ch.n_recur, ch.seq_heads, ch.trim_last), (8, 24, 32, false));
+        let p = attn.prefix.unwrap();
+        assert_eq!((p.offset, p.embd_entry, p.norm_entry, p.table), (1, 250, 251, TRACE_PREFIXES[0].as_ref().unwrap().table));
+        assert!(trace_rules(0, true, true, false, false, Lineup::H18).unwrap().decision.is_none());
     }
 
     #[test]
