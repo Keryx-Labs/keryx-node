@@ -193,18 +193,21 @@ pub const H14_ACTIVATION_DAA: u64 = 121_985_000;
 pub const H15_ACTIVATION_DAA: u64 = 140_115_000;
 
 /// Testnet H15 gate: every verifiable-inference, audit and holder-reward v3 rule. Node and miner.
-pub const TESTNET_H15_ACTIVATION_DAA: u64 = 3_500;
+pub const TESTNET_H15_ACTIVATION_DAA: u64 = 1;
 /// Mainnet H16 gate. Node and miner.
 pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
 
 /// Testnet H16 gate.
-pub const TESTNET_H16_ACTIVATION_DAA: u64 = 180_000;
+pub const TESTNET_H16_ACTIVATION_DAA: u64 = 1;
 
 /// Mainnet H17 gate.
 pub const H17_ACTIVATION_DAA: u64 = 153_085_000;
 
 /// Testnet H17 gate.
-pub const TESTNET_H17_ACTIVATION_DAA: u64 = 565_000;
+pub const TESTNET_H17_ACTIVATION_DAA: u64 = 1;
+
+/// Testnet H18 gate. Node and miner.
+pub const TESTNET_H18_ACTIVATION_DAA: u64 = 3_000;
 
 /// Number of tiers of the H18 lineup.
 pub const H18_TIER_COUNT: usize = 7;
@@ -3399,8 +3402,8 @@ pub const TESTNET_PARAMS: Params = Params {
     trace_seed_bind_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     attention_activation: ForkActivation::new(TESTNET_H15_ACTIVATION_DAA),
     service_ledger_activation: ForkActivation::new(1),
-    production_index_activation: ForkActivation::new(500),
-    exact_verification_activation: ForkActivation::new(500),
+    production_index_activation: ForkActivation::new(1),
+    exact_verification_activation: ForkActivation::new(1),
     suspension_pov_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     untraced_response_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     answer_shape_window_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
@@ -3409,7 +3412,7 @@ pub const TESTNET_PARAMS: Params = Params {
     audit_queue_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     pad_margin_activation: ForkActivation::new(TESTNET_H16_ACTIVATION_DAA),
     ratio_probation_activation: ForkActivation::new(TESTNET_H17_ACTIVATION_DAA),
-    h18_activation: ForkActivation::never(),
+    h18_activation: ForkActivation::new(TESTNET_H18_ACTIVATION_DAA),
     service_burnable_window_daa: 6_000,
     chain_anchor: None,
     service_state_checkpoint: None,
@@ -3783,7 +3786,7 @@ mod pad_table_tests {
                 assert_eq!(g.daa_score(), expected);
             }
         }
-        assert!(TESTNET_H16_ACTIVATION_DAA > TESTNET_H15_ACTIVATION_DAA);
+        assert!(TESTNET_H16_ACTIVATION_DAA >= TESTNET_H15_ACTIVATION_DAA);
         assert!(H16_ACTIVATION_DAA > H15_ACTIVATION_DAA);
         assert_eq!(H16_ACTIVATION_DAA, 147_000_000);
     }
@@ -3967,7 +3970,7 @@ mod pad_table_tests {
         assert_eq!(MAINNET_PARAMS.ratio_probation_activation.daa_score(), H17_ACTIVATION_DAA);
         assert_eq!(TESTNET_PARAMS.ratio_probation_activation.daa_score(), TESTNET_H17_ACTIVATION_DAA);
         assert!(H17_ACTIVATION_DAA > H16_ACTIVATION_DAA);
-        assert!(TESTNET_H17_ACTIVATION_DAA > TESTNET_H16_ACTIVATION_DAA);
+        assert!(TESTNET_H17_ACTIVATION_DAA >= TESTNET_H16_ACTIVATION_DAA);
         assert_eq!(H17_ACTIVATION_DAA, 153_085_000);
         for p in [&SIMNET_PARAMS, &DEVNET_PARAMS] {
             assert_eq!(p.ratio_probation_activation, ForkActivation::never());
@@ -3976,9 +3979,8 @@ mod pad_table_tests {
 
     #[test]
     fn pad_margin_gate_follows_pom_v5() {
-        for p in [&MAINNET_PARAMS, &TESTNET_PARAMS] {
-            assert!(p.pad_margin_activation.daa_score() > p.pom_v5_activation.daa_score());
-        }
+        assert!(MAINNET_PARAMS.pad_margin_activation.daa_score() > MAINNET_PARAMS.pom_v5_activation.daa_score());
+        assert!(TESTNET_PARAMS.pad_margin_activation.daa_score() >= TESTNET_PARAMS.pom_v5_activation.daa_score());
     }
 }
 
