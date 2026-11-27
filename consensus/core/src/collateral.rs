@@ -309,8 +309,8 @@ struct TraceAudit {
     pieces: u8,
     /// Progress of an attention opening of several phases.
     attn: Option<AttnProgress>,
-    /// Parts of a stage-2 trace piece already proven: bit `i` for drawn point `i`, bit `POINTS`
-    /// for the prefix point.
+    /// Parts of a stage-2 trace piece already proven: bit `2i` for the weight rows of drawn point
+    /// `i`, bit `2i + 1` for the link of its input, bit `2 * POINTS` for the prefix point.
     trace_parts: u8,
     /// Deadline on its escrow key's chain before the network backlog; 0 when unset.
     chain_start: u64,
@@ -458,23 +458,35 @@ fn is_chain_part(body: &[u8]) -> bool {
 /// Bits of the stage-2 trace parts a trace part body proves; `None` for another body or a part
 /// with a duplicate or out-of-range point index.
 pub fn chain_part_bits(body: &[u8]) -> Option<u8> {
-    use keryx_verifiable_inference::{draw::POINTS, opening::{inner_body, ChainPart}};
+    use keryx_verifiable_inference::{
+        draw::POINTS,
+        opening::{inner_body, ChainPart, HALF_LINK, HALF_PRODUCT, HALF_WHOLE},
+    };
     let part = ChainPart::decode(&inner_body(body)?)?;
     let mut bits = 0u8;
     for p in &part.points {
-        if p.index as u32 >= POINTS || bits & (1 << p.index) != 0 {
+        if p.index as u32 >= POINTS {
             return None;
         }
-        bits |= 1 << p.index;
+        let b = match p.half {
+            HALF_WHOLE => 0b11,
+            HALF_PRODUCT => 0b01,
+            HALF_LINK => 0b10,
+            _ => return None,
+        } << (2 * p.index);
+        if bits & b != 0 {
+            return None;
+        }
+        bits |= b;
     }
     if part.prefix.is_some() {
-        bits |= 1 << POINTS;
+        bits |= 1 << (2 * POINTS);
     }
     (bits != 0).then_some(bits)
 }
 
 /// Bits of a complete stage-2 trace piece.
-const TRACE_PARTS_ALL: u8 = (1 << (keryx_verifiable_inference::draw::POINTS + 1)) - 1;
+const TRACE_PARTS_ALL: u8 = (1 << (2 * keryx_verifiable_inference::draw::POINTS + 1)) - 1;
 
 /// Checks that a trace part body proves its drawn points, and the prefix point when it carries it,
 /// of `audit` under `seed`.
@@ -494,7 +506,7 @@ fn trace_part_valid(
     let trace_root = split_trace_root(rules, audit, &part.roots)?;
     let resp = verify::ResponseCtx { trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
     for p in &part.points {
-        if chain::verify_chain_point(&rules.ctx, cc, &resp, seed, p.index as u32, &p.point, p.tok, &p.link, p.experts.as_ref()).is_err() {
+        if chain::verify_chain_point_half(&rules.ctx, cc, &resp, seed, p.index as u32, &p.point, p.tok, &p.link, p.experts.as_ref(), p.half).is_err() {
             return Err(if p.index == 0 { "point 0" } else { "point 1" });
         }
     }
@@ -6101,12 +6113,33 @@ mod tests {
                     if tamper && i == 1 {
                         p.x[0] ^= 1;
                     }
-                    PartPoint { index: i as u8, point: p, tok, link, experts: None }
+                    PartPoint { index: i as u8, half: keryx_verifiable_inference::opening::HALF_WHOLE, point: p, tok, link, experts: None }
                 };
                 let prefix = Some(self.tier.open_prefix(&self.trace, &self.seed, 0));
                 let a = ChainPart { response_txid: TXID, roots: None, points: vec![point(0)], prefix: None };
                 let b = ChainPart { response_txid: TXID, roots: None, points: vec![point(1)], prefix };
                 [a.encode(), b.encode()]
+            }
+
+            /// Trace piece in three parts: point 0 whole, the weight rows of point 1, then the link
+            /// of point 1 with the prefix point.
+            fn half_bodies(&self, tamper_link: bool) -> [Vec<u8>; 3] {
+                use keryx_verifiable_inference::opening::{ChainPart, LinkOpening, PartPoint, Point, HALF_LINK, HALF_PRODUCT, HALF_WHOLE};
+                let (p0, tok0, link0) = self.tier.open_point(&self.trace, &self.seed, 0);
+                let (p1, tok1, link1) = self.tier.open_point(&self.trace, &self.seed, 1);
+                let mut input = Point { rows: Vec::new(), bias: None, ..p1.clone() };
+                if tamper_link {
+                    input.x[0] ^= 1;
+                }
+                let part = |points: Vec<PartPoint>, prefix| ChainPart { response_txid: TXID, roots: None, points, prefix }.encode();
+                [
+                    part(vec![PartPoint { index: 0, half: HALF_WHOLE, point: p0, tok: tok0, link: link0, experts: None }], None),
+                    part(vec![PartPoint { index: 1, half: HALF_PRODUCT, point: p1, tok: tok1, link: LinkOpening::None, experts: None }], None),
+                    part(
+                        vec![PartPoint { index: 1, half: HALF_LINK, point: input, tok: tok1, link: link1, experts: None }],
+                        Some(self.tier.open_prefix(&self.trace, &self.seed, 0)),
+                    ),
+                ]
             }
 
             fn resid_body(&self, tamper: bool) -> Vec<u8> {
@@ -6175,6 +6208,28 @@ mod tests {
             let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, parts[0].clone()), opening(ESCROW_PK, parts[1].clone())]);
             assert!(misses.is_empty() && verdicts == vec![None]);
             assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_point_in_two_halves_closes_the_trace_piece_and_a_forged_half_strikes() {
+            use crate::collateral::PIECE_TRACE;
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            run.parts = true;
+            let parts = run.half_bodies(false);
+            for (k, b) in [2usize, 0, 1].into_iter().enumerate() {
+                let (misses, verdicts) = run.fold(203 + k as u64, h, &[], &[opening(ESCROW_PK, parts[b].clone())]);
+                assert!(misses.is_empty() && verdicts.is_empty(), "part {b}: {verdicts:?}");
+            }
+            assert_eq!(run.pieces(), Some(PIECE_TRACE));
+
+            let mut run = Stage2::drawn();
+            run.parts = true;
+            let parts = run.half_bodies(true);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, parts[1].clone())]).0.is_empty());
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, parts[2].clone())]);
+            assert_eq!(verdicts, vec![Some("point 1")]);
+            assert_eq!(misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![miner()]);
         }
 
         #[test]
