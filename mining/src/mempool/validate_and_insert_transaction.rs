@@ -588,6 +588,7 @@ pub(crate) type OpeningKey = ([u8; 32], u8, Vec<u64>, u8);
 /// for a stage-2 trace part, the parts it proves.
 pub(crate) fn ai_opening_key(payload: &[u8]) -> Option<OpeningKey> {
     let body = SignedPayload::split(payload)?.body;
-    let parts = keryx_consensus_core::collateral::chain_part_bits(body).unwrap_or(0);
+    use keryx_consensus_core::collateral::{chain_part_bits, sel_part_bits};
+    let parts = chain_part_bits(body).or_else(|| sel_part_bits(body).map(|b| b << 5)).unwrap_or(0);
     Some((body.get(1..33)?.try_into().ok()?, opening_body_piece(body), attn_path(body).unwrap_or_default(), parts))
 }

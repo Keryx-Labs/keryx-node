@@ -312,6 +312,8 @@ struct TraceAudit {
     /// Parts of a stage-2 trace piece already proven: bit `2i` for the weight rows of drawn point
     /// `i`, bit `2i + 1` for the link of its input, bit `2 * POINTS` for the prefix point.
     trace_parts: u8,
+    /// Halves of a selection piece already proven: bit 0 the selected pools, bit 1 the others.
+    sel_parts: u8,
     /// Deadline on its escrow key's chain before the network backlog; 0 when unset.
     chain_start: u64,
     /// `tokens_root` of the response, kept from the H18 lineup.
@@ -485,6 +487,19 @@ pub fn chain_part_bits(body: &[u8]) -> Option<u8> {
     (bits != 0).then_some(bits)
 }
 
+/// Bits of the selection half a selection part body proves; `None` for another body.
+pub fn sel_part_bits(body: &[u8]) -> Option<u8> {
+    use keryx_verifiable_inference::opening::{inner_body, SelOpeningPoint, VERSION_SEL_PART};
+    let b = inner_body(body)?;
+    if b.first() != Some(&VERSION_SEL_PART) {
+        return None;
+    }
+    SelOpeningPoint::decode(&b).map(|op| op.part)
+}
+
+/// Bits of a complete selection piece sent in halves.
+const SEL_PARTS_ALL: u8 = 0b11;
+
 /// Bits of a complete stage-2 trace piece.
 const TRACE_PARTS_ALL: u8 = (1 << (2 * keryx_verifiable_inference::draw::POINTS + 1)) - 1;
 
@@ -519,13 +534,13 @@ fn trace_part_valid(
 /// The piece an opening body, seeded or not, proves.
 /// Piece an opening body proves.
 pub fn opening_body_piece(body: &[u8]) -> u8 {
-    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_COMP, VERSION_ATTN_COMP, VERSION_COMP_SEL, VERSION_ENGRAM, inner_body};
+    use keryx_verifiable_inference::opening::{VERSION_ATTN, VERSION_DECISION, VERSION_RECUR, VERSION_RESID, VERSION_SEL, VERSION_SEL_PART, VERSION_COMP, VERSION_ATTN_COMP, VERSION_COMP_SEL, VERSION_ENGRAM, inner_body};
     match inner_body(body).and_then(|b| b.first().copied()) {
         Some(VERSION_ATTN | VERSION_ATTN_COMP) => PIECE_ATTN,
         Some(VERSION_RECUR) => PIECE_RECUR,
         Some(VERSION_RESID) => PIECE_RESID,
         Some(VERSION_DECISION) => PIECE_DECISION,
-        Some(VERSION_SEL | VERSION_COMP_SEL) => PIECE_SEL,
+        Some(VERSION_SEL | VERSION_SEL_PART | VERSION_COMP_SEL) => PIECE_SEL,
         Some(VERSION_COMP) => PIECE_COMP,
         Some(VERSION_ENGRAM) => PIECE_ENGRAM,
         _ => PIECE_TRACE,
@@ -2129,6 +2144,7 @@ impl ServiceLedger {
                 pieces: 0,
                 attn: None,
                 trace_parts: 0,
+                sel_parts: 0,
                 chain_start: 0,
                 answer_root: ev.tokens_root.filter(|_| h18_now),
             };
@@ -2229,6 +2245,10 @@ impl ServiceLedger {
             if is_part && (!rules.as_ref().is_some_and(|r| r.chain_parts) || part_bits.is_some_and(|b| a.trace_parts & b != 0)) {
                 continue;
             }
+            let sel_bits = if piece == PIECE_SEL { sel_part_bits(&op.body) } else { None };
+            if sel_bits.is_some_and(|b| a.sel_parts & b != 0 || !rules.as_ref().is_some_and(|r| r.chain_parts)) {
+                continue;
+            }
             if piece == PIECE_ATTN
                 && let Some(path) = keryx_verifiable_inference::opening::attn_path(&op.body)
                 && Some(&path[..]) != a.attn.as_ref().map_or(Some(&[][..]), AttnProgress::awaited)
@@ -2270,6 +2290,14 @@ impl ServiceLedger {
                 && (a.trace_parts | bits) != TRACE_PARTS_ALL
             {
                 a.trace_parts |= bits;
+                self.trace_audits.insert(op.response_txid, a);
+                continue;
+            }
+            if let Some(bits) = sel_bits
+                && verdict.is_ok()
+                && (a.sel_parts | bits) != SEL_PARTS_ALL
+            {
+                a.sel_parts |= bits;
                 self.trace_audits.insert(op.response_txid, a);
                 continue;
             }
@@ -2461,6 +2489,11 @@ impl ServiceLedger {
     /// Stage-2 trace parts already proven of a drawn audit whose trace piece is still owed.
     pub fn awaited_trace_parts(&self, response_txid: &[u8; 32]) -> Option<u8> {
         self.trace_audits.get(response_txid).filter(|a| a.seed.is_some() && a.pieces & PIECE_TRACE == 0).map(|a| a.trace_parts)
+    }
+
+    /// Selection halves already proven of a drawn audit whose selection piece is still owed.
+    pub fn awaited_sel_parts(&self, response_txid: &[u8; 32]) -> Option<u8> {
+        self.trace_audits.get(response_txid).filter(|a| a.seed.is_some() && a.pieces & PIECE_SEL == 0).map(|a| a.sel_parts)
     }
 
     pub fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
@@ -2891,6 +2924,9 @@ const SNAPSHOT_ENCODING_VERSION_ANSWER: u8 = 15;
 /// already proven of the drawn audits (`[n: u32] n × [response_txid: 32] [parts: u8]`, key order),
 /// not empty.
 const SNAPSHOT_ENCODING_VERSION_PARTS: u8 = 16;
+/// Version 16 with the selection halves already proven after each entry's trace parts
+/// (`[n: u32] n × [response_txid: 32] [parts: u8] [selection halves: u8]`).
+const SNAPSHOT_ENCODING_VERSION_SEL_PARTS: u8 = 17;
 /// Children an attention phase may commit.
 const MAX_ATTN_CHILDREN: u64 = 1 << 16;
 
@@ -2981,8 +3017,11 @@ impl ServiceLedgerSnapshot {
         let answered: Vec<(&[u8; 32], &[u8; 32])> = self.trace_audits.iter().filter_map(|(k, a)| a.answer_root.as_ref().map(|r| (k, r))).collect();
         let early_answered: Vec<(&([u8; 32], Hash), &[u8; 32])> =
             self.early_traces.iter().filter_map(|(k, t)| t.answer_root.as_ref().map(|r| (k, r))).collect();
-        let parted: Vec<(&[u8; 32], u8)> = self.trace_audits.iter().filter(|(_, a)| a.trace_parts != 0).map(|(k, a)| (k, a.trace_parts)).collect();
-        let version = if !parted.is_empty() {
+        let parted: Vec<(&[u8; 32], u8, u8)> =
+            self.trace_audits.iter().filter(|(_, a)| a.trace_parts != 0 || a.sel_parts != 0).map(|(k, a)| (k, a.trace_parts, a.sel_parts)).collect();
+        let version = if parted.iter().any(|&(_, _, sel)| sel != 0) {
+            SNAPSHOT_ENCODING_VERSION_SEL_PARTS
+        } else if !parted.is_empty() {
             SNAPSHOT_ENCODING_VERSION_PARTS
         } else if !answered.is_empty() || !early_answered.is_empty() {
             SNAPSHOT_ENCODING_VERSION_ANSWER
@@ -3265,9 +3304,12 @@ impl ServiceLedgerSnapshot {
         }
         if version >= SNAPSHOT_ENCODING_VERSION_PARTS {
             out.extend_from_slice(&(parted.len() as u32).to_le_bytes());
-            for (txid, parts) in parted {
+            for (txid, parts, sel) in parted {
                 out.extend_from_slice(txid);
                 out.push(parts);
+                if version >= SNAPSHOT_ENCODING_VERSION_SEL_PARTS {
+                    out.push(sel);
+                }
             }
         }
         out
@@ -3294,6 +3336,7 @@ impl ServiceLedgerSnapshot {
                 | SNAPSHOT_ENCODING_VERSION_RESERVE
                 | SNAPSHOT_ENCODING_VERSION_ANSWER
                 | SNAPSHOT_ENCODING_VERSION_PARTS
+                | SNAPSHOT_ENCODING_VERSION_SEL_PARTS
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -3458,6 +3501,7 @@ impl ServiceLedgerSnapshot {
                     pieces: 0,
                     attn: None,
                     trace_parts: 0,
+                    sel_parts: 0,
                     chain_start: 0,
                     answer_root: None,
                 };
@@ -3715,9 +3759,20 @@ impl ServiceLedgerSnapshot {
             for _ in 0..n {
                 let txid = r.key()?;
                 let parts = r.u8()?;
+                let sel = if version >= SNAPSHOT_ENCODING_VERSION_SEL_PARTS { r.u8()? } else { 0 };
                 match snap.trace_audits.get_mut(&txid) {
-                    Some(a) if a.seed.is_some() && a.trace_parts == 0 && parts != 0 && parts < TRACE_PARTS_ALL && a.pieces & PIECE_TRACE == 0 => {
-                        a.trace_parts = parts
+                    Some(a)
+                        if a.seed.is_some()
+                            && a.trace_parts == 0
+                            && a.sel_parts == 0
+                            && (parts != 0 || sel != 0)
+                            && parts < TRACE_PARTS_ALL
+                            && (parts == 0 || a.pieces & PIECE_TRACE == 0)
+                            && sel < SEL_PARTS_ALL
+                            && (sel == 0 || a.pieces & PIECE_SEL == 0) =>
+                    {
+                        a.trace_parts = parts;
+                        a.sel_parts = sel;
                     }
                     _ => return Err("malformed trace parts section".into()),
                 }
@@ -5955,6 +6010,7 @@ mod tests {
                 pieces: 0,
                 attn: None,
                 trace_parts: 0,
+                sel_parts: 0,
                 chain_start: 0,
                 answer_root: None,
             };
@@ -6254,6 +6310,30 @@ mod tests {
 
             let mut bad = bytes.clone();
             *bad.last_mut().unwrap() = crate::collateral::TRACE_PARTS_ALL;
+            assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
+        }
+
+        #[test]
+        fn selection_halves_proven_before_a_snapshot_survive_its_round_trip() {
+            use crate::collateral::ServiceLedgerSnapshot;
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            run.parts = true;
+            let parts = run.part_bodies(false);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, parts[0].clone())]).0.is_empty());
+            assert_eq!(run.ledger.snapshot().to_bytes()[0], 16);
+            run.ledger.trace_audits.get_mut(&TXID).unwrap().sel_parts = 1;
+            let bytes = run.ledger.snapshot().to_bytes();
+            assert_eq!(bytes[0], 17);
+            let snap = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(snap.to_bytes(), bytes);
+            let mut restored = ServiceLedger::default();
+            restored.restore_snapshot(&snap);
+            let a = restored.trace_audits.get(&TXID).unwrap();
+            assert_eq!((a.trace_parts, a.sel_parts), (run.ledger.trace_audits[&TXID].trace_parts, 1));
+            assert_eq!(restored.awaited_sel_parts(&TXID), Some(1));
+            let mut bad = bytes.clone();
+            *bad.last_mut().unwrap() = 3;
             assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
         }
 
@@ -7256,6 +7336,7 @@ mod tests {
                 pieces: 0,
                 attn: None,
                 trace_parts: 0,
+                sel_parts: 0,
                 chain_start: 0,
                 answer_root: None,
             };

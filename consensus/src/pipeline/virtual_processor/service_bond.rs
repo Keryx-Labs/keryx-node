@@ -567,7 +567,7 @@ impl VirtualStateProcessor {
     /// Whether the opening `tx` proves a piece its response still owes, from the key, seed and
     /// attention path the audit awaits (the signature is a validity rule, checked elsewhere).
     pub(crate) fn opening_awaited(&self, tx: &keryx_consensus_core::tx::Transaction) -> bool {
-        use keryx_consensus_core::collateral::{chain_part_bits, opening_body_piece, trace_seed};
+        use keryx_consensus_core::collateral::{chain_part_bits, opening_body_piece, sel_part_bits, trace_seed};
         use keryx_verifiable_inference::opening::{SignedPayload, attn_path, seed_block};
         let Some(s) = SignedPayload::split(&tx.payload) else { return false };
         let Some(txid) = s.body.get(1..33).and_then(|b| <[u8; 32]>::try_from(b).ok()) else { return false };
@@ -578,6 +578,7 @@ impl VirtualStateProcessor {
             && attn_path(s.body).is_none_or(|p| ledger.awaited_attention_path(&txid) == Some(p))
             && ledger.awaited_opening_pieces(&txid, |t, at| self.required_pieces_at(t, at)).is_some_and(|m| m & opening_body_piece(s.body) != 0)
             && chain_part_bits(s.body).is_none_or(|b| ledger.awaited_trace_parts(&txid).is_some_and(|have| have & b == 0))
+            && sel_part_bits(s.body).is_none_or(|b| ledger.awaited_sel_parts(&txid).is_some_and(|have| have & b == 0))
     }
 
     pub(crate) fn ai_response_admission(&self, request_hash: &[u8; 32], escrow_pubkey: Option<&[u8; 32]>, virtual_daa_score: u64) -> Option<bool> {
