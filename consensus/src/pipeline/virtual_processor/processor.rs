@@ -1664,7 +1664,7 @@ impl VirtualStateProcessor {
             }
             v => TxRuleError::AiRequestPayloadRule(v.to_string()),
         })?;
-        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation, self.attention_activation)
+        check_verifiable_inference_era(&mutable_tx.tx, virtual_daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation, self.attention_activation, self.h18_activation)
             .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         self.validate_mempool_transaction_in_utxo_context(mutable_tx, virtual_utxo_view, virtual_daa_score, args)?;
         Ok(())
@@ -1769,6 +1769,7 @@ impl VirtualStateProcessor {
             self.trace_chain_activation,
             self.trace_seed_bind_activation,
             self.attention_activation,
+            self.h18_activation,
         )
         .map_err(|v| TxRuleError::AiRequestPayloadRule(v.to_string()))?;
         let ValidatedTransaction { calculated_fee, .. } =

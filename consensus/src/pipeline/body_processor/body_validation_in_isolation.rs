@@ -175,7 +175,7 @@ impl BlockBodyProcessor {
     fn check_verifiable_inference_era(self: &Arc<Self>, block: &Block) -> BlockProcessResult<()> {
         let mut openings = 0usize;
         for tx in block.transactions.iter().skip(1) {
-            if let Err(v) = check_verifiable_inference_era(tx, block.header.daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation, self.attention_activation) {
+            if let Err(v) = check_verifiable_inference_era(tx, block.header.daa_score, self.verifiable_inference_activation, self.trace_chain_activation, self.trace_seed_bind_activation, self.attention_activation, self.h18_activation) {
                 return Err(match v {
                     VerifiableEraViolation::OpeningBeforeActivation => RuleError::AiOpeningBeforeActivation(tx.id()),
                     VerifiableEraViolation::TraceBeforeActivation => RuleError::AiTraceBeforeActivation(tx.id()),

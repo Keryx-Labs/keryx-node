@@ -581,11 +581,13 @@ pub(crate) fn ai_opening_response_txid(payload: &[u8]) -> Option<[u8; 32]> {
     SignedPayload::split(payload)?.body.get(1..33)?.try_into().ok()
 }
 
-/// Response, proven piece and attention path of an opening.
-pub(crate) type OpeningKey = ([u8; 32], u8, Vec<u64>);
+/// Response, proven piece, attention path and trace part bits of an opening.
+pub(crate) type OpeningKey = ([u8; 32], u8, Vec<u64>, u8);
 
-/// Key of an opening in the mempool: its response, the piece it proves and its attention path.
+/// Key of an opening in the mempool: its response, the piece it proves, its attention path and,
+/// for a stage-2 trace part, the parts it proves.
 pub(crate) fn ai_opening_key(payload: &[u8]) -> Option<OpeningKey> {
     let body = SignedPayload::split(payload)?.body;
-    Some((body.get(1..33)?.try_into().ok()?, opening_body_piece(body), attn_path(body).unwrap_or_default()))
+    let parts = keryx_consensus_core::collateral::chain_part_bits(body).unwrap_or(0);
+    Some((body.get(1..33)?.try_into().ok()?, opening_body_piece(body), attn_path(body).unwrap_or_default(), parts))
 }

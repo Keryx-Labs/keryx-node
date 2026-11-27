@@ -309,6 +309,9 @@ struct TraceAudit {
     pieces: u8,
     /// Progress of an attention opening of several phases.
     attn: Option<AttnProgress>,
+    /// Parts of a stage-2 trace piece already proven: bit `i` for drawn point `i`, bit `POINTS`
+    /// for the prefix point.
+    trace_parts: u8,
     /// Deadline on its escrow key's chain before the network backlog; 0 when unset.
     chain_start: u64,
     /// `tokens_root` of the response, kept from the H18 lineup.
@@ -444,6 +447,60 @@ fn trace_opening_valid(
         (Some(pc), Some(p)) => {
             prefix::verify_prefix_point(&rules.ctx, pc, &resp, seed, &audit.request_hash, p).map(|_| ()).map_err(|_| "prefix point")
         }
+    }
+}
+
+/// Whether `body`, seeded or not, is a stage-2 trace part.
+fn is_chain_part(body: &[u8]) -> bool {
+    keryx_verifiable_inference::opening::inner_body(body).and_then(|b| b.first().copied()) == Some(keryx_verifiable_inference::opening::VERSION_CHAIN_PART)
+}
+
+/// Bits of the stage-2 trace parts a trace part body proves; `None` for another body or a part
+/// with a duplicate or out-of-range point index.
+pub fn chain_part_bits(body: &[u8]) -> Option<u8> {
+    use keryx_verifiable_inference::{draw::POINTS, opening::{inner_body, ChainPart}};
+    let part = ChainPart::decode(&inner_body(body)?)?;
+    let mut bits = 0u8;
+    for p in &part.points {
+        if p.index as u32 >= POINTS || bits & (1 << p.index) != 0 {
+            return None;
+        }
+        bits |= 1 << p.index;
+    }
+    if part.prefix.is_some() {
+        bits |= 1 << POINTS;
+    }
+    (bits != 0).then_some(bits)
+}
+
+/// Bits of a complete stage-2 trace piece.
+const TRACE_PARTS_ALL: u8 = (1 << (keryx_verifiable_inference::draw::POINTS + 1)) - 1;
+
+/// Checks that a trace part body proves its drawn points, and the prefix point when it carries it,
+/// of `audit` under `seed`.
+fn trace_part_valid(
+    rules: &crate::config::params::TraceRules,
+    audit: &TraceAudit,
+    seed: &[u8; 32],
+    txid: &[u8; 32],
+    body: &[u8],
+) -> Result<(), &'static str> {
+    use keryx_verifiable_inference::{chain, opening::{inner_body, ChainPart}, verify};
+    let (Some(cc), Some(pc), true) = (&rules.chain, &rules.prefix, rules.chain_parts) else { return Err("trace part before its rule") };
+    let Some(part) = inner_body(body).and_then(|b| ChainPart::decode(&b)) else { return Err("malformed body") };
+    if &part.response_txid != txid {
+        return Err("response id mismatch");
+    }
+    let trace_root = split_trace_root(rules, audit, &part.roots)?;
+    let resp = verify::ResponseCtx { trace_root, n_prompt: audit.n_prompt, n_pos: audit.n_pos };
+    for p in &part.points {
+        if chain::verify_chain_point(&rules.ctx, cc, &resp, seed, p.index as u32, &p.point, p.tok, &p.link, p.experts.as_ref()).is_err() {
+            return Err(if p.index == 0 { "point 0" } else { "point 1" });
+        }
+    }
+    match &part.prefix {
+        Some(pp) => chain::verify_chain_prefix_point(&rules.ctx, cc, pc, &resp, seed, &audit.request_hash, pp).map(|_| ()).map_err(|_| "prefix point"),
+        None => Ok(()),
     }
 }
 
@@ -2059,6 +2116,7 @@ impl ServiceLedger {
                 deadline_daa: 0,
                 pieces: 0,
                 attn: None,
+                trace_parts: 0,
                 chain_start: 0,
                 answer_root: ev.tokens_root.filter(|_| h18_now),
             };
@@ -2154,6 +2212,11 @@ impl ServiceLedger {
             if piece & required == 0 || a.pieces & piece != 0 {
                 continue;
             }
+            let is_part = piece == PIECE_TRACE && is_chain_part(&op.body);
+            let part_bits = if is_part { chain_part_bits(&op.body) } else { None };
+            if is_part && (!rules.as_ref().is_some_and(|r| r.chain_parts) || part_bits.is_some_and(|b| a.trace_parts & b != 0)) {
+                continue;
+            }
             if piece == PIECE_ATTN
                 && let Some(path) = keryx_verifiable_inference::opening::attn_path(&op.body)
                 && Some(&path[..]) != a.attn.as_ref().map_or(Some(&[][..]), AttnProgress::awaited)
@@ -2174,6 +2237,8 @@ impl ServiceLedger {
                 Some(r) if piece == PIECE_SEL => sel_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) if piece == PIECE_COMP => comp_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) if piece == PIECE_ENGRAM => engram_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
+                Some(_) if is_part && part_bits.is_none() => Err("trace part indices"),
+                Some(r) if is_part => trace_part_valid(r, &a, &seed, &op.response_txid, &op.body),
                 Some(r) => trace_opening_valid(r, &a, &seed, &op.response_txid, &op.body),
                 None => Err("no rules"),
             };
@@ -2185,6 +2250,14 @@ impl ServiceLedger {
                 if tr.sanction {
                     a.deadline_daa = a.deadline_daa.min(a.accepted_daa + AUDIT_SPAN_DAA);
                 }
+                self.trace_audits.insert(op.response_txid, a);
+                continue;
+            }
+            if let Some(bits) = part_bits
+                && verdict.is_ok()
+                && (a.trace_parts | bits) != TRACE_PARTS_ALL
+            {
+                a.trace_parts |= bits;
                 self.trace_audits.insert(op.response_txid, a);
                 continue;
             }
@@ -2373,6 +2446,11 @@ impl ServiceLedger {
 
     /// Path of the attention phase a drawn response awaits; `None` while a child is still to
     /// draw or when no attention opening is awaited.
+    /// Stage-2 trace parts already proven of a drawn audit whose trace piece is still owed.
+    pub fn awaited_trace_parts(&self, response_txid: &[u8; 32]) -> Option<u8> {
+        self.trace_audits.get(response_txid).filter(|a| a.seed.is_some() && a.pieces & PIECE_TRACE == 0).map(|a| a.trace_parts)
+    }
+
     pub fn awaited_attention_path(&self, response_txid: &[u8; 32]) -> Option<Vec<u64>> {
         let a = self.trace_audits.get(response_txid).filter(|a| a.seed.is_some() && a.pieces & PIECE_ATTN == 0)?;
         match &a.attn {
@@ -2797,6 +2875,10 @@ const SNAPSHOT_ENCODING_VERSION_RESERVE: u8 = 14;
 /// (`[n: u32] n × [response_txid: 32] [root: 32]`, key order) and of the early traces
 /// (`[m: u32] m × [request_hash: 32] [responder: 32] [root: 32]`, key order), not both empty.
 const SNAPSHOT_ENCODING_VERSION_ANSWER: u8 = 15;
+/// Sections of version 15 (the answer section possibly empty) followed by the stage-2 trace parts
+/// already proven of the drawn audits (`[n: u32] n × [response_txid: 32] [parts: u8]`, key order),
+/// not empty.
+const SNAPSHOT_ENCODING_VERSION_PARTS: u8 = 16;
 /// Children an attention phase may commit.
 const MAX_ATTN_CHILDREN: u64 = 1 << 16;
 
@@ -2887,7 +2969,10 @@ impl ServiceLedgerSnapshot {
         let answered: Vec<(&[u8; 32], &[u8; 32])> = self.trace_audits.iter().filter_map(|(k, a)| a.answer_root.as_ref().map(|r| (k, r))).collect();
         let early_answered: Vec<(&([u8; 32], Hash), &[u8; 32])> =
             self.early_traces.iter().filter_map(|(k, t)| t.answer_root.as_ref().map(|r| (k, r))).collect();
-        let version = if !answered.is_empty() || !early_answered.is_empty() {
+        let parted: Vec<(&[u8; 32], u8)> = self.trace_audits.iter().filter(|(_, a)| a.trace_parts != 0).map(|(k, a)| (k, a.trace_parts)).collect();
+        let version = if !parted.is_empty() {
+            SNAPSHOT_ENCODING_VERSION_PARTS
+        } else if !answered.is_empty() || !early_answered.is_empty() {
             SNAPSHOT_ENCODING_VERSION_ANSWER
         } else if self.tier_reserve.is_some() {
             SNAPSHOT_ENCODING_VERSION_RESERVE
@@ -3166,6 +3251,13 @@ impl ServiceLedgerSnapshot {
                 out.extend_from_slice(root);
             }
         }
+        if version >= SNAPSHOT_ENCODING_VERSION_PARTS {
+            out.extend_from_slice(&(parted.len() as u32).to_le_bytes());
+            for (txid, parts) in parted {
+                out.extend_from_slice(txid);
+                out.push(parts);
+            }
+        }
         out
     }
 
@@ -3189,6 +3281,7 @@ impl ServiceLedgerSnapshot {
                 | SNAPSHOT_ENCODING_VERSION_CHAIN
                 | SNAPSHOT_ENCODING_VERSION_RESERVE
                 | SNAPSHOT_ENCODING_VERSION_ANSWER
+                | SNAPSHOT_ENCODING_VERSION_PARTS
         ) {
             return Err("unsupported snapshot encoding".into());
         }
@@ -3352,6 +3445,7 @@ impl ServiceLedgerSnapshot {
                     deadline_daa: 0,
                     pieces: 0,
                     attn: None,
+                    trace_parts: 0,
                     chain_start: 0,
                     answer_root: None,
                 };
@@ -3588,7 +3682,7 @@ impl ServiceLedgerSnapshot {
                 }
             }
             let m = r.u32()?;
-            if n == 0 && m == 0 {
+            if n == 0 && m == 0 && version == SNAPSHOT_ENCODING_VERSION_ANSWER {
                 return Err("empty answer section".into());
             }
             for _ in 0..m {
@@ -3598,6 +3692,22 @@ impl ServiceLedgerSnapshot {
                 match snap.early_traces.get_mut(&(rh, key)) {
                     Some(t) if t.answer_root.is_none() => t.answer_root = Some(root),
                     _ => return Err("malformed answer section".into()),
+                }
+            }
+        }
+        if version >= SNAPSHOT_ENCODING_VERSION_PARTS {
+            let n = r.u32()?;
+            if n == 0 {
+                return Err("empty trace parts section".into());
+            }
+            for _ in 0..n {
+                let txid = r.key()?;
+                let parts = r.u8()?;
+                match snap.trace_audits.get_mut(&txid) {
+                    Some(a) if a.seed.is_some() && a.trace_parts == 0 && parts != 0 && parts < TRACE_PARTS_ALL && a.pieces & PIECE_TRACE == 0 => {
+                        a.trace_parts = parts
+                    }
+                    _ => return Err("malformed trace parts section".into()),
                 }
             }
         }
@@ -5306,6 +5416,7 @@ mod tests {
                         audit_all: self.audit_all,
                         attention: self.attention,
                         decision: None,
+                        chain_parts: false,
                     })
                 };
                 let lens = [(RH, self.shape.map_or(0, |(p, _)| p))];
@@ -5831,6 +5942,7 @@ mod tests {
                 deadline_daa: 0,
                 pieces: 0,
                 attn: None,
+                trace_parts: 0,
                 chain_start: 0,
                 answer_root: None,
             };
@@ -5899,6 +6011,7 @@ mod tests {
             tier: keryx_verifiable_inference::chainkit::Tier,
             trace: keryx_verifiable_inference::chainkit::Trace,
             seed: [u8; 32],
+            parts: bool,
         }
 
         impl Stage2 {
@@ -5921,7 +6034,7 @@ mod tests {
                     tokens: true,
                     tokens_root: None,
                 };
-                let mut run = Self { ledger: ServiceLedger::default(), tier, trace, seed: [0; 32] };
+                let mut run = Self { ledger: ServiceLedger::default(), tier, trace, seed: [0; 32], parts: false };
                 let h0 = Hash::from_bytes([0u8; 32]);
                 assert!(run.fold(100, h0, &[], &[]).0.is_empty());
                 assert!(run.fold(102, h0, &[ev], &[]).0.is_empty());
@@ -5939,6 +6052,7 @@ mod tests {
                     audit_all: true,
                     attention: false,
                     decision: None,
+                    chain_parts: self.parts,
                 };
                 let tier = |t: u8, _at: u64| (t == 0).then(|| rules.clone());
                 let lens = [(RH, 0)];
@@ -5979,6 +6093,22 @@ mod tests {
                 Opening { response_txid: TXID, points, prefix, experts: vec![None; links.len()], links, resid: None, roots: None }.encode()
             }
 
+            /// Trace piece in two parts: point 0, then point 1 with the prefix point.
+            fn part_bodies(&self, tamper: bool) -> [Vec<u8>; 2] {
+                use keryx_verifiable_inference::opening::{ChainPart, PartPoint};
+                let point = |i: u32| {
+                    let (mut p, tok, link) = self.tier.open_point(&self.trace, &self.seed, i);
+                    if tamper && i == 1 {
+                        p.x[0] ^= 1;
+                    }
+                    PartPoint { index: i as u8, point: p, tok, link, experts: None }
+                };
+                let prefix = Some(self.tier.open_prefix(&self.trace, &self.seed, 0));
+                let a = ChainPart { response_txid: TXID, roots: None, points: vec![point(0)], prefix: None };
+                let b = ChainPart { response_txid: TXID, roots: None, points: vec![point(1)], prefix };
+                [a.encode(), b.encode()]
+            }
+
             fn resid_body(&self, tamper: bool) -> Vec<u8> {
                 let mut r = self.tier.open_resid_piece(&self.trace, &self.seed);
                 r.response_txid = TXID;
@@ -6012,6 +6142,82 @@ mod tests {
             assert_eq!(run.pieces(), Some(PIECE_TRACE));
             let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, run.resid_body(false))]);
             assert!(misses.is_empty() && verdicts == vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn a_stage2_trace_piece_in_parts_closes_the_audit_in_any_order() {
+            use crate::collateral::{PIECE_RESID, PIECE_TRACE};
+            let h = Hash::from_bytes([3u8; 32]);
+            for order in [[0usize, 1], [1, 0]] {
+                let mut run = Stage2::drawn();
+                run.parts = true;
+                let parts = run.part_bodies(false);
+                let (misses, verdicts) = run.fold(203, h, &[], &[opening(ESCROW_PK, parts[order[0]].clone())]);
+                assert!(misses.is_empty() && verdicts.is_empty());
+                assert_eq!(run.pieces(), Some(0));
+                let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, parts[order[0]].clone())]);
+                assert!(misses.is_empty() && verdicts.is_empty(), "a repeated part is ignored");
+                let (misses, verdicts) = run.fold(205, h, &[], &[opening(ESCROW_PK, parts[order[1]].clone())]);
+                assert!(misses.is_empty() && verdicts.is_empty());
+                assert_eq!(run.pieces(), Some(PIECE_TRACE));
+                let (misses, verdicts) = run.fold(206, h, &[], &[opening(ESCROW_PK, run.resid_body(false))]);
+                assert!(misses.is_empty(), "{misses:?}");
+                assert_eq!(verdicts, vec![None]);
+                assert!(run.ledger.trace_audits.is_empty());
+            }
+
+            let mut run = Stage2::drawn();
+            run.parts = true;
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, run.resid_body(false))]).0.is_empty());
+            assert_eq!(run.pieces(), Some(PIECE_RESID));
+            let parts = run.part_bodies(false);
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, parts[0].clone()), opening(ESCROW_PK, parts[1].clone())]);
+            assert!(misses.is_empty() && verdicts == vec![None]);
+            assert!(run.ledger.trace_audits.is_empty());
+        }
+
+        #[test]
+        fn trace_parts_proven_before_a_snapshot_survive_its_round_trip() {
+            use crate::collateral::{ServiceLedgerSnapshot, PIECE_TRACE};
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            run.parts = true;
+            let parts = run.part_bodies(false);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, parts[0].clone())]).0.is_empty());
+            let bytes = run.ledger.snapshot().to_bytes();
+            let snap = ServiceLedgerSnapshot::from_bytes(&bytes).unwrap();
+            assert_eq!(snap.to_bytes(), bytes);
+            let mut restored = ServiceLedger::default();
+            restored.restore_snapshot(&snap);
+            assert_eq!(restored.trace_audits.get(&TXID).map(|a| a.trace_parts), run.ledger.trace_audits.get(&TXID).map(|a| a.trace_parts));
+            run.ledger = restored;
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, parts[0].clone())]);
+            assert!(misses.is_empty() && verdicts.is_empty(), "a part proven before the snapshot is still ignored");
+            assert!(run.fold(205, h, &[], &[opening(ESCROW_PK, parts[1].clone())]).0.is_empty());
+            assert_eq!(run.pieces(), Some(PIECE_TRACE));
+
+            let mut bad = bytes.clone();
+            *bad.last_mut().unwrap() = crate::collateral::TRACE_PARTS_ALL;
+            assert!(ServiceLedgerSnapshot::from_bytes(&bad).is_err());
+        }
+
+        #[test]
+        fn a_trace_part_is_ignored_before_its_rule_and_a_forged_one_strikes() {
+            let h = Hash::from_bytes([3u8; 32]);
+            let mut run = Stage2::drawn();
+            let parts = run.part_bodies(false);
+            let (misses, verdicts) = run.fold(203, h, &[], &[opening(ESCROW_PK, parts[0].clone()), opening(ESCROW_PK, parts[1].clone())]);
+            assert!(misses.is_empty() && verdicts.is_empty());
+            assert_eq!(run.ledger.trace_audits.get(&TXID).map(|a| (a.pieces, a.trace_parts)), Some((0, 0)));
+
+            let mut run = Stage2::drawn();
+            run.parts = true;
+            let parts = run.part_bodies(true);
+            assert!(run.fold(203, h, &[], &[opening(ESCROW_PK, parts[0].clone())]).0.is_empty());
+            let (misses, verdicts) = run.fold(204, h, &[], &[opening(ESCROW_PK, parts[1].clone())]);
+            assert_eq!(verdicts, vec![Some("point 1")]);
+            assert_eq!(misses.iter().map(|m| m.0).collect::<Vec<_>>(), vec![miner()]);
             assert!(run.ledger.trace_audits.is_empty());
         }
 
@@ -6745,6 +6951,7 @@ mod tests {
                         audit_all: true,
                         attention: false,
                         decision: None,
+                        chain_parts: false,
                     })
                 };
                 let events: Vec<TraceResponseEvent> = answers
@@ -6993,6 +7200,7 @@ mod tests {
                 deadline_daa,
                 pieces: 0,
                 attn: None,
+                trace_parts: 0,
                 chain_start: 0,
                 answer_root: None,
             };

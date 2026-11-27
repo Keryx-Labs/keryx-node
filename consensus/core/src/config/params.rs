@@ -1780,6 +1780,8 @@ pub struct TraceRules {
     pub attention: bool,
     /// An audit also needs the decision opening of the response.
     pub decision: Option<keryx_verifiable_inference::decision::DecisionCtx>,
+    /// The stage-2 trace piece may come in parts.
+    pub chain_parts: bool,
 }
 
 /// Audit rules of `tier` in `lineup`; `prefix` selects the prefix rule and its manifests,
@@ -1813,7 +1815,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
             n_products: c.manifest.n_products,
         };
         let decision = h18.as_ref().and_then(|h| h.decision);
-        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all, attention: attn.is_some(), decision });
+        return Some(TraceRules { ctx, prefix: Some(c.prefix), chain: Some(c.ctx), audit_all, attention: attn.is_some(), decision, chain_parts: h18.is_some() });
     }
     let m = match &h18 {
         Some(h) if prefix => h.prefix_manifest,
@@ -1832,7 +1834,7 @@ pub fn trace_rules(tier: u8, prefix: bool, audit_all: bool, chain: bool, attenti
         (Some(h), true) => Some(h.chain.prefix.clone()),
         (None, true) => Some(TRACE_PREFIXES.get(tier as usize)?.clone()?),
     };
-    Some(TraceRules { ctx, prefix, chain: None, audit_all, attention: false, decision: None })
+    Some(TraceRules { ctx, prefix, chain: None, audit_all, attention: false, decision: None, chain_parts: false })
 }
 
 /// Context floor of each tier of the H14 lineup, in tokens: the context a responder is held to.
