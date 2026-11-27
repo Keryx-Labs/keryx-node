@@ -761,7 +761,7 @@ pub const POM_TIERS_H18: &[crate::pom::PomTier] = &[
 ];
 
 /// Context pad tiles of each `POM_TIERS_H18` tier.
-pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_423_808, 1_778_688, 846_848, 4_439_040, 8_225_792, 3_375_104, 10_001_408];
+pub const POM_V5_PAD_TILES_H18: &[u64] = &[2_345_984, 1_618_944, 2_000_896, 3_490_816, 8_039_424, 2_621_440, 2_621_440];
 
 const _: () = assert!(
     POM_V5_PAD_TILES_H14.len() == POM_TIERS_H14.len()
